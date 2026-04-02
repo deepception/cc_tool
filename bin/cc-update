@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# cc-update: Update cc_tool templates and Superpowers plugin.
+# Ruflo needs no update action — npx -y always fetches latest on session start.
+set -euo pipefail
+
+CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+echo "Updating Claude Code tools..."
+echo ""
+
+# ── 1. Update cc_tool itself ─────────────────────────────────────────────────
+echo "1/2  cc_tool (templates, hook scripts)..."
+cd "$CC_TOOL_DIR"
+if git pull --ff-only origin main 2>&1 | grep -q "Already up to date"; then
+    echo "     Already up to date."
+elif git pull --ff-only origin main; then
+    echo "     ✓ Updated."
+else
+    echo "     ⚠️  git pull failed — check manually in $CC_TOOL_DIR"
+fi
+echo ""
+
+# ── 2. Update Superpowers ────────────────────────────────────────────────────
+echo "2/2  Superpowers plugin..."
+
+# Try git pull in plugin directory first (most reliable)
+PLUGIN_CANDIDATES=(
+    "$HOME/.claude/plugins/superpowers"
+    "$HOME/.config/claude/plugins/superpowers"
+    "$HOME/Library/Application Support/Claude/plugins/superpowers"
+)
+
+updated_superpowers=false
+for plugin_dir in "${PLUGIN_CANDIDATES[@]}"; do
+    if [[ -d "$plugin_dir/.git" ]]; then
+        if git -C "$plugin_dir" pull --ff-only origin main 2>&1 | grep -q "Already up to date"; then
+            echo "     Already up to date. ($plugin_dir)"
+        else
+            git -C "$plugin_dir" pull --ff-only origin main
+            echo "     ✓ Updated. ($plugin_dir)"
+        fi
+        updated_superpowers=true
+        break
+    fi
+done
+
+if ! $updated_superpowers; then
+    # Fallback: try claude CLI
+    if command -v claude &>/dev/null; then
+        claude plugin update superpowers 2>/dev/null && \
+            echo "     ✓ Updated via claude CLI." && \
+            updated_superpowers=true
+    fi
+fi
+
+if ! $updated_superpowers; then
+    echo "     ⚠️  Could not find Superpowers plugin directory."
+    echo "     Update manually: Claude Code → Extensions → Installed → superpowers → Update"
+    echo "     Or reinstall: cc-install-superpowers"
+fi
+
+echo ""
+
+# ── Note on Ruflo ─────────────────────────────────────────────────────────────
+echo "Ruflo: no action needed — npx -y @claude-flow/cli@latest auto-fetches latest"
+echo "       on every Claude Code session start."
+echo ""
+echo "To refresh hook scripts in a project after cc_tool update:"
+echo "  cc-setup /path/to/project   (non-destructive: only updates hooks, preserves permissions)"

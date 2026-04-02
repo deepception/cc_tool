@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# cc-setup: Configure Claude Code tools (Ruflo MCP + hooks) in a project.
+# Usage: cc-setup [project_path]
+set -euo pipefail
+
+CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="${1:-$(pwd)}"
+PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+
+# ── Validation ──────────────────────────────────────────────────────────────
+if [[ ! -d "$PROJECT_DIR" ]]; then
+    echo "Error: '$PROJECT_DIR' does not exist." >&2
+    exit 1
+fi
+
+echo "Setting up Claude Code tools in: $PROJECT_DIR"
+echo ""
+
+# ── 1. Clean up Ruflo-generated scaffolding ──────────────────────────────────
+SCAFFOLDING_DIRS=(
+    ".claude-flow"
+    ".claude/helpers"
+    ".claude/skills"
+    ".claude/commands"
+    ".claude/agents"
+)
+
+found_any=false
+for dir in "${SCAFFOLDING_DIRS[@]}"; do
+    if [[ -d "$PROJECT_DIR/$dir" ]]; then
+        found_any=true
+        count=$(find "$PROJECT_DIR/$dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+        echo "  Found Ruflo scaffolding: $dir ($count files)"
+    fi
+done
+
+if $found_any; then
+    echo ""
+    read -p "Remove Ruflo-generated scaffolding? [Y/n] " confirm
+    if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+        for dir in "${SCAFFOLDING_DIRS[@]}"; do
+            if [[ -d "$PROJECT_DIR/$dir" ]]; then
+                rm -rf "$PROJECT_DIR/$dir"
+                echo "  ✓ Removed $dir"
+            fi
+        done
+    fi
+    echo ""
+fi
+
+# ── 2. .mcp.json ─────────────────────────────────────────────────────────────
+if [[ -f "$PROJECT_DIR/.mcp.json" ]]; then
+    # Check if it already has claude-flow entry
+    if python3 -c "import json; d=json.load(open('$PROJECT_DIR/.mcp.json')); exit(0 if 'claude-flow' in d.get('mcpServers',{}) else 1)" 2>/dev/null; then
+        echo "  ✓ .mcp.json already has claude-flow entry — skipping"
+    else
+        echo "  .mcp.json exists but missing claude-flow. Merging..."
+        python3 - "$PROJECT_DIR/.mcp.json" "$CC_TOOL_DIR/templates/mcp.json" <<'EOF'
+import json, sys
+existing = json.load(open(sys.argv[1]))
+new = json.load(open(sys.argv[2]))
+existing.setdefault("mcpServers", {}).update(new["mcpServers"])
+open(sys.argv[1], "w").write(json.dumps(existing, indent=2) + "\n")
+EOF
+        echo "  ✓ .mcp.json merged"
+    fi
+else
+    cp "$CC_TOOL_DIR/templates/mcp.json" "$PROJECT_DIR/.mcp.json"
+    echo "  ✓ .mcp.json created"
+fi
+
+# ── 3. Hook scripts ───────────────────────────────────────────────────────────
+mkdir -p "$PROJECT_DIR/.claude/hooks"
+cp "$CC_TOOL_DIR/templates/hooks/prompt-linter.sh" "$PROJECT_DIR/.claude/hooks/prompt-linter.sh"
+cp "$CC_TOOL_DIR/templates/hooks/websearch-year.py" "$PROJECT_DIR/.claude/hooks/websearch-year.py"
+chmod +x "$PROJECT_DIR/.claude/hooks/prompt-linter.sh"
+echo "  ✓ .claude/hooks/ installed (prompt-linter.sh, websearch-year.py)"
+
+# ── 4. settings.json (merge hooks, preserve permissions) ────────────────────
+SETTINGS_FILE="$PROJECT_DIR/.claude/settings.json"
+HOOKS_TEMPLATE="$CC_TOOL_DIR/templates/hooks-config.json"
+
+mkdir -p "$PROJECT_DIR/.claude"
+
+if [[ -f "$SETTINGS_FILE" ]]; then
+    python3 - "$SETTINGS_FILE" "$HOOKS_TEMPLATE" <<'EOF'
+import json, sys
+settings = json.load(open(sys.argv[1]))
+hooks = json.load(open(sys.argv[2]))
+settings["hooks"] = hooks
+open(sys.argv[1], "w").write(json.dumps(settings, indent=2) + "\n")
+print("  ✓ .claude/settings.json hooks updated (permissions preserved)")
+EOF
+else
+    cp "$CC_TOOL_DIR/templates/settings.json" "$SETTINGS_FILE"
+    echo "  ✓ .claude/settings.json created"
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "Done! What's active in this project:"
+echo ""
+echo "  Ruflo MCP (259 tools)  — available via .mcp.json"
+echo "                           auto-fetches @claude-flow/cli@latest on session start"
+echo "  Hooks                  — prompt-linter + websearch year injection"
+echo ""
+echo "  Superpowers skills     — active if installed globally"
+echo "                           install once: cc-install-superpowers"
+echo "                           update:       cc-update"
+echo ""
+echo "  Manual invocation only — no auto-spawning, no behavioral CLAUDE.md from Ruflo"
+echo ""
+echo "Usage cheatsheet:"
+echo "  Design first          →  tell Claude: use superpowers:brainstorming"
+echo "  Write implementation  →  tell Claude: use superpowers:writing-plans"
+echo "  Parallel execution    →  tell Claude: use mcp__claude-flow__swarm_init"
+echo "  Debug a hard issue    →  tell Claude: use superpowers:systematic-debugging"
+echo "  Gate before done      →  tell Claude: use superpowers:verification-before-completion"

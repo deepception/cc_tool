@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# cc-install-superpowers: Install Superpowers as a global Claude Code plugin.
+# Run this once. After installation, Superpowers skills are active in all projects.
+set -euo pipefail
+
+echo "Installing Superpowers plugin globally..."
+echo ""
+
+# Strategy: clone into the Claude plugins directory directly.
+# This is the most reliable approach across Claude Code versions.
+
+PLUGIN_CANDIDATES=(
+    "$HOME/.claude/plugins"
+    "$HOME/.config/claude/plugins"
+)
+
+PLUGIN_BASE=""
+for candidate in "${PLUGIN_CANDIDATES[@]}"; do
+    if [[ -d "$(dirname "$candidate")" ]]; then
+        PLUGIN_BASE="$candidate"
+        break
+    fi
+done
+
+# Fallback: use ~/.claude/plugins and create it
+if [[ -z "$PLUGIN_BASE" ]]; then
+    PLUGIN_BASE="$HOME/.claude/plugins"
+fi
+
+PLUGIN_DIR="$PLUGIN_BASE/superpowers"
+
+if [[ -d "$PLUGIN_DIR" ]]; then
+    echo "Superpowers already installed at: $PLUGIN_DIR"
+    echo "To update: cc-update"
+    exit 0
+fi
+
+mkdir -p "$PLUGIN_BASE"
+
+echo "Cloning obra/superpowers into $PLUGIN_DIR..."
+git clone --depth 1 https://github.com/obra/superpowers.git "$PLUGIN_DIR"
+
+echo ""
+echo "✓ Superpowers installed."
+echo ""
+echo "Next step: register the plugin with Claude Code."
+echo ""
+echo "Option A (CLI):"
+echo "  claude plugin add $PLUGIN_DIR"
+echo ""
+echo "Option B (Marketplace — if Option A fails):"
+echo "  Open Claude Code → Extensions → Browse Marketplace"
+echo "  Search 'superpowers' by obra and install"
+echo ""
+echo "After registration, restart Claude Code and Superpowers skills will be"
+echo "available in every project session."
+echo ""
+echo "Available skills (invoke manually by telling Claude):"
+echo "  superpowers:brainstorming              design before any code"
+echo "  superpowers:writing-plans              test-first implementation plan"
+echo "  superpowers:executing-plans            run the plan via subagents"
+echo "  superpowers:tdd                        strict red-green-refactor"
+echo "  superpowers:systematic-debugging       root-cause before any fix"
+echo "  superpowers:verification-before-completion  hard gate: run tests, read output"
+echo "  superpowers:dispatching-parallel-agents    independent tasks in parallel"
+echo "  superpowers:requesting-code-review     isolated code review subagent"
+echo "  superpowers:finishing-a-development-branch  merge/PR/discard with cleanup"
