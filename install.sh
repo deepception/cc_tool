@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup: add cc_tool commands to your PATH.
+# One-time machine setup: add cc_tool commands to PATH and install Superpowers.
 # Run once from the cc_tool directory.
 set -euo pipefail
 
@@ -8,7 +8,7 @@ BIN_DIR="$SCRIPT_DIR/bin"
 
 chmod +x "$BIN_DIR/cc-setup" "$BIN_DIR/cc-update" "$BIN_DIR/cc-install-superpowers"
 
-# Detect shell profile
+# ── 1. PATH ───────────────────────────────────────────────────────────────────
 if [[ -f "$HOME/.zshrc" ]]; then
     PROFILE="$HOME/.zshrc"
 elif [[ -f "$HOME/.bashrc" ]]; then
@@ -28,11 +28,12 @@ else
     echo "✓ Added to PATH in $PROFILE"
 fi
 
+# ── 2. Superpowers (bin/ not in PATH yet, call via full path) ─────────────────
 echo ""
-echo "Reload your shell:"
+"$BIN_DIR/cc-install-superpowers"
+
+echo ""
+echo "Reload your shell, then set up your project:"
 echo "  source $PROFILE"
-echo ""
-echo "Then:"
-echo "  cc-install-superpowers       # one-time: install Superpowers globally"
-echo "  cc-setup [project_path]      # per-project: configure Ruflo + hooks"
-echo "  cc-update                    # update both tools anytime"
+echo "  cc-setup [project_path]      # per-project: configure Ruflo + hooks + CLAUDE.md"
+echo "  cc-update                    # update tools anytime"

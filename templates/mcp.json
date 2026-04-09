@@ -8,6 +8,11 @@
         "CLAUDE_FLOW_MODE": "v3"
       },
       "autoStart": false
+    },
+    "basic-memory": {
+      "command": "uvx",
+      "args": ["basic-memory", "mcp"],
+      "autoStart": false
     }
   }
 }
