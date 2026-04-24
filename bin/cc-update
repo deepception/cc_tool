@@ -1,36 +1,24 @@
 #!/usr/bin/env bash
-# cc-update: Update cc_tool templates and Superpowers plugin.
-# Ruflo needs no update action — npx -y always fetches latest on session start.
+# cc-update: Update external dependencies (Superpowers plugin, installed globally).
+# This does NOT touch any project. For per-project template refresh use cc-update-project.
+# cc_tool templates themselves are local — edit in place, then run cc-update-project.
+# Ruflo needs no update action — npx -y auto-fetches latest on every session start.
 set -euo pipefail
 
-CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-echo "Updating Claude Code tools..."
-echo ""
-
-# ── 1. cc_tool is local-only — no remote to pull ────────────────────────────
-echo "1/2  cc_tool (templates, hook scripts)..."
-echo "     Local-only — edit templates directly in $CC_TOOL_DIR"
-echo "     After any edits, re-run: cc-setup /path/to/project"
-echo ""
-
-# ── 2. Update Superpowers ────────────────────────────────────────────────────
-echo "2/2  Superpowers plugin..."
+echo "Updating Superpowers plugin..."
 
 if ! command -v claude &>/dev/null; then
-    echo "     ⚠️  'claude' CLI not found — cannot update"
-elif claude plugin update superpowers 2>&1; then
-    echo "     ✓ Updated"
-else
-    echo "     ⚠️  Update failed"
-    echo "     Try manually: claude plugin update superpowers"
+    echo "⚠️  'claude' CLI not found — cannot update"
+    exit 1
 fi
 
-echo ""
-
-# ── Note on Ruflo ─────────────────────────────────────────────────────────────
-echo "Ruflo: no action needed — npx -y @claude-flow/cli@latest auto-fetches latest"
-echo "       on every Claude Code session start."
-echo ""
-echo "To refresh hook scripts in a project after cc_tool update:"
-echo "  cc-setup /path/to/project   (non-destructive: only updates hooks, preserves permissions)"
+# Superpowers ships via its own marketplace (superpowers-dev).
+if claude plugin marketplace update superpowers-dev 2>&1 \
+   && claude plugin update superpowers@superpowers-dev 2>&1; then
+    echo "✓ Superpowers updated (restart Claude Code to apply)"
+else
+    echo "⚠️  Update failed. Try manually:"
+    echo "  claude plugin marketplace update superpowers-dev"
+    echo "  claude plugin update superpowers@superpowers-dev"
+    exit 1
+fi

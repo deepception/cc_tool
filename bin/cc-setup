@@ -24,36 +24,40 @@ if ! command -v uvx &>/dev/null; then
     echo ""
 fi
 
-# ── 1. Clean up Ruflo-generated scaffolding ──────────────────────────────────
-SCAFFOLDING_DIRS=(
-    ".claude-flow"
-    ".claude/helpers"
-    ".claude/skills"
-    ".claude/commands"
-    ".claude/agents"
-)
+# ── 1. Clean up Ruflo-generated scaffolding (first-time setup only) ─────────
+# Skip on re-run: once cc-setup has created .claude/settings.json, any
+# .claude/skills/ or .claude/commands/ dirs are ours, not Ruflo's.
+if [[ ! -f "$PROJECT_DIR/.claude/settings.json" ]]; then
+    SCAFFOLDING_DIRS=(
+        ".claude-flow"
+        ".claude/helpers"
+        ".claude/skills"
+        ".claude/commands"
+        ".claude/agents"
+    )
 
-found_any=false
-for dir in "${SCAFFOLDING_DIRS[@]}"; do
-    if [[ -d "$PROJECT_DIR/$dir" ]]; then
-        found_any=true
-        count=$(find "$PROJECT_DIR/$dir" -type f 2>/dev/null | wc -l | tr -d ' ')
-        echo "  Found Ruflo scaffolding: $dir ($count files)"
-    fi
-done
+    found_any=false
+    for dir in "${SCAFFOLDING_DIRS[@]}"; do
+        if [[ -d "$PROJECT_DIR/$dir" ]]; then
+            found_any=true
+            count=$(find "$PROJECT_DIR/$dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+            echo "  Found Ruflo scaffolding: $dir ($count files)"
+        fi
+    done
 
-if $found_any; then
-    echo ""
-    read -p "Remove Ruflo-generated scaffolding? [Y/n] " confirm
-    if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
-        for dir in "${SCAFFOLDING_DIRS[@]}"; do
-            if [[ -d "$PROJECT_DIR/$dir" ]]; then
-                rm -rf "$PROJECT_DIR/$dir"
-                echo "  ✓ Removed $dir"
-            fi
-        done
+    if $found_any; then
+        echo ""
+        read -p "Remove Ruflo-generated scaffolding? [Y/n] " confirm
+        if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+            for dir in "${SCAFFOLDING_DIRS[@]}"; do
+                if [[ -d "$PROJECT_DIR/$dir" ]]; then
+                    rm -rf "$PROJECT_DIR/$dir"
+                    echo "  ✓ Removed $dir"
+                fi
+            done
+        fi
+        echo ""
     fi
-    echo ""
 fi
 
 # ── 2. .mcp.json ─────────────────────────────────────────────────────────────
@@ -89,10 +93,11 @@ fi
 
 # ── 3. Hook scripts ───────────────────────────────────────────────────────────
 mkdir -p "$PROJECT_DIR/.claude/hooks"
-cp "$CC_TOOL_DIR/templates/hooks/prompt-linter.sh" "$PROJECT_DIR/.claude/hooks/prompt-linter.sh"
-cp "$CC_TOOL_DIR/templates/hooks/websearch-year.py" "$PROJECT_DIR/.claude/hooks/websearch-year.py"
-chmod +x "$PROJECT_DIR/.claude/hooks/prompt-linter.sh"
-echo "  ✓ .claude/hooks/ installed (prompt-linter.sh, websearch-year.py)"
+find "$CC_TOOL_DIR/templates/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) \
+    -exec cp {} "$PROJECT_DIR/.claude/hooks/" \;
+find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -name "*.sh" -exec chmod +x {} \;
+hook_count=$(find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) | wc -l | tr -d ' ')
+echo "  ✓ .claude/hooks/ installed ($hook_count hooks)"
 
 # ── 4. settings.json (merge hooks, preserve permissions) ────────────────────
 SETTINGS_FILE="$PROJECT_DIR/.claude/settings.json"
@@ -190,9 +195,10 @@ echo "  Ruflo MCP (259 tools)  — available via .mcp.json"
 echo "                           auto-fetches @claude-flow/cli@latest on session start"
 echo "  basic-memory           — available via .mcp.json"
 echo "                           requires uvx (uv package manager)"
-echo "  Hooks                  — prompt-linter + websearch year injection"
-echo "  Skills                 — reflect, skills-audit, skill-engineer in .claude/skills/"
-echo "                           add more to cc_tool/templates/skills/ to auto-deploy"
+echo "  Hooks                  — prompt-linter, websearch year, session context,"
+echo "                           bash-guard (branch/push/--no-verify), big-file warning"
+skill_count=$(find "$CC_TOOL_DIR/templates/skills" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+echo "  Skills                 — $skill_count in .claude/skills/ (add more to cc_tool/templates/skills/ to auto-deploy)"
 echo ""
 echo "  Superpowers skills     — active if installed globally"
 echo "                           install once: cc-install-superpowers"

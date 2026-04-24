@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# cc-update-permissions: Additively merge new deny-list entries from the cc_tool template
+# into an existing project's .claude/settings.json. Never removes or modifies existing entries.
+# Usage: cc-update-permissions [project_path]
+set -euo pipefail
+
+CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="${1:-$(pwd)}"
+PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+
+SETTINGS_FILE="$PROJECT_DIR/.claude/settings.json"
+TEMPLATE="$CC_TOOL_DIR/templates/settings.json"
+
+if [[ ! -f "$SETTINGS_FILE" ]]; then
+    echo "Error: $SETTINGS_FILE not found. Run cc-setup first." >&2
+    exit 1
+fi
+
+if [[ ! -f "$TEMPLATE" ]]; then
+    echo "Error: template not found at $TEMPLATE" >&2
+    exit 1
+fi
+
+echo "Checking deny-list in: $SETTINGS_FILE"
+
+to_add=$(python3 - "$SETTINGS_FILE" "$TEMPLATE" <<'PYEOF'
+import json, sys
+existing = json.load(open(sys.argv[1]))
+template = json.load(open(sys.argv[2]))
+existing_deny = set(existing.get("permissions", {}).get("deny", []))
+for entry in template.get("permissions", {}).get("deny", []):
+    if entry not in existing_deny:
+        print(entry)
+PYEOF
+)
+
+if [[ -z "$to_add" ]]; then
+    echo "✓ Already up to date — no new deny entries in template"
+    exit 0
+fi
+
+count=$(echo "$to_add" | wc -l | tr -d ' ')
+echo ""
+echo "$count new deny entries available:"
+echo "$to_add" | sed 's/^/  + /'
+echo ""
+read -p "Append to $SETTINGS_FILE? [Y/n] " confirm
+if [[ "$confirm" =~ ^[Nn]$ ]]; then
+    echo "Aborted."
+    exit 0
+fi
+
+python3 - "$SETTINGS_FILE" "$TEMPLATE" <<'PYEOF'
+import json, sys
+existing = json.load(open(sys.argv[1]))
+template = json.load(open(sys.argv[2]))
+existing.setdefault("permissions", {}).setdefault("deny", [])
+deny = existing["permissions"]["deny"]
+for entry in template.get("permissions", {}).get("deny", []):
+    if entry not in deny:
+        deny.append(entry)
+open(sys.argv[1], "w").write(json.dumps(existing, indent=2) + "\n")
+PYEOF
+
+echo "✓ Added $count deny entries"

@@ -10,6 +10,18 @@
       ]
     }
   ],
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/session-context.py",
+          "timeout": 3
+        }
+      ]
+    }
+  ],
   "PreToolUse": [
     {
       "matcher": "WebSearch",
@@ -18,6 +30,26 @@
           "type": "command",
           "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/websearch-year.py",
           "timeout": 5
+        }
+      ]
+    },
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/bash-guard.py",
+          "timeout": 3
+        }
+      ]
+    },
+    {
+      "matcher": "Read",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/big-file-guard.py",
+          "timeout": 2
         }
       ]
     }

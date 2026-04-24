@@ -19,9 +19,38 @@
       "Read(.env.*)",
       "Read(**/secrets/**)",
       "Read(**/*credentials*)",
+      "Read(~/.ssh/**)",
+      "Write(~/.ssh/**)",
+      "Edit(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Write(~/.aws/**)",
+      "Edit(~/.aws/**)",
+      "Read(~/.config/gh/**)",
+      "Write(**/*.pem)",
+      "Edit(**/*.pem)",
+      "Write(**/*.key)",
+      "Edit(**/*.key)",
+      "Write(**/id_rsa*)",
+      "Edit(**/id_rsa*)",
+      "Edit(**/uv.lock)",
+      "Edit(**/package-lock.json)",
+      "Edit(**/pnpm-lock.yaml)",
+      "Edit(**/yarn.lock)",
+      "Edit(**/Cargo.lock)",
+      "Edit(**/go.sum)",
+      "Edit(**/poetry.lock)",
+      "Edit(**/Gemfile.lock)",
+      "Edit(**/composer.lock)",
       "Bash(rm -rf *)",
       "Bash(git push --force *)",
-      "Bash(git reset --hard *)"
+      "Bash(git reset --hard *)",
+      "Bash(git clean -fd*)",
+      "Bash(git checkout .)",
+      "Bash(git checkout -- *)",
+      "Bash(git branch -D *)",
+      "Bash(git reflog expire *)",
+      "Bash(git filter-branch *)",
+      "Bash(git filter-repo *)"
     ]
   },
   "hooks": {
@@ -36,6 +65,18 @@
         ]
       }
     ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/session-context.py",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "WebSearch",
@@ -44,6 +85,26 @@
             "type": "command",
             "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/websearch-year.py",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/bash-guard.py",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/big-file-guard.py",
+            "timeout": 2
           }
         ]
       }

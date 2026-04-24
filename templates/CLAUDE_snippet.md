@@ -77,6 +77,7 @@ Before implementing any non-trivial change, run this internal reasoning protocol
 **Phase 5 — Meta-check**
 - "Am I solving the right problem at the right level of abstraction?"
 - "What hidden constraints am I accepting without questioning?"
+- "Would a senior engineer call this overcomplicated?"
 
 When uncertain at any phase: decompose into sub-questions, answer each with evidence from the codebase. Do NOT guess and push forward.
 
@@ -110,7 +111,7 @@ If a task will read more than ~3 files or produce output the user doesn't need v
 1. **Read before writing** — understand existing code before modifying it. Never speculate about code you have not opened — if a file is referenced, read it first.
 2. **Plan first** — use plan mode for any task with 3+ steps or architectural decisions.
 3. **Think before acting** — run the reasoning protocol for any non-trivial task.
-4. **Minimal impact** — touch only what is necessary; avoid cascading changes.
+4. **Minimal impact** — touch only what is necessary; avoid cascading changes. Every changed line should trace directly to the user's request. Remove imports and variables orphaned by YOUR changes; do not delete pre-existing dead code unless asked — mention it instead.
 5. **Verify before done** — prove every change works with tests or demonstration.
 6. **Never skip tests** — run at minimum the tests related to your changes.
 7. **No hardcoded secrets** — use environment variables and .env files.

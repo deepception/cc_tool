@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# cc-update-project: Update cc_tool-managed files (hooks, skills, permissions deny-list)
+# in an existing project. For first-time setup use cc-setup. For external deps use cc-update.
+# Usage: cc-update-project [project_path]
+set -euo pipefail
+
+CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="${1:-$(pwd)}"
+PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+
+if [[ ! -f "$PROJECT_DIR/.claude/settings.json" ]]; then
+    echo "Error: no .claude/settings.json in $PROJECT_DIR" >&2
+    echo "This doesn't look like an initialized project." >&2
+    echo "Run 'cc-setup $PROJECT_DIR' first for initial setup." >&2
+    exit 1
+fi
+
+echo "Updating cc_tool-managed files in: $PROJECT_DIR"
+echo ""
+echo "=== Step 1: refresh hooks, skills, and MCP config ==="
+"$CC_TOOL_DIR/bin/cc-setup" "$PROJECT_DIR"
+
+echo ""
+echo "=== Step 2: merge new deny entries ==="
+"$CC_TOOL_DIR/bin/cc-update-permissions" "$PROJECT_DIR"
+
+echo ""
+echo "Done."
