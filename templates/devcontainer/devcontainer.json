@@ -1,0 +1,36 @@
+{
+  "name": "cc_tool sandbox",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "TZ": "${localEnv:TZ:Etc/UTC}",
+      "CLOUD": "none"
+    }
+  },
+  "remoteUser": "node",
+  "runArgs": [
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    "--env-file=${localEnv:HOME}/.config/cc_tool/auth.env"
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    "source=cc-tool-claude-${devcontainerId},target=/home/node/.claude,type=volume",
+    "source=cc-tool-bashhistory-${devcontainerId},target=/commandhistory,type=volume"
+  ],
+  "containerEnv": {
+    "NODE_OPTIONS": "--max-old-space-size=4096",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+  "postStartCommand": "bash -c 'sudo /usr/local/bin/init-firewall.sh > /tmp/init-firewall.log 2>&1; rc=$?; cat /tmp/init-firewall.log; if [ $rc -ne 0 ]; then echo; echo \"⚠ firewall init failed (exit $rc) — container running WITHOUT firewall. Log: /tmp/init-firewall.log\"; fi; exit 0'",
+  "waitFor": "postStartCommand",
+  "customizations": {
+    "vscode": {
+      "extensions": ["anthropic.claude-code"]
+    }
+  }
+}

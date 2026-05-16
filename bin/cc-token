@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# cc-token: Generate a long-lived Claude Code OAuth token and write it (plus
+# a bridged GitHub token from `gh auth token`) to ~/.config/cc_tool/auth.env.
+# cc-devcontainer wires this file into the container via Docker's --env-file
+# in runArgs, so refreshing the token does NOT require sourcing a shell rc or
+# restarting Cursor — just rebuild the container.
+#
+# Usage:
+#   cc-token                  # interactive
+#   cc-token --file PATH      # write to a specific path (default: $HOME/.config/cc_tool/auth.env)
+set -euo pipefail
+
+AUTH_FILE="$HOME/.config/cc_tool/auth.env"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --file) AUTH_FILE="${2:-}"; shift 2 ;;
+        --file=*) AUTH_FILE="${1#*=}"; shift ;;
+        -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+        *) echo "Unknown arg: $1" >&2; exit 1 ;;
+    esac
+done
+
+mkdir -p "$(dirname "$AUTH_FILE")"
+touch "$AUTH_FILE"
+chmod 600 "$AUTH_FILE"
+
+if ! command -v claude &>/dev/null; then
+    echo "Error: 'claude' not found in PATH. Install Claude Code first." >&2
+    exit 1
+fi
+
+# ── 1. Generate token via claude setup-token (interactive) ──────────────────
+echo "── Generating a long-lived OAuth token ──"
+echo "  Browser will open. After login, claude prints the token."
+echo "  Copy the token — you'll paste it on the next prompt."
+echo ""
+claude setup-token || {
+    echo "claude setup-token failed or was cancelled." >&2
+    exit 1
+}
+echo ""
+
+# ── 2. Read pasted token (silent input) ─────────────────────────────────────
+read -rs -p "Paste the token: " TOKEN
+echo ""
+
+if [[ -z "$TOKEN" ]]; then
+    echo "Error: empty token, aborting." >&2
+    exit 1
+fi
+
+if [[ ! "$TOKEN" =~ ^sk-ant- ]]; then
+    echo "Warning: token doesn't start with 'sk-ant-' (Anthropic tokens usually do)." >&2
+    read -p "  Continue anyway? [y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
+fi
+
+# ── 3. Write env-file (key=value lines, no `export`) ───────────────────────
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+echo "CLAUDE_CODE_OAUTH_TOKEN=$TOKEN" > "$TMP"
+echo "  ✓ CLAUDE_CODE_OAUTH_TOKEN written"
+
+# ── 4. Bridge GitHub auth from host's gh CLI (optional) ─────────────────────
+if command -v gh &>/dev/null; then
+    if GH_VAL="$(gh auth token 2>/dev/null)" && [[ -n "$GH_VAL" ]]; then
+        echo "GITHUB_TOKEN=$GH_VAL" >> "$TMP"
+        echo "GH_TOKEN=$GH_VAL" >> "$TMP"
+        echo "  ✓ GITHUB_TOKEN bridged from 'gh auth token'"
+    else
+        echo "  ⚠ gh CLI not authenticated on host."
+        echo "    Run 'gh auth login' on host, then re-run cc-token to bridge GitHub access."
+    fi
+else
+    echo "  ⚠ 'gh' CLI not installed on host — skipping GitHub token bridge."
+fi
+
+mv "$TMP" "$AUTH_FILE"
+chmod 600 "$AUTH_FILE"
+
+echo ""
+echo "✓ Saved to $AUTH_FILE"
+echo ""
+echo "── Next ──"
+echo "  In Cursor: Command Palette → Dev Containers: Rebuild Container"
+echo "  (No need to source any rc file or restart Cursor — Docker reads the"
+echo "  file directly at container start via --env-file.)"

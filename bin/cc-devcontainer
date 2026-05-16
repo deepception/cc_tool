@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# cc-devcontainer: Drop a .devcontainer/ into a project so Claude Code runs
+# inside an isolated container with a default-deny firewall and an optional
+# read-only mount of cloud credentials and host MCP config.
+#
+# Usage:
+#   cc-devcontainer [PROJECT_DIR]
+#       [--cloud aws|gcp|none] [--firewall on|off]
+#       [--share-mcp-auth] [--mcp-domains a.com,b.com]
+#       [--force]
+set -euo pipefail
+
+CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEMPLATE_DIR="$CC_TOOL_DIR/templates/devcontainer"
+
+PROJECT_DIR=""
+CLOUD="none"
+FIREWALL="on"
+SHARE_MCP_AUTH=0
+MCP_DOMAINS=""
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cloud)    CLOUD="${2:-}"; shift 2 ;;
+        --cloud=*)  CLOUD="${1#*=}"; shift ;;
+        --firewall) FIREWALL="${2:-}"; shift 2 ;;
+        --firewall=*) FIREWALL="${1#*=}"; shift ;;
+        --share-mcp-auth) SHARE_MCP_AUTH=1; shift ;;
+        --mcp-domains) MCP_DOMAINS="${2:-}"; shift 2 ;;
+        --mcp-domains=*) MCP_DOMAINS="${1#*=}"; shift ;;
+        --force)    FORCE=1; shift ;;
+        -h|--help)
+            sed -n '2,13p' "$0"; exit 0 ;;
+        -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+        *)  PROJECT_DIR="$1"; shift ;;
+    esac
+done
+
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+
+case "$CLOUD" in
+    aws|gcp|none) ;;
+    *) echo "Error: --cloud must be aws, gcp, or none (got '$CLOUD')" >&2; exit 1 ;;
+esac
+
+case "$FIREWALL" in
+    on|off) ;;
+    *) echo "Error: --firewall must be on or off (got '$FIREWALL')" >&2; exit 1 ;;
+esac
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+    echo "Error: '$PROJECT_DIR' does not exist." >&2
+    exit 1
+fi
+
+echo "Setting up devcontainer in: $PROJECT_DIR"
+echo "  cloud:           $CLOUD"
+echo "  firewall:        $FIREWALL"
+echo "  share-mcp-auth:  $([[ $SHARE_MCP_AUTH -eq 1 ]] && echo on || echo off)"
+echo "  mcp-domains:     ${MCP_DOMAINS:-(none)}"
+echo ""
+
+if (( SHARE_MCP_AUTH )); then
+    if [[ ! -f "$HOME/.claude.json" ]]; then
+        echo "  ⚠ --share-mcp-auth set but $HOME/.claude.json doesn't exist. Skipping mount."
+        SHARE_MCP_AUTH=0
+    else
+        echo "  ⚠ --share-mcp-auth ON — host MCP tokens visible inside container."
+        echo "    Untrusted code in the container can read those tokens. The firewall"
+        echo "    still blocks exfiltration to non-allowlisted hosts."
+        echo ""
+    fi
+fi
+
+# Ensure auth env-file exists so Docker's --env-file in runArgs doesn't fail
+# even if the user hasn't run cc-token yet. (cc-token populates it.)
+AUTH_FILE="$HOME/.config/cc_tool/auth.env"
+mkdir -p "$(dirname "$AUTH_FILE")"
+[[ -f "$AUTH_FILE" ]] || { touch "$AUTH_FILE"; chmod 600 "$AUTH_FILE"; echo "  ✓ created empty $AUTH_FILE (run cc-token to populate)"; }
+
+
+DEVCONTAINER_DIR="$PROJECT_DIR/.devcontainer"
+mkdir -p "$DEVCONTAINER_DIR"
+
+# ── 1. Dockerfile + managed-settings + firewall script ──────────────────────
+for f in Dockerfile managed-settings.json init-firewall.sh; do
+    dst="$DEVCONTAINER_DIR/$f"
+    if [[ -f "$dst" && $FORCE -eq 0 ]]; then
+        echo "  ✓ $f already present — skipping (use --force to overwrite)"
+    else
+        cp "$TEMPLATE_DIR/$f" "$dst"
+        echo "  ✓ $f written"
+    fi
+done
+chmod +x "$DEVCONTAINER_DIR/init-firewall.sh"
+
+# ── 1b. mcp-allowed-domains: extra hosts the firewall should allowlist ──────
+# Always written (empty file if no --mcp-domains) so the Dockerfile COPY succeeds.
+MCP_DOMAINS_FILE="$DEVCONTAINER_DIR/mcp-allowed-domains"
+if [[ -n "$MCP_DOMAINS" ]]; then
+    echo "$MCP_DOMAINS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' > "$MCP_DOMAINS_FILE"
+    echo "  ✓ mcp-allowed-domains written ($(wc -l < "$MCP_DOMAINS_FILE") domains)"
+else
+    : > "$MCP_DOMAINS_FILE"
+fi
+
+# ── 2. devcontainer.json — patched for cloud + firewall choice ──────────────
+DEVCONTAINER_JSON="$DEVCONTAINER_DIR/devcontainer.json"
+
+if [[ -f "$DEVCONTAINER_JSON" && $FORCE -eq 0 ]]; then
+    echo "  ✓ devcontainer.json already present — skipping (use --force to overwrite)"
+else
+    python3 - "$TEMPLATE_DIR/devcontainer.json" "$DEVCONTAINER_JSON" "$CLOUD" "$FIREWALL" "$SHARE_MCP_AUTH" <<'EOF'
+import json, sys
+
+template_path, out_path, cloud, firewall, share_mcp = sys.argv[1:6]
+with open(template_path) as f:
+    cfg = json.load(f)
+
+cfg["build"]["args"]["CLOUD"] = cloud
+
+# Cloud-specific bind mounts + env
+if cloud == "aws":
+    cfg["mounts"].append(
+        "source=${localEnv:HOME}/.aws,target=/home/node/.aws,type=bind,readonly"
+    )
+    cfg["containerEnv"].update({
+        "AWS_SHARED_CREDENTIALS_FILE": "/home/node/.aws/credentials",
+        "AWS_CONFIG_FILE": "/home/node/.aws/config",
+        "AWS_PROFILE": "${localEnv:AWS_PROFILE:default}",
+        "AWS_REGION": "${localEnv:AWS_REGION:}",
+    })
+elif cloud == "gcp":
+    cfg["mounts"].append(
+        "source=${localEnv:HOME}/.config/gcloud,target=/home/node/.config/gcloud,type=bind,readonly"
+    )
+    cfg["containerEnv"].update({
+        "CLOUDSDK_CONFIG": "/home/node/.config/gcloud",
+        "GOOGLE_APPLICATION_CREDENTIALS":
+            "${localEnv:GOOGLE_APPLICATION_CREDENTIALS:}",
+        "CLOUDSDK_CORE_PROJECT": "${localEnv:CLOUDSDK_CORE_PROJECT:}",
+    })
+
+# Host MCP config bind mount (read-only)
+if share_mcp == "1":
+    cfg["mounts"].append(
+        "source=${localEnv:HOME}/.claude.json,target=/home/node/.claude.json,type=bind,readonly"
+    )
+
+# Firewall toggle
+if firewall == "off":
+    cfg.pop("runArgs", None)
+    cfg.pop("postStartCommand", None)
+    cfg.pop("waitFor", None)
+
+with open(out_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+EOF
+    echo "  ✓ devcontainer.json written"
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "Done."
+echo ""
+
+# Auth pre-check: tokens come from $HOME/.config/cc_tool/auth.env (populated
+# by cc-token), so check the file rather than the shell env.
+AUTH_FILE_FOR_CHECK="$HOME/.config/cc_tool/auth.env"
+if [[ ! -s "$AUTH_FILE_FOR_CHECK" ]] || ! grep -q -E '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=' "$AUTH_FILE_FOR_CHECK" 2>/dev/null; then
+    echo "⚠ No CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY in $AUTH_FILE_FOR_CHECK"
+    echo "  The container's firewall blocks OAuth login from inside. Run on host:"
+    echo ""
+    echo "    cc-token                  # generates token + bridges GitHub auth"
+    echo ""
+    echo "  Then rebuild the container (no shell reload needed)."
+    echo ""
+fi
+
+echo "To start the container:"
+echo "  VS Code:     Dev Containers extension → 'Reopen in Container'"
+echo "  JetBrains:   Remote Development → 'New Dev Container From Local Project'"
+echo "  Cursor/CLI:  npm i -g @devcontainers/cli"
+echo "               devcontainer up --workspace-folder $PROJECT_DIR"
+echo "               devcontainer exec --workspace-folder $PROJECT_DIR claude"
+echo ""
+echo "What's inside the container:"
+echo "  • Claude Code CLI (via devcontainer feature)"
+echo "  • Project mounted at /workspace (bind, read-write)"
+echo "  • cc_tool's .mcp.json travels with the project — claude-flow (npx) and"
+echo "    basic-memory (uvx) MCPs spawn inside with node + uv installed"
+if [[ "$CLOUD" != "none" ]]; then
+    if [[ "$CLOUD" == "aws" ]]; then
+        echo "  • ~/.aws mounted read-only at /home/node/.aws"
+    else
+        echo "  • ~/.config/gcloud mounted read-only at /home/node/.config/gcloud"
+    fi
+fi
+echo "  • GitHub via gh CLI — pass GITHUB_TOKEN/GH_TOKEN in your host shell,"
+echo "    or 'gh auth login' inside the container"
+if [[ "$FIREWALL" == "on" ]]; then
+    echo "  • Default-deny egress firewall (allowlist in init-firewall.sh)"
+else
+    echo "  • Firewall OFF — container has full host network access"
+fi

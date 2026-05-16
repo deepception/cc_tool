@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cc-update-permissions: Additively merge new deny-list entries from the cc_tool template
+# cc-update-permissions: Additively merge new deny and ask entries from the cc_tool template
 # into an existing project's .claude/settings.json. Never removes or modifies existing entries.
 # Usage: cc-update-permissions [project_path]
 set -euo pipefail
@@ -21,28 +21,41 @@ if [[ ! -f "$TEMPLATE" ]]; then
     exit 1
 fi
 
-echo "Checking deny-list in: $SETTINGS_FILE"
+echo "Checking permissions in: $SETTINGS_FILE"
 
-to_add=$(python3 - "$SETTINGS_FILE" "$TEMPLATE" <<'PYEOF'
+diff_output=$(python3 - "$SETTINGS_FILE" "$TEMPLATE" <<'PYEOF'
 import json, sys
 existing = json.load(open(sys.argv[1]))
 template = json.load(open(sys.argv[2]))
-existing_deny = set(existing.get("permissions", {}).get("deny", []))
-for entry in template.get("permissions", {}).get("deny", []):
-    if entry not in existing_deny:
-        print(entry)
+existing_perms = existing.get("permissions", {})
+template_perms = template.get("permissions", {})
+for section in ("deny", "ask"):
+    have = set(existing_perms.get(section, []))
+    for entry in template_perms.get(section, []):
+        if entry not in have:
+            print(f"{section}\t{entry}")
 PYEOF
 )
 
-if [[ -z "$to_add" ]]; then
-    echo "✓ Already up to date — no new deny entries in template"
+if [[ -z "$diff_output" ]]; then
+    echo "✓ Already up to date — no new deny/ask entries in template"
     exit 0
 fi
 
-count=$(echo "$to_add" | wc -l | tr -d ' ')
+deny_count=$(echo "$diff_output" | grep -c $'^deny\t' || true)
+ask_count=$(echo "$diff_output" | grep -c $'^ask\t' || true)
+total=$(echo "$diff_output" | wc -l | tr -d ' ')
+
 echo ""
-echo "$count new deny entries available:"
-echo "$to_add" | sed 's/^/  + /'
+echo "$total new permissions available ($deny_count deny, $ask_count ask):"
+if (( deny_count > 0 )); then
+    echo "  deny:"
+    echo "$diff_output" | awk -F'\t' '$1=="deny" {print "    + " $2}'
+fi
+if (( ask_count > 0 )); then
+    echo "  ask:"
+    echo "$diff_output" | awk -F'\t' '$1=="ask" {print "    + " $2}'
+fi
 echo ""
 read -p "Append to $SETTINGS_FILE? [Y/n] " confirm
 if [[ "$confirm" =~ ^[Nn]$ ]]; then
@@ -54,12 +67,15 @@ python3 - "$SETTINGS_FILE" "$TEMPLATE" <<'PYEOF'
 import json, sys
 existing = json.load(open(sys.argv[1]))
 template = json.load(open(sys.argv[2]))
-existing.setdefault("permissions", {}).setdefault("deny", [])
-deny = existing["permissions"]["deny"]
-for entry in template.get("permissions", {}).get("deny", []):
-    if entry not in deny:
-        deny.append(entry)
+existing.setdefault("permissions", {})
+template_perms = template.get("permissions", {})
+for section in ("deny", "ask"):
+    existing["permissions"].setdefault(section, [])
+    arr = existing["permissions"][section]
+    for entry in template_perms.get(section, []):
+        if entry not in arr:
+            arr.append(entry)
 open(sys.argv[1], "w").write(json.dumps(existing, indent=2) + "\n")
 PYEOF
 
-echo "✓ Added $count deny entries"
+echo "✓ Added $total permission entries ($deny_count deny, $ask_count ask)"
