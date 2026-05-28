@@ -10,15 +10,37 @@ Claude Code's internal transcript JSONL, which is not a stable public API; if
 the format changes this no-ops gracefully.
 
 Tunables (env vars):
-  CONTEXT_USAGE_LIMIT     token budget to measure against (default 200000)
+  CONTEXT_USAGE_LIMIT     token budget to measure against. When unset, derived
+                          from the session model (1,000,000 for Opus 4.8,
+                          200,000 otherwise); set this to override.
   CONTEXT_USAGE_WARN_PCT  warn at/above this percent (default 80)
 """
 import json
 import os
 import sys
 
-LIMIT = int(os.environ.get("CONTEXT_USAGE_LIMIT", "200000"))
 WARN_PCT = int(os.environ.get("CONTEXT_USAGE_WARN_PCT", "80"))
+
+
+def context_limit(model):
+    """Token budget for the warning.
+
+    An explicit CONTEXT_USAGE_LIMIT always wins. Otherwise derive from the
+    session model: Opus 4.8 runs a 1M-token window by default, while
+    4.7-and-earlier use 200K. (Opus 4.8 on Microsoft Foundry serves 200K under
+    the same model id, so this over-estimates for that minority — it under-warns
+    rather than spamming false alarms, which is the safer failure.) Unknown
+    models fall back to the 200K floor.
+    """
+    env_limit = os.environ.get("CONTEXT_USAGE_LIMIT")
+    if env_limit:
+        try:
+            return int(env_limit)
+        except ValueError:
+            pass
+    if model and "opus-4-8" in model:
+        return 1_000_000
+    return 200_000
 
 
 def main() -> None:
@@ -32,6 +54,7 @@ def main() -> None:
         return
 
     latest = None
+    latest_model = None
     try:
         with open(transcript, encoding="utf-8") as f:
             for line in f:
@@ -42,29 +65,37 @@ def main() -> None:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                usage = entry.get("message", {}).get("usage")
+                message = entry.get("message")
+                if not isinstance(message, dict):
+                    continue
+                usage = message.get("usage")
                 if isinstance(usage, dict):
                     latest = usage
+                model = message.get("model")
+                if isinstance(model, str) and model:
+                    latest_model = model
     except OSError:
         return
 
     if not latest:
         return
 
+    limit = context_limit(latest_model)
+
     used = (
         latest.get("input_tokens", 0)
         + latest.get("cache_read_input_tokens", 0)
         + latest.get("cache_creation_input_tokens", 0)
     )
-    if used <= 0 or LIMIT <= 0:
+    if used <= 0 or limit <= 0:
         return
 
-    pct = round(used / LIMIT * 100)
+    pct = round(used / limit * 100)
     if pct < WARN_PCT:
         return
 
     print(
-        f"[context-usage] {used // 1000}K / {LIMIT // 1000}K tokens ({pct}%). "
+        f"[context-usage] {used // 1000}K / {limit // 1000}K tokens ({pct}%). "
         f"Consider /compact or /clear before the window fills.",
         file=sys.stderr,
     )

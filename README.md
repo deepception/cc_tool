@@ -43,7 +43,7 @@ What it does:
 - Removes Ruflo-generated scaffolding (`.claude-flow/`, `.claude/helpers/`, `.claude/skills/`, `.claude/commands/`, `.claude/agents/`) — with confirmation
 - Creates/merges `.mcp.json` with Ruflo + basic-memory MCP server configs
 - Installs hook scripts into `.claude/hooks/`
-- Creates `.claude/settings.json` (new projects) or updates only the `hooks` section (existing projects, preserving your permissions)
+- Creates `.claude/settings.json` (new projects) or updates the `hooks` section + commit-attribution policy (existing projects, preserving your permissions). The policy (`attribution.commit: ""`) keeps Claude out of commit co-authors.
 - Copies skills from `templates/skills/` into `.claude/skills/` (skips existing ones)
 - Creates `CLAUDE.md` from `CLAUDE_template.md` if none exists (full template with placeholders), or appends `CLAUDE_snippet.md` to an existing one (AI tools + reasoning protocol + verification + critical rules)
 
@@ -61,7 +61,7 @@ cc-devcontainer /path/to/project    # sandbox Claude Code in a container (see be
 ```
 
 - **`cc-setup`** — initialize a project the first time: `.mcp.json`, `.claude/settings.json`, `.claude/hooks/`, `.claude/skills/`, `CLAUDE.md`. Safe to re-run; idempotent on the parts it manages.
-- **`cc-update-project`** — roll new cc_tool changes into an existing project: re-copies hooks, adds any new skills, merges new hooks into `settings.json`, additively merges new `deny`/`ask` entries, and replaces the marker-delimited methodology block in `CLAUDE.md` in place. Preserves existing permissions and all project-specific CLAUDE.md content; never clobbers local edits. Ends with a non-destructive template-drift check (lists template sections the project lacks). **Note:** project-specific CLAUDE.md *structure* (Overview, Codebase Map, Commands…) is seeded once from the template and is **not** auto-merged on update — only the managed methodology block is. Internally calls `cc-setup` + `cc-update-permissions`.
+- **`cc-update-project`** — roll new cc_tool changes into an existing project: re-copies hooks, adds any new skills, merges new hooks into `settings.json`, additively merges new `deny`/`ask` entries, applies the commit-attribution policy, and replaces the marker-delimited methodology block in `CLAUDE.md` in place. Preserves existing permissions and all project-specific CLAUDE.md content; never clobbers local edits. Ends with a non-destructive template-drift check (lists template sections the project lacks). **Note:** project-specific CLAUDE.md *structure* (Overview, Codebase Map, Commands…) is seeded once from the template and is **not** auto-merged on update — only the managed methodology block is. Internally calls `cc-setup` + `cc-update-permissions`.
 - **`cc-update`** — updates global plugins (Superpowers from `obra/superpowers`; checks/installs `security-guidance` from `anthropics/claude-plugins-official`). Independent of any project.
 
 Ruflo needs no update — always latest via `npx -y`. `cc_tool` itself is local-only — edit templates in place, then run `cc-update-project` on any project to pick up changes.
@@ -186,6 +186,15 @@ Claude uses it automatically when CLAUDE.md is present. You can also ask explici
 ### Ruflo
 
 Ruflo's MCP tools (swarm parallelism, multi-repo coordination) are loaded via `.mcp.json` and visible to Claude in every session. Claude may use them on its own when it judges they fit the task — you don't need to ask for them explicitly. For most parallel work (3-5 tasks), Claude will prefer `superpowers:dispatching-parallel-agents` since it's simpler.
+
+### Native dynamic workflows (Claude Code v2.1.154+, Opus 4.8)
+
+The harness can now write and run its own multi-agent orchestration (the `Workflow` tool — triggered by the word "workflow", `/deep-research`, a saved workflow, or `ultracode` mode), spawning tens-to-hundreds of subagents whose intermediate results stay out of the main context. This overlaps Ruflo's swarm role for large independent fan-out. Two things to know:
+
+- **Permissions:** workflow-spawned subagents run in `acceptEdits` (file edits auto-approved) and inherit this project's `settings.json` allowlist. The `deny`/`ask` lists and the devcontainer firewall remain the enforced boundary; pre-populating `allow` with build/test commands keeps long runs from stalling on mid-run prompts.
+- **Disabling:** set `disableWorkflows: true` in `settings.json` (or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`), which also removes `ultracode` and the bare-word trigger.
+
+cc_tool ships one saved workflow, [`.claude/workflows/model-recalibration-audit.js`](.claude/workflows/model-recalibration-audit.js) — re-audits this setup against a new Claude model (see the config-staleness note above), writing its report under `docs/` (git-ignored). Re-run it per model release with `Workflow({name:"model-recalibration-audit", args:{newModel, oldModel}})`.
 
 ---
 

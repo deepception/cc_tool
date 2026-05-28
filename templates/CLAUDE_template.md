@@ -109,9 +109,9 @@ Prefer running single test files over the full suite for faster feedback.
 <!-- Keep these general. Add project-specific rules as needed. -->
 
 - Each module is an independent package with its own dependency manifest
-- Shared utilities belong in a common module; do NOT duplicate across packages
+- Shared utilities belong in a common module; avoid duplicating across packages
 - Configuration uses environment variables; NEVER hardcode secrets
-- Logging uses structured logging; do NOT use `print()` for production output
+- Logging uses structured logging; use the logger rather than `print()` for production output
 
 ---
 
@@ -120,16 +120,16 @@ Prefer running single test files over the full suite for faster feedback.
 ### Planning
 
 1. Enter plan mode for any task with 3+ steps or architectural decisions
-2. Read relevant source files BEFORE proposing changes
+2. Read relevant source files before proposing changes
 3. Write a plan with checkable items when appropriate
-4. Track progress — mark items complete as you go
+4. Keep the plan updated as the source of truth
 
 ### Implementation
 
 1. Make the smallest change that solves the problem
 2. Run formatter and linter after editing code
 3. Run relevant tests after changes — prefer single test files over full suite
-4. Verify the change works before marking complete
+4. Confirm the change works — run the relevant tests, or exercise it directly if untested
 5. Never commit files containing secrets (.env, credentials, API keys)
 
 ### Git Conventions

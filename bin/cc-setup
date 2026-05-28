@@ -127,13 +127,22 @@ HOOKS_TEMPLATE="$CC_TOOL_DIR/templates/hooks-config.json"
 mkdir -p "$PROJECT_DIR/.claude"
 
 if [[ -f "$SETTINGS_FILE" ]]; then
-    python3 - "$SETTINGS_FILE" "$HOOKS_TEMPLATE" <<'EOF'
+    python3 - "$SETTINGS_FILE" "$HOOKS_TEMPLATE" "$CC_TOOL_DIR/templates/settings.json" <<'EOF'
 import json, sys
 settings = json.load(open(sys.argv[1]))
 hooks = json.load(open(sys.argv[2]))
+template = json.load(open(sys.argv[3]))
 settings["hooks"] = hooks
+# Managed attribution policy (keeps Claude out of commit co-authors). Apply each
+# key only where the project hasn't set its own — never clobber user overrides,
+# so re-runs stay idempotent (same additive approach as the permissions merge).
+tmpl_attr = template.get("attribution")
+if isinstance(tmpl_attr, dict):
+    attr = settings.setdefault("attribution", {})
+    for k, v in tmpl_attr.items():
+        attr.setdefault(k, v)
 open(sys.argv[1], "w").write(json.dumps(settings, indent=2) + "\n")
-print("  ✓ .claude/settings.json hooks updated (permissions preserved)")
+print("  ✓ .claude/settings.json hooks + attribution updated (permissions preserved)")
 EOF
 else
     cp "$CC_TOOL_DIR/templates/settings.json" "$SETTINGS_FILE"

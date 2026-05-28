@@ -2,6 +2,23 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.0.5
+
+- **Recalibrated the config for Claude Opus 4.8** (released 2026-05-28; a drop-in replacement for 4.7 with no breaking API changes), driven by the new `model-recalibration-audit` workflow. No P0 changes — tuning only. **Every security/safety guardrail is unchanged** (permission `deny`/`ask` lists, `bash-guard` protections, devcontainer firewall + managed settings, `websearch-year.py`, `big-file-guard.py` threshold, `session-context.py` caps, and the Superpowers-vs-Ruflo separation).
+- **New reusable workflow** [.claude/workflows/model-recalibration-audit.js](.claude/workflows/model-recalibration-audit.js) — re-audits hooks/permissions/CLAUDE.md/skills against a newer Claude model (research → capability profile → per-component analysis → adversarial verification → report). Re-runnable per model release with `args { newModel, oldModel }`, matching the v0.0.4 config-staleness note.
+- **`CLAUDE_snippet.md` — reasoning and phrasing tuned for 4.8** (4.8 steers reasoning via the `effort` lever / adaptive thinking, follows instructions more literally, and over-triggers on emphatic guardrail phrasing):
+  - Replaced the always-resident 5-phase Reasoning protocol with a compact `## Reasoning approach` directive that defers depth control to `effort` (e.g. `/effort xhigh`). Kept the clarify/alternatives/altitude judgment, the contradiction-handling rule, and the no-guessing rule.
+  - Downgraded anti-laziness "Never/CRITICAL/MUST" phrasing to plain imperatives across the practice list, Verification protocol, and Critical rule #3; de-duplicated the triply-stated verify-before-done rule (now one authoritative Verification protocol, referenced elsewhere). Secret-handling rules stay emphatic.
+  - Reframed Ruflo/superpowers fan-out from ceilings ("3+/under 4 tasks") to positive "consider fanning out" guidance (4.8 fans out conservatively by default); **kept "Never auto-invoke Ruflo"**.
+  - Stated the Verification protocol's scope explicitly; added a note on harness-native dynamic workflows + the `disableWorkflows` / `CLAUDE_CODE_DISABLE_WORKFLOWS=1` switch.
+- **`context-usage.py` — 1M-context-aware (Opus 4.8 default window):** derives the budget from the session model (`message.model` in the transcript) — 1,000,000 for Opus 4.8, 200,000 fallback for 4.7-and-earlier / Foundry / unknown — instead of a hardcoded 200K. `CONTEXT_USAGE_LIMIT` still overrides. Fixes false "80% full" warnings firing at ~16% of a real 1M window. (The model-detection assumption was verified against a live 4.8 transcript: `message.model` is `claude-opus-4-8`.)
+- **`bash-guard.py` — hardened push detection:** now denies `git push --all` / `--mirror` and parses every refspec positional (checking each destination, normalizing `refs/heads/…` and `+`/`src:dst` forms) instead of only the second token. Parsing is scoped to the `git push` invocation via a punctuation-aware tokenizer, so chained commands, comments, and quoted text no longer cause false negatives or false positives; falls back to the legacy regex if tokenizing fails.
+- **`prompt-linter.sh`** — dropped the per-prompt "ask one clarifying question" directive (4.8 self-initiates clarification) and raised the length threshold from 50 → 150 words; now a neutral length note.
+- **`CLAUDE_template.md`** — softened non-security "do NOT / BEFORE" conventions to plain imperatives (secret-handling rules unchanged); reframed the verification and progress-tracking workflow lines.
+- **Skills** — `skills-audit` now separates a broad coverage pass from a prioritization step (4.8 obeys narrow review rubrics literally, which can drop recall); `skill-engineer` now teaches plain-imperative phrasing and explicit instruction scope for authored skills.
+- **README** — documents the native dynamic-workflow / `ultracode` capability of the Opus 4.8 harness, that workflow subagents run in `acceptEdits` and inherit the `settings.json` allowlist, and how to disable them.
+- **Keep Claude out of commit co-authors** — `templates/settings.json` sets `attribution: { "commit": "" }`, suppressing the `Co-Authored-By: Claude` trailer in cc_tool-managed projects (native Claude Code setting, not a hook). `cc-setup` applies it to existing projects too, only where unset (additive, idempotent).
+
 ## v0.0.4
 
 - **Sharpened CLAUDE_snippet.md** with four clauses distilled from a community extension of Karpathy's CLAUDE.md rules (skill not forked — the phrasings are sharper than the skill):

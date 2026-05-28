@@ -141,6 +141,7 @@ Your task is to [analyze/audit something].
 
 **Writing style:**
 - Use imperative sentences: "Scan all files" not "You should scan all files"
+- Use plain imperatives ("Use this tool when X"), not intensifiers ("CRITICAL: You MUST", "always default to", "if in doubt, use X") — strong guardrail phrasing over-triggers. State scope explicitly when a rule spans multiple items.
 - Be specific: "List files matching `.claude/skills/*/SKILL.md`" not "Find skill files"
 - One instruction per bullet point
 - Use bold for step names, code blocks for commands/paths
@@ -218,3 +219,4 @@ When updating an existing skill:
 - **Duplicate coverage**: Skill that restates CLAUDE.md content — reference it instead
 - **Over-restricting tools**: Adding `allowed-tools` without a clear security reason
 - **Missing trigger phrases**: Description that doesn't match how users actually ask for it
+- **Over-forceful phrasing**: `CRITICAL` / `MUST` / `ALWAYS` / anti-laziness language — see Writing style; plain imperatives read more reliably

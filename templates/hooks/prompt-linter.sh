@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Warn when a prompt is long and potentially ambiguous (UserPromptSubmit hook)
+# Note when a prompt is unusually long (UserPromptSubmit hook). Informational
+# only — the model decides whether any clarification is actually warranted.
 
 input=$(cat)
 word_count=$(echo "$input" | wc -w | tr -d ' ')
 
-if [ "$word_count" -gt 50 ]; then
-    echo "Note: This prompt is ${word_count} words. Before proceeding, verify that the desired outcome and scope are clear. If ambiguous, ask one clarifying question before starting work."
+if [ "$word_count" -gt 150 ]; then
+    echo "Note: this is a long prompt (${word_count} words); it may bundle several distinct asks."
 fi
