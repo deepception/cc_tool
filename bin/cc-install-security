@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# cc-install-security: Install the Anthropic-verified "security-guidance" plugin globally.
+# It adds a PreToolUse review over Claude-AUTHORED code — flags command injection,
+# eval/new Function, XSS (innerHTML/dangerouslySetInnerHTML), Python pickle, os.system,
+# and unsafe exec. Complements cc_tool's access-control hardening (which governs what
+# Claude can touch); this governs the safety of what Claude writes.
+set -euo pipefail
+
+if ! command -v claude &>/dev/null; then
+    echo "Error: 'claude' CLI not found. Install Claude Code first." >&2
+    exit 1
+fi
+
+if claude plugin list 2>/dev/null | grep -q "security-guidance"; then
+    echo "✓ security-guidance already installed"
+    echo "  To update: cc-update"
+    exit 0
+fi
+
+if ! claude plugin marketplace list 2>/dev/null | grep -q "claude-plugins-official"; then
+    echo "Adding anthropics/claude-plugins-official marketplace..."
+    if ! claude plugin marketplace add anthropics/claude-plugins-official 2>&1; then
+        echo "" >&2
+        echo "✗ Failed to add marketplace." >&2
+        echo "  Try manually: claude plugin marketplace add anthropics/claude-plugins-official" >&2
+        exit 1
+    fi
+fi
+
+echo "Installing security-guidance plugin..."
+if claude plugin install security-guidance@claude-plugins-official; then
+    echo ""
+    echo "✓ security-guidance installed (restart Claude Code to apply)"
+    echo "  Reviews Claude-authored code for: command injection, eval/new Function,"
+    echo "  XSS, Python pickle, os.system, unsafe exec."
+else
+    echo "" >&2
+    echo "✗ Installation failed." >&2
+    echo "  Try manually:" >&2
+    echo "    claude plugin marketplace add anthropics/claude-plugins-official" >&2
+    echo "    claude plugin install security-guidance@claude-plugins-official" >&2
+    exit 1
+fi

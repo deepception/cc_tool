@@ -25,4 +25,51 @@ echo "=== Step 2: merge new deny entries ==="
 "$CC_TOOL_DIR/bin/cc-update-permissions" "$PROJECT_DIR"
 
 echo ""
+echo "=== Step 3: CLAUDE.md template-drift check (informational, non-destructive) ==="
+CLAUDE_MD="$PROJECT_DIR/CLAUDE.md"
+TEMPLATE="$CC_TOOL_DIR/templates/CLAUDE_template.md"
+if [[ -f "$CLAUDE_MD" && -f "$TEMPLATE" ]]; then
+    python3 - "$TEMPLATE" "$CLAUDE_MD" <<'PYEOF'
+import re, sys
+
+template = open(sys.argv[1], encoding="utf-8").read()
+claude = open(sys.argv[2], encoding="utf-8").read()
+
+# Compare only the project-specific content — the managed snippet block is
+# updated separately and carries its own headings.
+START = "<!-- cc_tool:snippet:start"
+if START in claude:
+    claude = claude[: claude.index(START)]
+
+
+def headings(text):
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^(#{2,3})\s+(.*)", line)
+        if m:
+            out.append(m.group(2).strip())
+    return out
+
+
+tmpl = headings(template)
+proj = {h.lower() for h in headings(claude)}
+missing = [h for h in tmpl if h.lower() not in proj]
+overlap = (len(tmpl) - len(missing)) / max(len(tmpl), 1)
+
+if not missing:
+    print("  ✓ CLAUDE.md already has every current template section")
+elif overlap < 0.4:
+    print("  ℹ This project's CLAUDE.md is heavily customized (few headings match the template).")
+    print("    Template structural changes are NOT auto-applied. To adopt new template")
+    print("    sections, review templates/CLAUDE_template.md and add them by hand.")
+else:
+    print("  ℹ Template sections not present in this project (adopt manually if wanted):")
+    for h in missing:
+        print(f"    - {h}")
+PYEOF
+else
+    echo "  (no CLAUDE.md — skipped)"
+fi
+
+echo ""
 echo "Done."

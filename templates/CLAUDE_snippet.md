@@ -1,3 +1,4 @@
+<!-- cc_tool:snippet:start — managed by cc_tool; this block is replaced wholesale on cc-update-project. Put project-specific guidance ABOVE this marker. -->
 ## AI agent tools
 
 This project has Superpowers skills (methodology layer), Ruflo MCP tools (explicit toolbox), and basic-memory (persistent knowledge graph) configured.
@@ -78,6 +79,7 @@ Before implementing any non-trivial change, run this internal reasoning protocol
 - "Am I solving the right problem at the right level of abstraction?"
 - "What hidden constraints am I accepting without questioning?"
 - "Would a senior engineer call this overcomplicated?"
+- "Where two patterns contradict, am I picking one (more recent / more tested) and flagging the other — or silently averaging them into a weird hybrid?"
 
 When uncertain at any phase: decompose into sub-questions, answer each with evidence from the codebase. Do NOT guess and push forward.
 
@@ -91,6 +93,7 @@ Never mark a task complete without proving it works.
 2. Run affected tests — read the actual output, do not assume it passed
 3. If changing critical logic, verify against known test scenarios
 4. State what was verified: "Tests X, Y, Z passed. Linter clean."
+5. Surface uncertainty, never hide it. "Completed" is wrong if anything was skipped silently; "tests pass" is wrong if any were skipped or excluded.
 
 ---
 
@@ -111,9 +114,12 @@ If a task will read more than ~3 files or produce output the user doesn't need v
 1. **Read before writing** — understand existing code before modifying it. Never speculate about code you have not opened — if a file is referenced, read it first.
 2. **Plan first** — use plan mode for any task with 3+ steps or architectural decisions.
 3. **Think before acting** — run the reasoning protocol for any non-trivial task.
-4. **Minimal impact** — touch only what is necessary; avoid cascading changes. Every changed line should trace directly to the user's request. Remove imports and variables orphaned by YOUR changes; do not delete pre-existing dead code unless asked — mention it instead.
+4. **Minimal impact** — touch only what is necessary; avoid cascading changes. Every changed line should trace directly to the user's request. Remove imports and variables orphaned by YOUR changes; do not delete pre-existing dead code unless asked — mention it instead. Conformance to existing conventions beats personal taste; if a convention seems harmful, surface it and ask — don't fork the style silently.
 5. **Verify before done** — prove every change works with tests or demonstration.
 6. **Never skip tests** — run at minimum the tests related to your changes.
 7. **No hardcoded secrets** — use environment variables and .env files.
 8. **Never hand-edit lockfiles** — `uv.lock`, `package-lock.json`, `pnpm-lock.yaml` are managed by their tools.
 9. **Run quality checks before every commit** — format, lint, type check.
+10. **Right tool for the job** — use Claude for judgment work (classification, drafting, summarization, ambiguous extraction). Do NOT route deterministic logic through Claude (status-code handling, retries, type transforms, routing). If plain code can answer the question, plain code answers.
+
+<!-- cc_tool:snippet:end -->

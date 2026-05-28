@@ -61,10 +61,12 @@ cc-devcontainer /path/to/project    # sandbox Claude Code in a container (see be
 ```
 
 - **`cc-setup`** — initialize a project the first time: `.mcp.json`, `.claude/settings.json`, `.claude/hooks/`, `.claude/skills/`, `CLAUDE.md`. Safe to re-run; idempotent on the parts it manages.
-- **`cc-update-project`** — roll new cc_tool template changes into an existing project: re-copies hooks, adds any new skills, merges new hooks into `settings.json`, additively merges new `deny` entries. Preserves existing permissions, never clobbers local edits. Internally calls `cc-setup` + `cc-update-permissions`.
-- **`cc-update`** — updates the Superpowers plugin globally from GitHub (`obra/superpowers`). Independent of any project.
+- **`cc-update-project`** — roll new cc_tool changes into an existing project: re-copies hooks, adds any new skills, merges new hooks into `settings.json`, additively merges new `deny`/`ask` entries, and replaces the marker-delimited methodology block in `CLAUDE.md` in place. Preserves existing permissions and all project-specific CLAUDE.md content; never clobbers local edits. Ends with a non-destructive template-drift check (lists template sections the project lacks). **Note:** project-specific CLAUDE.md *structure* (Overview, Codebase Map, Commands…) is seeded once from the template and is **not** auto-merged on update — only the managed methodology block is. Internally calls `cc-setup` + `cc-update-permissions`.
+- **`cc-update`** — updates global plugins (Superpowers from `obra/superpowers`; checks/installs `security-guidance` from `anthropics/claude-plugins-official`). Independent of any project.
 
 Ruflo needs no update — always latest via `npx -y`. `cc_tool` itself is local-only — edit templates in place, then run `cc-update-project` on any project to pick up changes.
+
+> **Config staleness:** re-audit your hooks, permissions, and CLAUDE.md roughly once per Claude model release. Capabilities and failure modes shift between models — a guardrail that earned its keep on one model may be noise (or a gap) on the next.
 
 ---
 
@@ -203,9 +205,10 @@ cc_tool/
     cc-devcontainer              drop .devcontainer/ to sandbox Claude Code in Docker
     cc-token                     generate/refresh CLAUDE_CODE_OAUTH_TOKEN on host (for sandboxed containers)
     cc-update-project            update an existing project (hooks + skills + permissions)
-    cc-update                    update Superpowers plugin globally
-    cc-update-permissions        [internal] deny-list merge helper, called by cc-update-project
+    cc-update                    update global plugins (Superpowers + security-guidance)
+    cc-update-permissions        [internal] deny/ask merge helper, called by cc-update-project
     cc-install-superpowers       install Superpowers globally (called by install.sh)
+    cc-install-security          install Anthropic security-guidance plugin (called by install.sh)
   templates/
     mcp.json                     Ruflo + basic-memory MCP server configs
     settings.json                full settings for new projects
@@ -229,52 +232,11 @@ cc_tool/
       session-context.py         SessionStart: git state, sensitive files, detected quality commands
       bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, block --no-verify
       big-file-guard.py          PreToolUse Read: warn on files >200KB without offset/limit
+      context-usage.py           Stop: warn when session context window passes 80% (suggest /compact)
 ```
 
 ---
 
 ## Changelog
 
-### v0.0.3
-
-- **Sandboxed Claude Code via devcontainer** — new [bin/cc-devcontainer](bin/cc-devcontainer) drops a spec-compliant `.devcontainer/` (VS Code / Cursor / JetBrains / Codespaces / `@devcontainers/cli` all launch it) so Claude Code runs in Docker with the project bind-mounted at `/workspace`.
-- **Default-deny egress firewall** — iptables + ipset allowlist (Anthropic API, npm/PyPI, GitHub IP ranges, VS Code hosts, `astral.sh`); `--firewall off` to disable.
-- **Cloud opt-in** — `--cloud aws|gcp|none` (default `none`). `aws` installs `awscli`, bind-mounts `~/.aws` read-only, exposes `AWS_*` env vars, allowlists `*.amazonaws.com`. `gcp` does the same for `google-cloud-cli` + `~/.config/gcloud` + `*.googleapis.com`.
-- **Org-policy + tooling parity inside container** — [managed-settings.json](templates/devcontainer/managed-settings.json) at `/etc/claude-code/` disables `--dangerously-skip-permissions`; cc_tool's MCPs (`claude-flow`, `basic-memory`) run as-is via node + uv in the image; `gh` CLI with `GITHUB_TOKEN`/`GH_TOKEN` passthrough. One-shot: `cc-setup /path --devcontainer --cloud aws`.
-- **One-command auth** — new [bin/cc-token](bin/cc-token) runs `claude setup-token` and writes `CLAUDE_CODE_OAUTH_TOKEN` to your shell profile; the env var is auto-forwarded through `containerEnv`. The firewall stays tight (no OAuth domains allowlisted) and re-auth is a single command when the token eventually expires.
-- **Extended `permissions.deny`** in [templates/settings.json](templates/settings.json) from 36 → 54 entries — defense-in-depth below the devcontainer firewall:
-  - GCP credentials: `~/.config/gcloud/**`, `~/.boto`, `/etc/boto.cfg`, `**/*service-account*.json`, `**/*sa-key*.json`, `**/*application_default_credentials*`
-  - Other secret-bearing paths: `~/.kube/**`, `~/.docker/config.json`, `~/.netrc`, `~/.pgpass`
-  - Env-var exfiltration patterns: `Bash(printenv*AWS*)`, `Bash(printenv*GOOGLE*)`
-  - Pipe-to-shell installer pattern: `Bash(curl * | sh)`, `Bash(curl * | bash)`, `Bash(wget * | sh)`, `Bash(wget * | bash)`
-- **New `permissions.ask` block** (20 entries) — Claude must explicitly confirm every package install, defending against supply-chain attacks (postinstall scripts, typosquats, freshly-compromised maintainers):
-  - Install commands: `npm install*`, `npm add*`, `pnpm install*`, `pnpm add*`, `yarn add*`, `bun add*`, `pip install*`, `uv add*`, `uv pip install*`, `poetry add*`, `cargo install*`, `go install*`, `pipx install*`, `uv tool install*`
-  - Ad-hoc runners (no lockfile, fresh-pull): `npx *`, `uvx *`, `pnpm dlx*`, `pipx run *`
-- **`cc-update-permissions`** extended to merge the `ask` array additively too (was deny-only). Same UX: shows diff grouped by section, asks confirmation, only adds. Existing `cc-update-project` picks this up automatically.
-
-### v0.0.2
-
-- **New hooks:**
-  - `session-context.py` (SessionStart) — injects git branch/dirty status, recent commits, sensitive files in root, and auto-detected quality commands from `package.json` / `pyproject.toml` / `Makefile`
-  - `bash-guard.py` (PreToolUse Bash) — blocks `git commit` / `git push` to `main` / `master` / `production` / `release` (allows `--amend`), blocks any `--no-verify` bypass
-  - `big-file-guard.py` (PreToolUse Read) — non-blocking warning on files >200KB read without `offset` / `limit`
-- **Extended `permissions.deny`** in [templates/settings.json](templates/settings.json) from 7 → 36 entries: user-level secrets (`~/.ssh/**`, `~/.aws/**`, `~/.config/gh/**`), key files (`**/*.pem`, `**/*.key`, `**/id_rsa*`), nine lockfile globs, and seven additional dangerous-git commands (`git clean -fd*`, `git checkout .`, `git checkout -- *`, `git branch -D *`, `git reflog expire *`, `git filter-branch *`, `git filter-repo *`)
-- **New commands for a cleaner three-command model:**
-  - `cc-update-project` — update an existing project's cc_tool-managed files (hooks + skills + additive deny-list merge). Main user-facing update command.
-  - `cc-update-permissions` — internal helper called by `cc-update-project`; shows diff, asks confirmation, only adds (never removes or modifies). Can be invoked directly for deny-list-only updates.
-- **Forked two external skills** into `templates/skills/` (MIT, [mattpocock/skills](https://github.com/mattpocock/skills); LICENSE preserved per attribution):
-  - `design-an-interface` — parallel sub-agents generate 3+ divergent interface designs for a module, then compare. Based on Ousterhout's "Design It Twice."
-  - `improve-codebase-architecture` — exploratory refactor-hunting that surfaces shallow-module opportunities, designs deepened interfaces via parallel agents, and files the result as a GitHub issue RFC.
-- **Sharpened CLAUDE_snippet.md** with three clauses distilled from Karpathy's LLM-coding guidelines (no skill forked — the rules are sharper than the skill):
-  - Critical rule #4 now includes *"Every changed line should trace directly to the user's request"* and *"Remove imports/variables orphaned by YOUR changes; do not delete pre-existing dead code unless asked — mention it instead"* (covers drive-by dead-code-deletion failure mode)
-  - Reasoning protocol Phase 5 adds *"Would a senior engineer call this overcomplicated?"*
-- **Infra:** `cc-setup` now glob-copies all `*.sh` / `*.py` in `templates/hooks/` — future hooks auto-install without editing the script
-
-### v0.0.1
-
-- Initial release: `cc-setup`, `cc-update`, `cc-install-superpowers`
-- Ruflo + basic-memory MCP via `.mcp.json`
-- Superpowers plugin install
-- Two hooks: `prompt-linter.sh` (UserPromptSubmit), `websearch-year.py` (PreToolUse WebSearch)
-- `CLAUDE_template.md` for new projects, `CLAUDE_snippet.md` for existing ones
-- Three project skills: `reflect`, `skills-audit`, `skill-engineer`
+See [CHANGELOG.md](CHANGELOG.md) for the full version history.

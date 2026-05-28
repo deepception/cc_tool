@@ -1,24 +1,38 @@
 #!/usr/bin/env bash
-# cc-update: Update external dependencies (Superpowers plugin, installed globally).
+# cc-update: Update external dependencies (global plugins: Superpowers + security-guidance).
 # This does NOT touch any project. For per-project template refresh use cc-update-project.
 # cc_tool templates themselves are local — edit in place, then run cc-update-project.
 # Ruflo needs no update action — npx -y auto-fetches latest on every session start.
 set -euo pipefail
 
-echo "Updating Superpowers plugin..."
+CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if ! command -v claude &>/dev/null; then
-    echo "⚠️  'claude' CLI not found — cannot update"
+    echo "⚠️  'claude' CLI not found — cannot update plugins"
     exit 1
 fi
 
-# Superpowers ships via its own marketplace (superpowers-dev).
+echo "Updating Superpowers plugin..."
 if claude plugin marketplace update superpowers-dev 2>&1 \
    && claude plugin update superpowers@superpowers-dev 2>&1; then
     echo "✓ Superpowers updated (restart Claude Code to apply)"
 else
-    echo "⚠️  Update failed. Try manually:"
+    echo "⚠️  Superpowers update failed. Try manually:"
     echo "  claude plugin marketplace update superpowers-dev"
     echo "  claude plugin update superpowers@superpowers-dev"
-    exit 1
+fi
+
+echo ""
+echo "Checking security-guidance plugin..."
+if claude plugin list 2>/dev/null | grep -q "security-guidance"; then
+    if claude plugin marketplace update claude-plugins-official 2>&1 \
+       && claude plugin update security-guidance@claude-plugins-official 2>&1; then
+        echo "✓ security-guidance updated"
+    else
+        echo "⚠️  security-guidance update failed (non-fatal). Update manually:"
+        echo "  claude plugin update security-guidance@claude-plugins-official"
+    fi
+else
+    echo "  Not installed — installing now..."
+    "$CC_TOOL_DIR/bin/cc-install-security" || echo "⚠️  security-guidance install failed (non-fatal)"
 fi

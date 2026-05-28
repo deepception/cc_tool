@@ -165,41 +165,44 @@ SNIPPET="$CC_TOOL_DIR/templates/CLAUDE_snippet.md"
 TEMPLATE="$CC_TOOL_DIR/templates/CLAUDE_template.md"
 
 inject_snippet() {
-    if [[ -f "$CLAUDE_MD" ]] && grep -qF "## AI agent tools" "$CLAUDE_MD" 2>/dev/null; then
-        if grep -q "basic-memory" "$CLAUDE_MD" && grep -q "Reasoning protocol" "$CLAUDE_MD"; then
-            echo "  ✓ CLAUDE.md already has current agent guidance — skipping"
-        else
-            read -p "  CLAUDE.md has outdated agent guidance. Update the AI agent tools section? [Y/n] " confirm
-            if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
-                python3 - "$CLAUDE_MD" "$SNIPPET" <<'EOF'
-import re, sys
-with open(sys.argv[1]) as f:
-    content = f.read()
-with open(sys.argv[2]) as f:
-    snippet = f.read()
-# Replace the ## AI agent tools block (to next ## heading or EOF)
-updated = re.sub(
-    r'(?m)^## AI agent tools\b.*?(?=^## |\Z)',
-    snippet.rstrip() + '\n\n',
-    content,
-    flags=re.DOTALL
-)
-with open(sys.argv[1], 'w') as f:
-    f.write(updated)
-EOF
-                echo "  ✓ CLAUDE.md agent guidance updated"
-            fi
-        fi
-    elif [[ -f "$CLAUDE_MD" ]]; then
-        echo "" >> "$CLAUDE_MD"
-        cat "$SNIPPET" >> "$CLAUDE_MD"
-        echo "  ✓ Agent guidance appended to existing CLAUDE.md"
-        echo "    (reasoning protocol, verification, critical rules + AI tools)"
-    else
+    if [[ ! -f "$CLAUDE_MD" ]]; then
         cat "$TEMPLATE" "$SNIPPET" > "$CLAUDE_MD"
         echo "  ✓ CLAUDE.md created (project template + agent guidance)"
         echo "    Fill in placeholders marked with <!-- --> before committing"
+        return
     fi
+    # Existing CLAUDE.md: replace the cc_tool-managed snippet block in place.
+    # Idempotent — preserves all project-specific content, never duplicates.
+    python3 - "$CLAUDE_MD" "$SNIPPET" <<'EOF'
+import sys
+
+claude_path, snippet_path = sys.argv[1], sys.argv[2]
+content = open(claude_path, encoding="utf-8").read()
+snippet = open(snippet_path, encoding="utf-8").read().strip()
+
+START = "<!-- cc_tool:snippet:start"
+END = "<!-- cc_tool:snippet:end -->"
+
+if START in content and END in content:
+    # Preferred path: replace exactly between the managed markers.
+    pre = content[: content.index(START)]
+    post = content[content.index(END) + len(END):]
+    new = pre.rstrip() + "\n\n" + snippet + "\n" + post.lstrip("\n")
+    action = "updated (managed block replaced)"
+elif "## AI agent tools" in content:
+    # Legacy: snippet was appended without markers and is the trailing block.
+    # Replace from that heading to EOF; migrates the file to use markers.
+    pre = content[: content.index("## AI agent tools")]
+    new = pre.rstrip() + "\n\n" + snippet + "\n"
+    action = "updated (migrated to managed markers)"
+else:
+    # No cc_tool snippet present yet — append it.
+    new = content.rstrip() + "\n\n" + snippet + "\n"
+    action = "appended"
+
+open(claude_path, "w", encoding="utf-8").write(new)
+print(f"  ✓ CLAUDE.md agent guidance {action}")
+EOF
 }
 
 echo ""

@@ -22,6 +22,18 @@
       ]
     }
   ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/context-usage.py",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
   "PreToolUse": [
     {
       "matcher": "WebSearch",

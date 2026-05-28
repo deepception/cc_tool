@@ -6,14 +6,21 @@
 
 Brief description of what this project does, its tech stack, and primary purpose.
 
-### Modules
+### Codebase Map
 
-<!-- List your project's modules/packages. Delete if single-module project. -->
+<!-- One line per top-level folder so Claude can navigate without exploring blind. -->
 
-| Module | Purpose |
-|--------|---------|
+| Path | What lives here |
+|------|-----------------|
 | `module_a/` | Description |
 | `module_b/` | Description |
+
+<!--
+For LARGE codebases: keep THIS root file lean (big picture + pointers + gotchas only).
+Put local conventions in a CLAUDE.md inside the relevant subdirectory — Claude loads
+every CLAUDE.md on the path from the file it's editing up to the repo root. A bloated
+root file is loaded into every session regardless of relevance.
+-->
 
 ### Key Documentation
 
