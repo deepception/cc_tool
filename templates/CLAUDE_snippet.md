@@ -31,19 +31,44 @@ Call these explicitly when the situation matches.
 
 | Situation | Tool |
 |-----------|------|
-| 4+ truly independent tasks need to run in parallel | `mcp__claude-flow__swarm_init` + `mcp__claude-flow__agent_spawn` |
+| Fan-out needing persistent swarm state or cross-repo coordination (see Orchestration table below) | `mcp__claude-flow__swarm_init` + `mcp__claude-flow__agent_spawn` |
 | Pass state between parallel agents within a swarm session | `mcp__claude-flow__memory_store` / `mcp__claude-flow__memory_retrieve` |
 | Tracking progress on a multi-step operation across agents | `mcp__claude-flow__task_create` / `mcp__claude-flow__task_complete` |
 | Changes span multiple repositories simultaneously | `mcp__claude-flow__coordination_orchestrate` |
 
-For lighter-weight parallelism, `superpowers:dispatching-parallel-agents` is usually sufficient; reach for swarm for large independent fan-out.
+### Orchestration: which fan-out mechanism
 
-Harness-native dynamic workflows (Claude Code v2.1.154+) are another option for large independent fan-out. Disable them with `disableWorkflows: true` in settings or `CLAUDE_CODE_DISABLE_WORKFLOWS=1` if undesired.
+Pick by shape of the work. See the `dynamic-workflows` skill for the pattern catalog.
+
+| Use | When |
+|-----|------|
+| `superpowers:dispatching-parallel-agents` | a handful of independent tasks (~2–5), you need the results back in your context, no codified repeat |
+| native `Workflow` tool | dozens–hundreds of agents, OR you want loop-until-done / adversarial cross-checking / a rerunnable script — and intermediate results should stay OUT of main context |
+| Ruflo swarm | cross-repo work, or persistent swarm state across a session |
+| agent teams (experimental, gated by `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) | peer Claudes that must message/debate each other |
+
+Model/effort routing on fan-out: run repetitive arms on a cheap model / lower effort; reserve Opus and `/effort xhigh` for synthesis and verification (e.g. Planner and Reviewer on Opus, Coder and Tester on Sonnet). Bake routing into the workflow script when you create it, not mid-run.
+
+Disable native workflows with `disableWorkflows: true` in settings or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
+
+### Safe autonomous loops
+
+Before any loop or unattended run:
+
+- **Spec first** — a written spec with machine-checkable acceptance criteria BEFORE the loop starts. No spec → no loop. Pair with `/goal` to force a hard completion condition.
+- **Bound it** — explicit iteration / retry caps; never loop forever.
+- **Cost guard** — tier models: strong model (Opus) to plan and judge, cheap model (Sonnet/Haiku) or lower effort for repetitive parallel arms.
+- **No irreversible unattended actions** — draft and queue, don't send and pray. (The bash-guard hook already blocks pushes/commits to protected branches.)
+- **Verification gate** — a loop reports done only when tests / acceptance criteria actually pass, and for unattended runs the judge must not be the worker itself (see Verification protocol).
+
+Harness-native loop tools: `/loop` (recurring or self-paced re-invocation) and `/schedule` (cron cloud routines). Caveats: scope each run's tools tightly, define explicit failure handling, and review the post-run logs.
 
 ### basic-memory (persistent knowledge graph)
 
 Use for knowledge that must survive across sessions: project decisions, architecture notes, user preferences, recurring patterns.
 Do NOT use for ephemeral swarm state — that is Ruflo's job.
+
+basic-memory vs `knowledge-wiki`: basic-memory is a graph of decisions/preferences/architecture notes you emit as you work; `knowledge-wiki` compiles an external SOURCE corpus once into a queryable wiki you read repeatedly.
 
 | Situation | Tool |
 |-----------|------|
@@ -69,8 +94,10 @@ Prove a task works before marking it complete.
 1. Run the formatter and linter
 2. Run affected tests — read the actual output, do not assume it passed
 3. If changing critical logic, verify against known test scenarios
-4. State what was verified: "Tests X, Y, Z passed. Linter clean."
+4. State what was verified, including the actual command run and the tail of its real output (e.g. the `N passed in Xs` line). A "tests pass" claim with no pasted command output is a skipped step, not a verification.
 5. State any uncertainty or skipped step explicitly. Do not report "completed" if work was skipped, or "tests pass" if any test was skipped or excluded.
+
+For long or unattended runs, prefer a separate verification/review subagent (or `superpowers:requesting-code-review`) over self-judging.
 
 Scope: apply this protocol to every code-changing task, not only large ones. "Affected tests" means the tests covering the files you changed and their direct callers; when unsure which tests apply, say so rather than skipping verification.
 
@@ -86,19 +113,22 @@ Context is your most important resource. Use subagents (Task tool) to keep explo
 
 If a task will read more than ~3 files or produce output the user doesn't need verbatim, delegate it to a subagent and return a summary.
 
+When the same large corpus will be queried repeatedly — especially across a loop or fan-out — synthesize it once into a queryable summary (e.g. `knowledge-wiki`) rather than having each pass or agent re-read the raw source.
+
 ---
 
 ## Critical rules
 
 1. **Read before writing** — understand existing code before modifying it. Never speculate about code you have not opened — if a file is referenced, read it first.
-2. **Plan first** — use plan mode for any task with 3+ steps or architectural decisions.
-3. **Reason at the right depth** — for genuinely ambiguous or architectural decisions, pause to weigh alternatives and surface trade-offs before acting.
-4. **Minimal impact** — touch only what is necessary; avoid cascading changes. Every changed line should trace directly to the user's request. Remove imports and variables orphaned by YOUR changes; do not delete pre-existing dead code unless asked — mention it instead. Conformance to existing conventions beats personal taste; if a convention seems harmful, surface it and ask — don't fork the style silently.
-5. **Verify before done** — follow the Verification protocol above.
-6. **Never skip tests** — run at minimum the tests related to your changes.
-7. **No hardcoded secrets** — use environment variables and .env files.
-8. **Never hand-edit lockfiles** — `uv.lock`, `package-lock.json`, `pnpm-lock.yaml` are managed by their tools.
-9. **Run quality checks before every commit** — format, lint, type check.
-10. **Right tool for the job** — use Claude for judgment work (classification, drafting, summarization, ambiguous extraction). Do NOT route deterministic logic through Claude (status-code handling, retries, type transforms, routing). If plain code can answer the question, plain code answers.
+2. **No fabrication** — never invent functions, methods, imports, flags, config keys, or file paths. Before referencing a symbol you haven't just read, open the file / grep / check `--help` to confirm it exists. If you can't confirm something, say "I don't know" or "I couldn't verify X" — an unverifiable claim is worse than admitting uncertainty. Admitting uncertainty is rewarded, not penalized.
+3. **Plan first** — use plan mode for any task with 3+ steps or architectural decisions.
+4. **Reason at the right depth** — for genuinely ambiguous or architectural decisions, pause to weigh alternatives and surface trade-offs before acting.
+5. **Minimal impact** — touch only what is necessary; avoid cascading changes. Every changed line should trace directly to the user's request. Remove imports and variables orphaned by YOUR changes; do not delete pre-existing dead code unless asked — mention it instead. Conformance to existing conventions beats personal taste; if a convention seems harmful, surface it and ask — don't fork the style silently.
+6. **Verify before done** — follow the Verification protocol above.
+7. **Never skip tests** — run at minimum the tests related to your changes.
+8. **No hardcoded secrets** — use environment variables and .env files.
+9. **Never hand-edit lockfiles** — `uv.lock`, `package-lock.json`, `pnpm-lock.yaml` are managed by their tools.
+10. **Run quality checks before every commit** — format, lint, type check.
+11. **Right tool for the job** — use Claude for judgment work (classification, drafting, summarization, ambiguous extraction). Do NOT route deterministic logic through Claude (status-code handling, retries, type transforms, routing). If plain code can answer the question, plain code answers.
 
 <!-- cc_tool:snippet:end -->

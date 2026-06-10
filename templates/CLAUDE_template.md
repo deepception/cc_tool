@@ -129,8 +129,9 @@ Prefer running single test files over the full suite for faster feedback.
 1. Make the smallest change that solves the problem
 2. Run formatter and linter after editing code
 3. Run relevant tests after changes — prefer single test files over full suite
-4. Confirm the change works — run the relevant tests, or exercise it directly if untested
-5. Never commit files containing secrets (.env, credentials, API keys)
+4. Confirm the change works — run the relevant tests, or exercise it directly if untested. State the actual command run and the tail of its real output (e.g. the `N passed in Xs` line); "tests pass" with no pasted output is a skipped step.
+5. No fabrication — never reference a function, flag, config key, or path you have not confirmed exists (full rule: "No fabrication" under Critical rules below)
+6. Never commit files containing secrets (.env, credentials, API keys)
 
 ### Git Conventions
 

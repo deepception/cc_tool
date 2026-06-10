@@ -9,7 +9,7 @@ One-command setup for Claude Code projects: Ruflo MCP tools + basic-memory + Sup
 | **Superpowers** (`obra/superpowers`) | Methodology skills: TDD, brainstorming, debugging, verification | `cc-update` pulls from GitHub |
 | **basic-memory** (`basicmachines-co/basic-memory`) | Persistent knowledge graph: project decisions, cross-session memory | `uvx` auto-downloads on first use — nothing to do |
 | **Ruflo** (`@claude-flow/cli`) | MCP tools for swarm coordination, multi-repo orchestration | `npx -y` auto-fetches latest on every session start — nothing to do |
-| **Hooks** (5 scripts) | Prompt linting, search-year injection, session context, Bash guard (branch/push/`--no-verify`), big-file read warning | Local scripts — edit templates in `cc_tool/`, re-run `cc-setup` |
+| **Hooks** (7 scripts) | Prompt linting, search-year injection, session context, Bash guard (branch/push/`--no-verify`/secret reads), big-file read warning, context-usage warning (80% → `/compact`), post-edit typecheck | Local scripts — edit templates in `cc_tool/`, re-run `cc-setup` |
 
 **Design principle:** Superpowers is the methodology layer — most skills trigger automatically via CLAUDE.md rules. Ruflo MCP tools are available in every session and Claude may use them when needed (swarm parallelism, multi-repo). basic-memory is the persistent knowledge layer that survives across sessions. No Ruflo CLAUDE.md, no behavioral autopilot.
 
@@ -151,6 +151,10 @@ The token is forwarded automatically through `containerEnv` (already wired in [t
 
 **Note on `Reopen in Container`** — that command only appears in the Command Palette when the currently-opened folder contains a `.devcontainer/`. Run `cc-devcontainer .` first, then open the project; the extension also shows a notification offering to reopen. If you want to start the container without first opening the folder, use `Dev Containers: Open Folder in Container...`.
 
+### `/sandbox` for non-container projects
+
+If you don't run the devcontainer, Claude Code's native `/sandbox` is the lighter-weight alternative: it enforces Bash filesystem and network access at the OS level (Seatbelt on macOS, bubblewrap on Linux) without Docker. Key fact for this setup: path-based Read/Edit deny rules merge into the sandbox filesystem boundary, so the literal-path entries of cc_tool's deny list (`~/.kube/**`, `~/.docker/config.json`, `~/.netrc`, `~/.config/gcloud/**`, `~/.aws/**`, …) gain real OS-level teeth once `/sandbox` is on — a Bash command can no longer reach those paths, not just the Read/Edit tools. Glob-pattern entries (`**/*service-account*.json`, `**/*.pem`, `**/id_rsa*`, …) are OS-enforced only on macOS (Seatbelt supports glob rules); Linux bubblewrap supports literal paths only, so on Linux those entries still bind only the Read/Edit tools. This is especially worth turning on for unattended/loop runs, where Bash would otherwise have no human gate.
+
 ---
 
 ## How to work with the setup
@@ -194,7 +198,37 @@ The harness can now write and run its own multi-agent orchestration (the `Workfl
 - **Permissions:** workflow-spawned subagents run in `acceptEdits` (file edits auto-approved) and inherit this project's `settings.json` allowlist. The `deny`/`ask` lists and the devcontainer firewall remain the enforced boundary; pre-populating `allow` with build/test commands keeps long runs from stalling on mid-run prompts.
 - **Disabling:** set `disableWorkflows: true` in `settings.json` (or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`), which also removes `ultracode` and the bare-word trigger.
 
-cc_tool ships one saved workflow, [`.claude/workflows/model-recalibration-audit.js`](.claude/workflows/model-recalibration-audit.js) — re-audits this setup against a new Claude model (see the config-staleness note above), writing its report under `docs/` (git-ignored). Re-run it per model release with `Workflow({name:"model-recalibration-audit", args:{newModel, oldModel}})`.
+**Workflow pattern catalog** — six composable patterns the harness can apply:
+
+- **classify-and-act** — route the input before doing anything (pick the right branch/tool first).
+- **fan-out-and-synthesize** — run independent sub-steps in parallel, then a synthesize barrier merges them.
+- **adversarial-verification** — a separate agent tries to refute each finding (counters the model's self-preferential bias toward its own output).
+- **generate-and-filter** — generate wide, then filter down by an explicit rubric.
+- **tournament** — pairwise comparison instead of absolute scoring; wins for taste/ranking judgments.
+- **loop-until-done** — repeat until a stop condition (no new findings, logs clean), not a fixed iteration count.
+
+The shipped `model-recalibration-audit.js` already composes two of these (fan-out-and-synthesize, adversarial-verification), wired together as a pipeline. The full catalog — with worked examples and when each fits — lives in the `dynamic-workflows` skill.
+
+**Operational controls**:
+
+- Pair a workflow with `/goal` for a hard completion target, or `/loop` for a recurring schedule.
+- Set an explicit **token budget** so a fan-out or loop can't run away.
+- **Quarantine pattern** for untrusted input: have read-only reader agents (no privileged actions, no edits, no shell side effects) ingest the untrusted data, so a prompt-injection in that data can't reach into edits or commands.
+
+cc_tool ships three saved workflows under [`.claude/workflows/`](.claude/workflows/):
+
+- [`model-recalibration-audit.js`](.claude/workflows/model-recalibration-audit.js) — re-audits this setup against a new Claude model (see the config-staleness note above), writing its report under `docs/` (git-ignored). Re-run per model release with `Workflow({name:"model-recalibration-audit", args:{newModel, oldModel}})`.
+- [`ship-pipeline.js`](.claude/workflows/ship-pipeline.js) — Planner → Coder → Tester → Reviewer pipeline for shipping a change end-to-end.
+- [`loop-until-clean.js`](.claude/workflows/loop-until-clean.js) — loop-until-done sweep that fans out finder agents over a target until two consecutive rounds surface nothing new, then adversarially verifies the survivors and returns only the confirmed findings.
+
+### Unattended / autonomous runs
+
+An unattended run has **no human to answer a permission prompt** — so this project's `ask` list (`npm install*`, `npx *`, `pip install*`, `uv add*`, `cargo install*`, …) derails the run the first time the agent reaches for an install: in `claude -p` the tool call is **auto-denied** (headless mode can't show a prompt; the agent gets a permission error and routes around it or gives up), while an unwatched interactive session (`/loop`, a long-running saved workflow) **stalls indefinitely** on the prompt. Recall that workflow subagents run `acceptEdits` and inherit the `allow` list but still honor `ask`/`deny`, so a mid-run `ask` fails or stalls the whole thing silently, depending on the run mode.
+
+For unattended runs, pick one:
+
+- **Pre-resolve + pre-allowlist (host):** install dependencies *before* the run so no `ask` rule ever triggers, and add the specific build/test/dev-server commands the loop needs (plus Playwright MCP, if the loop drives a browser) to `allow` in `settings.json`. Pair this with native `/sandbox` (see above) so the widened allowlist keeps an OS-level boundary on Bash.
+- **Run inside `cc-devcontainer`:** the firewall + `managed-settings.json` make `--dangerously-skip-permissions` safe-by-sandbox — no prompts to stall on, because the container itself is the trust boundary.
 
 ---
 
@@ -233,15 +267,23 @@ cc_tool/
       reflect/SKILL.md                        session reflection and learning extraction
       skills-audit/SKILL.md                   audit installed skills for quality and overlap
       skill-engineer/SKILL.md                 create and update skills from workflow descriptions
+      dynamic-workflows/SKILL.md              the 6 Workflow patterns + operational controls (full catalog)
+      knowledge-wiki/SKILL.md                 Karpathy compile-once wiki: distill a codebase/topic into a durable wiki
       design-an-interface/SKILL.md            generate 3+ divergent interface designs via parallel sub-agents (MIT, mattpocock/skills)
       improve-codebase-architecture/SKILL.md  surface deep-module refactor opportunities as GitHub-issue RFCs (MIT, mattpocock/skills)
     hooks/
       prompt-linter.sh           warns on long ambiguous prompts
       websearch-year.py          appends year to temporal searches
       session-context.py         SessionStart: git state, sensitive files, detected quality commands
-      bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, block --no-verify
+      bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, block --no-verify, block secret-file reads (.env, keys, credential stores) via grep/awk/xargs/inline interpreters
       big-file-guard.py          PreToolUse Read: warn on files >200KB without offset/limit
       context-usage.py           Stop: warn when session context window passes 80% (suggest /compact)
+      post-edit-typecheck.py     PostToolUse Edit|Write|MultiEdit: fast project check (tsc/cargo; ruff file-scoped for Python) after source edits, surface errors inline; tsc timeouts back off for 30 min via a marker in .git/
+  .claude/
+    workflows/                   saved Workflow definitions (run via the Workflow tool)
+      model-recalibration-audit.js  re-audit this setup against a new Claude model
+      ship-pipeline.js              Planner → Coder → Tester → Reviewer pipeline
+      loop-until-clean.js           loop-until-done sweep: stop after two dry rounds, then verify survivors
 ```
 
 ---

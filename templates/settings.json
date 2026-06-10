@@ -66,8 +66,28 @@
       "Read(~/.docker/config.json)",
       "Read(~/.netrc)",
       "Read(~/.pgpass)",
-      "Bash(printenv*AWS*)",
-      "Bash(printenv*GOOGLE*)",
+      "Read(~/.azure/**)",
+      "Read(~/.config/doctl/**)",
+      "Read(~/.git-credentials)",
+      "Read(~/.config/git/credentials)",
+      "Read(~/.npmrc)",
+      "Read(~/.config/npm/npmrc)",
+      "Read(~/.pypirc)",
+      "Read(~/.gnupg/**)",
+      "Read(**/.terraform/**)",
+      "Read(**/terraform.tfstate)",
+      "Read(**/terraform.tfstate.backup)",
+      "Read(**/*secret*.tfvars*)",
+      "Read(~/.bash_history)",
+      "Read(~/.zsh_history)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/id_rsa*)",
+      "Bash(env)",
+      "Bash(printenv)",
+      "Bash(printenv:*)",
+      "Bash(set)",
+      "Bash(export -p)",
       "Bash(curl * | sh)",
       "Bash(curl * | bash)",
       "Bash(wget * | sh)",
@@ -160,6 +180,18 @@
             "type": "command",
             "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/big-file-guard.py",
             "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/post-edit-typecheck.py",
+            "timeout": 15
           }
         ]
       }

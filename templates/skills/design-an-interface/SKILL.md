@@ -30,6 +30,8 @@ Prompt template for each sub-agent:
 
 Design an interface for: [module description]
 
+Before generating, inspect the project's existing interfaces, types, and naming conventions so the design speaks the codebase's vocabulary, not generic defaults — but your structural approach must still differ radically per your constraint below.
+
 Requirements: [gathered requirements]
 
 Constraints for this design: [assign a different constraint to each agent]

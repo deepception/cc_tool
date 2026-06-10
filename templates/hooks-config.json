@@ -65,5 +65,17 @@
         }
       ]
     }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Edit|Write|MultiEdit",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/post-edit-typecheck.py",
+          "timeout": 15
+        }
+      ]
+    }
   ]
 }

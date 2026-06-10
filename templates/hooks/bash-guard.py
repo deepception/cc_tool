@@ -5,6 +5,11 @@ Blocks:
   - git commit on protected branches (main/master/production/release), unless --amend
   - git push to protected branches
   - any git command using --no-verify (bypasses project pre-commit/pre-push hooks)
+  - reads of known secret files via tools Claude Code's Read-deny can't see
+    (grep/awk/source/xargs cat/python -c open(...)/node -e ...), e.g. `grep KEY .env`.
+    Claude's permission deny already covers Read + recognized cat/head/tail/sed, so
+    this only fills the gap for arbitrary readers. Conservative: only fires on a
+    clear secret-path reference, so benign commands (grep -r TODO src/) pass through.
 """
 import json
 import re
@@ -110,8 +115,151 @@ def parse_git_push(cmd: str):
     return found, dests, push_all, bare, True
 
 
+# ── Secret-read guard ─────────────────────────────────────────────────────────
+# Patterns matching a path token that names known secret material. Anchored to a
+# path boundary (start, '/', or '~/') so a substring like "environment" or
+# "keystore" doesn't trip ".env"/"id_rsa". Each must look like a real path
+# reference, not an arbitrary flag value.
+_SECRET_PATH_RE = re.compile(
+    r"""(?:^|/|~/)        # path boundary
+        (?:
+            \.env(?:\.[^/\s]+)?    # .env, .env.local, .env.production …
+          | id_rsa[^/\s]*          # id_rsa, id_rsa.pub …
+          | \.git-credentials
+          | \.npmrc
+          | \.pypirc
+        )$
+    """,
+    re.VERBOSE,
+)
+# Suffix/dir patterns checked separately (apply anywhere in the token's basename).
+_SECRET_SUFFIX_RE = re.compile(r"\.(?:pem|key)$")
+_SECRET_SUBSTR = (
+    ".aws/credentials",
+    ".ssh/",
+)
+# A bare "~/.ssh" or ".aws/credentials" reference (no trailing component) also counts.
+_SECRET_EXACT = (".ssh",)
+
+
+def _is_secret_token(tok: str) -> bool:
+    """True if a path-like token clearly references secret material."""
+    # Strip surrounding quotes shlex may leave on partial tokens.
+    t = tok.strip().strip("'\"")
+    if not t:
+        return False
+    if _SECRET_PATH_RE.search(t):
+        return True
+    base = t.rsplit("/", 1)[-1]
+    if _SECRET_SUFFIX_RE.search(base):
+        return True
+    if any(s in t for s in _SECRET_SUBSTR):
+        return True
+    # Trailing ~/.ssh or .ssh as the final path component.
+    cleaned = t.rstrip("/")
+    if cleaned.rsplit("/", 1)[-1] in _SECRET_EXACT and (
+        "/" in cleaned or cleaned.startswith("~") or cleaned in _SECRET_EXACT
+    ):
+        # Only treat a lone ".ssh" path component as secret when it looks like a
+        # home-relative path, to avoid matching an unrelated "ssh" subcommand arg.
+        if cleaned in _SECRET_EXACT or cleaned.startswith("~") or "/.ssh" in cleaned:
+            return True
+    return False
+
+
+# Readers whose file arguments Claude's recognized-file-command deny does NOT cover.
+# (cat/head/tail/sed are already handled by Read-deny, so we don't re-police them.)
+_SECRET_READERS = {
+    "grep", "egrep", "fgrep", "rg", "ag",
+    "awk", "gawk", "nawk",
+    "source", ".",
+    "dd", "od", "xxd", "hexdump", "strings", "base64", "cut", "tr", "sort", "uniq",
+}
+# grep-family readers take a search PATTERN as their first non-flag argument;
+# that token is not a file path (grep -r ".env" src/ searches FOR the string).
+_PATTERN_FIRST_READERS = {"grep", "egrep", "fgrep", "rg", "ag"}
+# Interpreters that can read files via inline code; we scan their inline string for
+# a secret path literal.
+_INLINE_INTERP = {"python", "python3", "node", "ruby", "perl", "php", "deno", "bun"}
+
+
+def check_secret_read(cmd: str) -> None:
+    """Deny Bash commands that read a known secret path via an uncovered reader.
+
+    Conservative by construction: requires BOTH a recognized reader/interpreter
+    AND a clear secret-path token, so normal commands pass untouched.
+    """
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return  # unparseable (e.g. unbalanced quotes) — fail open, don't guess
+
+    n = len(tokens)
+    for i, tok in enumerate(tokens):
+        # 1) reader followed somewhere by a secret-path argument
+        if tok in _SECRET_READERS:
+            if tok in (".", "source") and not (
+                i == 0 or (tokens[i - 1] and all(c in _SHELL_OP_CHARS for c in tokens[i - 1]))
+            ):
+                continue  # '.'/'source' as an argument (find . ..., rsync ... .) is not a reader
+            # First non-flag token after a grep-family command is the search pattern,
+            # not a file — skip exactly one such token.
+            skip_pattern = tok in _PATTERN_FIRST_READERS
+            for nxt in tokens[i + 1:]:
+                if nxt and all(c in _SHELL_OP_CHARS for c in nxt):
+                    break  # don't cross into the next simple command
+                if nxt.startswith("-"):
+                    continue
+                if skip_pattern:
+                    skip_pattern = False
+                    continue
+                if _is_secret_token(nxt):
+                    deny(
+                        f"Refusing to read secret material ('{nxt.strip(chr(39) + chr(34))}') "
+                        f"via '{tok}'. These files (.env, keys, credential stores) are "
+                        f"blocked for a reason; don't exfiltrate or echo their contents."
+                    )
+        # 2) `xargs cat <secretfile>` and friends — flag a secret token anywhere
+        #    that follows xargs (the piped reader is opaque to Read-deny).
+        if tok == "xargs":
+            for nxt in tokens[i + 1:]:
+                if nxt and all(c in _SHELL_OP_CHARS for c in nxt):
+                    break
+                if not nxt.startswith("-") and _is_secret_token(nxt):
+                    deny(
+                        f"Refusing 'xargs' pipeline that targets secret material "
+                        f"('{nxt.strip(chr(39) + chr(34))}')."
+                    )
+        # 3) inline interpreter code: python -c "open('.env')", node -e "...id_rsa..."
+        if tok in _INLINE_INTERP:
+            for j in range(i + 1, n):
+                arg = tokens[j]
+                if arg and all(c in _SHELL_OP_CHARS for c in arg):
+                    break
+                if arg in ("-c", "-e", "--eval", "--exec"):
+                    if j + 1 < n and _inline_has_secret(tokens[j + 1]):
+                        deny(
+                            "Refusing inline interpreter code that opens secret material "
+                            "(.env / keys / credential stores). Read of these paths is "
+                            "blocked; don't bypass it via -c/-e."
+                        )
+
+
+def _inline_has_secret(code: str) -> bool:
+    """Scan an inline -c/-e string for a quoted secret-path literal."""
+    for m in re.finditer(r"""['"]([^'"]+)['"]""", code):
+        if _is_secret_token(m.group(1)):
+            return True
+    return False
+
+
 data = json.load(sys.stdin)
 cmd = data.get("tool_input", {}).get("command", "")
+
+# Secret-read guard runs for ALL Bash commands (not just git).
+check_secret_read(cmd)
 
 if not re.search(r"(^|[\s;&|])git\s", cmd):
     sys.exit(0)
