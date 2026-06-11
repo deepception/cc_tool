@@ -47,7 +47,7 @@ Pick by shape of the work. See the `dynamic-workflows` skill for the pattern cat
 | Ruflo swarm | cross-repo work, or persistent swarm state across a session |
 | agent teams (experimental, gated by `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) | peer Claudes that must message/debate each other |
 
-Model/effort routing on fan-out: run repetitive arms on a cheap model / lower effort; reserve Opus and `/effort xhigh` for synthesis and verification (e.g. Planner and Reviewer on Opus, Coder and Tester on Sonnet). Bake routing into the workflow script when you create it, not mid-run.
+Model/effort routing on fan-out: run repetitive arms on a cheap model / lower effort; reserve the strongest tier for synthesis and verification — Opus 4.8 at `/effort xhigh`, or Fable 5 at `high` (`xhigh` only for the most capability-sensitive stages) (e.g. Planner and Reviewer on Opus, Coder and Tester on Sonnet). For the hardest / most ambiguous features, route Planner/Reviewer to `fable` via the Agent tool's model option — ~2x Opus cost, so opt in stage-by-stage, not as a default (pass the string `fable`, not `claude-fable-5[1m]`; needs Claude Code ≥2.1.170, ≥2.1.173 for `[1m]` normalization). Bake routing into the workflow script when you create it, not mid-run.
 
 Disable native workflows with `disableWorkflows: true` in settings or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
 
@@ -57,7 +57,7 @@ Before any loop or unattended run:
 
 - **Spec first** — a written spec with machine-checkable acceptance criteria BEFORE the loop starts. No spec → no loop. Pair with `/goal` to force a hard completion condition.
 - **Bound it** — explicit iteration / retry caps; never loop forever.
-- **Cost guard** — tier models: strong model (Opus) to plan and judge, cheap model (Sonnet/Haiku) or lower effort for repetitive parallel arms.
+- **Cost guard** — tier models: strong model (Opus 4.8, or `fable` for the hardest plan/judge stages) to plan and judge, cheap model (Sonnet/Haiku) or lower effort for repetitive parallel arms.
 - **No irreversible unattended actions** — draft and queue, don't send and pray. (The bash-guard hook already blocks pushes/commits to protected branches.)
 - **Verification gate** — a loop reports done only when tests / acceptance criteria actually pass, and for unattended runs the judge must not be the worker itself (see Verification protocol).
 
@@ -79,11 +79,27 @@ basic-memory vs `knowledge-wiki`: basic-memory is a graph of decisions/preferenc
 
 ---
 
+## Model routing
+
+Default to **claude-opus-4-8** — it remains the rational everyday model. Escalate a session or stage to **claude-fable-5** (the tier above Opus 4.8) when at least one holds:
+
+- the hardest / most ambiguous problems, or first-shot correctness on a complex well-specified spec matters
+- the task spans >5 files or >~30 min, or runs autonomously >1h
+- it is vision-heavy (dense technical images / screenshots)
+- 2+ prior Opus 4.8 attempts stalled or needed repeated retries
+- code review / debugging where bug-finding recall matters (Fable's recall is officially higher than Opus 4.8, outside security domains)
+
+Stay on (or fall back to) Opus 4.8 for: routine/short work (escalation is not worth ~2x cost); offensive-security-adjacent or deep security-audit work (Fable may refuse via the cyber classifier — fall back fable->opus-4-8); and ZDR/zero-retention orgs (Fable 5 is a Covered Model requiring 30-day retention). Switch with `/model`; `fallbackModel` accepts an ordered chain.
+
+The >5-files / >30-min / vision / 2-failed-attempts / >1h thresholds are a community heuristic (consistent with Anthropic's positioning); the capability shapes and the security/ZDR caveats are from Anthropic docs.
+
+---
+
 ## Reasoning approach
 
 For debugging, architecture decisions, complex logic, multi-file changes, or ambiguous requirements: clarify the actual ask and acceptance criteria, weigh at least two approaches, and check you are solving the right problem at the right altitude rather than over-engineering. Decompose uncertainty into sub-questions and answer each with evidence from the codebase rather than guessing. If contradictory patterns exist, pick one (prefer the more recent / more tested) and flag the conflict rather than silently blending them. For trivial changes (typos, single-line fixes, renames), skip this. Surface only conclusions and the chosen approach to the user.
 
-If a task needs deeper reasoning, raise the effort level (e.g. `/effort xhigh`) rather than expanding this prompt.
+If a task needs deeper reasoning, raise the effort level rather than expanding this prompt — on Opus 4.8 use `/effort xhigh`; on Fable 5 `high` is already the default, so reserve `xhigh` for the most capability-sensitive work (lower effort on Fable often exceeds xhigh on prior models).
 
 ---
 
@@ -112,6 +128,8 @@ Context is your most important resource. Use subagents (Task tool) to keep explo
 **Stay in main context for:** direct file edits the user requested, short targeted reads (1-2 files), conversations requiring back-and-forth, tasks where the user needs intermediate steps.
 
 If a task will read more than ~3 files or produce output the user doesn't need verbatim, delegate it to a subagent and return a summary.
+
+On Fable 5, when you do fan out: prefer async subagents (kick them off and check results non-blocking) over blocking joins; favor long-lived subagents that reuse cached reads over many short-lived ones; and verification belongs to a fresh-context subagent rather than self-critique (the judge-not-the-worker rule in the Verification protocol).
 
 When the same large corpus will be queried repeatedly — especially across a loop or fan-out — synthesize it once into a queryable summary (e.g. `knowledge-wiki`) rather than having each pass or agent re-read the raw source.
 

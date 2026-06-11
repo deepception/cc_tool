@@ -11,8 +11,8 @@ the format changes this no-ops gracefully.
 
 Tunables (env vars):
   CONTEXT_USAGE_LIMIT     token budget to measure against. When unset, derived
-                          from the session model (1,000,000 for Opus 4.8,
-                          200,000 otherwise); set this to override.
+                          from the session model (1,000,000 for Opus 4.8 /
+                          Fable 5, 200,000 otherwise); set this to override.
   CONTEXT_USAGE_WARN_PCT  warn at/above this percent (default 80)
 """
 import json
@@ -26,11 +26,14 @@ def context_limit(model):
     """Token budget for the warning.
 
     An explicit CONTEXT_USAGE_LIMIT always wins. Otherwise derive from the
-    session model: Opus 4.8 runs a 1M-token window by default, while
-    4.7-and-earlier use 200K. (Opus 4.8 on Microsoft Foundry serves 200K under
-    the same model id, so this over-estimates for that minority — it under-warns
-    rather than spamming false alarms, which is the safer failure.) Unknown
-    models fall back to the 200K floor.
+    session model: Opus 4.8 and Fable 5 run a 1M-token window by default, while
+    4.7-and-earlier use 200K. A bracketed variant suffix (e.g. '[1m]', passed
+    through by harnesses <2.1.173) is stripped before matching, and family
+    substrings are used so Bedrock/Vertex-prefixed ids also match. (Opus 4.8 on
+    Microsoft Foundry serves 200K under the same model id, so this
+    over-estimates for that minority — it under-warns rather than spamming
+    false alarms, which is the safer failure.) Unknown models fall back to the
+    200K floor.
     """
     env_limit = os.environ.get("CONTEXT_USAGE_LIMIT")
     if env_limit:
@@ -38,8 +41,10 @@ def context_limit(model):
             return int(env_limit)
         except ValueError:
             pass
-    if model and "opus-4-8" in model:
-        return 1_000_000
+    if model:
+        base = model.split("[", 1)[0]  # tolerate a '[1m]' variant suffix (harness <2.1.173 passes it through)
+        if "opus-4-8" in base or "fable-5" in base:
+            return 1_000_000
     return 200_000
 
 

@@ -1,9 +1,9 @@
 export const meta = {
   name: 'model-recalibration-audit',
-  description: 'Audit cc_tool setup (calibrated for Opus 4.7) against a newer model (Opus 4.8) and produce prioritized, evidence-verified recalibration recommendations',
+  description: 'Audit the cc_tool setup against a newer Claude model and produce prioritized, evidence-verified recalibration recommendations',
   whenToUse: 'Run once per Claude model release to re-audit hooks, permissions, CLAUDE.md guidance, and skills against the new model\'s capabilities. Parameterize via args.newModel / args.oldModel.',
   phases: [
-    { title: 'Research', detail: 'Multi-angle web sweep for the new model\'s capabilities + 4.7→4.8 deltas' },
+    { title: 'Research', detail: 'Multi-angle web sweep for the new model\'s capabilities + old→new deltas' },
     { title: 'Profile', detail: 'Synthesize a single capability profile with confidence levels and research gaps' },
     { title: 'Analyze', detail: 'One agent per setup component: extract encoded model-behavior assumptions, classify vs profile' },
     { title: 'Verify', detail: 'Adversarially verify every proposed change; reject unverified-capability and guardrail-weakening claims' },
@@ -12,15 +12,30 @@ export const meta = {
 }
 
 // ---- config (reusable across model releases via args) -------------------
-const cfg = (args && typeof args === 'object') ? args : {}
+// args may arrive as an object OR as a JSON-encoded string (some callers
+// stringify) — parse defensively; a silent fall-through to defaults once
+// caused a full audit to run against the wrong model pair.
+let cfg = {}
+if (typeof args === 'string') {
+  try { cfg = JSON.parse(args) } catch (e) { cfg = {} }
+} else if (args && typeof args === 'object' && !Array.isArray(args)) {
+  cfg = args
+}
+if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {}
+if (!cfg.newModel) {
+  log('WARNING: no usable args.newModel — running with built-in defaults (Opus 4.7 → Opus 4.8, release-day facts). Pass args as a JSON object: {newModel, oldModel, newModelId, releaseDate?, confirmedFacts?}.')
+} else if (!cfg.confirmedFacts) {
+  log(`WARNING: args.newModel set but no args.confirmedFacts — the built-in default facts were written for the Opus 4.8 release and may be WRONG for ${cfg.newModel}. Strongly consider passing confirmedFacts.`)
+}
 const NEW_MODEL = cfg.newModel || 'Claude Opus 4.8'
 const NEW_MODEL_ID = cfg.newModelId || 'claude-opus-4-8'
 const OLD_MODEL = cfg.oldModel || 'Claude Opus 4.7'
 const ROOT = cfg.root || '/home/lukasz/Files/hobby/cc_tool'
+const RELEASE_DATE = cfg.releaseDate || (cfg.newModel ? null : '2026-05-28')
 // Facts authoritative for THIS environment (from the running harness/system prompt).
 // These are the trustworthy floor: web research about a same-day release is often thin.
 const CONFIRMED_FACTS = cfg.confirmedFacts || [
-  `${NEW_MODEL} (model ID '${NEW_MODEL_ID}') was released 2026-05-28 and is the latest Claude model.`,
+  `${NEW_MODEL} (model ID '${NEW_MODEL_ID}') ${RELEASE_DATE ? `was released ${RELEASE_DATE}` : 'was released recently (exact date not provided — establish it via research)'} and is the latest Claude model.`,
   `${NEW_MODEL} supports a 1,000,000-token (1M) context window (variant '${NEW_MODEL_ID}[1m]'). Earlier Opus context was commonly 200K. Whether ${OLD_MODEL} also offered 1M is uncertain — treat the AVAILABILITY of 1M context as confirmed for ${NEW_MODEL}.`,
   `Fast mode in Claude Code uses Claude Opus with faster output (NOT a smaller/downgraded model); available on Opus 4.8/4.7/4.6; toggled with /fast.`,
   `${NEW_MODEL} knowledge cutoff is January 2026.`,
@@ -131,7 +146,7 @@ ${angle}
 
 INSTRUCTIONS:
 - Use WebSearch and WebFetch (load their schemas via ToolSearch: "select:WebSearch,WebFetch" or keyword search). Prefer official Anthropic sources (anthropic.com, docs.claude.com); then reputable analysis.
-- The model was released TODAY (2026-05-28). Coverage may be thin or absent. That is fine — DO NOT FABRICATE. If you cannot find authoritative info for a claim, either omit it or mark confidence 'speculative' and say so in the source field.
+- The model may have been released very recently${RELEASE_DATE ? ` (${RELEASE_DATE})` : ''} — possibly after your training data. Coverage may be thin or absent. That is fine — DO NOT FABRICATE. If you cannot find authoritative info for a claim, either omit it or mark confidence 'speculative' and say so in the source field.
 - For every fact, set confidence honestly: 'confirmed' only with an official/primary source; 'likely' for reputable secondary corroboration; 'speculative' for inference. The ENVIRONMENT-CONFIRMED FACTS above are already 'confirmed' — you may restate the ones relevant to your angle but focus on adding NEW findings.
 - Each fact should note its delta from ${OLD_MODEL} (or "unknown").
 - Set sourcesFound=false if you found no authoritative material about ${NEW_MODEL} specifically.
@@ -185,7 +200,7 @@ const COMPONENTS = [
     focus: 'Lines 88-96: "never mark complete without proving it works; run tests; surface uncertainty". Guards the classic "claims done without testing" failure mode. Is that failure mode reduced/eliminated in the new model, or model-independent and still essential?' },
   { name: 'CLAUDE_snippet: Context management (delegate-to-subagents rule)',
     files: [`${ROOT}/templates/CLAUDE_snippet.md`],
-    focus: 'Lines 100-108: "Context is your most important resource. Delegate exploration/research to subagents; if reading 3+ files, delegate." This was calibrated for ~200K context. Re-examine hard against the 1M context window of the new model — is the >3-files-delegate threshold now overly aggressive / counterproductive?' },
+    focus: 'Lines 100-108: "Context is your most important resource. Delegate exploration/research to subagents; if reading 3+ files, delegate." If the context window CHANGED between the old and new model, re-examine the delegate threshold; if it did not, verify prior calibration rather than redoing it. Also weigh the new model\'s documented delegation behavior and pricing.' },
   { name: 'CLAUDE_snippet: Critical rules (10)',
     files: [`${ROOT}/templates/CLAUDE_snippet.md`],
     focus: 'Lines 112-124: the 10 critical rules (read-before-write, plan-first 3+ steps, minimal-impact, no drive-by dead-code deletion, right-tool-for-the-job, etc.). Which are model-independent hygiene vs. which were patches for specific 4.7 failure modes that may now be noise?' },
@@ -209,10 +224,10 @@ const COMPONENTS = [
     focus: 'Blocks commit/push to main/master/production/release and --no-verify bypass. Model-independent safety guardrail — verify carefully before recommending any relaxation.' },
   { name: 'hook: big-file-guard.py (PreToolUse Read)',
     files: [`${ROOT}/templates/hooks/big-file-guard.py`],
-    focus: 'Warns on reading files >200KB without offset/limit. This threshold was calibrated for a ~200K context window. Re-examine HARD against the 1M context window — is 200KB now too conservative? Should the threshold scale, or is the guard about cost/noise rather than context capacity?' },
+    focus: 'Warns on reading files >200KB without offset/limit. If the context window changed between the old and new model, re-examine the threshold; otherwise verify prior calibration. The guard is also about cost/noise — weigh the new model\'s input pricing when deciding whether conservative is right.' },
   { name: 'hook: context-usage.py (Stop)',
     files: [`${ROOT}/templates/hooks/context-usage.py`],
-    focus: 'Warns when the session context window passes 80% (default limit, suggests /compact). The default CONTEXT_USAGE_LIMIT was almost certainly set for a ~200K window. Re-examine HARD against 1M context: is the default limit now wrong by 5x? Does it read the real window size or assume one?' },
+    focus: 'Warns when the session context window passes 80% (default limit, suggests /compact). Check: does its model→budget mapping RECOGNIZE the new model ID (including any "[1m]" suffix variants), or does it fall back to a wrong default window? If the window size changed between models, recalibrate; otherwise verify. Also consider whether the warning is model-visible (some models self-trim when shown remaining-context counts).' },
   { name: 'Project skills (templates/skills/*)',
     files: [`${ROOT}/templates/skills/reflect/SKILL.md`, `${ROOT}/templates/skills/skills-audit/SKILL.md`, `${ROOT}/templates/skills/skill-engineer/SKILL.md`, `${ROOT}/templates/skills/design-an-interface/SKILL.md`, `${ROOT}/templates/skills/improve-codebase-architecture/SKILL.md`],
     focus: 'The 5 bundled skills. Do any reference a specific model, model-tuned thresholds, or assumptions (e.g. parallel-subagent counts, context limits) that should be recalibrated? skill-engineer/SKILL.md is the one file grep flagged for a model reference — check it specifically.' },
@@ -315,7 +330,7 @@ Write the report with these sections:
 3. "## Recommended changes" — grouped P0 → P1 → P2. Each: component, file+location, the change (with concrete proposed wording/diff), the confirmed/likely capability it rests on, and the risk of NOT doing it. The 1M-context-window recalibration of context-usage.py default, big-file-guard threshold, and the delegate-to-subagents rule should feature prominently IF they survived verification.
 4. "## Leave as-is (deliberately not changing)" — the keep-list, with one-line reasons. Emphasize security/safety guardrails are model-independent.
 5. "## Needs confirmation before acting" — anything resting on speculative facts / researchGaps. Phrase as questions to resolve against ${NEW_MODEL} release notes once available.
-6. "## Suggested CHANGELOG entry" — a ready-to-paste v0.0.5 entry in the existing CHANGELOG.md style summarizing the recalibration.
+6. "## Suggested CHANGELOG entry" — a ready-to-paste entry for the NEXT version after the latest one in CHANGELOG.md (read it to determine the number), in the existing style, summarizing the recalibration.
 7. "## How to re-run this audit" — note it was produced by the 'model-recalibration-audit' workflow, re-runnable per model release with args {newModel, oldModel}.
 
 Be precise and honest. Do not overstate confidence. If a section is empty, say so explicitly rather than padding.

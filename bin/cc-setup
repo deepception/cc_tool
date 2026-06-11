@@ -149,6 +149,39 @@ else
     echo "  ✓ .claude/settings.json created"
 fi
 
+# ── 4b. Workflows safety precondition ────────────────────────────────────────
+# Workflow-spawned subagents run in acceptEdits and inherit the allowlist, so
+# the deterministic bash-guard.py PreToolUse hook — not a permission prompt —
+# is what gates protected-branch git writes mid-run. Warn when workflows are
+# enabled without that hook able to fire.
+if ! command -v python3 &>/dev/null; then
+    echo "  ⚠ python3 not found — all .py hooks (incl. bash-guard.py, the enforced"
+    echo "    protected-branch gate under native workflows) FAIL OPEN without it."
+    echo "    Install python3, or set \"disableWorkflows\": true in .claude/settings.json."
+else
+    python3 - "$SETTINGS_FILE" <<'EOF'
+import json, sys
+try:
+    settings = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+if settings.get("disableWorkflows"):
+    sys.exit(0)
+entries = (settings.get("hooks") or {}).get("PreToolUse") or []
+for entry in entries:
+    if "Bash" not in str(entry.get("matcher", "")):
+        continue
+    for h in entry.get("hooks") or []:
+        if "bash-guard.py" in str(h.get("command", "")):
+            sys.exit(0)
+print('  ⚠ Native workflows are enabled (no "disableWorkflows": true) but no')
+print("    PreToolUse Bash hook invokes bash-guard.py. Workflow subagents run in")
+print("    acceptEdits and inherit the allowlist, so that hook is the enforced")
+print("    boundary for protected-branch git writes mid-run. Re-run cc-setup to")
+print('    install hooks, or set "disableWorkflows": true.')
+EOF
+fi
+
 # ── 5. Skills ────────────────────────────────────────────────────────────────
 SKILLS_TEMPLATE_DIR="$CC_TOOL_DIR/templates/skills"
 if [[ -d "$SKILLS_TEMPLATE_DIR" ]]; then

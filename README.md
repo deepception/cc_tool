@@ -17,6 +17,23 @@ One-command setup for Claude Code projects: Ruflo MCP tools + basic-memory + Sup
 
 ---
 
+## Choosing a model: Opus 4.8 (default) vs Fable 5 (escalation)
+
+Claude Opus 4.8 stays the rational everyday default. Claude Fable 5 (`claude-fable-5`, GA 2026-06-09) is the capability tier above it, at exactly 2x the price ($10/$50 vs $5/$25 per MTok, as of 2026-06). Same 1M context, same 128K output, same API — a drop-in escalation, not a replacement.
+
+**Route a session/stage to Fable 5 when at least one holds:** the task spans >5 files or >30 min; it involves images/screenshots/dense technical vision; a prior Opus 4.8 attempt stalled or needed >2 retries; it runs autonomously >1h without check-in; or it is hard, well-specified, long-horizon, or deep code review/debugging (Fable has higher bug-finding recall). Otherwise stay on Opus 4.8.
+
+**Two caveats that send work back to Opus 4.8:**
+
+- *Refusals:* Fable 5 runs safety classifiers; offensive-security-adjacent or deep security-audit work can trip the `cyber`/`reasoning_extraction` categories (HTTP 200, `stop_reason: refusal`). Official mitigation is to fall back to Opus 4.8 — set `"fallbackModel": "claude-opus-4-8"` in `.claude/settings.json` so availability gaps fall back automatically; on a refusal, Opus 4.8 is one `/model` away.
+- *ZDR:* Fable 5 requires 30-day retention and is not available under zero-data-retention agreements. ZDR orgs stay on Opus 4.8.
+
+**Speed vs capability at equal price:** Fable 5 has no fast mode (fast is Opus 4.8/4.7/4.6 only). Opus 4.8 in fast mode costs $10/$50 — the *same* price as Fable 5 standard — so the real choice at that price point is Opus-fast (lower latency) vs Fable-standard (higher capability).
+
+Per-stage routing inside workflows/skills and the on-fan-out effort guidance live in [templates/CLAUDE_snippet.md](templates/CLAUDE_snippet.md) (`## Model routing` and `### Orchestration: which fan-out mechanism`).
+
+---
+
 ## Setup (2 commands, once per machine)
 
 ```bash
@@ -66,7 +83,7 @@ cc-devcontainer /path/to/project    # sandbox Claude Code in a container (see be
 
 Ruflo needs no update — always latest via `npx -y`. `cc_tool` itself is local-only — edit templates in place, then run `cc-update-project` on any project to pick up changes.
 
-> **Config staleness:** re-audit your hooks, permissions, and CLAUDE.md roughly once per Claude model release. Capabilities and failure modes shift between models — a guardrail that earned its keep on one model may be noise (or a gap) on the next.
+> **Config staleness:** re-audit your hooks, permissions, and CLAUDE.md roughly once per Claude model release. Capabilities and failure modes shift between models — a guardrail that earned its keep on one model may be noise (or a gap) on the next — and a release may add a *new active tier* (a second model worth routing specific work to) or make instructions written for an older model too prescriptive for the newer one while remaining appropriate for the older one. Re-auditing covers all three: stale guardrails, model routing, and over-scaffolded guidance.
 
 ---
 
@@ -191,11 +208,11 @@ Claude uses it automatically when CLAUDE.md is present. You can also ask explici
 
 Ruflo's MCP tools (swarm parallelism, multi-repo coordination) are loaded via `.mcp.json` and visible to Claude in every session. Claude may use them on its own when it judges they fit the task — you don't need to ask for them explicitly. For most parallel work (3-5 tasks), Claude will prefer `superpowers:dispatching-parallel-agents` since it's simpler.
 
-### Native dynamic workflows (Claude Code v2.1.154+, Opus 4.8)
+### Native dynamic workflows (Claude Code v2.1.154+)
 
-The harness can now write and run its own multi-agent orchestration (the `Workflow` tool — triggered by the word "workflow", `/deep-research`, a saved workflow, or `ultracode` mode), spawning tens-to-hundreds of subagents whose intermediate results stay out of the main context. This overlaps Ruflo's swarm role for large independent fan-out. Two things to know:
+The harness can now write and run its own multi-agent orchestration (the `Workflow` tool — triggered by the word "workflow", `/deep-research`, a saved workflow, or `ultracode` mode), spawning tens-to-hundreds of subagents whose intermediate results stay out of the main context. This overlaps Ruflo's swarm role for large independent fan-out. Per-stage model routing: the harness Agent tool's model enum includes `fable` (Claude Fable 5) alongside the Opus/Sonnet tiers — route the hardest plan/review stages of a workflow to Fable 5 and keep routine arms on Opus 4.8/Sonnet (see `### Orchestration: which fan-out mechanism` in CLAUDE_snippet.md). Two things to know:
 
-- **Permissions:** workflow-spawned subagents run in `acceptEdits` (file edits auto-approved) and inherit this project's `settings.json` allowlist. The `deny`/`ask` lists and the devcontainer firewall remain the enforced boundary; pre-populating `allow` with build/test commands keeps long runs from stalling on mid-run prompts.
+- **Permissions:** workflow-spawned subagents run in `acceptEdits` (file edits auto-approved) and inherit this project's `settings.json` allowlist. The `deny`/`ask` lists and the devcontainer firewall still apply to what they cover — but they do not gate protected-branch git writes: `Bash(git commit *)` is allowlisted and `deny` only blocks `git push --force *`, so the deterministic `bash-guard.py` PreToolUse hook is the enforced boundary for commit/push to `main`/`master`/`production`/`release` during a workflow run. Keep that hook installed wherever workflows are enabled; pre-populating `allow` with build/test commands keeps long runs from stalling on mid-run prompts.
 - **Disabling:** set `disableWorkflows: true` in `settings.json` (or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`), which also removes `ultracode` and the bare-word trigger.
 
 **Workflow pattern catalog** — six composable patterns the harness can apply:

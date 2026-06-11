@@ -16,8 +16,14 @@ const cfg = (args && typeof args === 'object') ? args : {}
 const FEATURE = cfg.feature || (typeof args === 'string' ? args.trim() : '')
 if (!FEATURE) return { error: 'No feature provided. Pass args.feature (or a plain request string as args) and re-invoke.' }
 const ROOT = cfg.root || 'the current repository (your working directory)'
-const PLAN_MODEL = cfg.planModel || 'opus'    // planning + review want the stronger model
+// Planning + review want the stronger model. For the hardest features pass
+// planModel:'fable' (Claude Fable 5: higher first-shot correctness + bug-finding
+// recall) — ~2x opus cost, opt-in per feature, not the default. If the feature
+// under review is security-sensitive (crypto, auth, exploit-adjacent), keep or
+// fall back to opus (Fable's cyber classifier may refuse).
+const PLAN_MODEL = cfg.planModel || 'opus'
 const CODE_MODEL = cfg.codeModel || 'sonnet'  // implementation + testing are throughput-bound
+const REVIEW_MODEL = cfg.reviewModel || PLAN_MODEL  // independent review tier (e.g. reviewModel:'fable')
 
 // ---- schemas (the structured hand-offs between stages) ------------------
 const SPEC_SCHEMA = {
@@ -178,7 +184,7 @@ METHOD:
 - List issues by severity (blocking / should-fix / nit) with concrete location and suggestion.
 - nextSteps: if fail, what the coder must change; if pass, what remains before merge (the human still commits).
 Return the structured review.`,
-      { label: 'review:gate', phase: 'Review', model: PLAN_MODEL, schema: REVIEW_SCHEMA }
+      { label: 'review:gate', phase: 'Review', model: REVIEW_MODEL, schema: REVIEW_SCHEMA }
     )
   }
 )
@@ -188,7 +194,7 @@ log(`Pipeline complete — review verdict: ${review && review.verdict}`)
 
 return {
   feature: FEATURE,
-  models: { plan: PLAN_MODEL, code: CODE_MODEL, test: CODE_MODEL, review: PLAN_MODEL },
+  models: { plan: PLAN_MODEL, code: CODE_MODEL, test: CODE_MODEL, review: REVIEW_MODEL },
   spec,
   code: codeReport,
   tests: testReport,
