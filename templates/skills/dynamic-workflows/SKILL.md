@@ -31,7 +31,7 @@ Pick `parallel` vs `pipeline` by one question: do I need ALL results before the 
 
 **fan-out-and-synthesize** — one agent per enumerable independent item (file, module, research angle), then a synthesize barrier merges the results. The dominant pattern; reach for it whenever the work splits into independent pieces and the answer needs all of them.
 
-**adversarial-verification** — a separate skeptic agent tries to refute each finding against an explicit rubric. The verifier sees only the rubric and the artifact — never the producer or its reasoning — so it can't be charmed into agreement. Use whenever the producer's output feeds a decision; this is the structural fix for self-preferential bias.
+**adversarial-verification** — a separate skeptic agent tries to refute each finding against an explicit rubric. The verifier sees only the rubric and the artifact — never the producer or its reasoning — so it can't be charmed into agreement. Its default is to reject: it confirms a finding only when it can reproduce it at the cited location, so its job is killing false positives, not rubber-stamping. Use whenever the producer's output feeds a decision; this is the structural fix for self-preferential bias — a model grading its own work passes almost everything.
 
 **generate-and-filter** — generate wide and commit late: many candidates first, then filter and dedup by an explicit rubric. Use for brainstorming, naming, and solution design, where the first idea is rarely the best and judging is cheaper than generating.
 
@@ -60,12 +60,13 @@ Treat them as templates to adapt, not scripts to run verbatim — copy one into 
 
 ## Operational controls
 
-- **Pair loops with `/goal`** for a hard completion target. Without it, workflows stop at soft completion — "looks done" instead of "is done".
+- **Pair loops with `/goal`** for a hard completion target. Without it, workflows stop at soft completion — "looks done" instead of "is done". A complete `/goal` states the task in one line and carries measurable success criteria, invariant constraints, a checkpoint rule (pause vs run-through), a self-verify step, and a budget cap. Let the model draft it — it prompts a loop better than a hand-written spec.
 - **`/loop`** runs the whole workflow on a recurring schedule.
 - **Set an explicit token budget in the prompt.** Ambitious workflows balloon 5-10x past the naive estimate; the budget is the only brake.
 - **Quarantine untrusted input** (support tickets, scraped pages, third-party API output): the reader agents that touch it get NO privileged actions — no edits, no shell side effects — and separate agents act on their sanitized summaries. A prompt injection in the data then has nothing to grab.
 - **Workflow subagents run with acceptEdits and inherit the session's tool allowlist** — they apply file edits without prompting, so the deny-list / bash-guard hook is the load-bearing safety boundary, not an interactive confirmation. Give each agent an explicit scope (which files/commands are in-bounds), keep untrusted-input readers tool-restricted per the quarantine rule above, and don't enable workflows in a project that lacks the bash-guard PreToolUse hook.
 - **Effort is model-conditional.** On `fable` subagents, default effort is `high` (`xhigh` only for the most capability-sensitive stage); on `opus` keep `xhigh` for coding/synthesis. Route a stage to `fable` when it is long-horizon, ambiguous, vision-heavy, or stalled twice on `opus` — not for routine fan-out throughput.
+- **Reflect-or-kill on retry loops.** When a stage can retry, don't just spend the whole cap — after each attempt have the agent judge against the goal and emit one of `continue` / `abandon` / `escalate`: `abandon` a branch that is no longer converging, `escalate` to a stronger model or a human instead of grinding identical failed attempts. The iteration cap is the backstop; reflect-or-kill is what usually ends the loop first.
 
 ## When NOT to use
 

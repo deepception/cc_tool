@@ -53,10 +53,11 @@ Disable native workflows with `disableWorkflows: true` in settings or `CLAUDE_CO
 
 ### Safe autonomous loops
 
-Before any loop or unattended run:
+Designing a loop rather than firing a one-off? The `loop-engineering` skill names the six-component anatomy (trigger, isolation, written-down context, tool integration, independent verification, disk-based state). Before any loop or unattended run:
 
-- **Spec first** — a written spec with machine-checkable acceptance criteria BEFORE the loop starts. No spec → no loop. Pair with `/goal` to force a hard completion condition.
-- **Bound it** — explicit iteration / retry caps; never loop forever.
+- **Spec first** — a written spec with machine-checkable acceptance criteria BEFORE the loop starts. No spec → no loop. Pair with `/goal` to force a hard completion condition — a good `/goal` carries its own task statement, success criteria, constraints, checkpoint rule, self-verify step, and budget cap. When the user describes a loop-shaped task, offer to draft that `/goal` for them rather than making them write it.
+- **Bound it** — explicit iteration / retry caps so a loop never runs forever, plus an early exit: each iteration judges whether it is still converging and abandons or escalates a doomed branch rather than spending the whole cap on it.
+- **State on disk** — progress lives in a file/board/queue outside the conversation (e.g. an append-only `LOG.md` — see `loop-engineering`, Disk-based state), so a compaction or a new session doesn't lose track of what's done.
 - **Cost guard** — tier models: strong model (Opus 4.8, or `fable` for the hardest plan/judge stages) to plan and judge, cheap model (Sonnet/Haiku) or lower effort for repetitive parallel arms.
 - **No irreversible unattended actions** — draft and queue, don't send and pray. (The bash-guard hook already blocks pushes/commits to protected branches.)
 - **Verification gate** — a loop reports done only when tests / acceptance criteria actually pass, and for unattended runs the judge must not be the worker itself (see Verification protocol).
@@ -132,6 +133,8 @@ If a task will read more than ~3 files or produce output the user doesn't need v
 On Fable 5, when you do fan out: prefer async subagents (kick them off and check results non-blocking) over blocking joins; favor long-lived subagents that reuse cached reads over many short-lived ones; and verification belongs to a fresh-context subagent rather than self-critique (the judge-not-the-worker rule in the Verification protocol).
 
 When the same large corpus will be queried repeatedly — especially across a loop or fan-out — synthesize it once into a queryable summary (e.g. `knowledge-wiki`) rather than having each pass or agent re-read the raw source.
+
+Long loops degrade because the context becomes disorganized, not because the model gets worse — watch for it as a run passes ~15 steps (a community heuristic, like the routing thresholds above). Four moves keep loop context clean: **Write** durable state outside the window (scratchpad, rules file, basic-memory) instead of re-deriving it; **Select** only the slice each step needs; **Compress** finished phases into a short summary before the next; **Isolate** each phase in its own subagent context so one phase can't contaminate the next. These prevent poisoning (a bad fact compounds across iterations), distraction (the agent rehashes history instead of acting), confusion (too many tools/instructions blur the decision), and clash (contradictory context left in the window). A loop that re-reads the same corpus every pass hits all four — compile it once (knowledge-wiki) and Select from that.
 
 ---
 

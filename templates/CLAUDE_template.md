@@ -141,6 +141,21 @@ Prefer running single test files over the full suite for faster feedback.
 - One logical change per commit
 - Always run code quality checks before committing
 
+### Loops & autonomous runs
+
+<!-- Optional. Delete this subsection if you don't want auto-offered loops in this project. -->
+
+When a task you just did by hand is clearly going to recur (PR babysitting, test-suite or deploy monitoring, triage of incoming items), offer to turn it into a loop rather than waiting to be asked — name the trigger, the verifiable end state, and where its state would live, then let the user confirm before creating anything. The model usually drafts a loop spec better than a hand-written one, so offer to draft the `/goal` prompt. A well-formed `/goal` has all six of:
+
+- one-line task statement
+- 3-5 measurable success criteria
+- constraints that hold throughout
+- a checkpoint rule — when to pause vs run through
+- a self-verify instruction (verifier is not the worker; see Verification protocol)
+- a max budget guard (token or iteration cap)
+
+Default checkpoint rule: "Pause only when work needs my input — destructive actions, scope changes, or items only I can provide." For a recurring version of a one-off task, offer `/loop <interval>` instead. Follow the `loop-engineering` skill for the anatomy and the "Safe autonomous loops" gates; start with one loop, verify it end-to-end, then expand.
+
 ---
 
 ## Domain Context

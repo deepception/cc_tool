@@ -247,6 +247,8 @@ For unattended runs, pick one:
 - **Pre-resolve + pre-allowlist (host):** install dependencies *before* the run so no `ask` rule ever triggers, and add the specific build/test/dev-server commands the loop needs (plus Playwright MCP, if the loop drives a browser) to `allow` in `settings.json`. Pair this with native `/sandbox` (see above) so the widened allowlist keeps an OS-level boundary on Bash.
 - **Run inside `cc-devcontainer`:** the firewall + `managed-settings.json` make `--dangerously-skip-permissions` safe-by-sandbox — no prompts to stall on, because the container itself is the trust boundary.
 
+**Where the run lives** — an unattended loop needs a host that stays up when you walk away; a laptop that sleeps on lid-close will kill it. The `cc-devcontainer` above is one durable home; for long or recurring loops, a persistent box you SSH into — the container on an always-on machine, or a cheap Linux VPS with the session under `tmux`/`screen` so it survives disconnects — is the other. `/schedule` (cron cloud routines) sidesteps this entirely by running the agent in Anthropic's cloud rather than on your machine.
+
 ---
 
 ## Do Superpowers and Ruflo cross-trigger each other?
@@ -285,6 +287,7 @@ cc_tool/
       skills-audit/SKILL.md                   audit installed skills for quality and overlap
       skill-engineer/SKILL.md                 create and update skills from workflow descriptions
       dynamic-workflows/SKILL.md              the 6 Workflow patterns + operational controls (full catalog)
+      loop-engineering/SKILL.md               structural model of an autonomous loop: six-component anatomy, disk state, inner/outer layers
       knowledge-wiki/SKILL.md                 Karpathy compile-once wiki: distill a codebase/topic into a durable wiki
       design-an-interface/SKILL.md            generate 3+ divergent interface designs via parallel sub-agents (MIT, mattpocock/skills)
       improve-codebase-architecture/SKILL.md  surface deep-module refactor opportunities as GitHub-issue RFCs (MIT, mattpocock/skills)
