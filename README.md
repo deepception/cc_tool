@@ -9,6 +9,7 @@ One-command setup for Claude Code projects: Ruflo MCP tools + basic-memory + Sup
 | **Superpowers** (`obra/superpowers`) | Methodology skills: TDD, brainstorming, debugging, verification | `cc-update` pulls from GitHub |
 | **basic-memory** (`basicmachines-co/basic-memory`) | Persistent knowledge graph: project decisions, cross-session memory | `uvx` auto-downloads on first use — nothing to do |
 | **Ruflo** (`@claude-flow/cli`) | MCP tools for swarm coordination, multi-repo orchestration | `npx -y` auto-fetches latest on every session start — nothing to do |
+| **taste-skill** (`Leonxlnx/taste-skill`) | Anti-slop frontend design skills (global): flagship + minimalist/brutalist/soft/redesign/output variants, routed by the `design-director` project skill | `cc-update` runs `npx skills update -g` |
 | **Hooks** (7 scripts) | Prompt linting, search-year injection, session context, Bash guard (branch/push/`--no-verify`/secret reads), big-file read warning, context-usage warning (80% → `/compact`), post-edit typecheck | Local scripts — edit templates in `cc_tool/`, re-run `cc-setup` |
 
 **Design principle:** Superpowers is the methodology layer — most skills trigger automatically via CLAUDE.md rules. Ruflo MCP tools are available in every session and Claude may use them when needed (swarm parallelism, multi-repo). basic-memory is the persistent knowledge layer that survives across sessions. No Ruflo CLAUDE.md, no behavioral autopilot.
@@ -46,7 +47,7 @@ source ~/.zshrc   # or ~/.bashrc
 cc-setup /path/to/your/project
 ```
 
-`install.sh` handles PATH registration, adds the `obra/superpowers` marketplace, and installs the Superpowers plugin in one run.
+`install.sh` handles PATH registration, adds the `obra/superpowers` marketplace, and installs the Superpowers plugin, the security-guidance plugin, and the taste-skill design skills (global) in one run.
 
 ---
 
@@ -79,7 +80,7 @@ cc-devcontainer /path/to/project    # sandbox Claude Code in a container (see be
 
 - **`cc-setup`** — initialize a project the first time: `.mcp.json`, `.claude/settings.json`, `.claude/hooks/`, `.claude/skills/`, `CLAUDE.md`. Safe to re-run; idempotent on the parts it manages.
 - **`cc-update-project`** — roll new cc_tool changes into an existing project: re-copies hooks, adds any new skills, merges new hooks into `settings.json`, additively merges new `deny`/`ask` entries, applies the commit-attribution policy, and replaces the marker-delimited methodology block in `CLAUDE.md` in place. Preserves existing permissions and all project-specific CLAUDE.md content; never clobbers local edits. Ends with a non-destructive template-drift check (lists template sections the project lacks). **Note:** project-specific CLAUDE.md *structure* (Overview, Codebase Map, Commands…) is seeded once from the template and is **not** auto-merged on update — only the managed methodology block is. Internally calls `cc-setup` + `cc-update-permissions`.
-- **`cc-update`** — updates global plugins (Superpowers from `obra/superpowers`; checks/installs `security-guidance` from `anthropics/claude-plugins-official`). Independent of any project.
+- **`cc-update`** — updates global plugins (Superpowers from `obra/superpowers`; checks/installs `security-guidance` from `anthropics/claude-plugins-official`; checks/installs the taste-skill design skills and runs `npx skills update -g`). Independent of any project.
 
 Ruflo needs no update — always latest via `npx -y`. `cc_tool` itself is local-only — edit templates in place, then run `cc-update-project` on any project to pick up changes.
 
@@ -208,6 +209,10 @@ Claude uses it automatically when CLAUDE.md is present. You can also ask explici
 
 Ruflo's MCP tools (swarm parallelism, multi-repo coordination) are loaded via `.mcp.json` and visible to Claude in every session. Claude may use them on its own when it judges they fit the task — you don't need to ask for them explicitly. For most parallel work (3-5 tasks), Claude will prefer `superpowers:dispatching-parallel-agents` since it's simpler.
 
+### Design & frontend taste (taste-skill + design-director)
+
+Frontend visual work (landing pages, heroes, portfolios, redesigns) is covered by two layers. `install.sh` (or `cc-install-tasteskill`) installs a curated subset of [Leonxlnx/taste-skill](https://github.com/Leonxlnx/taste-skill) (MIT) as **global** skills: `design-taste-frontend` (flagship — brief inference, VARIANCE/MOTION/DENSITY dials, anti-slop rules), `minimalist-ui`, `industrial-brutalist-ui`, `high-end-visual-design`, `redesign-existing-projects`, `full-output-enforcement`. The **`design-director` project skill** (copied by `cc-setup`) is the control layer: it reads the brief, routes to the right variant, and composes a section-by-section *master design prompt* from three archetype templates (signature-interaction hero, immersive scroll experience, dark minimal landing — distilled from motionsites.ai-style briefs) plus a prompt-anatomy guide. Say "design a landing page for X" and the routing happens automatically; the archetypes also work standalone if taste-skill isn't installed.
+
 ### Native dynamic workflows (Claude Code v2.1.154+)
 
 The harness can now write and run its own multi-agent orchestration (the `Workflow` tool — triggered by the word "workflow", `/deep-research`, a saved workflow, or `ultracode` mode), spawning tens-to-hundreds of subagents whose intermediate results stay out of the main context. This overlaps Ruflo's swarm role for large independent fan-out. Per-stage model routing: the harness Agent tool's model enum includes `fable` (Claude Fable 5) alongside the Opus/Sonnet tiers — route the hardest plan/review stages of a workflow to Fable 5 and keep routine arms on Opus 4.8/Sonnet (see `### Orchestration: which fan-out mechanism` in CLAUDE_snippet.md). Two things to know:
@@ -271,6 +276,7 @@ cc_tool/
     cc-update-permissions        [internal] deny/ask merge helper, called by cc-update-project
     cc-install-superpowers       install Superpowers globally (called by install.sh)
     cc-install-security          install Anthropic security-guidance plugin (called by install.sh)
+    cc-install-tasteskill        install taste-skill design skills globally (called by install.sh)
   templates/
     mcp.json                     Ruflo + basic-memory MCP server configs
     settings.json                full settings for new projects
@@ -290,6 +296,8 @@ cc_tool/
       loop-engineering/SKILL.md               structural model of an autonomous loop: six-component anatomy, disk state, inner/outer layers
       knowledge-wiki/SKILL.md                 Karpathy compile-once wiki: distill a codebase/topic into a durable wiki
       design-an-interface/SKILL.md            generate 3+ divergent interface designs via parallel sub-agents (MIT, mattpocock/skills)
+      design-director/SKILL.md                route frontend design briefs to taste-skill variants + compose master design prompts
+        references/                             prompt-anatomy guide + 3 archetype master-prompt templates
       improve-codebase-architecture/SKILL.md  surface deep-module refactor opportunities as GitHub-issue RFCs (MIT, mattpocock/skills)
     hooks/
       prompt-linter.sh           warns on long ambiguous prompts

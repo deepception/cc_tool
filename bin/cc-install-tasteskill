@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# cc-install-tasteskill: Install a curated subset of taste-skill (Leonxlnx/taste-skill, MIT)
+# as global (user-level) Claude Code skills. Run once; the design-director project skill
+# (templates/skills/design-director/) routes among the installed variants.
+# Excluded on purpose: gpt-tasteskill + stitch-skill (other-platform variants),
+# taste-skill-v1 (legacy), image-to-code + imagegen-* + brandkit (need an image-generation tool).
+set -euo pipefail
+
+TASTE_SKILLS=(
+    design-taste-frontend
+    minimalist-ui
+    industrial-brutalist-ui
+    high-end-visual-design
+    redesign-existing-projects
+    full-output-enforcement
+)
+
+if ! command -v npx &>/dev/null; then
+    echo "Error: 'npx' not found. Install Node.js first." >&2
+    exit 1
+fi
+
+# Check if already installed (global skills are linked into ~/.claude/skills)
+if [[ -e "$HOME/.claude/skills/design-taste-frontend" ]]; then
+    echo "✓ taste-skill already installed globally"
+    echo "  To update: cc-update"
+    exit 0
+fi
+
+SKILL_FLAGS=()
+for s in "${TASTE_SKILLS[@]}"; do
+    SKILL_FLAGS+=(--skill "$s")
+done
+
+echo "Installing taste-skill design skills globally (Leonxlnx/taste-skill)..."
+# The skills CLI exits non-zero if ANY detected agent rejects global install
+# (e.g. PromptScript), even when the Claude Code install succeeded — so verify
+# by checking the installed directory, not the exit code.
+npx -y skills add Leonxlnx/taste-skill -g -y --agent claude-code "${SKILL_FLAGS[@]}" || true
+
+if [[ -e "$HOME/.claude/skills/design-taste-frontend" ]]; then
+    echo ""
+    echo "✓ taste-skill installed (global). Variants:"
+    echo "  design-taste-frontend       default anti-slop landing/portfolio skill (3 dials)"
+    echo "  minimalist-ui               clean editorial (Notion/Linear) style"
+    echo "  industrial-brutalist-ui     raw Swiss/terminal aesthetic"
+    echo "  high-end-visual-design      expensive soft/premium agency look"
+    echo "  redesign-existing-projects  audit-first upgrade of existing UIs"
+    echo "  full-output-enforcement     no-truncation output discipline"
+    echo ""
+    echo "  The design-director skill (installed per-project by cc-setup) routes among these."
+else
+    echo ""
+    echo "✗ Installation failed. Try manually:" >&2
+    echo "  npx -y skills add Leonxlnx/taste-skill -g -y --agent claude-code \\" >&2
+    printf '      --skill %s\n' "${TASTE_SKILLS[@]}" >&2
+    exit 1
+fi

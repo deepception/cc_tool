@@ -23,6 +23,21 @@ else
 fi
 
 echo ""
+echo "Checking taste-skill design skills..."
+if [[ -d "$HOME/.claude/skills/design-taste-frontend" ]]; then
+    # Note: `skills update -g` updates ALL global skills managed by the skills CLI, not just taste-skill.
+    if npx -y skills update -g -y 2>&1; then
+        echo "✓ global skills updated (incl. taste-skill)"
+    else
+        echo "⚠️  taste-skill update failed (non-fatal). Update manually:"
+        echo "  npx -y skills update -g -y"
+    fi
+else
+    echo "  Not installed — installing now..."
+    "$CC_TOOL_DIR/bin/cc-install-tasteskill" || echo "⚠️  taste-skill install failed (non-fatal)"
+fi
+
+echo ""
 echo "Checking security-guidance plugin..."
 if claude plugin list 2>/dev/null | grep -q "security-guidance"; then
     if claude plugin marketplace update claude-plugins-official 2>&1 \

@@ -78,6 +78,10 @@ basic-memory vs `knowledge-wiki`: basic-memory is a graph of decisions/preferenc
 | Search for notes by topic or concept | `mcp__basic-memory__search_notes` |
 | Append to or update an existing note | `mcp__basic-memory__edit_note` |
 
+### Design & frontend taste
+
+Any frontend *visual* design work — landing page, hero section, portfolio, marketing site, redesign, "make it look good / premium / not generic" — starts with the `design-director` skill: it reads the brief, routes to the right globally-installed taste-skill variant (`design-taste-frontend`, `minimalist-ui`, `industrial-brutalist-ui`, `high-end-visual-design`, `redesign-existing-projects`), and composes a section-by-section master design prompt from its archetype templates. Not for dashboards/data-heavy product UI; module/API shape questions go to `design-an-interface` instead.
+
 ---
 
 ## Model routing
