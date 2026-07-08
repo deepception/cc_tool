@@ -86,6 +86,10 @@ If the project has a `vault/`: route any mid-session "note this down / remember 
 
 Any frontend *visual* design work — landing page, hero section, portfolio, marketing site, redesign, "make it look good / premium / not generic" — starts with the `design-director` skill: it reads the brief, routes to the right globally-installed taste-skill variant (`design-taste-frontend`, `minimalist-ui`, `industrial-brutalist-ui`, `high-end-visual-design`, `redesign-existing-projects`), and composes a section-by-section master design prompt from its archetype templates. Not for dashboards/data-heavy product UI; module/API shape questions go to `design-an-interface` instead.
 
+### App QA & e2e testing
+
+"Test the app end to end / QA this app / review the UI" → the `app-qa` skill orchestrates the full engagement (e2e test plan + execution, UI/UX walkthrough, static frontend review — up to three docs in the project's `docs/`). A single activity goes straight to its worker skill: `e2e-testing` (plan + run scenarios, agent-driven or paired with the user), `ui-ux-review` (live severity-tagged walkthrough), `frontend-review` (source-level interface review, no live app needed). Doc formats live in the skills' references, not here.
+
 ---
 
 ## Model routing
