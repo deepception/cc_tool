@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# cc-vault: Scaffold a self-writing vault in a project — a single-inbox
+# markdown vault Claude processes on a schedule (files notes, adds backlinks,
+# writes digests and weekly syntheses) without the user in the loop.
+# Deterministic scaffolding stays in a script; the `vault` project skill
+# handles the judgment work (process / synthesize / health).
+#
+# Usage:
+#   cc-vault [PROJECT_DIR] [--private] [--force]
+#
+#   --private   add vault/ to the project's .gitignore (notes stay local)
+#   --force     overwrite seed files (README.md, AUTOMATION.md, index.md, log.md)
+set -euo pipefail
+
+CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEMPLATE_DIR="$CC_TOOL_DIR/templates/vault"
+
+PROJECT_DIR=""
+PRIVATE=0
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --private) PRIVATE=1; shift ;;
+        --force)   FORCE=1; shift ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+        *)  PROJECT_DIR="$1"; shift ;;
+    esac
+done
+
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+    echo "Error: '$PROJECT_DIR' does not exist." >&2
+    exit 1
+fi
+
+VAULT_DIR="$PROJECT_DIR/vault"
+echo "Setting up self-writing vault in: $VAULT_DIR"
+echo ""
+
+# ── 1. Directory structure ───────────────────────────────────────────────────
+for d in inbox raw notes daily synthesis; do
+    mkdir -p "$VAULT_DIR/$d"
+    touch "$VAULT_DIR/$d/.gitkeep"
+done
+echo "  ✓ vault/{inbox,raw,notes,daily,synthesis}/"
+
+# ── 2. Seed files (skipped if present, unless --force) ───────────────────────
+for f in README.md AUTOMATION.md index.md log.md; do
+    dst="$VAULT_DIR/$f"
+    if [[ -f "$dst" && $FORCE -eq 0 ]]; then
+        echo "  ✓ $f already present — skipping (use --force to overwrite)"
+    else
+        sed "s|__PROJECT_DIR__|$PROJECT_DIR|g" "$TEMPLATE_DIR/$f" > "$dst"
+        echo "  ✓ $f written"
+    fi
+done
+
+# ── 3. Optional: keep the vault out of git ───────────────────────────────────
+if (( PRIVATE )); then
+    GITIGNORE="$PROJECT_DIR/.gitignore"
+    if [[ -f "$GITIGNORE" ]] && grep -qxE 'vault/?' "$GITIGNORE"; then
+        echo "  ✓ vault/ already in .gitignore"
+    else
+        printf 'vault/\n' >> "$GITIGNORE"
+        echo "  ✓ vault/ added to .gitignore"
+    fi
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "Done. The vault's contract lives in vault/README.md."
+echo ""
+echo "  Capture:   drop raw thoughts (voice transcripts, quick notes) into vault/inbox/"
+echo "  Process:   /vault process     — file inbox → linked notes + daily digest"
+echo "  Weekly:    /vault synthesize  — themes, contradictions, half-made promises"
+echo "  Health:    /vault health      — graph pulse (link density, orphans, backlog)"
+echo ""
+echo "  To run it WITHOUT you, wire one trigger from vault/AUTOMATION.md"
+echo "  (system cron / '/schedule' cloud routine / '/loop')."

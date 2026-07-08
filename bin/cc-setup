@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # cc-setup: Configure Claude Code tools (Ruflo MCP + basic-memory + hooks) in a project.
-# Usage: cc-setup [project_path] [--devcontainer [--cloud aws|gcp|none] [--firewall on|off]]
+# Usage: cc-setup [project_path] [--vault] [--devcontainer [--cloud aws|gcp|none] [--firewall on|off]]
 set -euo pipefail
 
 CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PROJECT_DIR=""
 WITH_DEVCONTAINER=0
+WITH_VAULT=0
 DEVCONTAINER_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --vault) WITH_VAULT=1; shift ;;
         --devcontainer) WITH_DEVCONTAINER=1; shift ;;
         --cloud|--cloud=*|--firewall|--firewall=*|--force)
             DEVCONTAINER_ARGS+=("$1")
@@ -273,7 +275,14 @@ echo "                           update:       cc-update"
 echo ""
 echo "  Manual invocation only — no auto-spawning, no behavioral CLAUDE.md from Ruflo"
 
-# ── 7. Optional devcontainer setup ──────────────────────────────────────────
+# ── 7. Optional self-writing vault ───────────────────────────────────────────
+if (( WITH_VAULT )); then
+    echo ""
+    echo "── Vault ───────────────────────────────────────────────────────────"
+    "$CC_TOOL_DIR/bin/cc-vault" "$PROJECT_DIR"
+fi
+
+# ── 8. Optional devcontainer setup ──────────────────────────────────────────
 if (( WITH_DEVCONTAINER )); then
     echo ""
     echo "── Devcontainer ────────────────────────────────────────────────────"

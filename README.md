@@ -1,6 +1,6 @@
 # cc_tool
 
-One-command setup for Claude Code projects: Ruflo MCP tools + basic-memory + Superpowers skills.
+One-command setup for Claude Code projects: Ruflo MCP tools + basic-memory + Superpowers skills — plus optional per-project extras: a self-writing vault (`cc-vault`) and a sandboxed devcontainer (`cc-devcontainer`).
 
 ## What this configures
 
@@ -10,7 +10,8 @@ One-command setup for Claude Code projects: Ruflo MCP tools + basic-memory + Sup
 | **basic-memory** (`basicmachines-co/basic-memory`) | Persistent knowledge graph: project decisions, cross-session memory | `uvx` auto-downloads on first use — nothing to do |
 | **Ruflo** (`@claude-flow/cli`) | MCP tools for swarm coordination, multi-repo orchestration | `npx -y` auto-fetches latest on every session start — nothing to do |
 | **taste-skill** (`Leonxlnx/taste-skill`) | Anti-slop frontend design skills (global): flagship + minimalist/brutalist/soft/redesign/output variants, routed by the `design-director` project skill | `cc-update` runs `npx skills update -g` |
-| **Hooks** (7 scripts) | Prompt linting, search-year injection, session context, Bash guard (branch/push/`--no-verify`/secret reads), big-file read warning, context-usage warning (80% → `/compact`), post-edit typecheck | Local scripts — edit templates in `cc_tool/`, re-run `cc-setup` |
+| **Vault** (`cc-vault`, optional per project) | Self-writing vault: you dump raw thoughts into `vault/inbox/`; scheduled Claude runs file, cross-link, digest, and synthesize them **without you** | Local scaffold — `cc-vault --force` refreshes the seed files |
+| **Hooks** (7 scripts) | Prompt linting, search-year injection, session context (incl. vault state), Bash guard (branch/push/`--no-verify`/secret reads), big-file read warning, context-usage warning (80% → `/compact`), post-edit typecheck | Local scripts — edit templates in `cc_tool/`, re-run `cc-setup` |
 
 **Design principle:** Superpowers is the methodology layer — most skills trigger automatically via CLAUDE.md rules. Ruflo MCP tools are available in every session and Claude may use them when needed (swarm parallelism, multi-repo). basic-memory is the persistent knowledge layer that survives across sessions. No Ruflo CLAUDE.md, no behavioral autopilot.
 
@@ -64,6 +65,7 @@ What it does:
 - Creates `.claude/settings.json` (new projects) or updates the `hooks` section + commit-attribution policy (existing projects, preserving your permissions). The policy (`attribution.commit: ""`) keeps Claude out of commit co-authors.
 - Copies skills from `templates/skills/` into `.claude/skills/` (skips existing ones)
 - Creates `CLAUDE.md` from `CLAUDE_template.md` if none exists (full template with placeholders), or appends `CLAUDE_snippet.md` to an existing one (AI tools + reasoning protocol + verification + critical rules)
+- With `--vault`: chains to `cc-vault` to scaffold a self-writing vault (see the [Self-writing vault](#self-writing-vault-your-thinking-processed-without-you) section)
 
 Re-running `cc-setup` is safe and idempotent — permissions are never overwritten.
 
@@ -76,6 +78,7 @@ cc-setup /path/to/project           # first-time setup
 cc-update-project /path/to/project  # update an existing project (hooks + skills + permissions)
 cc-update                           # update external deps (Superpowers plugin)
 cc-devcontainer /path/to/project    # sandbox Claude Code in a container (see below)
+cc-vault /path/to/project           # scaffold a self-writing vault (see below)
 ```
 
 - **`cc-setup`** — initialize a project the first time: `.mcp.json`, `.claude/settings.json`, `.claude/hooks/`, `.claude/skills/`, `CLAUDE.md`. Safe to re-run; idempotent on the parts it manages.
@@ -205,6 +208,31 @@ Cross-session knowledge: project decisions, architecture notes, user preferences
 
 Claude uses it automatically when CLAUDE.md is present. You can also ask explicitly: "save this decision to basic-memory" or "what do we know about X?"
 
+### Self-writing vault (your thinking, processed without you)
+
+The optional fourth layer: a per-project, single-inbox markdown vault where Claude maintains your own raw thinking the way basic-memory maintains decisions. You only capture; scheduled runs do everything else — file, cross-link, digest, synthesize. Distilled from the "Self-Writing Vault" pattern, and the shipped worked example of a *proactive loop* (see the `loop-engineering` skill).
+
+```bash
+cc-vault /path/to/project      # scaffold vault/           (or: cc-setup /path --vault)
+                               # --private → git-ignore it; --force → re-copy seed files
+
+# capture — the inbox is the ONLY folder you write; no sorting at capture time
+echo "half-idea about X" > vault/inbox/$(date +%F)-x.md   # or voice-transcription drops files here
+
+# operations (the `vault` project skill), in a Claude Code session:
+/vault process      # inbox → originals preserved untouched in dated raw/, distilled into
+                    # notes/ with ≥3 [[backlinks]] each, index updated, daily digest written
+/vault synthesize   # weekly: the one file worth rereading — recurring themes,
+                    # contradictions in your own thinking, half-made promises
+/vault health       # monthly graph pulse: link density, orphans, inbox backlog
+```
+
+**Run it without you** — wire ONE trigger from the generated `vault/AUTOMATION.md` (your project path pre-substituted): a system cron line running headless `claude -p --model sonnet --permission-mode acceptEdits "/vault process"` each weekday morning, a `/schedule` cloud routine (no laptop involved), or `/loop` in a long-lived session. Two properties make this cheap and safe unattended: processing needs only file edits inside `vault/` (nothing on the `ask` list, so headless runs never stall), and an empty inbox exits after one check — a daily trigger on a quiet vault costs ~nothing.
+
+**The contract** (full version in the scaffolded `vault/README.md`): `inbox/` is the single inlet; `raw/` originals are immutable; every note gets ≥3 backlinks, at least one to an old note; digests daily, synthesis weekly; health means link density climbing, not file count growing. `session-context.py` surfaces vault state (inbox backlog + latest digest/synthesis) at every session start, so each session opens already knowing where your thinking stands.
+
+**Boundaries**: your own raw thinking → vault; an external source corpus to digest once → `knowledge-wiki`; cross-project decisions/preferences → basic-memory.
+
 ### Ruflo
 
 Ruflo's MCP tools (swarm parallelism, multi-repo coordination) are loaded via `.mcp.json` and visible to Claude in every session. Claude may use them on its own when it judges they fit the task — you don't need to ask for them explicitly. For most parallel work (3-5 tasks), Claude will prefer `superpowers:dispatching-parallel-agents` since it's simpler.
@@ -268,7 +296,8 @@ For unattended runs, pick one:
 cc_tool/
   install.sh                     one-time machine setup (PATH + Superpowers)
   bin/
-    cc-setup                     first-time project setup (--devcontainer chains to cc-devcontainer)
+    cc-setup                     first-time project setup (--vault / --devcontainer chain to cc-vault / cc-devcontainer)
+    cc-vault                     scaffold a self-writing vault (single-inbox autonomous note processing)
     cc-devcontainer              drop .devcontainer/ to sandbox Claude Code in Docker
     cc-token                     generate/refresh CLAUDE_CODE_OAUTH_TOKEN on host (for sandboxed containers)
     cc-update-project            update an existing project (hooks + skills + permissions)
@@ -283,6 +312,10 @@ cc_tool/
     hooks-config.json            hooks-only (merged into existing settings)
     CLAUDE_template.md           full CLAUDE.md for new projects (placeholders to fill in)
     CLAUDE_snippet.md            appended to existing CLAUDE.md (AI tools + reasoning + critical rules)
+    vault/                       seed files dropped into project vault/ by cc-vault
+      README.md                    the vault contract (5 rules + layout table)
+      AUTOMATION.md                trigger wiring: cron / /schedule / /loop (path substituted)
+      index.md, log.md             routing table + append-only run ledger seeds
     devcontainer/                files dropped into project .devcontainer/ by cc-devcontainer
       devcontainer.json            base config (cloud-specific mounts/env added at setup)
       Dockerfile                   node:20 + iptables/ipset + uv + optional cloud CLI
@@ -293,8 +326,9 @@ cc_tool/
       skills-audit/SKILL.md                   audit installed skills for quality and overlap
       skill-engineer/SKILL.md                 create and update skills from workflow descriptions
       dynamic-workflows/SKILL.md              the 6 Workflow patterns + operational controls (full catalog)
-      loop-engineering/SKILL.md               structural model of an autonomous loop: six-component anatomy, disk state, inner/outer layers
+      loop-engineering/SKILL.md               structural model of an autonomous loop: loop-type taxonomy, six-component anatomy, disk state, inner/outer layers
       knowledge-wiki/SKILL.md                 Karpathy compile-once wiki: distill a codebase/topic into a durable wiki
+      vault/SKILL.md                          self-writing vault operations: process inbox → linked notes + digest, weekly synthesis, graph health
       design-an-interface/SKILL.md            generate 3+ divergent interface designs via parallel sub-agents (MIT, mattpocock/skills)
       design-director/SKILL.md                route frontend design briefs to taste-skill variants + compose master design prompts
         references/                             prompt-anatomy guide + 3 archetype master-prompt templates
@@ -302,7 +336,7 @@ cc_tool/
     hooks/
       prompt-linter.sh           warns on long ambiguous prompts
       websearch-year.py          appends year to temporal searches
-      session-context.py         SessionStart: git state, sensitive files, detected quality commands
+      session-context.py         SessionStart: git state, sensitive files, vault state, detected quality commands
       bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, block --no-verify, block secret-file reads (.env, keys, credential stores) via grep/awk/xargs/inline interpreters
       big-file-guard.py          PreToolUse Read: warn on files >200KB without offset/limit
       context-usage.py           Stop: warn when session context window passes 80% (suggest /compact)

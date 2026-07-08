@@ -62,14 +62,14 @@ Designing a loop rather than firing a one-off? The `loop-engineering` skill name
 - **No irreversible unattended actions** — draft and queue, don't send and pray. (The bash-guard hook already blocks pushes/commits to protected branches.)
 - **Verification gate** — a loop reports done only when tests / acceptance criteria actually pass, and for unattended runs the judge must not be the worker itself (see Verification protocol).
 
-Harness-native loop tools: `/loop` (recurring or self-paced re-invocation) and `/schedule` (cron cloud routines). Caveats: scope each run's tools tightly, define explicit failure handling, and review the post-run logs.
+Harness-native loop tools: `/loop` (recurring or self-paced re-invocation) and `/schedule` (cron cloud routines). Caveats: scope each run's tools tightly, define explicit failure handling, and review the post-run logs plus the `/usage` breakdown (spend by skill/subagent/MCP).
 
 ### basic-memory (persistent knowledge graph)
 
 Use for knowledge that must survive across sessions: project decisions, architecture notes, user preferences, recurring patterns.
 Do NOT use for ephemeral swarm state — that is Ruflo's job.
 
-basic-memory vs `knowledge-wiki`: basic-memory is a graph of decisions/preferences/architecture notes you emit as you work; `knowledge-wiki` compiles an external SOURCE corpus once into a queryable wiki you read repeatedly.
+basic-memory vs `knowledge-wiki` vs `vault`: basic-memory is a cross-project graph of decisions/preferences/architecture notes you emit as you work; `knowledge-wiki` compiles an external SOURCE corpus once into a queryable wiki you read repeatedly; a project `vault/` holds the USER'S own raw thinking, filed autonomously by the `vault` skill.
 
 | Situation | Tool |
 |-----------|------|
@@ -77,6 +77,10 @@ basic-memory vs `knowledge-wiki`: basic-memory is a graph of decisions/preferenc
 | Load context about a topic before starting work | `mcp__basic-memory__build_context` |
 | Search for notes by topic or concept | `mcp__basic-memory__search_notes` |
 | Append to or update an existing note | `mcp__basic-memory__edit_note` |
+
+### Self-writing vault
+
+If the project has a `vault/`: route any mid-session "note this down / remember this thought" capture to a new dated file in `vault/inbox/` (the single inlet) — never file it into `vault/notes/` directly, and never edit anything under `vault/raw/`. Filing, weekly synthesis, and graph health belong to the scheduled `/vault` runs (see the `vault` skill; contract in `vault/README.md`).
 
 ### Design & frontend taste
 

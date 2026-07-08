@@ -55,6 +55,20 @@ if sensitive:
     parts.append(f"Sensitive files present (denied by permissions): {', '.join(sensitive)}")
 
 
+# ── Self-writing vault state (vault skill), if present ─────────────────────
+vault = project_dir / "vault"
+if (vault / "inbox").is_dir():
+    inbox = [p for p in (vault / "inbox").iterdir() if p.is_file() and p.name != ".gitkeep"]
+    line = f"Vault: {len(inbox)} unprocessed inbox file(s)" if inbox else "Vault: inbox empty"
+    for sub, label in (("daily", "latest digest"), ("synthesis", "latest synthesis")):
+        d = vault / sub
+        if d.is_dir():
+            newest = max((p.name for p in d.iterdir() if p.suffix == ".md"), default=None)
+            if newest:
+                line += f"; {label}: vault/{sub}/{newest}"
+    parts.append(line)
+
+
 # ── Quality commands ───────────────────────────────────────────────────────
 commands: list[str] = []
 
