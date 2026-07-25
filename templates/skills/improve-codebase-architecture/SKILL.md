@@ -1,6 +1,8 @@
 ---
 name: improve-codebase-architecture
 description: Explore a codebase to find opportunities for architectural improvement, focusing on making the codebase more testable by deepening shallow modules. Use when user wants to improve architecture, find refactoring opportunities, consolidate tightly-coupled modules, or make a codebase more AI-navigable.
+user-invocable: true
+disable-model-invocation: true
 ---
 
 # Improve Codebase Architecture
@@ -48,7 +50,9 @@ Show this to the user, then immediately proceed to Step 5. The user reads and th
 
 ### 5. Design multiple interfaces
 
-Spawn 3+ sub-agents in parallel using the Agent tool. Each must produce a **radically different** interface for the deepened module.
+Spawn a small number of sub-agents in parallel (three is usually right) using the Agent tool. Each must produce a **radically different** interface for the deepened module.
+
+This is a deliberate exception to the delegation cap in CLAUDE.md: the value here comes from genuinely independent designs produced without sight of each other, which one agent cannot reproduce sequentially. It is not a licence to fan out on ordinary work.
 
 Prompt each sub-agent with a separate technical brief (file paths, coupling details, dependency category, what's being hidden). This brief is independent of the user-facing explanation in Step 4. Give each agent a different design constraint:
 
@@ -73,4 +77,4 @@ After comparing, give your own recommendation: which design you think is stronge
 
 ### 7. Create GitHub issue
 
-Create a refactor RFC as a GitHub issue using `gh issue create`. Use the template in [REFERENCE.md](REFERENCE.md). Do NOT ask the user to review before creating — just create it and share the URL.
+Draft the refactor RFC using the template in [REFERENCE.md](REFERENCE.md). Show the user the drafted body, then create it with `gh issue create` once they confirm — a GitHub issue is public and outward-facing, so it gets a confirmation even though they invoked this skill deliberately. Share the URL afterwards.

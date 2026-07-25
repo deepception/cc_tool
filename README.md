@@ -1,36 +1,30 @@
 # cc_tool
 
-One-command setup for Claude Code projects: Ruflo MCP tools + basic-memory + Superpowers skills — plus optional per-project extras: a self-writing vault (`cc-vault`) and a sandboxed devcontainer (`cc-devcontainer`).
+One-command setup for Claude Code projects: Superpowers skills + project skills + hooks + a calibrated `settings.json` — plus optional per-project extras: a self-writing vault (`cc-vault`) and a sandboxed devcontainer (`cc-devcontainer`).
 
 ## What this configures
 
 | Tool | What it does | Update strategy |
 |------|-------------|-----------------|
 | **Superpowers** (`obra/superpowers`) | Methodology skills: TDD, brainstorming, debugging, verification | `cc-update` pulls from GitHub |
-| **basic-memory** (`basicmachines-co/basic-memory`) | Persistent knowledge graph: project decisions, cross-session memory | `uvx` auto-downloads on first use — nothing to do |
-| **Ruflo** (`@claude-flow/cli`) | MCP tools for swarm coordination, multi-repo orchestration | `npx -y` auto-fetches latest on every session start — nothing to do |
-| **taste-skill** (`Leonxlnx/taste-skill`) | Anti-slop frontend design skills (global): flagship + minimalist/brutalist/soft/redesign/output variants, routed by the `design-director` project skill | `cc-update` runs `npx skills update -g` |
+| **taste-skill** (`Leonxlnx/taste-skill`) | Anti-slop for the **visual** surface (global): flagship + minimalist/brutalist/soft/redesign/output frontend-design variants, routed by the `design-director` project skill | `cc-update` runs `npx skills update -g` |
+| **no-ai-slop** (forked, `petergyang/no-ai-slop`, MIT) | Anti-slop for the **prose** surface (project skill, on demand): edits a draft *you* wrote into sharper writing, or names the AI-writing patterns in it without rewriting. Distinct from `## Output discipline` in CLAUDE.md, which governs what Claude writes | Vendored in `templates/skills/`; `cc-setup` installs it and never overwrites an existing copy — delete the project's `.claude/skills/no-ai-slop/` to pick up a newer one |
 | **Vault** (`cc-vault`, optional per project) | Self-writing vault: you dump raw thoughts into `vault/inbox/`; scheduled Claude runs file, cross-link, digest, and synthesize them **without you** | Local scaffold — `cc-vault --force` refreshes the seed files |
-| **Hooks** (7 scripts) | Prompt linting, search-year injection, session context (incl. vault state), Bash guard (branch/push/`--no-verify`/secret reads), big-file read warning, context-usage warning (80% → `/compact`), post-edit typecheck | Local scripts — edit templates in `cc_tool/`, re-run `cc-setup` |
+| **Hooks** (5 scripts) | Session context (incl. vault state), Bash guard (branch/push/`--no-verify`/secret reads), big-file read warning, context-usage warning (80% → `/compact`), post-edit typecheck | Local scripts — edit templates in `cc_tool/`, re-run `cc-setup` |
 
-**Design principle:** Superpowers is the methodology layer — most skills trigger automatically via CLAUDE.md rules. Ruflo MCP tools are available in every session and Claude may use them when needed (swarm parallelism, multi-repo). basic-memory is the persistent knowledge layer that survives across sessions. No Ruflo CLAUDE.md, no behavioral autopilot.
+**Design principle:** Superpowers is the methodology layer — most skills trigger automatically via CLAUDE.md rules; the project skills in `.claude/skills/` are the explicit toolbox you invoke by name. Orchestration is harness-native (the `Workflow` tool, `superpowers:dispatching-parallel-agents`). cc_tool installs no MCP server — no background daemon, no behavioral autopilot.
 
-**Prerequisites:** `node`/`npx` (for Ruflo), `uv`/`uvx` (for basic-memory). Install uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+**Prerequisites:** `python3` (hooks + the JSON merges in `cc-setup`), `node`/`npx` (for the global skills installed via `npx skills`).
 
 ---
 
-## Choosing a model: Opus 4.8 (default) vs Fable 5 (escalation)
+## Choosing a model
 
-Claude Opus 4.8 stays the rational everyday default. Claude Fable 5 (`claude-fable-5`, GA 2026-06-09) is the capability tier above it, at exactly 2x the price ($10/$50 vs $5/$25 per MTok, as of 2026-06). Same 1M context, same 128K output, same API — a drop-in escalation, not a replacement.
+**Claude Opus 5** (`claude-opus-5`) is the default — everything routes here unless there is a stated reason not to ($5/$25 per MTok, 1M context, 128K output). **Claude Sonnet 5** (`claude-sonnet-5`) is the cheap tier: repetitive parallel arms, high-volume or headless work, scheduled runs — $3/$15, same 1M context. **Claude Fable 5** (`claude-fable-5`) is available but rarely justified: 2x the price ($10/$50) for an edge Opus 5 mostly closes, so escalate only for the genuinely hardest long-horizon or vision-heavy work. Fable also requires 30-day retention, so ZDR orgs cannot use it at all.
 
-**Route a session/stage to Fable 5 when at least one holds:** the task spans >5 files or >30 min; it involves images/screenshots/dense technical vision; a prior Opus 4.8 attempt stalled or needed >2 retries; it runs autonomously >1h without check-in; or it is hard, well-specified, long-horizon, or deep code review/debugging (Fable has higher bug-finding recall). Otherwise stay on Opus 4.8.
+Nothing older is a routing option — Opus 4.8/4.7/4.6 are the same price class as Opus 5 with less capability, and Haiku is not used. If latency is the constraint, `/fast` runs Opus with faster output at $10/$50 — the same model, not a downgrade to a smaller one.
 
-**Two caveats that send work back to Opus 4.8:**
-
-- *Refusals:* Fable 5 runs safety classifiers; offensive-security-adjacent or deep security-audit work can trip the `cyber`/`reasoning_extraction` categories (HTTP 200, `stop_reason: refusal`). Official mitigation is to fall back to Opus 4.8 — set `"fallbackModel": "claude-opus-4-8"` in `.claude/settings.json` so availability gaps fall back automatically; on a refusal, Opus 4.8 is one `/model` away.
-- *ZDR:* Fable 5 requires 30-day retention and is not available under zero-data-retention agreements. ZDR orgs stay on Opus 4.8.
-
-**Speed vs capability at equal price:** Fable 5 has no fast mode (fast is Opus 4.8/4.7/4.6 only). Opus 4.8 in fast mode costs $10/$50 — the *same* price as Fable 5 standard — so the real choice at that price point is Opus-fast (lower latency) vs Fable-standard (higher capability).
+> **The one exception.** Opus 5 runs safety classifiers and can decline offensive-security-adjacent work (HTTP 200, `stop_reason: refusal`); Opus 4.8 is the documented landing spot for cyber-category refusals, one `/model` away. That is the only reason an older Opus appears anywhere in cc_tool. cc_tool ships no `fallbackModel` — that setting covers availability gaps rather than refusals; add one to `.claude/settings.json` yourself if you want it.
 
 Per-stage routing inside workflows/skills and the on-fan-out effort guidance live in [templates/CLAUDE_snippet.md](templates/CLAUDE_snippet.md) (`## Model routing` and `### Orchestration: which fan-out mechanism`).
 
@@ -59,19 +53,17 @@ cc-setup /path/to/your/project
 ```
 
 What it does:
-- Removes Ruflo-generated scaffolding (`.claude-flow/`, `.claude/helpers/`, `.claude/skills/`, `.claude/commands/`, `.claude/agents/`) — with confirmation
-- Creates/merges `.mcp.json` with Ruflo + basic-memory MCP server configs
 - Installs hook scripts into `.claude/hooks/`
 - Creates `.claude/settings.json` (new projects) or updates the `hooks` section + commit-attribution policy (existing projects, preserving your permissions). The policy (`attribution.commit: ""`) keeps Claude out of commit co-authors.
 - Copies skills from `templates/skills/` into `.claude/skills/` (skips existing ones)
-- Creates `CLAUDE.md` from `CLAUDE_template.md` if none exists (full template with placeholders), or appends `CLAUDE_snippet.md` to an existing one (AI tools + reasoning protocol + verification + critical rules)
+- Creates `CLAUDE.md` from `CLAUDE_template.md` if none exists (full template with placeholders), or appends `CLAUDE_snippet.md` to an existing one (AI tools + model routing + reasoning approach + output discipline + verification + context management + critical rules)
 - With `--vault`: chains to `cc-vault` to scaffold a self-writing vault (see the [Self-writing vault](#self-writing-vault-your-thinking-processed-without-you) section)
 
 Re-running `cc-setup` is safe and idempotent — permissions are never overwritten.
 
 ---
 
-## Three commands, one job each
+## The commands, one job each
 
 ```bash
 cc-setup /path/to/project           # first-time setup
@@ -81,11 +73,11 @@ cc-devcontainer /path/to/project    # sandbox Claude Code in a container (see be
 cc-vault /path/to/project           # scaffold a self-writing vault (see below)
 ```
 
-- **`cc-setup`** — initialize a project the first time: `.mcp.json`, `.claude/settings.json`, `.claude/hooks/`, `.claude/skills/`, `CLAUDE.md`. Safe to re-run; idempotent on the parts it manages.
+- **`cc-setup`** — initialize a project the first time: `.claude/settings.json`, `.claude/hooks/`, `.claude/skills/`, `CLAUDE.md`. Safe to re-run; idempotent on the parts it manages. It does not manage `.mcp.json` — add an MCP server directly or with `claude mcp add` if a project needs one.
 - **`cc-update-project`** — roll new cc_tool changes into an existing project: re-copies hooks, adds any new skills, merges new hooks into `settings.json`, additively merges new `deny`/`ask` entries, applies the commit-attribution policy, and replaces the marker-delimited methodology block in `CLAUDE.md` in place. Preserves existing permissions and all project-specific CLAUDE.md content; never clobbers local edits. Ends with a non-destructive template-drift check (lists template sections the project lacks). **Note:** project-specific CLAUDE.md *structure* (Overview, Codebase Map, Commands…) is seeded once from the template and is **not** auto-merged on update — only the managed methodology block is. Internally calls `cc-setup` + `cc-update-permissions`.
 - **`cc-update`** — updates global plugins (Superpowers from `obra/superpowers`; checks/installs `security-guidance` from `anthropics/claude-plugins-official`; checks/installs the taste-skill design skills and runs `npx skills update -g`). Independent of any project.
 
-Ruflo needs no update — always latest via `npx -y`. `cc_tool` itself is local-only — edit templates in place, then run `cc-update-project` on any project to pick up changes.
+`cc_tool` itself is local-only — edit templates in place, then run `cc-update-project` on any project to pick up changes.
 
 > **Config staleness:** re-audit your hooks, permissions, and CLAUDE.md roughly once per Claude model release. Capabilities and failure modes shift between models — a guardrail that earned its keep on one model may be noise (or a gap) on the next — and a release may add a *new active tier* (a second model worth routing specific work to) or make instructions written for an older model too prescriptive for the newer one while remaining appropriate for the older one. Re-auditing covers all three: stale guardrails, model routing, and over-scaffolded guidance.
 
@@ -97,7 +89,7 @@ For projects where the agent runs untrusted code, touches cloud credentials, or 
 
 - **Filesystem** — project bind-mounted at `/workspace`; nothing outside it (host `~/.ssh`, `~/.config/gh`, host `~/.claude.json`) is visible. Optional read-only cloud creds via `--cloud`.
 - **Network** — default-deny egress + ipset allowlist (Anthropic API, npm/PyPI, GitHub IP ranges, VS Code hosts, `astral.sh`, plus cloud hosts when `--cloud` is set). Disable with `--firewall off`.
-- **Policy & tooling** — `managed-settings.json` at `/etc/claude-code/` blocks `--dangerously-skip-permissions` from inside; cc_tool's MCPs (`claude-flow` / `basic-memory`) run as-is via node + uv in the image; GitHub via `gh` CLI (host `GITHUB_TOKEN`/`GH_TOKEN` carried through, or `gh auth login` inside).
+- **Policy & tooling** — `managed-settings.json` at `/etc/claude-code/` blocks `--dangerously-skip-permissions` from inside; node, python3, and uv are in the image, so a project's own MCP servers run as-is; GitHub via `gh` CLI (host `GITHUB_TOKEN`/`GH_TOKEN` carried through, or `gh auth login` inside).
 
 ```bash
 cc-devcontainer /path/to/project                # cloud=none, firewall on (safest)
@@ -119,7 +111,7 @@ cc-setup /path/to/project --devcontainer --cloud aws    # one-shot: project setu
 
 Re-running `cc-devcontainer` is idempotent — pass `--force` to overwrite existing `.devcontainer/` files.
 
-**Bringing host MCPs (Atlassian, GitHub, etc.) into the container** — by default the container only sees project-scope MCPs from `.mcp.json` (claude-flow, basic-memory). To carry your host's user-scope MCPs in, pass `--share-mcp-auth` (bind-mounts host `~/.claude.json` read-only) plus `--mcp-domains` to allowlist the API hosts those MCPs talk to. Tradeoff: anything in the container can read the bind-mounted MCP tokens — the firewall blocks exfiltration to non-allowlisted destinations, but the tokens themselves are visible. Use this only when the agent runs code you trust.
+**Bringing host MCPs (Atlassian, GitHub, etc.) into the container** — by default the container only sees project-scope MCPs from the project's own `.mcp.json`, if it has one. To carry your host's user-scope MCPs in, pass `--share-mcp-auth` (bind-mounts host `~/.claude.json` read-only) plus `--mcp-domains` to allowlist the API hosts those MCPs talk to. Tradeoff: anything in the container can read the bind-mounted MCP tokens — the firewall blocks exfiltration to non-allowlisted destinations, but the tokens themselves are visible. Use this only when the agent runs code you trust.
 
 **`--mcp-domains` per MCP** — `--share-mcp-auth` carries over *all* MCPs from `~/.claude.json`; the `--mcp-domains` list just controls which extra hosts the firewall lets through. Add the rows that apply to you:
 
@@ -205,17 +197,12 @@ These skills are available but require you to ask for them:
 /e2e-testing       — plan + execute e2e tests, agent-run or paired   (see App QA section)
 /ui-ux-review      — severity-tagged walkthrough of the live app
 /frontend-review   — static interface-layer source review
+/no-ai-slop        — de-slop a draft you wrote, or detect AI patterns without rewriting
 ```
-
-### basic-memory (persistent knowledge)
-
-Cross-session knowledge: project decisions, architecture notes, user preferences. Stored as Obsidian-compatible markdown in `~/basic-memory/` — human-readable, git-trackable, navigable as a graph.
-
-Claude uses it automatically when CLAUDE.md is present. You can also ask explicitly: "save this decision to basic-memory" or "what do we know about X?"
 
 ### Self-writing vault (your thinking, processed without you)
 
-The optional fourth layer: a per-project, single-inbox markdown vault where Claude maintains your own raw thinking the way basic-memory maintains decisions. You only capture; scheduled runs do everything else — file, cross-link, digest, synthesize. Distilled from the "Self-Writing Vault" pattern, and the shipped worked example of a *proactive loop* (see the `loop-engineering` skill).
+An optional per-project, single-inbox markdown vault where Claude maintains your own raw thinking. You only capture; scheduled runs do everything else — file, cross-link, digest, synthesize. Distilled from the "Self-Writing Vault" pattern, and the shipped worked example of a *proactive loop* (see the `loop-engineering` skill).
 
 ```bash
 cc-vault /path/to/project      # scaffold vault/           (or: cc-setup /path --vault)
@@ -232,15 +219,11 @@ echo "half-idea about X" > vault/inbox/$(date +%F)-x.md   # or voice-transcripti
 /vault health       # monthly graph pulse: link density, orphans, inbox backlog
 ```
 
-**Run it without you** — wire ONE trigger from the generated `vault/AUTOMATION.md` (your project path pre-substituted): a system cron line running headless `claude -p --model sonnet --permission-mode acceptEdits "/vault process"` each weekday morning, a `/schedule` cloud routine (no laptop involved), or `/loop` in a long-lived session. Two properties make this cheap and safe unattended: processing needs only file edits inside `vault/` (nothing on the `ask` list, so headless runs never stall), and an empty inbox exits after one check — a daily trigger on a quiet vault costs ~nothing.
+**Run it without you** — wire ONE trigger from the generated `vault/AUTOMATION.md` (your project path pre-substituted): a system cron line running headless `claude -p --model claude-sonnet-5 --permission-mode acceptEdits "/vault process"` each weekday morning, a `/schedule` cloud routine (no laptop involved), or `/loop` in a long-lived session. Two properties make this cheap and safe unattended: processing needs only file edits inside `vault/` (nothing on the `ask` list, so headless runs never stall), and an empty inbox exits after one check — a daily trigger on a quiet vault costs ~nothing.
 
 **The contract** (full version in the scaffolded `vault/README.md`): `inbox/` is the single inlet; `raw/` originals are immutable; every note gets ≥3 backlinks, at least one to an old note; digests daily, synthesis weekly; health means link density climbing, not file count growing. `session-context.py` surfaces vault state (inbox backlog + latest digest/synthesis) at every session start, so each session opens already knowing where your thinking stands.
 
-**Boundaries**: your own raw thinking → vault; an external source corpus to digest once → `knowledge-wiki`; cross-project decisions/preferences → basic-memory.
-
-### Ruflo
-
-Ruflo's MCP tools (swarm parallelism, multi-repo coordination) are loaded via `.mcp.json` and visible to Claude in every session. Claude may use them on its own when it judges they fit the task — you don't need to ask for them explicitly. For most parallel work (3-5 tasks), Claude will prefer `superpowers:dispatching-parallel-agents` since it's simpler.
+**Boundaries**: your own raw thinking → vault; an external source corpus to digest once → `knowledge-wiki`; cross-session decisions/preferences → Claude Code's native memory.
 
 ### Design & frontend taste (taste-skill + design-director)
 
@@ -278,7 +261,7 @@ Point Claude at any app — web, API, CLI, TUI, mobile — and get the QA engage
 
 ### Native dynamic workflows (Claude Code v2.1.154+)
 
-The harness can now write and run its own multi-agent orchestration (the `Workflow` tool — triggered by the word "workflow", `/deep-research`, a saved workflow, or `ultracode` mode), spawning tens-to-hundreds of subagents whose intermediate results stay out of the main context. This overlaps Ruflo's swarm role for large independent fan-out. Per-stage model routing: the harness Agent tool's model enum includes `fable` (Claude Fable 5) alongside the Opus/Sonnet tiers — route the hardest plan/review stages of a workflow to Fable 5 and keep routine arms on Opus 4.8/Sonnet (see `### Orchestration: which fan-out mechanism` in CLAUDE_snippet.md). Two things to know:
+The harness can now write and run its own multi-agent orchestration (the `Workflow` tool — triggered by the word "workflow", `/deep-research`, a saved workflow, or `ultracode` mode), spawning tens-to-hundreds of subagents whose intermediate results stay out of the main context. It is the mechanism for large independent fan-out. Per-stage model routing: keep plan/review stages on Opus 5 and routine arms on Sonnet 5; the Agent tool's model enum also accepts `fable`, opt-in for the rare hardest stage (see `### Orchestration: which fan-out mechanism` in CLAUDE_snippet.md). Two things to know:
 
 - **Permissions:** workflow-spawned subagents run in `acceptEdits` (file edits auto-approved) and inherit this project's `settings.json` allowlist. The `deny`/`ask` lists and the devcontainer firewall still apply to what they cover — but they do not gate protected-branch git writes: `Bash(git commit *)` is allowlisted and `deny` only blocks `git push --force *`, so the deterministic `bash-guard.py` PreToolUse hook is the enforced boundary for commit/push to `main`/`master`/`production`/`release` during a workflow run. Keep that hook installed wherever workflows are enabled; pre-populating `allow` with build/test commands keeps long runs from stalling on mid-run prompts.
 - **Disabling:** set `disableWorkflows: true` in `settings.json` (or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`), which also removes `ultracode` and the bare-word trigger.
@@ -319,12 +302,6 @@ For unattended runs, pick one:
 
 ---
 
-## Do Superpowers and Ruflo cross-trigger each other?
-
-**No.** Superpowers skills contain zero Ruflo calls. Ruflo agents run headless (`claude -p`) so Superpowers hooks don't fire. This setup does NOT include Ruflo's `CLAUDE.md` (the 38KB behavioral file from `npx ruflo init`) — without it, Ruflo is inert until you explicitly call an MCP tool. Don't add Ruflo's `CLAUDE.md` or this separation breaks.
-
----
-
 ## Directory structure
 
 ```
@@ -340,13 +317,12 @@ cc_tool/
     cc-update-permissions        [internal] deny/ask merge helper, called by cc-update-project
     cc-install-superpowers       install Superpowers globally (called by install.sh)
     cc-install-security          install Anthropic security-guidance plugin (called by install.sh)
-    cc-install-tasteskill        install taste-skill design skills globally (called by install.sh)
+    cc-install-tasteskill        install taste-skill visual-design skills globally (called by install.sh)
   templates/
-    mcp.json                     Ruflo + basic-memory MCP server configs
-    settings.json                full settings for new projects
-    hooks-config.json            hooks-only (merged into existing settings)
+    settings.json                full settings for new projects; its hooks block is also
+                                 what cc-setup merges into an existing settings.json
     CLAUDE_template.md           full CLAUDE.md for new projects (placeholders to fill in)
-    CLAUDE_snippet.md            appended to existing CLAUDE.md (AI tools + reasoning + critical rules)
+    CLAUDE_snippet.md            appended to existing CLAUDE.md (AI tools + model routing + reasoning + output discipline + verification + context mgmt + critical rules)
     vault/                       seed files dropped into project vault/ by cc-vault
       README.md                    the vault contract (5 rules + layout table)
       AUTOMATION.md                trigger wiring: cron / /schedule / /loop (path substituted)
@@ -364,7 +340,9 @@ cc_tool/
       loop-engineering/SKILL.md               structural model of an autonomous loop: loop-type taxonomy, six-component anatomy, disk state, inner/outer layers
       knowledge-wiki/SKILL.md                 Karpathy compile-once wiki: distill a codebase/topic into a durable wiki
       vault/SKILL.md                          self-writing vault operations: process inbox → linked notes + digest, weekly synthesis, graph health
-      design-an-interface/SKILL.md            generate 3+ divergent interface designs via parallel sub-agents (MIT, mattpocock/skills)
+      no-ai-slop/SKILL.md                     edit a draft you wrote into sharper prose, or name its AI patterns without rewriting (MIT, petergyang/no-ai-slop)
+        eval.md, LICENSE                        upstream self-check + preserved MIT licence (vendored verbatim)
+      design-an-interface/SKILL.md            generate divergent interface designs via parallel sub-agents, then compare (MIT, mattpocock/skills)
       design-director/SKILL.md                route frontend design briefs to taste-skill variants + compose master design prompts
         references/                             prompt-anatomy guide + 3 archetype master-prompt templates
       improve-codebase-architecture/SKILL.md  surface deep-module refactor opportunities as GitHub-issue RFCs (MIT, mattpocock/skills)
@@ -376,19 +354,29 @@ cc_tool/
       frontend-review/SKILL.md                static interface-layer source review; no-duplication contract vs sibling docs
         references/                             the 8 review dimensions + coverage-mapping format
     hooks/
-      prompt-linter.sh           warns on long ambiguous prompts
-      websearch-year.py          appends year to temporal searches
       session-context.py         SessionStart: git state, sensitive files, vault state, detected quality commands
       bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, block --no-verify, block secret-file reads (.env, keys, credential stores) via grep/awk/xargs/inline interpreters
       big-file-guard.py          PreToolUse Read: warn on files >200KB without offset/limit
       context-usage.py           Stop: warn when session context window passes 80% (suggest /compact)
       post-edit-typecheck.py     PostToolUse Edit|Write|MultiEdit: fast project check (tsc/cargo; ruff file-scoped for Python) after source edits, surface errors inline; tsc timeouts back off for 30 min via a marker in .git/
+  tests/
+    test_bash_guard.py           124-case allow/deny matrix for bash-guard.py (stdlib only, self-contained fixtures)
   .claude/
     workflows/                   saved Workflow definitions (run via the Workflow tool)
       model-recalibration-audit.js  re-audit this setup against a new Claude model
       ship-pipeline.js              Planner → Coder → Tester → Reviewer pipeline
       loop-until-clean.js           loop-until-done sweep: stop after two dry rounds, then verify survivors
 ```
+
+### Verifying the Bash guard
+
+`bash-guard.py` is the enforced boundary for protected-branch git writes during unattended and workflow runs, so it has a matrix rather than a promise:
+
+```bash
+python3 tests/test_bash_guard.py        # 124 cases, ~3s, exits non-zero on any deviation
+```
+
+Expectations encode *intended* behaviour, including the bypasses deliberately out of scope (shell expansion, `sh -c` wrappers, base64) — those assert ALLOW on purpose, so a change that appears to close one surfaces here as a diff to justify rather than a silent behavioural shift. Re-run after editing the guard, and whenever the Claude Code CLI changes its hook contract.
 
 ---
 

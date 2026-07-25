@@ -1,12 +1,12 @@
 export const meta = {
   name: 'ship-pipeline',
-  description: 'Four-agent team that ships one feature end-to-end: Planner (Opus) → Coder (Sonnet) → Tester (Sonnet) → Reviewer (Opus), each handing structured output to the next.',
+  description: 'Four-agent team that ships one feature end-to-end: Planner (Opus 5) → Coder (Sonnet 5) → Tester (Sonnet 5) → Reviewer (Opus 5), each handing structured output to the next.',
   whenToUse: 'When you want a single well-scoped change driven through plan → implement → test → review with model-tiered agents and a read-only review gate. Parameterize via args.feature (or pass a plain string as args).',
   phases: [
-    { title: 'Plan', detail: 'Opus planner turns the feature request into a concrete, file-level implementation spec' },
-    { title: 'Code', detail: 'Sonnet coder implements the spec and reports a change summary + touched files' },
-    { title: 'Test', detail: 'Sonnet tester writes/runs tests against the spec and reports pass/fail evidence' },
-    { title: 'Review', detail: 'Opus reviewer (read-only gate) returns a pass/fail verdict + blocking issues' },
+    { title: 'Plan', detail: 'Opus 5 planner turns the feature request into a concrete, file-level implementation spec' },
+    { title: 'Code', detail: 'Sonnet 5 coder implements the spec and reports a change summary + touched files' },
+    { title: 'Test', detail: 'Sonnet 5 tester writes/runs tests against the spec and reports pass/fail evidence' },
+    { title: 'Review', detail: 'Opus 5 reviewer (read-only gate) returns a pass/fail verdict + blocking issues' },
   ],
 }
 
@@ -16,14 +16,13 @@ const cfg = (args && typeof args === 'object') ? args : {}
 const FEATURE = cfg.feature || (typeof args === 'string' ? args.trim() : '')
 if (!FEATURE) return { error: 'No feature provided. Pass args.feature (or a plain request string as args) and re-invoke.' }
 const ROOT = cfg.root || 'the current repository (your working directory)'
-// Planning + review want the stronger model. For the hardest features pass
-// planModel:'fable' (Claude Fable 5: higher first-shot correctness + bug-finding
-// recall) — ~2x opus cost, opt-in per feature, not the default. If the feature
-// under review is security-sensitive (crypto, auth, exploit-adjacent), keep or
-// fall back to opus (Fable's cyber classifier may refuse).
-const PLAN_MODEL = cfg.planModel || 'opus'
-const CODE_MODEL = cfg.codeModel || 'sonnet'  // implementation + testing are throughput-bound
-const REVIEW_MODEL = cfg.reviewModel || PLAN_MODEL  // independent review tier (e.g. reviewModel:'fable')
+// Planning + review are judgment work: Opus 5. Coding + testing are
+// throughput-bound: Sonnet 5. planModel:'fable' (Claude Fable 5) is available
+// but rarely worth ~2x opus cost — opt in per feature for a genuinely hardest
+// one, never as a default.
+const PLAN_MODEL = cfg.planModel || 'opus'          // Opus 5
+const CODE_MODEL = cfg.codeModel || 'sonnet'        // Sonnet 5
+const REVIEW_MODEL = cfg.reviewModel || PLAN_MODEL  // independent review tier if you want one
 
 // ---- schemas (the structured hand-offs between stages) ------------------
 const SPEC_SCHEMA = {
@@ -93,7 +92,7 @@ const REVIEW_SCHEMA = {
   required: ['verdict', 'summary', 'issues', 'meetsAcceptanceCriteria', 'nextSteps'],
 }
 
-// ---- Stage 1: Plan (Opus) ----------------------------------------------
+// ---- Stage 1: Plan (Opus 5) --------------------------------------------
 phase('Plan')
 log(`Planning feature: ${FEATURE.slice(0, 120)}`)
 
@@ -122,7 +121,7 @@ let codeReport, testReport
 
 const result = await pipeline(
   [spec],
-  // Stage 2: Code (Sonnet)
+  // Stage 2: Code (Sonnet 5)
   async (s) => {
     log('Implementing the spec')
     codeReport = await agent(
@@ -141,7 +140,7 @@ Set implemented=true only if you actually changed the working tree. Return the s
     )
     return codeReport
   },
-  // Stage 3: Test (Sonnet)
+  // Stage 3: Test (Sonnet 5)
   async (code) => {
     log(`Testing the change (implemented=${code && code.implemented})`)
     testReport = await agent(
@@ -163,7 +162,7 @@ Return the structured test report.`
     )
     return testReport
   },
-  // Stage 4: Review (Opus, read-only gate)
+  // Stage 4: Review (Opus 5, read-only gate)
   (tests) => {
     log(`Reviewing (tests passed=${tests && tests.passed})`)
     return agent(

@@ -45,7 +45,7 @@ Your task is to review the current conversation and extract actionable improveme
 4. **Ask the user** what to implement.
 
 5. **Execute approved actions**:
-   - Write new rules to `.claude/rules/`
+   - Write new project rules into `CLAUDE.md`, above the `cc_tool:snippet:start` marker (that region is yours; everything below the marker is overwritten by `cc-update-project`)
    - Update existing skills
    - Create new skills in `.claude/skills/`
    - Save knowledge to auto memory

@@ -48,7 +48,7 @@ RUN mkdir -p /home/node/.claude /commandhistory \
 
 USER node
 
-# uv/uvx for basic-memory MCP (per cc_tool's templates/mcp.json)
+# uv/uvx — Python project tooling (uv sync/add/run), matching the allowlist in settings.json
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
  && echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/node/.bashrc
 ENV PATH="/home/node/.local/bin:${PATH}"

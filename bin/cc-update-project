@@ -17,7 +17,7 @@ fi
 
 echo "Updating cc_tool-managed files in: $PROJECT_DIR"
 echo ""
-echo "=== Step 1: refresh hooks, skills, and MCP config ==="
+echo "=== Step 1: refresh hooks and skills ==="
 "$CC_TOOL_DIR/bin/cc-setup" "$PROJECT_DIR"
 
 echo ""

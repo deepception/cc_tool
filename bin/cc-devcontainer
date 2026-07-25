@@ -190,8 +190,8 @@ echo ""
 echo "What's inside the container:"
 echo "  • Claude Code CLI (via devcontainer feature)"
 echo "  • Project mounted at /workspace (bind, read-write)"
-echo "  • cc_tool's .mcp.json travels with the project — claude-flow (npx) and"
-echo "    basic-memory (uvx) MCPs spawn inside with node + uv installed"
+echo "  • node + python3 + uv installed, so a project's own .mcp.json servers"
+echo "    (if it has any) spawn inside the container"
 if [[ "$CLOUD" != "none" ]]; then
     if [[ "$CLOUD" == "aws" ]]; then
         echo "  • ~/.aws mounted read-only at /home/node/.aws"

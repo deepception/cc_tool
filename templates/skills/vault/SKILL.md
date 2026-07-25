@@ -1,6 +1,6 @@
 ---
 name: vault
-description: Self-writing vault — a single-inbox markdown vault for the USER'S raw project thinking (voice transcripts, quick notes, half-ideas), which Claude files, cross-links, and synthesizes on a schedule without the user. Operations: init (scaffold), process (inbox → linked notes + daily digest), synthesize (weekly themes/contradictions), health (graph pulse). Use when the user wants to set up a vault, capture a thought mid-session, process the inbox, or run note upkeep unattended. Distinct from knowledge-wiki (digests an EXTERNAL source corpus) and basic-memory (cross-project decision graph).
+description: Self-writing vault — a single-inbox markdown vault for the USER'S raw project thinking (voice transcripts, quick notes, half-ideas), which Claude files, cross-links, and synthesizes on a schedule without the user. Operations: init (scaffold), process (inbox → linked notes + daily digest), synthesize (weekly themes/contradictions), health (graph pulse). Use when the user wants to set up a vault, capture a thought mid-session, process the inbox, or run note upkeep unattended. Distinct from knowledge-wiki (digests an EXTERNAL source corpus) and Claude Code's native memory (cross-session decisions).
 user-invocable: true
 argument-hint: [init|process|synthesize|health]
 ---
@@ -72,6 +72,6 @@ run has a baseline.
 ## Boundaries
 
 Your OWN raw thinking → vault. An EXTERNAL corpus to digest once and query →
-`knowledge-wiki`. Cross-project decisions/preferences emitted while working →
-basic-memory. A loop's work ledger → that loop's `LOG.md` (`vault/log.md` is this
-loop's).
+`knowledge-wiki`. Cross-session decisions/preferences emitted while working →
+Claude Code's native memory. A loop's work ledger → that loop's `LOG.md`
+(`vault/log.md` is this loop's).

@@ -1,8 +1,8 @@
 # Vault automation — pick ONE trigger
 
 The vault is a proactive loop: a trigger runs `/vault process` with no human in
-real time. Filing notes is routine work — run it on a small/cheap model and keep
-the strongest models for judgment work.
+real time. Filing notes is routine, high-volume work — run it on Claude Sonnet 5
+(the cheap tier) and keep Opus 5 for judgment work.
 
 ## Option 1 — system cron (local; recommended start)
 
@@ -12,9 +12,9 @@ that sleeps on lid-close will skip runs.
 ```cron
 # crontab -e
 # weekday mornings 07:00 — file the inbox, write the daily digest
-0 7 * * 1-5 cd __PROJECT_DIR__ && claude -p --model sonnet --permission-mode acceptEdits "/vault process" >> /tmp/claude-vault-cron.log 2>&1
+0 7 * * 1-5 cd __PROJECT_DIR__ && claude -p --model claude-sonnet-5 --permission-mode acceptEdits "/vault process" >> /tmp/claude-vault-cron.log 2>&1
 # Sunday 18:00 — weekly synthesis
-0 18 * * 0 cd __PROJECT_DIR__ && claude -p --model sonnet --permission-mode acceptEdits "/vault synthesize" >> /tmp/claude-vault-cron.log 2>&1
+0 18 * * 0 cd __PROJECT_DIR__ && claude -p --model claude-sonnet-5 --permission-mode acceptEdits "/vault synthesize" >> /tmp/claude-vault-cron.log 2>&1
 ```
 
 Headless note: `claude -p` auto-denies anything on the settings.json `ask` list

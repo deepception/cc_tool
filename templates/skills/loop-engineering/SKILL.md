@@ -40,7 +40,7 @@ A loop that runs unattended has all six. Missing one is usually why a loop stall
 
 ## Disk-based state
 
-Context is lost on compaction and between runs; a loop's memory of what's done must live on disk. Minimum: an append-only `LOG.md` the agent reads (latest few entries) before major work and appends a concise summary to after, with entries linking to the artifacts they produced. Scale up to a task board or queue when several loops share a domain. This is distinct from `knowledge-wiki` (a read-only compiled corpus) and `basic-memory` (a cross-session decision graph) — it is the loop's own work ledger.
+Context is lost on compaction and between runs; a loop's memory of what's done must live on disk. Minimum: an append-only `LOG.md` the agent reads (latest few entries) before major work and appends a concise summary to after, with entries linking to the artifacts they produced. Scale up to a task board or queue when several loops share a domain. This is distinct from `knowledge-wiki` (a read-only compiled corpus) and Claude Code's native memory (cross-session decisions) — it is the loop's own work ledger.
 
 ## Inner vs outer loop
 

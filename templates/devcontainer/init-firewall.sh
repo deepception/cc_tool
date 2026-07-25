@@ -25,7 +25,7 @@ BASE_DOMAINS=(
     "statsig.anthropic.com"
     "statsig.com"
     "sentry.io"
-    # Package registries (cc_tool MCPs: claude-flow via npx, basic-memory via uvx)
+    # Package registries (npm/npx, pip, uv — project deps and any project-configured MCPs)
     "registry.npmjs.org"
     "pypi.org"
     "files.pythonhosted.org"

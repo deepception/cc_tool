@@ -142,7 +142,8 @@ Your task is to [analyze/audit something].
 **Writing style:**
 - Use imperative sentences: "Scan all files" not "You should scan all files"
 - Use plain imperatives ("Use this tool when X"), not intensifiers ("CRITICAL: You MUST", "always default to", "if in doubt, use X") — strong guardrail phrasing over-triggers. State scope explicitly when a rule spans multiple items.
-- **Fable 5 de-scaffold**: when authoring or migrating skills for Fable 5, prefer the shortest instruction that works; add step-by-step scaffolding only where it measurably helps over Fable's default behavior. Retain prescriptive detail the Opus 4.8 path relies on.
+- **De-scaffold**: prefer the shortest instruction that works; add step-by-step scaffolding only where it measurably beats the model's default behavior. Opus 5 and Sonnet 5 both respond badly to long enumerated instruction lists.
+- **State goals and constraints, not step lists**, unless the order genuinely matters. A skill that says "spawn N sub-agents" or "always add a verification step" fights the delegation cap and the Verification protocol in the managed CLAUDE.md block — check yours against those before shipping it.
 - Be specific: "List files matching `.claude/skills/*/SKILL.md`" not "Find skill files"
 - One instruction per bullet point
 - Use bold for step names, code blocks for commands/paths
@@ -221,4 +222,5 @@ When updating an existing skill:
 - **Over-restricting tools**: Adding `allowed-tools` without a clear security reason
 - **Missing trigger phrases**: Description that doesn't match how users actually ask for it
 - **Over-forceful phrasing**: `CRITICAL` / `MUST` / `ALWAYS` / anti-laziness language — see Writing style; plain imperatives read more reliably
-- **Cargo-cult prescription (Fable 5)**: porting every enumerated step from a prior-model skill unchanged — review whether default Fable performance already exceeds the scaffold
+- **Cargo-cult prescription**: porting every enumerated step from a prior-model skill unchanged — review whether the current model's default behavior already exceeds the scaffold. Today's models are more capable unscaffolded than the ones most existing skills were written for
+- **Hardcoded fan-out floors**: "spawn 3+ agents", "always delegate X" — Opus 5 already over-delegates, so a floor compounds it. Justify any fan-out as a deliberate exception or drop it

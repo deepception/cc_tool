@@ -2,7 +2,6 @@
 # cc-update: Update external dependencies (global plugins: Superpowers + security-guidance).
 # This does NOT touch any project. For per-project template refresh use cc-update-project.
 # cc_tool templates themselves are local — edit in place, then run cc-update-project.
-# Ruflo needs no update action — npx -y auto-fetches latest on every session start.
 set -euo pipefail
 
 CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

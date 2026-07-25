@@ -35,7 +35,7 @@ if claude plugin install superpowers; then
     echo "  superpowers:brainstorming              design before any code"
     echo "  superpowers:writing-plans              test-first implementation plan"
     echo "  superpowers:executing-plans            run the plan via subagents"
-    echo "  superpowers:tdd                        strict red-green-refactor"
+    echo "  superpowers:test-driven-development     strict red-green-refactor"
     echo "  superpowers:systematic-debugging       root-cause before any fix"
     echo "  superpowers:verification-before-completion  hard gate: run tests, read output"
     echo "  superpowers:dispatching-parallel-agents    independent tasks in parallel"

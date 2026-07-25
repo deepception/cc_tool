@@ -11,17 +11,29 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 project_dir = Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 PROTECTED = {"main", "master", "production", "release"}
 parts: list[str] = []
 
+# Shared budget for ALL subprocess work, not per call: this hook is registered
+# with "timeout": 3 in settings.json, and three independent 2 s timeouts could
+# reach 6 s on a large or cold repo (git status --porcelain is the usual
+# straggler) — the hook then gets killed and injects no context at all. One 2 s
+# deadline across every run() keeps the worst case inside the registration with
+# room for interpreter start-up.
+_DEADLINE = time.monotonic() + 2.0
+
 
 def run(cmd: list[str]) -> str:
+    remaining = _DEADLINE - time.monotonic()
+    if remaining <= 0.05:
+        return ""
     try:
         out = subprocess.run(
-            cmd, cwd=project_dir, capture_output=True, text=True, timeout=2,
+            cmd, cwd=project_dir, capture_output=True, text=True, timeout=remaining,
         )
         return out.stdout.strip() if out.returncode == 0 else ""
     except (FileNotFoundError, subprocess.TimeoutExpired):

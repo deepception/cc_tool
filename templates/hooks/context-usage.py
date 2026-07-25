@@ -11,8 +11,10 @@ the format changes this no-ops gracefully.
 
 Tunables (env vars):
   CONTEXT_USAGE_LIMIT     token budget to measure against. When unset, derived
-                          from the session model (1,000,000 for Opus 4.8 /
-                          Fable 5, 200,000 otherwise); set this to override.
+                          from the session model — 1,000,000 for the families in
+                          NATIVE_1M_FAMILIES (Opus 5, Sonnet 5, Fable 5,
+                          Mythos 5, Opus 4.8, Opus 4.7), 200,000 otherwise.
+                          Set this to override.
   CONTEXT_USAGE_WARN_PCT  warn at/above this percent (default 80)
 """
 import json
@@ -22,18 +24,42 @@ import sys
 WARN_PCT = int(os.environ.get("CONTEXT_USAGE_WARN_PCT", "80"))
 
 
+# Model families Claude Code runs with a 1M-token context window. Everything
+# else gets the 200K floor.
+#
+# Ground truth is the CLI's OWN model registry, not the API docs — the two
+# disagree. Opus 4.6 and Sonnet 4.6 serve 1M through the API but are
+# configured at 200K in the harness, and this hook measures a *harness*
+# session. Re-check once per model release against the shipped binary:
+#
+#     grep -ao 'context:{window:[0-9]*[^}]*}' "$(command -v claude)" | sort -u
+#
+# That check is 30 seconds and is ground truth; both previous versions of this
+# mapping were wrong because they were written from recall instead.
+#
+# Family substrings, so Bedrock/Vertex-prefixed and date-suffixed ids match.
+# Note "opus-5" does not match "claude-opus-4-5", nor "sonnet-5" "claude-sonnet-4-5".
+NATIVE_1M_FAMILIES = (
+    "opus-5", "sonnet-5", "fable-5", "mythos-5",   # the lineup in use
+    "opus-4-8", "opus-4-7",                        # still 1M in-harness
+)
+
+
 def context_limit(model):
     """Token budget for the warning.
 
-    An explicit CONTEXT_USAGE_LIMIT always wins. Otherwise derive from the
-    session model: Opus 4.8 and Fable 5 run a 1M-token window by default, while
-    4.7-and-earlier use 200K. A bracketed variant suffix (e.g. '[1m]', passed
-    through by harnesses <2.1.173) is stripped before matching, and family
-    substrings are used so Bedrock/Vertex-prefixed ids also match. (Opus 4.8 on
-    Microsoft Foundry serves 200K under the same model id, so this
-    over-estimates for that minority — it under-warns rather than spamming
-    false alarms, which is the safer failure.) Unknown models fall back to the
-    200K floor.
+    An explicit CONTEXT_USAGE_LIMIT always wins. Otherwise the model decides:
+    families in NATIVE_1M_FAMILIES get 1M, everything else the 200K floor. A
+    bracketed variant suffix (e.g. '[1m]', passed through by harnesses
+    <2.1.173) is stripped before matching.
+
+    Unknown models get 200K deliberately. The two failure directions are not
+    symmetric in the way this hook's earlier comment claimed: over-estimating
+    the window means the warning can *never* fire, and a guard that silently
+    never fires is worse than one that fires early — you notice a false alarm
+    and can set CONTEXT_USAGE_LIMIT, but you never notice silence. A new 1M
+    model therefore warns early until it is added above; that is the cheap
+    failure, and the model-recalibration workflow catches it each release.
     """
     env_limit = os.environ.get("CONTEXT_USAGE_LIMIT")
     if env_limit:
@@ -41,10 +67,9 @@ def context_limit(model):
             return int(env_limit)
         except ValueError:
             pass
-    if model:
-        base = model.split("[", 1)[0]  # tolerate a '[1m]' variant suffix (harness <2.1.173 passes it through)
-        if "opus-4-8" in base or "fable-5" in base:
-            return 1_000_000
+    base = (model or "").split("[", 1)[0]  # tolerate a '[1m]' variant suffix
+    if any(family in base for family in NATIVE_1M_FAMILIES):
+        return 1_000_000
     return 200_000
 
 

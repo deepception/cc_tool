@@ -21,16 +21,16 @@ Act as a **research librarian**: do the interlinking, deduplication, and index u
 
 - A handful of files, or a one-off read — the compile cost only pays back across many queries.
 - A corpus that changes faster than you can re-ingest it.
-- Emitting your own decisions / preferences / cross-project architecture notes — that is `basic-memory` (see below).
+- Emitting your own decisions / preferences / cross-project architecture notes — that belongs in Claude Code's native memory (see below).
 
-## Relationship to basic-memory
+## Relationship to native memory
 
 Complementary, not a replacement.
 
-- **basic-memory** stores **emitted** knowledge: decisions, preferences, architecture — a cross-project graph living in `~/basic-memory/`.
+- **Claude Code's memory** stores **emitted** knowledge: decisions, preferences, architecture — carried across sessions by the harness itself.
 - **knowledge-wiki** **digests** an external **source** corpus into a project-local wiki, tracked in the repo.
 
-Different inputs (your output vs. an external corpus), different scope (cross-project graph vs. one project's source digest). Use both; do not conflate them.
+Different inputs (your output vs. an external corpus), different scope (cross-session notes vs. one project's source digest). Use both; do not conflate them.
 
 ## Layout
 
