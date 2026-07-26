@@ -52,6 +52,20 @@ Name the highest-complexity uncovered components; tie gaps to bugs from other di
 - Import patterns that defeat tree-shaking where the framework documents a supported pattern.
 - Env vars: client-appropriate prefixes only, no secrets client-side; .env presence vs .gitignore.
 
+## 9. Motion & interaction feel
+
+Applies to any app with transitions, animations, or drag/swipe interactions; skip it for CLIs and APIs and say so. The rule catalog and exact values live in [`product-ui-motion`](../../product-ui-motion/SKILL.md) and its `references/` — read them before writing findings, and pull curves, durations and spring configs from there rather than approximating. If that skill isn't installed alongside, review this dimension from the code's own motion tokens and flag the missing standard.
+
+- Animation on something the user hits 100+ times a day — a command palette, core navigation, a frequent toggle. The fix is usually deletion, not tuning.
+- `transition: all`, `ease-in` on anything the user waits on, UI durations over 300ms outside modals/drawers/sheets.
+- Entrances from `scale(0)`; `transform-origin: center` on a trigger-anchored popover, dropdown or tooltip (modals are exempt).
+- `@keyframes` on rapidly-triggered elements (toasts, toggles) where transitions or springs would retarget instead of restarting.
+- Layout properties animated (`width`, `height`, `top`, `left`, `margin`, `padding`); a parent CSS variable driving child transforms.
+- Missing `prefers-reduced-motion` handling on movement; `:hover` motion not gated behind `@media (hover: hover) and (pointer: fine)`.
+- Symmetric timing on a press-and-release or hold interaction; a group entrance with no stagger where 30–80ms belongs.
+
+Report these as the `Before | After | Why` table from `motion-standards.md` rather than prose bullets, and close with a short **considered and rejected** list — places that could animate and deliberately should not, each with the reason. A motion section that only adds motion is a wishlist. Feel judgements that code can't settle (does a crossfade read as one object, is a spring's bounce right) go to "Needs live confirmation" with the feel-check that would settle them.
+
 ## Doc skeleton
 
     # <App> — Frontend Code Review (<date>)
@@ -62,6 +76,6 @@ Name the highest-complexity uncovered components; tie gaps to bugs from other di
 
     Severity: 🔴 must fix · 🟡 should fix · 🔵 polish.
 
-    ## 1..8 [the dimensions that apply; state which were skipped and why]
+    ## 1..9 [the dimensions that apply; state which were skipped and why]
     ## Coverage gaps (summary)
     ## Needs live confirmation

@@ -8,7 +8,7 @@ One-command setup for Claude Code projects: Superpowers skills + project skills 
 |------|-------------|-----------------|
 | **Superpowers** (`obra/superpowers`) | Methodology skills: TDD, brainstorming, debugging, verification | `cc-update` pulls from GitHub |
 | **taste-skill** (`Leonxlnx/taste-skill`) | Anti-slop for the **visual** surface (global): flagship + minimalist/brutalist/soft/redesign/output frontend-design variants, routed by the `design-director` project skill | `cc-update` runs `npx skills update -g` |
-| **no-ai-slop** (forked, `petergyang/no-ai-slop`, MIT) | Anti-slop for the **prose** surface (project skill, on demand): edits a draft *you* wrote into sharper writing, or names the AI-writing patterns in it without rewriting. Distinct from `## Output discipline` in CLAUDE.md, which governs what Claude writes | Vendored in `templates/skills/`; `cc-setup` installs it and never overwrites an existing copy — delete the project's `.claude/skills/no-ai-slop/` to pick up a newer one |
+| **no-ai-slop** (forked, `petergyang/no-ai-slop`, MIT) | Anti-slop for the **prose** surface (project skill, on demand): edits a draft *you* wrote into sharper writing, or names the AI-writing patterns in it without rewriting. Distinct from `## Output discipline` in CLAUDE.md, which governs what Claude writes | Vendored in `templates/skills/`; `cc-setup` installs it and refreshes an untouched copy, but never overwrites one you edited — delete the project's `.claude/skills/no-ai-slop/` to force-adopt the current version |
 | **Vault** (`cc-vault`, optional per project) | Self-writing vault: you dump raw thoughts into `vault/inbox/`; scheduled Claude runs file, cross-link, digest, and synthesize them **without you** | Local scaffold — `cc-vault --force` refreshes the seed files |
 | **Hooks** (5 scripts) | Session context (incl. vault state), Bash guard (branch/push/`--no-verify`/secret reads), big-file read warning, context-usage warning (80% → `/compact`), post-edit typecheck | Local scripts — edit templates in `cc_tool/`, re-run `cc-setup` |
 
@@ -55,7 +55,7 @@ cc-setup /path/to/your/project
 What it does:
 - Installs hook scripts into `.claude/hooks/`
 - Creates `.claude/settings.json` (new projects) or updates the `hooks` section + commit-attribution policy (existing projects, preserving your permissions). The policy (`attribution.commit: ""`) keeps Claude out of commit co-authors.
-- Copies skills from `templates/skills/` into `.claude/skills/` (skips existing ones)
+- Copies skills from `templates/skills/` into `.claude/skills/`. An existing skill directory is **refreshed** when its contents still match a version cc_tool has shipped (i.e. untouched locally); a directory carrying local edits is left alone and named in the output. Local *additions* inside a refreshed skill are preserved.
 - Creates `CLAUDE.md` from `CLAUDE_template.md` if none exists (full template with placeholders), or appends `CLAUDE_snippet.md` to an existing one (AI tools + model routing + reasoning approach + output discipline + verification + context management + critical rules)
 - With `--vault`: chains to `cc-vault` to scaffold a self-writing vault (see the [Self-writing vault](#self-writing-vault-your-thinking-processed-without-you) section)
 
@@ -74,7 +74,7 @@ cc-vault /path/to/project           # scaffold a self-writing vault (see below)
 ```
 
 - **`cc-setup`** — initialize a project the first time: `.claude/settings.json`, `.claude/hooks/`, `.claude/skills/`, `CLAUDE.md`. Safe to re-run; idempotent on the parts it manages. It does not manage `.mcp.json` — add an MCP server directly or with `claude mcp add` if a project needs one.
-- **`cc-update-project`** — roll new cc_tool changes into an existing project: re-copies hooks, adds any new skills, merges new hooks into `settings.json`, additively merges new `deny`/`ask` entries, applies the commit-attribution policy, and replaces the marker-delimited methodology block in `CLAUDE.md` in place. Preserves existing permissions and all project-specific CLAUDE.md content; never clobbers local edits. Ends with a non-destructive template-drift check (lists template sections the project lacks). **Note:** project-specific CLAUDE.md *structure* (Overview, Codebase Map, Commands…) is seeded once from the template and is **not** auto-merged on update — only the managed methodology block is. Internally calls `cc-setup` + `cc-update-permissions`.
+- **`cc-update-project`** — roll new cc_tool changes into an existing project: re-copies hooks, adds new skills *and refreshes unmodified existing ones*, merges new hooks into `settings.json`, additively merges new `deny`/`ask` entries, applies the commit-attribution policy, and replaces the marker-delimited methodology block in `CLAUDE.md` in place. Preserves existing permissions and all project-specific CLAUDE.md content; never clobbers local edits. Ends with a non-destructive template-drift check (lists template sections the project lacks). **Note:** project-specific CLAUDE.md *structure* (Overview, Codebase Map, Commands…) is seeded once from the template and is **not** auto-merged on update — only the managed methodology block is. Internally calls `cc-setup` + `cc-update-permissions`.
 - **`cc-update`** — updates global plugins (Superpowers from `obra/superpowers`; checks/installs `security-guidance` from `anthropics/claude-plugins-official`; checks/installs the taste-skill design skills and runs `npx skills update -g`). Independent of any project.
 
 `cc_tool` itself is local-only — edit templates in place, then run `cc-update-project` on any project to pick up changes.
@@ -225,9 +225,11 @@ echo "half-idea about X" > vault/inbox/$(date +%F)-x.md   # or voice-transcripti
 
 **Boundaries**: your own raw thinking → vault; an external source corpus to digest once → `knowledge-wiki`; cross-session decisions/preferences → Claude Code's native memory.
 
-### Design & frontend taste (taste-skill + design-director)
+### Design & frontend taste (taste-skill + design-director + product-ui-motion)
 
 Frontend visual work (landing pages, heroes, portfolios, redesigns) is covered by two layers. `install.sh` (or `cc-install-tasteskill`) installs a curated subset of [Leonxlnx/taste-skill](https://github.com/Leonxlnx/taste-skill) (MIT) as **global** skills: `design-taste-frontend` (flagship — brief inference, VARIANCE/MOTION/DENSITY dials, anti-slop rules), `minimalist-ui`, `industrial-brutalist-ui`, `high-end-visual-design`, `redesign-existing-projects`, `full-output-enforcement`. The **`design-director` project skill** (copied by `cc-setup`) is the control layer: it reads the brief, routes to the right variant, and composes a section-by-section *master design prompt* from three archetype templates (signature-interaction hero, immersive scroll experience, dark minimal landing — distilled from motionsites.ai-style briefs) plus a prompt-anatomy guide. Say "design a landing page for X" and the routing happens automatically; the archetypes also work standalone if taste-skill isn't installed.
+
+Those two layers cover the *marketing* surface and explicitly scope out dashboards and data-heavy product UI. The **`product-ui-motion` project skill** owns what they leave behind: how product components actually move. It asks whether a thing should animate at all before asking how — a frequency gate where 100+/day interactions get no animation at all — then supplies the exact durations, easing curves, `transform-origin` and interruptibility rules, with gesture physics (velocity handoff, Apple's momentum projection, rubber-banding) in a second reference. It fires on "add a drawer", "this dropdown feels sluggish", and as dimension 9 of `frontend-review`, so the same catalog governs the code that gets written and the review that reads it. The rule set is derived from [emilkowalski/skills](https://github.com/emilkowalski/skills) (MIT) — condensed from four overlapping skills into one, with seven technical claims corrected against current browser and library behaviour and two blanket bans narrowed to the frequency arguments underneath them. Where the global taste skills prescribe landing-page motion values (`transition: all`, transitions on *all* interactive elements, a flat `ease-in-out` ban), `product-ui-motion` supersedes them at product scale; those files are third-party and npx-managed, so cc_tool states precedence rather than patching them.
 
 ### App QA & e2e testing (app-qa + three workers)
 
@@ -345,6 +347,8 @@ cc_tool/
       design-an-interface/SKILL.md            generate divergent interface designs via parallel sub-agents, then compare (MIT, mattpocock/skills)
       design-director/SKILL.md                route frontend design briefs to taste-skill variants + compose master design prompts
         references/                             prompt-anatomy guide + 3 archetype master-prompt templates
+      product-ui-motion/SKILL.md              motion craft for product UI: frequency gate, easing/duration budgets, origin, interruptibility (derived from MIT, emilkowalski/skills)
+        references/                             full motion catalog + review format; gesture physics (velocity handoff, momentum projection, rubber-banding)
       improve-codebase-architecture/SKILL.md  surface deep-module refactor opportunities as GitHub-issue RFCs (MIT, mattpocock/skills)
       app-qa/SKILL.md                         full QA engagement orchestrator: e2e + UI/UX review + frontend review over shared discovery, up to three docs
       e2e-testing/SKILL.md                    plan + execute e2e tests of any app type; agent-run or paired mode; ✅/❌ walkthrough plan doc
@@ -352,7 +356,7 @@ cc_tool/
       ui-ux-review/SKILL.md                   live severity-tagged UX walkthrough (🔴🟡🔵) with beyond-happy-path sweep
         references/                             severity rubric, doc structure, app-type adaptation table
       frontend-review/SKILL.md                static interface-layer source review; no-duplication contract vs sibling docs
-        references/                             the 8 review dimensions + coverage-mapping format
+        references/                             the 9 review dimensions + coverage-mapping format
     hooks/
       session-context.py         SessionStart: git state, sensitive files, vault state, detected quality commands
       bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, block --no-verify, block secret-file reads (.env, keys, credential stores) via grep/awk/xargs/inline interpreters

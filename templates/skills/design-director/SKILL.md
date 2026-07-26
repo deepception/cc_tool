@@ -53,4 +53,4 @@ The archetypes are **structural skeletons, not looks**: they encode choreography
 
 ## When NOT to use this
 
-Dashboards, admin panels, data tables, multi-step product flows — taste-skill itself scopes those out; follow the project's existing component system instead (brutalist data-editorial being the one exception above). Module/API shape questions → `design-an-interface`. Pure copywriting → the content is an input to this skill, not its output.
+Dashboards, admin panels, data tables, multi-step product flows — taste-skill itself scopes those out; follow the project's existing component system instead (brutalist data-editorial being the one exception above). For how those components should *move* — and for any dropdown, modal, drawer, toast, palette or drag interaction anywhere — use `product-ui-motion`, whose duration and easing values supersede the taste skills' at product scale. Module/API shape questions → `design-an-interface`. Pure copywriting → the content is an input to this skill, not its output.

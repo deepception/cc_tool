@@ -47,6 +47,62 @@ mkdir -p "$PROJECT_DIR/.claude/hooks"
 find "$CC_TOOL_DIR/templates/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) \
     -exec cp {} "$PROJECT_DIR/.claude/hooks/" \;
 find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -name "*.sh" -exec chmod +x {} \;
+
+# Prune hooks cc_tool used to ship and no longer does. Copying alone left them
+# behind forever: the settings.json hooks block is replaced wholesale, so an
+# orphan stops being registered but the file lingers as dead weight — and a
+# reader can't tell it from a live guard. A file is only removed when cc_tool has
+# shipped that exact filename at some point AND the project's copy still matches
+# a version cc_tool shipped. So a project's OWN hooks (never shipped by cc_tool)
+# and a locally-edited former cc_tool hook are both left alone.
+python3 - "$CC_TOOL_DIR" "$PROJECT_DIR" <<'EOF'
+import hashlib, subprocess, sys
+from pathlib import Path
+
+cc_tool, project = Path(sys.argv[1]), Path(sys.argv[2])
+tdir, hdir = cc_tool / "templates" / "hooks", project / ".claude" / "hooks"
+PREFIX = "templates/hooks/"
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", str(cc_tool), *args],
+                          capture_output=True, text=True).stdout
+
+
+def blob_oid(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+# filename -> {oids cc_tool has ever shipped for it}
+shipped = {}
+for commit in git("log", "--all", "--format=%H", "--", PREFIX).split():
+    for line in git("ls-tree", "-r", commit, "--", PREFIX).splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == "blob" and path.startswith(PREFIX):
+            shipped.setdefault(path[len(PREFIX):], set()).add(parts[2])
+
+current = {p.name for p in tdir.iterdir() if p.is_file()}
+pruned, kept = [], []
+for name, oids in shipped.items():
+    if name in current:
+        continue
+    victim = hdir / name
+    if not victim.is_file():
+        continue
+    if blob_oid(victim.read_bytes()) in oids:
+        victim.unlink()
+        pruned.append(name)
+    else:
+        kept.append(name)
+
+if pruned:
+    print("  ✓ pruned %d retired hook(s): %s" % (len(pruned), ", ".join(sorted(pruned))))
+if kept:
+    print("  • kept locally-modified retired hook(s), remove by hand if unwanted: %s"
+          % ", ".join(sorted(kept)))
+EOF
+
 hook_count=$(find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) | wc -l | tr -d ' ')
 echo "  ✓ .claude/hooks/ installed ($hook_count hooks)"
 
@@ -112,22 +168,113 @@ EOF
 fi
 
 # ── 3. Skills ────────────────────────────────────────────────────────────────
+# New skill directories are copied in. An EXISTING directory is refreshed only
+# when its content still matches some version of the template in cc_tool's git
+# history — i.e. nobody edited it locally. A directory that matches no shipped
+# version is left alone and reported, so local edits are never clobbered.
+#
+# Skipping at directory level (the behaviour before this) meant every edit to an
+# existing skill's SKILL.md or references/ was invisible to already-configured
+# projects forever — only brand-new skill directories ever propagated.
 SKILLS_TEMPLATE_DIR="$CC_TOOL_DIR/templates/skills"
 if [[ -d "$SKILLS_TEMPLATE_DIR" ]]; then
     mkdir -p "$PROJECT_DIR/.claude/skills"
-    installed=0
-    skipped=0
-    for skill_src in "$SKILLS_TEMPLATE_DIR"/*/; do
-        skill_name="$(basename "$skill_src")"
-        skill_dst="$PROJECT_DIR/.claude/skills/$skill_name"
-        if [[ -d "$skill_dst" ]]; then
-            (( skipped++ )) || true
-        else
-            cp -r "$skill_src" "$skill_dst"
-            (( installed++ )) || true
-        fi
-    done
-    echo "  ✓ .claude/skills/ — installed $installed, skipped $skipped (already present)"
+    python3 - "$CC_TOOL_DIR" "$PROJECT_DIR" <<'EOF'
+import hashlib, shutil, subprocess, sys
+from pathlib import Path
+
+cc_tool, project = Path(sys.argv[1]), Path(sys.argv[2])
+tdir, sdir = cc_tool / "templates" / "skills", project / ".claude" / "skills"
+
+IGNORE = {"__pycache__", ".DS_Store"}
+
+
+def blob_oid(data: bytes) -> str:
+    """Git's own object id for a blob, so working-tree files and tree entries
+    can be compared without materialising anything from history."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def snapshot(root: Path) -> dict[str, str]:
+    return {
+        str(p.relative_to(root)): blob_oid(p.read_bytes())
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and not IGNORE & set(p.parts)
+    }
+
+
+def git(*args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cc_tool), *args], capture_output=True, text=True
+    ).stdout
+
+
+def shipped_versions(name: str):
+    """Every version of templates/skills/<name>/ this repo has ever shipped."""
+    prefix = f"templates/skills/{name}/"
+    for commit in git("log", "--format=%H", "--", prefix).split():
+        snap = {}
+        for line in git("ls-tree", "-r", commit, prefix).splitlines():
+            meta, _, path = line.partition("\t")
+            parts = meta.split()
+            if len(parts) == 3 and parts[1] == "blob":
+                snap[path[len(prefix):]] = parts[2]
+        if snap:
+            yield snap
+
+
+installed = refreshed = current = local = 0
+local_names: list[str] = []
+
+for skill_src in sorted(p for p in tdir.iterdir() if p.is_dir()):
+    name = skill_src.name
+    dst = sdir / name
+    if not dst.is_dir():
+        shutil.copytree(skill_src, dst)
+        installed += 1
+        continue
+
+    want, have = snapshot(skill_src), snapshot(dst)
+    up_to_date = all(have.get(k) == oid for k, oid in want.items())
+    extras = set(have) - set(want)
+    if up_to_date and not extras:
+        current += 1
+        continue
+
+    # An extra file is stale only if cc_tool once shipped it; anything else is a
+    # local addition and stays. Without this split, a skill carrying a local
+    # extra would re-report as "refreshed" on every run and never settle.
+    versions = list(shipped_versions(name))
+    stale = extras & set().union(*versions) if versions else set()
+    if up_to_date and not stale:
+        current += 1
+        continue
+
+    # Unmodified copy of an older release? Every file that version shipped must
+    # still be byte-identical here.
+    if not any(all(have.get(k) == oid for k, oid in v.items()) for v in versions):
+        local += 1
+        local_names.append(name)
+        continue
+
+    for rel in want:
+        target = dst / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(skill_src / rel, target)
+    for rel in stale:
+        (dst / rel).unlink(missing_ok=True)
+    refreshed += 1
+
+parts = [f"installed {installed}", f"refreshed {refreshed}", f"already current {current}"]
+if local:
+    parts.append(f"locally modified {local}")
+print("  ✓ .claude/skills/ — " + ", ".join(parts))
+if local_names:
+    print("    ℹ Left untouched (content matches no shipped version — local edits):")
+    for n in local_names:
+        print(f"      - {n}")
+    print("    Delete the project copy to pick up the current template.")
+EOF
 fi
 
 # ── 4. CLAUDE.md ─────────────────────────────────────────────────────────────

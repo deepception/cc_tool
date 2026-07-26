@@ -3,9 +3,9 @@ name: frontend-review
 description: >-
   Static source review of an app's interface layer — API client and auth plumbing,
   state management, component quality, i18n, type safety, accessibility, test
-  coverage, build hygiene — written to docs/FRONTEND-REVIEW.md. Use when the user
-  asks for a frontend code review or a source-level complement to live testing.
-  Runs without the app running.
+  coverage, build hygiene, motion and interaction feel — written to
+  docs/FRONTEND-REVIEW.md. Use when the user asks for a frontend code review or a
+  source-level complement to live testing. Runs without the app running.
 user-invocable: true
 argument-hint: [src-path]
 ---
