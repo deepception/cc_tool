@@ -2,7 +2,16 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
-## v0.0.13
+## v0.0.14
+
+Prompt-bloat spot-check, prompted by a since-published Anthropic blog post ("The new rules of context engineering for Claude 5 generation models", Thariq Shihipar, 2026-07-24) reporting an 80%+ cut to Claude Code's own internal system prompt. A 24-agent research+audit workflow ([docs/opus5-prompt-bloat-audit-2026-08-01.md](docs/opus5-prompt-bloat-audit-2026-08-01.md)) verified the primary source directly: **that 80% figure is scoped exclusively to Claude Code's own harness-internal system prompt — no percentage exists anywhere for user-authored CLAUDE.md/Skill files**, so it is not a valid reduction target for this repo's templates. Separately, v0.0.12's recalibration already absorbed the substance of the same direction (de-scaffolding, output discipline, delegation caps) a month before the post was published.
+
+Of 11 candidate cuts the audit generated, adversarial verification rejected 8 — three for re-discovering doctrine v0.0.12 already established, five for misapplying the guidance to instances the facts didn't support (most notably a proposal to strip `design-an-interface`'s per-agent constraint examples, which turned out to be the skill's own documented anti-convergence enforcement device, deliberately hardened in v0.0.12). 3 low-risk P2 items survived and are applied here:
+
+- **`skill-engineer`** — deleted three fill-in-the-blank "Structure by skill type" code-block templates (Reference / Task-Workflow / Audit) that duplicated the "Classify the Skill Type" table above them; the file was violating its own stated "under 200 lines" rule (227 lines) and is now 189. Also added a previously-missing description constraint: descriptions must stay under 1,536 characters (Claude Code's hard cap for the skill listing) and should lead with the primary trigger phrase, since the harness drops full descriptions for the least-invoked skills first once the listing exceeds its context budget — plus a matching step-7 checklist line.
+- **`design-an-interface`** — deleted a standalone "Evaluation Criteria" section that restated 4 of the 5 dimensions `### 4. Compare Designs` already lists, and was positioned even later in the document than where it's needed. The one non-duplicate clause ("beware over-generalization") and the book attribution were folded into step 4. 98 → 86 lines.
+
+No P0/P1 findings. Permissions, hooks, and the `bash-guard.py` boundary are untouched.
 
 Motion-craft release — closes the one real hole in the design surface. cc_tool's visual-design layer is scoped to marketing and says so in three places (`design-director` "when NOT to use this", `design-taste-frontend`'s own opening, the managed block's design paragraph), so **nothing owned how product components move**. Measured before the change: `grep -riE 'keyboard-initiated|100\+ times|interruptib|transform-origin|under 300ms|scale\(0\)'` returned **0 hits across all of `templates/` and 0 across the six global taste skills** (control grep on the same trees returns 4 files, so the pattern was live). Driven by a five-agent debate over [emilkowalski/skills](https://github.com/emilkowalski/skills) — three opposed position papers, then two cross-examining rounds — with every load-bearing claim re-verified in the repo before anything shipped. The debate's own numbers did not all survive that check: one paper reported 2 pre-existing hits for the vocabulary grep above; the actual count is 0.
 

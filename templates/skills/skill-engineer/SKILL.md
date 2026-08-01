@@ -99,46 +99,6 @@ user-invocable: true           # false only for pure reference/knowledge skills
 - Move code templates to `templates/` directory
 - Keep only workflow steps and key rules in SKILL.md
 
-**Structure by skill type:**
-
-**Reference skill:**
-```markdown
-# Title
-
-## Section
-[Tables, patterns, code examples]
-```
-
-**Task/Workflow skill:**
-```markdown
-# Title
-
-Your task is to [specific action].
-
-## Steps
-
-1. **Step name**: Description
-2. **Step name**: Description
-
-## Output Format
-[How to present results]
-```
-
-**Audit skill:**
-```markdown
-# Title
-
-Your task is to [analyze/audit something].
-
-## Steps
-
-1. **Scan**: [What to look at]
-2. **Analyze**: [What to check for]
-3. **Present findings**: [Format]
-4. **Ask user**: [What decision to make]
-5. **Execute**: [Apply approved changes]
-```
-
 **Writing style:**
 - Use imperative sentences: "Scan all files" not "You should scan all files"
 - Use plain imperatives ("Use this tool when X"), not intensifiers ("CRITICAL: You MUST", "always default to", "if in doubt, use X") — strong guardrail phrasing over-triggers. State scope explicitly when a rule spans multiple items.
@@ -152,6 +112,8 @@ Your task is to [analyze/audit something].
 #### Description Writing
 
 The description is critical — it determines when Claude loads the skill.
+
+Descriptions must stay under 1,536 characters (Claude Code's hard cap for the skill listing). Lead with the primary trigger phrase or key use case in the first sentence — Claude Code drops full descriptions for the least-invoked skills first when the always-visible listing exceeds its context budget.
 
 **Good descriptions include:**
 - What the skill does (action verb)
@@ -187,6 +149,7 @@ Run this checklist:
 
 - [ ] `name` is kebab-case, max 64 chars, no spaces
 - [ ] `description` contains action verb and trigger phrases
+- [ ] `description` is under 1,536 characters, with the primary trigger phrase in the first sentence
 - [ ] Frontmatter fields are only those needed (no unnecessary fields)
 - [ ] SKILL.md is under 200 lines (reference.md for overflow)
 - [ ] No overlap with existing skills

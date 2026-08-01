@@ -61,10 +61,10 @@ Present designs sequentially so user can absorb each approach before comparison.
 
 ### 4. Compare Designs
 
-After showing all designs, compare them on:
+After showing all designs, compare them on these dimensions (from "A Philosophy of Software Design"):
 
 - **Interface simplicity**: fewer methods, simpler params
-- **General-purpose vs specialized**: flexibility vs focus
+- **General-purpose vs specialized**: flexibility vs focus, but beware over-generalization
 - **Implementation efficiency**: does shape allow efficient internals?
 - **Depth**: small interface hiding significant complexity (good) vs large interface with thin implementation (bad)
 - **Ease of correct use** vs **ease of misuse**
@@ -77,18 +77,6 @@ Often the best design combines insights from multiple options. Ask:
 
 - "Which design best fits your primary use case?"
 - "Any elements from other designs worth incorporating?"
-
-## Evaluation Criteria
-
-From "A Philosophy of Software Design":
-
-**Interface simplicity**: Fewer methods, simpler params = easier to learn and use correctly.
-
-**General-purpose**: Can handle future use cases without changes. But beware over-generalization.
-
-**Implementation efficiency**: Does interface shape allow efficient implementation? Or force awkward internals?
-
-**Depth**: Small interface hiding significant complexity = deep module (good). Large interface with thin implementation = shallow module (avoid).
 
 ## Anti-Patterns
 
