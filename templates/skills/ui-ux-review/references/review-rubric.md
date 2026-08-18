@@ -37,6 +37,8 @@ Severity measures user impact, not implementation effort.
 
 ## Beyond-happy-path checklist
 
+- Wayfinding: at each screen, can the user tell where they are, where they can go next,
+  what's in front of them, and how to get back out? Never trap the user.
 - Both themes: grey-on-grey, unreadable, or unstyled regions?
 - Viewport ≤1280px: clipping, missing horizontal-scroll affordances?
 - i18n: leaks from other locales, missing diacritics, date/number formats per locale, native-widget placeholder formats.

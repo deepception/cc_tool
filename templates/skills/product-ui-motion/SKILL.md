@@ -91,7 +91,10 @@ list `display` in the transition, or the animation is skipped.
 and `clip-path` also composite but cost enough to measure. Keep `width`, `height`,
 `top`, `left`, `margin` and `padding` out of animation — they lay out every frame.
 (`interpolate-size: allow-keywords` makes height-to-auto animatable but is Chromium-only
-as of mid-2026, so keep a non-animating fallback.)
+as of mid-2026, so keep a non-animating fallback.) **Accordions are the one sanctioned
+exception** — there's no `transform` equivalent for expand/collapse. Measure the
+content's real height in JS (or use a headless primitive that does) rather than
+animating to `auto`, and keep the duration short since every frame costs layout.
 
 **Accessibility.** `prefers-reduced-motion` means gentler, not zero — keep opacity and
 colour transitions that aid comprehension, drop movement. Gate hover motion behind

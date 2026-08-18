@@ -340,16 +340,21 @@ cc_tool/
       skill-engineer/SKILL.md                 create and update skills from workflow descriptions
       dynamic-workflows/SKILL.md              the 6 Workflow patterns + operational controls (full catalog)
       loop-engineering/SKILL.md               structural model of an autonomous loop: loop-type taxonomy, six-component anatomy, disk state, inner/outer layers
+      gauntlet-loop/SKILL.md                  builder vs. independent critic iterated against a concrete reference bar (technique: somethingbig.ai/gauntlet-loop)
       knowledge-wiki/SKILL.md                 Karpathy compile-once wiki: distill a codebase/topic into a durable wiki
       vault/SKILL.md                          self-writing vault operations: process inbox → linked notes + digest, weekly synthesis, graph health
       no-ai-slop/SKILL.md                     edit a draft you wrote into sharper prose, or name its AI patterns without rewriting (MIT, petergyang/no-ai-slop)
         eval.md, LICENSE                        upstream self-check + preserved MIT licence (vendored verbatim)
       design-an-interface/SKILL.md            generate divergent interface designs via parallel sub-agents, then compare (MIT, mattpocock/skills)
       design-director/SKILL.md                route frontend design briefs to taste-skill variants + compose master design prompts
-        references/                             prompt-anatomy guide + 3 archetype master-prompt templates
+        references/                             prompt-anatomy guide + 3 archetype master-prompt templates + design-token scaffold + 3 aesthetic references (organic-tactile, punk-zine, psychedelic-surreal)
       product-ui-motion/SKILL.md              motion craft for product UI: frequency gate, easing/duration budgets, origin, interruptibility (derived from MIT, emilkowalski/skills)
         references/                             full motion catalog + review format; gesture physics (velocity handoff, momentum projection, rubber-banding)
+      pick-ui-library/SKILL.md                task-to-library lookup for common UI mechanics: toasts, DnD, virtualization, forms (MIT, emilkowalski/skills)
+      scroll-world/SKILL.md                   scroll-scrubbed AI-video "fly through the world" landing page pipeline (MIT, oso95/scroll-world)
+        references/, LICENSE                  Higgsfield/Monid prompts + scrub engine + knockout script (vendored verbatim); needs paid external services, not bundled
       improve-codebase-architecture/SKILL.md  surface deep-module refactor opportunities as GitHub-issue RFCs (MIT, mattpocock/skills)
+      triage/SKILL.md                         GitHub issue triage: bug/enhancement x 5-state machine, verify-before-label, agent-brief handoff (derived from mattpocock/skills)
       app-qa/SKILL.md                         full QA engagement orchestrator: e2e + UI/UX review + frontend review over shared discovery, up to three docs
       e2e-testing/SKILL.md                    plan + execute e2e tests of any app type; agent-run or paired mode; ✅/❌ walkthrough plan doc
         references/                             test-plan doc format + app-type driving-tools table

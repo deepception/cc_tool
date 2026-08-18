@@ -77,6 +77,13 @@ el.animate([{ clipPath: 'inset(0 0 100% 0)' }, { clipPath: 'inset(0 0 0 0)' }],
   { duration: 1000, fill: 'forwards', easing: 'cubic-bezier(0.77, 0, 0.175, 1)' });
 ```
 
+**Skip the delay on adjacent tooltips.** In a toolbar, the first tooltip should wait out
+the normal activation delay, but once the user is already moving between triggers,
+follow-up tooltips should appear instantly — the delay's job (avoid firing on transient
+mouse-overs) is already satisfied. Track a shared "recently active" flag and switch
+adjacent triggers to `transition-duration: 0ms` (e.g. via a `[data-instant]` attribute)
+for both the delay and the animation while it's set.
+
 ## Where JS motion loses to CSS
 
 Motion's `x` / `y` / `scale` shorthands compose into a `transform` recomputed per frame
@@ -129,3 +136,18 @@ Match motion to the product's personality: a playful component can be bouncier, 
 dashboard stays crisp and fast. The easing, the duration, the visual design and the copy
 should read as one decision. Opacity paired with height in an entering list has no
 formula — adjust until it settles.
+
+## Multimodal feedback (motion + sound + haptics)
+
+When a channel beyond motion is available, three rules keep it from feeling bolted on:
+
+- **Causality.** Fire feedback on the actual causal event (the drop lands, the toggle
+  commits) — not on the animation that represents it.
+- **Harmony.** Visual, sound, and haptic must land on the same frame. A haptic pulse that
+  fires before a lagging CSS transition finishes breaks the illusion of one physical
+  event.
+- **Utility.** Reserve extra channels for moments that matter. Buzzing or chiming on
+  every minor interaction trains users to ignore it.
+
+Treat haptics as progressive enhancement, not a universal rule: the Vibration API has
+real support only on Android Chrome — no iOS Safari, no desktop.

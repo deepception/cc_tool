@@ -144,5 +144,6 @@ Long loops degrade because the context becomes disorganized, not because the mod
 8. **No hardcoded secrets** — use environment variables and .env files.
 9. **Never hand-edit lockfiles** — `uv.lock`, `package-lock.json`, `pnpm-lock.yaml` are managed by their tools.
 10. **Right tool for the job** — use Claude for judgment work (classification, drafting, summarization, ambiguous extraction). Do NOT route deterministic logic through Claude (status-code handling, retries, type transforms, routing). If plain code can answer the question, plain code answers.
+11. **Prefer established libraries over custom implementations** — when a well-maintained library already solves the problem correctly, reach for it instead of hand-rolling. Verify it's already a dependency, or name the install command, before assuming it. For UI-specific picks (toasts, virtualization, forms, drag-and-drop, etc.) see the `pick-ui-library` skill.
 
 <!-- cc_tool:snippet:end -->

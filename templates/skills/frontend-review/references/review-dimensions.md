@@ -16,6 +16,7 @@ What to look for, per dimension. Cite `file:line` for every finding. Severity: ð
 - Unbounded growth: arrays fed by streams/events without caps.
 
 ## 3. Component quality
+- Vague generic labels where a direct, specific one exists ("Home" for a progress dashboard, "Library" for a collection of exactly one type of item).
 - Interactions that look live but aren't: handlers that only console.log, edit affordances with no persistence path.
 - Destructive actions without confirmation.
 - Inverted threshold/comparison logic (a higher-is-better metric flagged as bad for exceeding a threshold).

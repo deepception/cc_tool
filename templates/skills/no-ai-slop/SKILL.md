@@ -4,12 +4,14 @@ description: Edit a draft the user wrote into sharper, more human writing while 
 ---
 
 <!-- Vendored from https://github.com/petergyang/no-ai-slop (MIT, (c) 2026 Peter Yang);
-     LICENSE ships alongside this file. The only cc_tool change is the `description`
-     above, narrowed so the skill fires on the user's own drafts rather than on
-     project docs — its editing rules (notably the em-dash guidance) are tuned for
-     human prose and would fight this repo's house style if applied to its docs.
-     The body below is upstream's, unmodified. For how Claude's *own* output is
-     governed, see `## Output discipline` in the managed CLAUDE.md block instead. -->
+     LICENSE ships alongside this file. cc_tool changes: the `description` above,
+     narrowed so the skill fires on the user's own drafts rather than on project
+     docs — its editing rules (notably the em-dash guidance) are tuned for human
+     prose and would fight this repo's house style if applied to its docs; and one
+     added section, `## cc_tool additions`, appended after upstream's own sections
+     and clearly marked as such. Everything else in the body is upstream's,
+     unmodified. For how Claude's *own* output is governed, see `## Output
+     discipline` in the managed CLAUDE.md block instead. -->
 
 # No AI slop
 
@@ -90,6 +92,12 @@ Often-empty phrases: it's worth noting, it's important to note, at the end of th
 **Formatting slop.** Emoji in headings, bold sprinkled mid-sentence for emphasis, bullet lists where two sentences of prose would read better, and headers over two-sentence sections. Format should follow the content, not decorate it.
 
 **Em dashes.** Do not use them as a default rhythm crutch. In short copy, use none. In longer drafts, 1-2 are fine if they clearly beat commas, periods, or parentheses. Remove clusters and decorative dashes.
+
+## cc_tool additions
+
+Not part of upstream. Checked against github.com/yetone/kill-ai-slop, which catalogues a separate, mostly visual/CSS taxonomy of AI slop (gradients, glassmorphism, card spam) — out of scope here; see cc_tool's design-taste skills for that. Its one prose-relevant finding not already covered above:
+
+**More words to cut.** Also banned outright: seamless, effortless, blazing-fast, next-level, unlock the power of, say goodbye to.
 
 ## Workflow
 
