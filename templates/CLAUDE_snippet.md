@@ -127,6 +127,18 @@ Long loops degrade because the context becomes disorganized, not because the mod
 
 ---
 
+## When a hook blocks you
+
+cc_tool's hooks refuse some tool calls before they run. A refusal reads `BLOCKED: <what and why>. Suggestion: <safe form>.`; a `NEEDS APPROVAL:` prefix means the user is being asked instead. Every decision is appended to `.git/cc_tool/activity.jsonl`.
+
+1. **Take the suggestion.** It names the safe form (`--force-with-lease`, one pid instead of `pkill node`, a feature branch, the Edit tool instead of `sed -i`). Use that form.
+2. **Do not rephrase the command to get past the guard.** No `sh -c`, no variable indirection, no `>` redirect in place of the Write tool, no base64. The pattern encodes a real hazard; evading it is a bug you are introducing, not a workaround.
+3. **A destructive op on a shared target is also an intent check.** Force-pushing, dropping data, deleting a branch, wiping a volume: confirm the user actually asked for this before reaching for the safe form.
+4. **Never loosen a guard to get through.** Editing the hook scripts, the `deny` list in `.claude/settings.json`, or `.claude/guard-rules.json` to unblock yourself is the canonical gate-gaming move. If a rule is wrong for this repo, say so and let the user change it (`distill-rules` skill for project rules).
+5. **A warning is information, not noise.** `[write-guard] stale read` means the file changed on disk since you last read it: re-read before editing. `red check pending` means your last edit to another file left errors: fix that first. `[post-edit-typecheck] NOT CHECKED` means silence was not a pass: run the check yourself before reporting done.
+
+---
+
 ## Critical rules
 
 1. **Read before writing** — understand existing code before modifying it. Never speculate about code you have not opened — if a file is referenced, read it first.

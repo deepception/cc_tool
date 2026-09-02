@@ -45,6 +45,11 @@ import subprocess
 import sys
 import time
 
+try:
+    import cc_hooklib as lib
+except Exception:  # noqa: BLE001 - session-state features degrade to no-ops
+    lib = None
+
 TIMEOUT = 10  # seconds; the registered hook timeout (settings.json) is slightly higher
 MAX_ERR_LINES = 12  # cap the output we surface to Claude
 SKIP_TTL = 30 * 60  # seconds; after a tsc timeout, skip re-running the check this long
@@ -98,8 +103,59 @@ def _remember_timeout(marker: str) -> None:
         pass  # fail-open: worst case is today's behavior (a silent stall per edit)
 
 
+_EDITED = ""      # the file this hook fired for (set in main)
+_SESSION = ""     # session id from the payload (set in main)
+_TIMED_OUT = False
+
+
+def _record_result(failed: bool, project_wide: bool) -> None:
+    """Remember a red check against the edited file in the session state so
+    write-guard.py can nudge before the next edit elsewhere; clear it on green
+    (a project-wide green clears every pending red, a file-scoped one only its own)."""
+    if not lib or not _EDITED:
+        return
+    root = lib.repo_root()
+    state = lib.load_session(root, _SESSION)
+    real = os.path.realpath(_EDITED)
+    if failed:
+        state["failed"][real] = time.time()
+    elif project_wide:
+        state["failed"] = {}
+    else:
+        state["failed"].pop(real, None)
+    lib.save_session(root, _SESSION, state)
+
+
+def _note(text: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "additionalContext": f"[post-edit-typecheck] {text}",
+    }}))
+    sys.exit(0)
+
+
+def _note_once(key: str, text: str) -> None:
+    """Say something once per session (e.g. 'no compiler available'), then stay quiet."""
+    if lib and _SESSION:
+        root = lib.repo_root()
+        state = lib.load_session(root, _SESSION)
+        if key in state["notes"]:
+            _silent_exit()
+        state["notes"][key] = time.time()
+        lib.save_session(root, _SESSION, state)
+    _note(text)
+
+
+def _not_checked(tool: str, why: str) -> None:
+    """NOT CHECKED is a no-verdict, not a pass — say so instead of staying silent,
+    so the model does not mistake silence for a clean result."""
+    _note(f"NOT CHECKED: `{tool}` {why}. Silence from this hook is not a clean result — "
+          "run the project's own check before reporting the change verified.")
+
+
 def _surface(tool: str, output: str) -> None:
     """Return a concise error note to Claude's context (additionalContext)."""
+    _record_result(failed=True, project_wide=False)
     output = re.sub(r"\x1b\[[0-9;]*m", "", output)  # defense-in-depth: strip ANSI codes
     lines = [ln for ln in output.splitlines() if ln.strip()]
     head = lines[:MAX_ERR_LINES]
@@ -128,8 +184,10 @@ def _run(cmd, cwd, timeout_marker=""):
             cmd, cwd=cwd, capture_output=True, text=True, timeout=TIMEOUT,
         )
     except subprocess.TimeoutExpired:
+        global _TIMED_OUT
+        _TIMED_OUT = True
         _remember_timeout(timeout_marker)
-        return None  # stay silent; the marker stops the per-edit re-pay
+        return None  # the marker stops the per-edit re-pay; main() reports NOT CHECKED once
     except (FileNotFoundError, OSError):
         return None  # tool vanished mid-run → stay silent
     if proc.returncode == 0:
@@ -162,10 +220,13 @@ def main():
     except (json.JSONDecodeError, ValueError):
         _silent_exit()
 
+    global _EDITED, _SESSION
     tool_input = data.get("tool_input", {}) or {}
     path = tool_input.get("file_path") or tool_input.get("path") or ""
     if not path:
         _silent_exit()
+    _EDITED = path
+    _SESSION = str(data.get("session_id") or "")
 
     ext = os.path.splitext(path)[1].lower()
     root = _find_repo_root(path)
@@ -182,13 +243,19 @@ def main():
         elif shutil.which("tsc"):
             cmd = ["tsc", "--noEmit"]
         else:
-            _silent_exit()  # no compiler available — silent exit per missing-tool contract
+            _note_once("tsc-missing", "NOT CHECKED: no `tsc` found (node_modules/.bin or PATH), so "
+                       "TypeScript edits in this session are not typechecked by the hook. Install "
+                       "dependencies or run the project's check yourself before reporting done.")
         marker = _skip_marker(root, "tsc")
         if _skip_fresh(marker):
             _silent_exit()  # a recent run couldn't finish within TIMEOUT; don't re-pay per edit
         out = _run(cmd, root, timeout_marker=marker)
         if out:
             _surface("tsc --noEmit", out)
+        if _TIMED_OUT:
+            _not_checked("tsc --noEmit", f"exceeded {TIMEOUT}s; the hook skips it for the next "
+                         f"{SKIP_TTL // 60} min (marker in .git/)")
+        _record_result(failed=False, project_wide=True)
         _silent_exit()
 
     # ── Python (ruff only — fast; never invoke a type checker here) ────────────
@@ -202,6 +269,7 @@ def main():
         out = _run(["ruff", "check", path], root)
         if out:
             _surface("ruff check", out)
+        _record_result(failed=False, project_wide=False)
         _silent_exit()
 
     # ── Rust ───────────────────────────────────────────────────────────────────
@@ -214,6 +282,9 @@ def main():
         out = _run(["cargo", "check", "--quiet"], root)
         if out:
             _surface("cargo check", out)
+        if _TIMED_OUT:
+            _not_checked("cargo check", f"exceeded {TIMEOUT}s (incremental progress is kept; the next edit retries)")
+        _record_result(failed=False, project_wide=True)
         _silent_exit()
 
     _silent_exit()

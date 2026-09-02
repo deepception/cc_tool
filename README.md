@@ -1,6 +1,6 @@
 # cc_tool
 
-One-command setup for Claude Code projects: Superpowers skills, a toolbox of project skills, five guard hooks, a calibrated `settings.json`, and a managed methodology block in `CLAUDE.md`. Optional per-project extras: a self-writing vault (`cc-vault`) and a sandboxed devcontainer (`cc-devcontainer`).
+One-command setup for Claude Code projects: Superpowers skills, a toolbox of project skills, seven guard hooks, a calibrated `settings.json`, and a managed methodology block in `CLAUDE.md`. Optional per-project extras: a self-writing vault (`cc-vault`) and a sandboxed devcontainer (`cc-devcontainer`).
 
 **Prerequisites:** `python3` (hooks and the JSON merges), `node`/`npx` (global skills installed via `npx skills`).
 
@@ -24,7 +24,7 @@ cc-setup /path/to/your/project
 | **Managed `CLAUDE.md` block** | Model routing, reasoning approach, output discipline, verification protocol, context management, critical rules; tells Claude when each Superpowers skill applies | [templates/CLAUDE_snippet.md](templates/CLAUDE_snippet.md), replaced in place on update |
 | **Superpowers** (`obra/superpowers`) | Methodology skills: brainstorming, planning, TDD, systematic debugging, verification before completion, code review | Global plugin, updated by `cc-update` |
 | **Project skills** (20) | The explicit toolbox: QA and e2e testing, design routing, product-UI motion, dynamic workflows, loop engineering, knowledge wiki, vault, issue triage, skill engineering, prose de-slopping and more | [templates/skills/](templates/skills/), copied and refreshed by `cc-setup` |
-| **Hooks** (5 scripts) | Session context, Bash guard (protected branches, `--no-verify`, secret reads), big-file read warning, context-usage warning at 80%, post-edit typecheck | [templates/hooks/](templates/hooks/) |
+| **Hooks** (7 scripts) | Session context, Bash guard (protected branches, `--no-verify`, secret reads, destructive commands, shell-write bypass warning), write guard (system paths, secrets in content, stale reads, red-check nudge), big-file read warning, context-usage warning at 80%, post-edit typecheck with explicit `NOT CHECKED`, activity log in `.git/cc_tool/`. Every refusal reads `BLOCKED: … Suggestion: …` and the managed block teaches Claude to take the suggestion rather than dodge the guard. Per-project rules in `.claude/guard-rules.json` (`distill-rules` skill) | [templates/hooks/](templates/hooks/) |
 | **taste-skill** (`Leonxlnx/taste-skill`) | Anti-slop for the visual surface, routed by the `design-director` project skill | Global skills, updated by `cc-update` |
 
 **Design principle:** Superpowers is the methodology layer and triggers automatically via the `CLAUDE.md` block; project skills are the toolbox you invoke by name. Orchestration is harness-native (the `Workflow` tool, `superpowers:dispatching-parallel-agents`). cc_tool installs no MCP server, no background daemon, no behavioral autopilot.

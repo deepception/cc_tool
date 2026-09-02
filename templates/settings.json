@@ -161,6 +161,16 @@
             "timeout": 2
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/write-guard.py",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -171,6 +181,16 @@
             "type": "command",
             "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/post-edit-typecheck.py",
             "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/activity-log.py",
+            "timeout": 3
           }
         ]
       }

@@ -59,13 +59,17 @@ cc_tool/
       frontend-review/SKILL.md                static interface-layer source review; no-duplication contract vs sibling docs
         references/                             the 9 review dimensions + coverage-mapping format
     hooks/
+      cc_hooklib.py              shared helpers (not a hook): repo root, BLOCKED: message format, activity log, per-session trajectory state, .claude/guard-rules.json loader
       session-context.py         SessionStart: git state, sensitive files, vault state, detected quality commands
-      bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, block --no-verify, block secret-file reads (.env, keys, credential stores) via grep/awk/xargs/inline interpreters
+      bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, --no-verify, secret-file reads via grep/awk/xargs/inline interpreters, destructive commands (rm -rf on roots/.git/lockfiles/CI, sudo rm, pkill <name>, push --force, curl|sh, env|curl, registry redirection, mkfs/dd, chmod 777); ask on reset --hard / clean -f / branch -D / stash drop / docker prune / kubectl delete --all / terraform destroy / DROP-TRUNCATE-DELETE-without-WHERE; warn on shell writes into source files (> / tee / sed -i / patch / git apply); applies project rules
+      write-guard.py             PreToolUse Edit|Write|MultiEdit: deny writes to system paths, shell/credential dotfiles, .git/; deny real-looking secrets in content (keys, tokens, JWTs, credential assignments; placeholders and .env* pass); ask on writes outside the repo (tunable); warn on stale reads (file changed on disk since last read) and on a red check pending in another file; applies project rules
       big-file-guard.py          PreToolUse Read: warn on files >200KB without offset/limit
       context-usage.py           Stop: warn when session context window passes 80% (suggest /compact)
-      post-edit-typecheck.py     PostToolUse Edit|Write|MultiEdit: fast project check (tsc/cargo; ruff file-scoped for Python) after source edits, surface errors inline; tsc timeouts back off for 30 min via a marker in .git/
+      post-edit-typecheck.py     PostToolUse Edit|Write|MultiEdit: fast project check (tsc/cargo; ruff file-scoped for Python) after source edits, surface errors inline; tsc timeouts back off for 30 min via a marker in .git/ and report NOT CHECKED (once) instead of staying silent; missing tsc reported once per session; red/green recorded in session state
+      activity-log.py            PostToolUse (every tool): one JSON line per tool call in .git/cc_tool/activity.jsonl (guards append their deny/ask/warn there too; rotates at 5 MB); records file mtimes after Read/Edit/Write for the stale-read check
   tests/
-    test_bash_guard.py           124-case allow/deny matrix for bash-guard.py (stdlib only, self-contained fixtures)
+    test_bash_guard.py           allow/ask/warn/deny matrix for bash-guard.py (stdlib only, self-contained fixtures)
+    test_write_guard.py          matrix for write-guard.py: location, secrets-in-content, trajectory warnings, project rules
   .claude/
     workflows/                   saved Workflow definitions (run via the Workflow tool)
       model-recalibration-audit.js  re-audit this setup against a new Claude model
@@ -78,7 +82,12 @@ cc_tool/
 `bash-guard.py` is the enforced boundary for protected-branch git writes during unattended and workflow runs, so it has a matrix rather than a promise:
 
 ```bash
-python3 tests/test_bash_guard.py        # 124 cases, ~3s, exits non-zero on any deviation
+python3 tests/test_bash_guard.py        # ~200 cases, a few seconds, exits non-zero on any deviation
+python3 tests/test_write_guard.py       # write-guard.py matrix
 ```
+
+## Project guard rules
+
+`.claude/guard-rules.json` adds per-project deny/ask/warn regexes that `bash-guard.py` (on the command string) and `write-guard.py` (on `file_path` or `content`) apply after their built-in checks. The `distill-rules` skill writes it from the imperatives in `CLAUDE.md` and the project's skills, with the lexical ladder never/must not → deny, should not/avoid → ask, should/prefer → warn. Schema and an example live at the top of `cc_hooklib.py`. A malformed file is reported to the model as "project rules are NOT enforced" rather than silently ignored.
 
 Expectations encode *intended* behaviour, including the bypasses deliberately out of scope (shell expansion, `sh -c` wrappers, base64) — those assert ALLOW on purpose, so a change that appears to close one surfaces here as a diff to justify rather than a silent behavioural shift. Re-run after editing the guard, and whenever the Claude Code CLI changes its hook contract.
