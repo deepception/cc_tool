@@ -25,7 +25,7 @@ Ask: "What does this module need to do? Who will use it?"
 
 Spawn a small number of sub-agents in parallel (three is usually right) using the Agent tool. Each must produce a **radically different** approach.
 
-This is a deliberate exception to the delegation cap in CLAUDE.md: the value comes from independent designs produced without sight of each other, which one agent cannot reproduce sequentially. It is not a licence to fan out on ordinary work.
+This is a deliberate exception to the delegation guidance in CLAUDE.md: the value comes from independent designs produced without sight of each other, which one agent cannot reproduce sequentially. It is not a licence to fan out on ordinary work.
 
 ```
 Prompt template for each sub-agent:
@@ -80,7 +80,5 @@ Often the best design combines insights from multiple options. Ask:
 
 ## Anti-Patterns
 
-- Don't let sub-agents produce similar designs - enforce radical difference
-- Don't skip comparison - the value is in contrast
-- Don't implement - this is purely about interface shape
-- Don't evaluate based on implementation effort
+- Don't implement — this is purely about interface shape.
+- Judge designs on shape and depth, not on implementation effort.

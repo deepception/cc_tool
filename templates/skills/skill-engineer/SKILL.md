@@ -102,12 +102,11 @@ user-invocable: true           # false only for pure reference/knowledge skills
 **Writing style:**
 - Use imperative sentences: "Scan all files" not "You should scan all files"
 - Use plain imperatives ("Use this tool when X"), not intensifiers ("CRITICAL: You MUST", "always default to", "if in doubt, use X") — strong guardrail phrasing over-triggers. State scope explicitly when a rule spans multiple items.
-- **De-scaffold**: prefer the shortest instruction that works; add step-by-step scaffolding only where it measurably beats the model's default behavior. Opus 5 and Sonnet 5 both respond badly to long enumerated instruction lists.
-- **State goals and constraints, not step lists**, unless the order genuinely matters. A skill that says "spawn N sub-agents" or "always add a verification step" fights the delegation cap and the Verification protocol in the managed CLAUDE.md block — check yours against those before shipping it.
+- **De-scaffold**: prefer the shortest instruction that works; add step-by-step scaffolding only where it measurably beats the model's default behavior. Current models respond badly to long enumerated instruction lists.
+- **State goals and constraints, not step lists**, unless the order genuinely matters. A skill that says "spawn N sub-agents" or "always add a verification step" fights the delegation guidance and the Verification protocol in the managed CLAUDE.md block — check yours against those before shipping it.
 - Be specific: "List files matching `.claude/skills/*/SKILL.md`" not "Find skill files"
-- One instruction per bullet point
-- Use bold for step names, code blocks for commands/paths
-- No filler words, no explanations of why — just what to do
+- Prose for behavior, with the reason beside each constraint — a rule without its reason gets applied where it doesn't fit. Bullets and tables for reference data (commands, paths, lookup tables).
+- Code blocks for commands and paths
 
 #### Description Writing
 
@@ -186,4 +185,4 @@ When updating an existing skill:
 - **Missing trigger phrases**: Description that doesn't match how users actually ask for it
 - **Over-forceful phrasing**: `CRITICAL` / `MUST` / `ALWAYS` / anti-laziness language — see Writing style; plain imperatives read more reliably
 - **Cargo-cult prescription**: porting every enumerated step from a prior-model skill unchanged — review whether the current model's default behavior already exceeds the scaffold. Today's models are more capable unscaffolded than the ones most existing skills were written for
-- **Hardcoded fan-out floors**: "spawn 3+ agents", "always delegate X" — Opus 5 already over-delegates, so a floor compounds it. Justify any fan-out as a deliberate exception or drop it
+- **Hardcoded fan-out floors**: "spawn 3+ agents", "always delegate X" — say *when* delegation pays instead of fixing a count; whether the current model over- or under-delegates changes per release

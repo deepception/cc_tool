@@ -12,8 +12,8 @@ the format changes this no-ops gracefully.
 Tunables (env vars):
   CONTEXT_USAGE_LIMIT     token budget to measure against. When unset, derived
                           from the session model — 1,000,000 for the families in
-                          NATIVE_1M_FAMILIES (Opus 5, Sonnet 5, Fable 5,
-                          Mythos 5, Opus 4.8, Opus 4.7), 200,000 otherwise.
+                          NATIVE_1M_FAMILIES (Opus 5, Sonnet 5, Fable 5.x,
+                          Mythos 5.x, Opus 4.8, Opus 4.7), 200,000 otherwise.
                           Set this to override.
   CONTEXT_USAGE_WARN_PCT  warn at/above this percent (default 80)
 """

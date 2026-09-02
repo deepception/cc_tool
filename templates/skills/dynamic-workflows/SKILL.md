@@ -6,7 +6,7 @@ user-invocable: true
 
 # Dynamic Workflows
 
-A workflow is a harness Claude writes for THIS task: a JS script that coordinates subagents. Each agent gets its own context (intermediate results stay out of the main conversation), its own model (`sonnet` — Sonnet 5 — for throughput, `opus` — Opus 5 — for judgment; `fable` (Claude Fable 5) is available but costs ~2x `opus` for an edge Opus 5 mostly closes, so reserve it for a genuinely hardest stage, never as a default), and its own isolation level (worktree or none). The structure — not better prompting — is what fixes three failure modes of long single-context work:
+A workflow is a harness Claude writes for THIS task: a JS script that coordinates subagents. Each agent gets its own context (intermediate results stay out of the main conversation), its own model (`sonnet` for throughput; `opus` or `fable` for judgment — `fable` is 2x `opus` per token with cache reads at half the price, and at `low`/`medium` effort often competitive on cost per task while scoring higher; see Model routing in CLAUDE.md), and its own isolation level (worktree or none). The structure — not better prompting — is what fixes three failure modes of long single-context work:
 
 - **Agentic laziness** — declares done after partial progress. A loop with a stop condition keeps going.
 - **Self-preferential bias** — can't fairly judge its own work. A separate verifier agent can.
@@ -65,7 +65,7 @@ Treat them as templates to adapt, not scripts to run verbatim — copy one into 
 - **Set an explicit token budget in the prompt.** Ambitious workflows balloon 5-10x past the naive estimate; the budget is the only brake.
 - **Quarantine untrusted input** (support tickets, scraped pages, third-party API output): the reader agents that touch it get NO privileged actions — no edits, no shell side effects — and separate agents act on their sanitized summaries. A prompt injection in the data then has nothing to grab.
 - **Workflow subagents run with acceptEdits and inherit the session's tool allowlist** — they apply file edits without prompting, so the deny-list / bash-guard hook is the load-bearing safety boundary, not an interactive confirmation. Give each agent an explicit scope (which files/commands are in-bounds), keep untrusted-input readers tool-restricted per the quarantine rule above, and don't enable workflows in a project that lacks the bash-guard PreToolUse hook.
-- **Effort is model-conditional.** On `opus` (Opus 5), start `xhigh` for coding and synthesis stages and `high` elsewhere, then sweep down — `low`/`medium` are unusually strong on this model, so cheap arms often need far less than you would give a prior model. On the rare stage routed to `fable`, `high` is already the default.
+- **Effort is model-conditional.** Start every stage at `high`, raise to `xhigh` only where a measured quality gain justifies it, then sweep down — `low`/`medium` are unusually strong on current models, so cheap arms often need far less than you would give a prior model. Re-run the sweep when a stage changes model; effort names do not carry the same meaning across models.
 - **Reflect-or-kill on retry loops.** When a stage can retry, don't just spend the whole cap — after each attempt have the agent judge against the goal and emit one of `continue` / `abandon` / `escalate`: `abandon` a branch that is no longer converging, `escalate` to a stronger model or a human instead of grinding identical failed attempts. The iteration cap is the backstop; reflect-or-kill is what usually ends the loop first.
 
 ## When NOT to use

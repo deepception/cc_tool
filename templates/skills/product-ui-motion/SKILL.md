@@ -13,12 +13,9 @@ user-invocable: true
 
 <!-- Rule catalog derived from https://github.com/emilkowalski/skills (MIT, (c) 2026 Emil
      Kowalski) — chiefly `review-animations/STANDARDS.md` and `apple-design` — condensed
-     and restructured for this repo. Seven technical claims were corrected against current
-     browser and library behaviour (Motion's acceleration mechanism, the 300ms/500ms
-     contradiction, response-vs-duration, the spring damping example, the package name,
-     @starting-style support, the compositor property list) and two blanket bans were
-     narrowed to the frequency arguments underneath them. The corrections are this repo's;
-     errors in them are ours, not upstream's. Detail in references/motion-standards.md. -->
+     and restructured for this repo, with several technical claims corrected against
+     current browser and library behaviour; the corrections are this repo's. Detail in
+     references/motion-standards.md. -->
 
 # Product UI Motion
 

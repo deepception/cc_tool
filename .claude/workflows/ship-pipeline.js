@@ -16,10 +16,10 @@ const cfg = (args && typeof args === 'object') ? args : {}
 const FEATURE = cfg.feature || (typeof args === 'string' ? args.trim() : '')
 if (!FEATURE) return { error: 'No feature provided. Pass args.feature (or a plain request string as args) and re-invoke.' }
 const ROOT = cfg.root || 'the current repository (your working directory)'
-// Planning + review are judgment work: Opus 5. Coding + testing are
-// throughput-bound: Sonnet 5. planModel:'fable' (Claude Fable 5) is available
-// but rarely worth ~2x opus cost — opt in per feature for a genuinely hardest
-// one, never as a default.
+// Planning + review are judgment work: 'opus' or 'fable' (fable is 2x per
+// token with half-price cache reads; at low/medium effort often competitive
+// on cost per task while scoring higher — measure).
+// Coding + testing are throughput-bound: 'sonnet'.
 const PLAN_MODEL = cfg.planModel || 'opus'          // Opus 5
 const CODE_MODEL = cfg.codeModel || 'sonnet'        // Sonnet 5
 const REVIEW_MODEL = cfg.reviewModel || PLAN_MODEL  // independent review tier if you want one

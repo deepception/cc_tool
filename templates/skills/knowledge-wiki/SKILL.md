@@ -49,7 +49,7 @@ Project-local and git-trackable, default under `.wiki/`:
 ### Ingest (one new source -> wiki)
 
 1. **Read** the source. Copy it into `raw/` first only if it is external or ephemeral (scraped page, downloaded paper, fetched doc) — then never edit the copy. If the source already lives in the repo (e.g., codebase files) or is too large to duplicate, read it in place and cite it by repo path; do not copy it into `raw/`.
-2. **Summarize** the source into a source page under `wiki/` (key claims, entities, terms), with citations back to the `raw/` path.
+2. **Summarize** the source into a source page under `wiki/` (key claims, entities, terms), in your own words, with citations back to the `raw/` path. Mark any passage you reproduce as a quotation — an unmarked copy reads as a wiki claim, and later lints can't tell it from one.
 3. **Surgically edit affected pages**: update existing entity/concept pages this source touches; create new ones only when genuinely new. Add `[[wikilinks]]` between related pages. Deduplicate overlapping claims.
 4. **Refresh `index.md`**: add or update the one-line summary for every page changed or created.
 5. **Append to `log.md`**: a dated line naming the source ingested and the pages touched.

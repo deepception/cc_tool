@@ -3,16 +3,6 @@ name: no-ai-slop
 description: Edit a draft the user wrote into sharper, more human writing while preserving their personal voice, or name the AI-slop patterns in it without rewriting. Use when the user hands over their own prose — an essay, post, newsletter, email, or announcement — and wants it clearer, more direct, more opinionated, or less AI-sounding, or asks whether it reads as AI. Not for code, code comments, or this repo's own documentation.
 ---
 
-<!-- Vendored from https://github.com/petergyang/no-ai-slop (MIT, (c) 2026 Peter Yang);
-     LICENSE ships alongside this file. cc_tool changes: the `description` above,
-     narrowed so the skill fires on the user's own drafts rather than on project
-     docs — its editing rules (notably the em-dash guidance) are tuned for human
-     prose and would fight this repo's house style if applied to its docs; and one
-     added section, `## cc_tool additions`, appended after upstream's own sections
-     and clearly marked as such. Everything else in the body is upstream's,
-     unmodified. For how Claude's *own* output is governed, see `## Output
-     discipline` in the managed CLAUDE.md block instead. -->
-
 # No AI slop
 
 You are a sharp human editor. Preserve the user's point and personal voice while making the writing clearer and more alive. Remove AI patterns without turning distinctive writing into generic polished prose.

@@ -32,7 +32,7 @@ const FIND_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
     findings: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
-      id: { type: 'string', description: 'canonical dedup slug "<repo-root-relative path>:<first affected line>:<kind>" where kind is a lowercase-kebab issue category, e.g. "bin/cc-new-project:42:unquoted-var". The same underlying issue MUST always produce the same id.' },
+      id: { type: 'string', description: 'canonical dedup slug "<repo-root-relative path>:<first affected line>:<kind>" where kind is a lowercase-kebab issue category, e.g. "bin/cc-new-project:42:unquoted-var". The same underlying issue produces the same id every round.' },
       title: { type: 'string' },
       location: { type: 'string', description: 'file + line range or symbol' },
       detail: { type: 'string' },
@@ -67,13 +67,13 @@ REPO ROOT: ${ROOT}
 TARGET TO SWEEP:
 ${TARGET}
 
-ALREADY-FOUND (do NOT re-report these ids; look for anything NOT in this list):
+ALREADY-FOUND (skip these; look for anything not in this list):
 ${survivors.length ? survivors.map(s => `  - ${s.id} — ${s.title}`).join('\n') : '  (nothing yet — this is the first pass)'}
 
 METHOD:
 - Use Read/Grep/Glob to inspect the target. Cover ground other finders may have missed; go for breadth this round.
-- For each NEW issue, emit id "<repo-root-relative path>:<first affected line>:<kind>" (kind = lowercase-kebab issue category). If an ALREADY-FOUND entry clearly refers to the same underlying issue — even at a slightly different line or with different wording — do NOT re-report it. Be precise with location.
-- If you genuinely find nothing new, return an empty findings array. Do NOT pad with low-confidence guesses.
+- For each new issue, emit id "<repo-root-relative path>:<first affected line>:<kind>" (kind = lowercase-kebab issue category). If an ALREADY-FOUND entry clearly refers to the same underlying issue — even at a slightly different line or with different wording — skip it. Be precise with location.
+- If you find nothing new, return an empty findings array; that is the correct answer, and each low-confidence guess costs a verification round.
 Return the structured findings.`
 
 while (round < MAX_ROUNDS && dryRounds < DRY_ROUNDS_TO_STOP && budgetHealthy()) {

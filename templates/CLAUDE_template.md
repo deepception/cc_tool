@@ -90,7 +90,6 @@ Prefer running single test files over the full suite for faster feedback.
 - Formatter: `ruff format`
 - Linter: `ruff check`
 - Type checker: `mypy` (target: Python 3.12)
-- Always run formatter and linter before committing
 - Use type hints on all new function signatures
 - Union types: `X | Y` syntax (not `Union[X, Y]`)
 - Prefer dataclasses for config and internal data; Pydantic for external interfaces
@@ -119,7 +118,7 @@ Prefer running single test files over the full suite for faster feedback.
 
 ### Planning
 
-1. Enter plan mode for any task with 3+ steps or architectural decisions
+1. Enter plan mode for architectural decisions or when the approach is genuinely unclear
 2. Read relevant source files before proposing changes
 3. Write a plan with checkable items when appropriate
 4. Keep the plan updated as the source of truth
@@ -139,7 +138,7 @@ Prefer running single test files over the full suite for faster feedback.
 
 - Commit messages: imperative mood, concise ("Add batch validation" not "Added batch validation")
 - One logical change per commit
-- Always run code quality checks before committing
+- Run the code quality checks before committing
 
 ### Loops & autonomous runs
 
