@@ -2,7 +2,7 @@
 
 The vault is a proactive loop: a trigger runs `/vault process` with no human in
 real time. Filing notes is routine, high-volume work — run it on Claude Sonnet 5
-(the cheap tier) and keep Opus 5 for judgment work.
+(the cheap tier) and keep Opus 5.5 for judgment work.
 
 ## Option 1 — system cron (local; recommended start)
 

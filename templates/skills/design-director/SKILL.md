@@ -58,6 +58,7 @@ Define tokens before layout — see `references/design-tokens.md` for the scaffo
 ## Non-negotiables (whatever the route)
 
 - **Exact values, not vibes** — tokens, font names, easing curves, durations, delays. "Premium feel" is not a spec; `cubic-bezier(0.16,1,0.3,1)` at `1.1s` staggered `0.12s` is.
+- **Name the defaults to avoid** — "not generic" just swaps one default look for another. Unless the design read calls for them, rule out the current model's fallback styles by name: cream or off-white backgrounds, italic accent words in headlines, numbered "01/02/03" section labels, monospace labels, pill-shaped buttons. After the first pass, check which styles it reached for instead and extend the list.
 - **One signature interaction** per page — a single mechanic the visitor remembers. Two competing gimmicks read as a template demo.
 - **`prefers-reduced-motion` fallback** for every animation system, always.
 - **Acceptance checklist** at the end of every master prompt — binary checks the implementer (you, later) can self-verify against.

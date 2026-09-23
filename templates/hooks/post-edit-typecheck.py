@@ -60,12 +60,12 @@ def _silent_exit():
 
 
 def _find_repo_root(start: str) -> str:
-    """Walk up from `start` to the first dir containing a .git, else CLAUDE_PROJECT_DIR."""
+    """Walk up from `start` to the first dir containing a .git (dir or worktree file), else CLAUDE_PROJECT_DIR."""
     d = os.path.abspath(start)
     if os.path.isfile(d):
         d = os.path.dirname(d)
     while True:
-        if os.path.isdir(os.path.join(d, ".git")):
+        if os.path.exists(os.path.join(d, ".git")):  # dir, or the file a worktree carries
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -76,9 +76,17 @@ def _find_repo_root(start: str) -> str:
 
 def _skip_marker(root: str, tool: str) -> str:
     """Marker path under .git/ — never committed, never in the worktree, dies
-    with the clone. Empty string when there is no .git dir (then no skip logic)."""
+    with the clone. In a git worktree (.git is a file) it goes in the shared
+    per-root state dir instead. Empty string when neither exists (no skip logic)."""
     git_dir = os.path.join(root, ".git")
-    return os.path.join(git_dir, f"cc-hook-skip-{tool}") if os.path.isdir(git_dir) else ""
+    if os.path.isdir(git_dir):
+        return os.path.join(git_dir, f"cc-hook-skip-{tool}")
+    if lib and os.path.isfile(git_dir):
+        try:
+            return os.path.join(lib.state_dir(root), f"cc-hook-skip-{tool}")
+        except Exception:  # noqa: BLE001 - no marker just means no skip
+            return ""
+    return ""
 
 
 def _skip_fresh(marker: str) -> bool:

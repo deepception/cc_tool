@@ -27,7 +27,7 @@ cc_tool/
       index.md, log.md             routing table + append-only run ledger seeds
     devcontainer/                files dropped into project .devcontainer/ by cc-devcontainer
       devcontainer.json            base config (cloud-specific mounts/env added at setup)
-      Dockerfile                   node:20 + iptables/ipset + uv + optional cloud CLI
+      Dockerfile                   node:24 + iptables/ipset + uv + optional cloud CLI
       init-firewall.sh             default-deny egress + ipset allowlist
       managed-settings.json        org-policy settings (highest precedence inside container)
     skills/                      project skills copied to .claude/skills/ on cc-setup

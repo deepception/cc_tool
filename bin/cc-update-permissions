@@ -57,7 +57,9 @@ if (( ask_count > 0 )); then
     echo "$diff_output" | awk -F'\t' '$1=="ask" {print "    + " $2}'
 fi
 echo ""
-read -p "Append to $SETTINGS_FILE? [Y/n] " confirm
+# `|| confirm=Y`: no terminal and nothing piped in (cc-update-project from
+# Claude's Bash tool, cron) is EOF, which would abort under set -e mid-update.
+read -p "Append to $SETTINGS_FILE? [Y/n] " confirm || confirm=Y
 if [[ "$confirm" =~ ^[Nn]$ ]]; then
     echo "Aborted."
     exit 0

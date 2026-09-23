@@ -47,7 +47,9 @@ _SYSTEM_PREFIXES = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64",
 _HOME_DOTFILES = {".bashrc", ".zshrc", ".profile", ".bash_profile", ".zprofile", ".zshenv",
                   ".gitconfig", ".npmrc", ".pypirc", ".netrc", ".git-credentials"}
 _HOME_DOTDIRS = (".ssh", ".aws", ".gnupg", ".config/gh", ".kube", ".docker")
-_SCRATCH_ALLOW = ("/tmp/", "/var/tmp/", "/var/folders/", "/private/tmp/")
+# realpath() resolves macOS's /var and /tmp symlinks to /private/…, so both spellings.
+_SCRATCH_ALLOW = ("/tmp/", "/var/tmp/", "/var/folders/", "/private/tmp/", "/private/var/tmp/",
+                  "/private/var/folders/")
 
 _SECRET_PATTERNS = [
     ("private key block", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----")),
@@ -136,7 +138,7 @@ def check_location(root: str, path: str, settings: dict) -> None:
     if home and _under(real, os.path.join(home, ".claude")):
         return  # Claude's own memory / settings
     tmpdir = os.environ.get("TMPDIR", "")
-    if any(h in real + "/" for h in _SCRATCH_ALLOW) or (tmpdir and _under(real, os.path.realpath(tmpdir))):
+    if any((real + "/").startswith(h) for h in _SCRATCH_ALLOW) or (tmpdir and _under(real, os.path.realpath(tmpdir))):
         return
     mode = settings.get("write_outside_repo", "ask")
     if mode == "off":

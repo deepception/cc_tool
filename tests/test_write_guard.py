@@ -112,6 +112,7 @@ CASES = [
     ("M01", "malformed", ROOT, "Write", "@@RAW@@not json", "s", A),
     ("M02", "malformed", ROOT, "Write", "@@RAW@@{\"tool_input\": null}", "s", A),
     ("M03", "malformed", ROOT, "Write", {"content": "no path"}, "s", A),
+    ("L09", "location", ROOT, "Write", {"file_path": os.path.join(OUTSIDE, "tmp", "evil.py"), "content": "x"}, "s", K),
 ]
 
 

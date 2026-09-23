@@ -2,7 +2,7 @@
 """Warn when the session's context window is filling up (Stop hook).
 
 Reads the latest token-usage figures from the session transcript and prints a
-one-line warning to stderr (visible to the user, NOT added to Claude's context)
+one-line systemMessage (shown to the user, NOT added to Claude's context)
 when usage crosses a threshold, suggesting /compact or /clear.
 
 Silent below threshold and on any error — never breaks the session. Parses
@@ -12,7 +12,7 @@ the format changes this no-ops gracefully.
 Tunables (env vars):
   CONTEXT_USAGE_LIMIT     token budget to measure against. When unset, derived
                           from the session model — 1,000,000 for the families in
-                          NATIVE_1M_FAMILIES (Opus 5, Sonnet 5, Fable 5.x,
+                          NATIVE_1M_FAMILIES (Opus 5.x, Sonnet 5, Fable 5.x,
                           Mythos 5.x, Opus 4.8, Opus 4.7), 200,000 otherwise.
                           Set this to override.
   CONTEXT_USAGE_WARN_PCT  warn at/above this percent (default 80)
@@ -38,7 +38,8 @@ WARN_PCT = int(os.environ.get("CONTEXT_USAGE_WARN_PCT", "80"))
 # mapping were wrong because they were written from recall instead.
 #
 # Family substrings, so Bedrock/Vertex-prefixed and date-suffixed ids match.
-# Note "opus-5" does not match "claude-opus-4-5", nor "sonnet-5" "claude-sonnet-4-5".
+# "opus-5" covers claude-opus-5 and claude-opus-5-5, but does not match
+# "claude-opus-4-5"; nor does "sonnet-5" match "claude-sonnet-4-5".
 NATIVE_1M_FAMILIES = (
     "opus-5", "sonnet-5", "fable-5", "mythos-5",   # the lineup in use
     "opus-4-8", "opus-4-7",                        # still 1M in-harness
@@ -124,11 +125,15 @@ def main() -> None:
     if pct < WARN_PCT:
         return
 
-    print(
-        f"[context-usage] {used // 1000}K / {limit // 1000}K tokens ({pct}%). "
-        f"Consider /compact or /clear before the window fills.",
-        file=sys.stderr,
-    )
+    # A Stop hook's stderr on exit 0 is discarded by Claude Code; only the
+    # JSON systemMessage field reaches the user. Every earlier version of
+    # this hook printed to stderr, so nobody ever saw the warning.
+    print(json.dumps({
+        "systemMessage": (
+            f"[context-usage] {used // 1000}K / {limit // 1000}K tokens ({pct}%). "
+            f"Consider /compact or /clear before the window fills."
+        )
+    }))
 
 
 if __name__ == "__main__":

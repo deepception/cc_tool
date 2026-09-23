@@ -51,7 +51,7 @@ always will be — this is inherent to the approach, not a TODO:
 
     B=master; git push origin $B     git push origin "$(echo master)" / `...` / $'mas\\x74er'
     F=.env; grep KEY $F              grep KEY .en*  (glob / brace expansion)
-    sh -c '...' / bash -c '...'      eval, heredoc-fed interpreters, base64 | sh
+    sh -c '...' / bash -c '...'      eval, heredocs fed to non-shell interpreters, base64 | sh
     git${IFS}commit                  computed paths: open(chr(46)+'env')
 
 Every one of those requires the caller to be *actively evading* the guard. This
@@ -72,6 +72,7 @@ explanation rather than letting the command through. It fails OPEN only where th
 still covers git commit/push. A payload it simply has no opinion on (no
 `command` key, empty command) exits 0 silently.
 """
+import bisect
 import json
 import os
 import re
@@ -201,7 +202,7 @@ def current_branch(repo_args=()) -> str:
 
 
 # ── Tokenizing ────────────────────────────────────────────────────────────────
-_SHELL_OP_CHARS = set("();<>|&")
+_SHELL_OP_CHARS = set("();<>|&\n")
 # Operator tokens that DON'T end a pipeline (a pipeline is the unit for `xargs`).
 _PIPE_TOKENS = {"|", "|&"}
 _GIT_GLOBAL_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
@@ -209,18 +210,200 @@ _GIT_GLOBAL_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
 _GIT_REPO_VALUE_OPTS = {"-C", "--git-dir", "--work-tree"}
 _GIT_REPO_INLINE_OPTS = ("--git-dir=", "--work-tree=")
 _PUSH_VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
+_GIT_CONFIG_READ_OPTS = {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--unset",
+                         "--unset-all", "-l", "--list"}
+
+
+_HEREDOC_OP_RE = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([A-Za-z0-9_.-]+)\3")
+# A heredoc whose opening line runs a shell (`bash <<EOF`, `cat <<EOF | sh`,
+# `ssh host <<EOF`) feeds its body in as commands; any other heredoc is data.
+_HEREDOC_EXEC_RE = re.compile(r"(?:^|[\s|;&(])(?:\S*/)?(?:sh|bash|zsh|dash|ksh|fish|ssh)(?=$|[\s|;&)])")
+_SUBST_RE = re.compile(r"\$\(([^()]*(?:\([^()]*\)[^()]*)*)\)|`([^`]*)`")
+_COMMENT_CONTEXT = set(" \t\n;&|()<>")
+
+
+def shell_prepass(cmd: str) -> str:
+    """Rewrite a command string the way the shell reads it, before tokenizing.
+
+    Quote-aware (with a context stack, so quotes nested inside `$(…)` or
+    backticks open a fresh context as they do in bash), so a `#` or `<<` inside
+    quotes stays text:
+      - `\\<newline>` line continuations are joined (bash removes them), so
+        `rm -rf \\<newline> ~` reads as one command, not `rm -rf` then `~`.
+      - unquoted `#` comments are dropped up to, not including, the newline;
+        shlex's own comment handling swallowed the newline and merged the next
+        line into the comment's command.
+      - a heredoc body is data unless its opening line runs a shell: data bodies
+        are replaced by just the `$(…)`/backtick substitutions an unquoted
+        delimiter would still execute; shell-fed bodies stay, as commands.
+    """
+    out: list = []
+    i, n = 0, len(cmd)
+    # Contexts: "top", "sub" ($(…)), "par" (plain parens inside a sub), "bq"
+    # (backticks), '"', "'", "$'". Only "top"/"sub"/"par"/"bq" see comments.
+    stack = ["top"]
+    pending: list = []    # heredocs opened on the current top-level line: (delim, expands)
+    line_start = 0        # index in `out` where the current line began
+    term_index: dict = {}  # built on first heredoc: stripped line -> [(start, end)]
+
+    def last_char() -> str:
+        for piece in reversed(out):
+            if piece:
+                return piece[-1]
+        return "\n"
+
+    while i < n:
+        c = cmd[i]
+        ctx = stack[-1]
+        if ctx in ("'", "$'"):
+            if ctx == "$'" and c == "\\" and i + 1 < n:
+                out.append(cmd[i:i + 2])
+                i += 2
+                continue
+            out.append(c)
+            i += 1
+            if c == "'":
+                stack.pop()
+            continue
+        if c == "\\" and i + 1 < n:
+            nxt = cmd[i + 1]
+            if nxt == "\n":
+                i += 2
+                continue
+            if nxt == "\r" and cmd[i + 2:i + 3] == "\n":
+                i += 3
+                continue
+            out.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if c == "$" and cmd[i + 1:i + 2] == "(" and cmd[i + 2:i + 3] != "(":
+            stack.append("sub")
+            out.append("$(")
+            i += 2
+            continue
+        if c == "`":
+            if ctx == "bq":
+                stack.pop()
+            else:
+                stack.append("bq")
+            out.append(c)
+            i += 1
+            continue
+        if ctx == '"':
+            out.append(c)
+            i += 1
+            if c == '"':
+                stack.pop()
+            continue
+        # ── unquoted (top level, or inside $(…) / backticks) ──
+        if c in ("'", '"'):
+            stack.append(c)
+            out.append(c)
+            i += 1
+            continue
+        if c == "$" and cmd[i + 1:i + 2] == "'":
+            stack.append("$'")
+            out.append("$'")
+            i += 2
+            continue
+        if c == "(" and ctx in ("sub", "par"):
+            stack.append("par")
+        elif c == ")" and ctx in ("sub", "par"):
+            stack.pop()
+        if c == "#" and last_char() in _COMMENT_CONTEXT:
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if cmd.startswith("<<<", i):
+            out.append("<<<")
+            i += 3
+            continue
+        if ctx == "top" and cmd.startswith("<<", i):
+            m = _HEREDOC_OP_RE.match(cmd, i)
+            if m:
+                pending.append((m.group(4), not (m.group(2) or m.group(3))))
+                out.append(m.group(0))
+                i = m.end()
+                continue
+        out.append(c)
+        i += 1
+        if c == "\n" and ctx == "top":
+            if pending:
+                line = "".join(out[line_start:])
+                if not term_index:
+                    pos = 0
+                    for text in cmd.split("\n"):
+                        term_index.setdefault(text.strip(), []).append((pos, pos + len(text)))
+                        pos += len(text) + 1
+                i = _consume_heredocs(cmd, i, pending, line, out, term_index)
+                pending = []
+            line_start = len(out)
+    return "".join(out)
+
+
+def _consume_heredocs(cmd, i, pending, line, out, term_index) -> int:
+    """Handle the bodies of the heredocs opened on `line`; return where commands resume.
+
+    Terminator matching is lenient (surrounding whitespace ignored), so a body
+    can only end early, which reads leftover body lines as commands: a false
+    positive, never a skipped command. An unterminated heredoc is left as
+    commands for the same reason.
+    """
+    feeds_shell = bool(_HEREDOC_EXEC_RE.search(line))
+    for delim, expands in pending:
+        spans = term_index.get(delim, [])
+        k = bisect.bisect_left(spans, (i, -1))
+        if k >= len(spans):
+            return i
+        body_end, term_end = spans[k]
+        body = cmd[i:body_end]
+        if feeds_shell:
+            out.append(shell_prepass(body))
+        elif expands:
+            subs = "".join((a or b) + "\n" for a, b in _SUBST_RE.findall(body))
+            if subs:
+                out.append(subs)
+        i = min(term_end + 1, len(cmd))
+    return i
+
+
+_CONTINUATION_OPS = {"|", "|&", "&&", "||"}
+
+
+def _normalize_ops(tokens):
+    """shlex glues a newline onto the operator before it (`|\\n`, `;\\n`) and
+    keeps a newline after an operator as its own token. A newline after `|`,
+    `&&` or `||` continues the command; anywhere else it separates like `;`."""
+    out = []
+    for tok in tokens:
+        if "\n" in tok and _is_op(tok):
+            core = tok.replace("\n", "")
+            if core:
+                out.append(core)
+            elif out and (out[-1] in _CONTINUATION_OPS or out[-1] == "\n"):
+                continue
+            else:
+                out.append("\n")
+        else:
+            out.append(tok)
+    return out
 
 
 def tokenize(cmd: str):
-    """shlex tokens, or None if the shell string itself is unparseable.
+    """shlex tokens of an already shell_prepass()ed string, or None if the
+    shell string itself is unparseable.
 
-    punctuation_chars makes ();<>|& (and ';') standalone tokens, so chained
-    commands, redirections, comments and quoted text don't bleed into the parse.
+    punctuation_chars makes ();<>|& standalone tokens, so chained commands,
+    redirections and quoted text don't bleed into the parse. A newline separates
+    commands exactly like ';' (shlex would otherwise read it as whitespace and
+    merge "cd /tmp\\npkill node" into one command whose first word is `cd`).
     """
     try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
+        lex.whitespace = " \t\r"
         lex.whitespace_split = True
-        return list(lex)
+        lex.commenters = ""  # comments were removed by shell_prepass, quote-aware
+        return _normalize_ops(list(lex))
     except ValueError:
         return None
 
@@ -489,7 +672,7 @@ def git_invocations(tokens):
     out = []
     i = 0
     while i < n:
-        if tokens[i] != "git":
+        if _cmd_name(tokens[i]) != "git":
             i += 1
             continue
         j = i + 1
@@ -545,6 +728,30 @@ def check_git(tokens) -> None:
                     "pre-commit/pre-push hooks just like --no-verify. Fix the "
                     "underlying failure instead of skipping the check."
                 )
+
+    # 1b) persistent form of the same bypass: `git config core.hooksPath <dir>`.
+    #     Reading or unsetting it is harmless; pointing it at nothing disables
+    #     every hook; pointing it at a directory is how repos install .githooks,
+    #     so that goes to the user.
+    for sub, _gopts, args, _repo in invocations:
+        if sub != "config":
+            continue
+        keys = [k for k, a in enumerate(args) if a.lower() == "core.hookspath"]
+        if not keys or args[:1] in (["get"], ["unset"], ["list"]) or any(
+                a in _GIT_CONFIG_READ_OPTS for a in args):
+            continue
+        values = [a for a in args[keys[0] + 1:] if not a.startswith("-")]
+        if not values:
+            continue  # `git config core.hooksPath` only prints the value
+        if values[0].strip() in ("", "/dev/null") or values[0].lower() == "nul":
+            deny(
+                "'git config core.hooksPath' pointed at nothing disables the project's "
+                "pre-commit/pre-push hooks for every future command, the persistent form of "
+                "--no-verify. Fix the underlying failure instead of skipping the check."
+            )
+        ask(f"'git config core.hooksPath {values[0]}' changes which hooks run for every future "
+            "git command in this repo",
+            "confirm the directory holds the project's own hooks (a checked-in .githooks is the usual case)")
 
     # 2) commit to a protected branch
     for sub, _gopts, args, repo in invocations:
@@ -613,14 +820,17 @@ def check_git_unparseable(cmd: str) -> None:
     reason to start blocking ordinary work, but it is also not a reason to stop
     looking for a push to master.
     """
-    if not re.search(r"(^|[\s;&|])git\s", cmd):
+    if not re.search(r"(^|[\s;&|])(?:\S*/)?git\s", cmd):
         return
+    if re.search(r"(^|[\s;&|])(?:\S*/)?git\s+push\b[^|;&\n]*?(?:\s--force(?=\s|$)|\s-[a-zA-Z]*f[a-zA-Z]*(?=\s|$))", cmd):
+        deny("'git push --force' overwrites whatever the remote has, including commits you have not seen",
+             "git push --force-with-lease (refuses if the remote moved), and only on a branch nobody else builds on")
     if re.search(r"(^|\s)--no-verify(\s|$)", cmd):
         deny(
             "bypass pre-commit/pre-push hooks via --no-verify. "
             "Fix the underlying failure (lint/format/test) instead of skipping the check."
         )
-    if re.search(r"(^|[\s;&|])git\s+commit\b", cmd) and not re.search(r"--amend\b", cmd):
+    if re.search(r"(^|[\s;&|])(?:\S*/)?git\s+commit\b", cmd) and not re.search(r"--amend\b", cmd):
         branch = current_branch()
         if branch in PROTECTED:
             deny(
@@ -663,6 +873,16 @@ def check_git_unparseable(cmd: str) -> None:
 #          user decides, and in an unattended run "ask" resolves to a refusal.
 _WRAPPERS = {"sudo", "env", "nohup", "command", "exec", "time", "nice", "ionice", "doas"}
 _WRAPPERS_WITH_VALUE = {"timeout": 1, "nice": 0, "ionice": 0}
+# Wrapper flags that consume the next token, so `sudo -u root rm -rf /` still
+# resolves to rm rather than to `root`.
+_WRAPPER_VALUE_FLAGS = {
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "--user", "--group"},
+    "doas": {"-u", "-C"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "-p", "--class", "--classdata", "--pid"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "env": {"-u", "-C", "-S", "--unset", "--chdir", "--split-string"},
+}
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
 _INTERPRETERS = _SHELLS | {"python", "python3", "node", "perl", "ruby", "php", "deno", "bun"}
 _FETCHERS = {"curl", "wget", "fetch"}
@@ -674,6 +894,14 @@ _RM_CATASTROPHIC = {"/", "/*", "~", "~/", "~/*", "$HOME", "$HOME/", "$HOME/*", "
                     "./", "../", ".git", "./.git", ".claude", "./.claude"}
 _RM_SYSTEM_PREFIXES = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc",
                        "/root", "/sbin", "/sys", "/usr", "/var")
+# Per-user temp space under /var (macOS $TMPDIR lives in /var/folders).
+_SCRATCH_PREFIXES = ("/var/tmp/", "/var/folders/")
+# find predicates that select files by name, path, age, size or owner — enough to
+# turn `find . -delete` (the whole project) into a targeted clean-up. -type is not
+# one: `find . -type f -delete` still empties the project.
+_FIND_NARROWING = {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex",
+                   "-iregex", "-newer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin",
+                   "-size", "-empty", "-user", "-group", "-perm", "-samefile", "-lname", "-ilname"}
 # Deleting these is never "just cleaning up": lockfiles, ignore rules, CI, container
 # and migration files carry state that is expensive or impossible to recreate.
 _PROTECTED_BASENAMES = {
@@ -682,9 +910,9 @@ _PROTECTED_BASENAMES = {
     "go.sum", "composer.lock", "flake.lock", "mix.lock",
     ".gitignore", ".gitattributes", "Dockerfile", "docker-compose.yml",
     "docker-compose.yaml", "compose.yml", "compose.yaml",
-    ".gitlab-ci.yml", "Jenkinsfile", ".travis.yml",
+    ".gitlab-ci.yml", "Jenkinsfile", ".travis.yml", "dependabot.yml", "dependabot.yaml",
 }
-_PROTECTED_PATH_PARTS = ("/.github/workflows/", "/migrations/", "/.github/")
+_PROTECTED_PATH_PARTS = ("/.github/workflows/", "/.github/actions/", "/migrations/")
 _PKG_CONFIG_FILES = {".npmrc", ".yarnrc", ".yarnrc.yml", "pip.conf", "pip.ini", ".pypirc",
                      "config.toml"}  # config.toml only when under .cargo/ (checked below)
 _SQL_DROP_RE = re.compile(r"\b(?:DROP\s+(?:DATABASE|SCHEMA|TABLE)|TRUNCATE(?:\s+TABLE)?)\b", re.I)
@@ -706,8 +934,9 @@ def _strip_wrappers(seg):
             i += 1
             skip = _WRAPPERS_WITH_VALUE.get(name, 0)
             # consume the wrapper's own flags / assignments / value
+            vflags = _WRAPPER_VALUE_FLAGS.get(name, set())
             while i < n and (seg[i].startswith("-") or (name == "env" and "=" in seg[i])):
-                i += 1
+                i += 2 if seg[i] in vflags else 1
             i += skip
             continue
         break
@@ -752,7 +981,7 @@ def _check_rm(seg, wrappers) -> None:
             deny(f"'rm' aimed at '{t}' would remove a whole tree that is not the project's to delete "
                  "(a root, the home directory, the repo itself, or its .git/.claude state)",
                  "name the specific files or directories to remove")
-        if t.startswith("/") and (t in _RM_SYSTEM_PREFIXES or t.startswith(tuple(p + "/" for p in _RM_SYSTEM_PREFIXES))):
+        if _is_system_path(t):
             deny(f"'rm' aimed at system path '{t}'", "the project never needs files under there removed")
         if _is_protected_file(t):
             deny(f"deleting '{t}' throws away state that is expensive to recreate (lockfile, ignore "
@@ -761,6 +990,32 @@ def _check_rm(seg, wrappers) -> None:
         if recursive and t.rsplit("/", 1)[-1] in ("node_modules", ".venv", "venv", "target"):
             ask(f"'rm -r' on '{t}' deletes a build/dependency tree; reinstalling is slow but not destructive",
                 "confirm this is intended rather than a stuck build that a clean rebuild would fix")
+
+
+def _is_system_path(t: str) -> bool:
+    if not t.startswith("/") or t.startswith(_SCRATCH_PREFIXES):
+        return False
+    return t in _RM_SYSTEM_PREFIXES or t.startswith(tuple(p + "/" for p in _RM_SYSTEM_PREFIXES))
+
+
+def _check_find_delete(seg) -> None:
+    """`find <roots> <predicates> -delete` (or -exec rm). Roots are the operands
+    before the first predicate. The project directory (`.`) is fine to clean
+    when a name/path/age/size test narrows what goes; a whole tree that is not
+    the project's is refused whatever the predicates."""
+    roots = []
+    for t in seg[1:]:
+        if t.startswith(("-", "(", "!")):
+            break
+        roots.append(_norm_path(t))
+    narrowed = any(t in _FIND_NARROWING for t in seg)
+    for r in roots or ["."]:
+        if r in (".", "./") and narrowed:
+            continue
+        if r in _RM_CATASTROPHIC or _is_system_path(r):
+            deny(f"'find {r} … -delete' removes files under a whole tree that is not the project's to delete",
+                 "narrow it with -name/-path, or run the same find without -delete first and delete "
+                 "the listed paths explicitly")
 
 
 def _check_kill(seg) -> None:
@@ -779,13 +1034,24 @@ def _check_kill(seg) -> None:
         deny("'kill … -1' signals every process the user owns", "kill a specific pid")
 
 
+def _restore_staged_only(sub, args) -> bool:
+    """`git restore --staged .` only unstages; add --worktree/-W and it discards."""
+    if sub != "restore":
+        return False
+    shorts = "".join(_short_flags(a) for a in args)
+    staged = "--staged" in args or "S" in shorts
+    worktree = "--worktree" in args or "W" in shorts
+    return staged and not worktree
+
+
 def _check_git_destructive(tokens) -> None:
     for sub, _gopts, args, _repo in git_invocations(tokens):
         if sub == "push":
             forced = "--force" in args or any(
                 "f" in _short_flags(a) and "F" not in _short_flags(a) for a in args
                 if _short_flags(a) and a not in ("-u",))
-            if forced and "--force-with-lease" not in args and not any(a.startswith("--force-with-lease=") for a in args):
+            forced = forced or any(a.startswith("+") and len(a) > 1 for a in args)
+            if forced:
                 deny("'git push --force' overwrites whatever the remote has, including commits you have not seen",
                      "git push --force-with-lease (refuses if the remote moved), and only on a branch nobody else builds on")
         elif sub == "reset" and "--hard" in args:
@@ -796,7 +1062,7 @@ def _check_git_destructive(tokens) -> None:
                 "run 'git clean -n' first to list what would go, or delete specific files")
         elif sub in ("checkout", "restore") and "." in args and all(
             a in (".", "--") or a.startswith("-") for a in args
-        ):
+        ) and not _restore_staged_only(sub, args):
             ask(f"'git {sub} .' throws away every uncommitted change in the working tree",
                 f"git {sub} -- <specific file>, or git stash to keep the work")
         elif sub == "branch" and ("-D" in args or ("--delete" in args and "--force" in args)):
@@ -924,12 +1190,14 @@ def check_destructive(cmd: str, tokens) -> None:
             _check_rm(real, wrappers)
         elif name in ("kill", "pkill", "killall"):
             _check_kill(real)
+        elif name == "find" and ("-delete" in real or ("-exec" in real and "rm" in real)):
+            _check_find_delete(real)
         else:
             _check_infra(real, wrappers)
     _check_pipelines(tokens)
     _check_redirect_targets(tokens)
     _check_sql(cmd, tokens)
-    if "git" in set(tokens):
+    if any(_cmd_name(t) == "git" for t in tokens):
         _check_git_destructive(tokens)
 
 
@@ -990,7 +1258,7 @@ def check_write_bypass(tokens) -> None:
         if name in ("ex", "ed", "patch"):
             warn(_bypass_note(_quoted(srcs[0]), name))
             return
-    for sub, _g, args, _r in git_invocations(tokens) if "git" in set(tokens) else []:
+    for sub, _g, args, _r in git_invocations(tokens) if any(_cmd_name(t) == "git" for t in tokens) else []:
         if sub == "apply" and "--check" not in args and "--stat" not in args:
             warn(_bypass_note("the patched files", "git apply"))
             return
@@ -1071,18 +1339,19 @@ def main() -> None:
             f"you are sure it does not commit/push to a protected branch or read secrets."
         )
 
-    tokens = tokenize(cmd)
+    prepped = shell_prepass(cmd)
+    tokens = tokenize(prepped)
     if tokens is None:
         # Unparseable shell string (e.g. unbalanced quotes). The secret scan
         # can't guess at it — that half stays fail-open, as before — but the git
         # half still gets its regex fallback.
-        check_git_unparseable(cmd)
+        check_git_unparseable(prepped)
         check_project_rules(cmd)
         flush_warnings()
         sys.exit(0)
 
     check_secret_read(tokens)
-    if "git" in set(tokens):  # cheap gate before the invocation walk
+    if any(_cmd_name(t) == "git" for t in tokens):  # cheap gate before the invocation walk
         check_git(tokens)
     check_destructive(cmd, tokens)
     check_project_rules(cmd)

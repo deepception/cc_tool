@@ -50,7 +50,7 @@ Show this to the user, then immediately proceed to Step 5. The user reads and th
 
 ### 5. Design multiple interfaces
 
-Spawn a small number of sub-agents in parallel (three is usually right) using the Agent tool. Each must produce a **radically different** interface for the deepened module.
+Spawn a small number of sub-agents in parallel using the Agent tool — as many as there are genuinely distinct approaches worth seeing, not a fixed count. Each must produce a **radically different** interface for the deepened module.
 
 This is a deliberate exception to the delegation guidance in CLAUDE.md: the value here comes from genuinely independent designs produced without sight of each other, which one agent cannot reproduce sequentially. It is not a licence to fan out on ordinary work.
 

@@ -1,12 +1,12 @@
 export const meta = {
   name: 'ship-pipeline',
-  description: 'Four-agent team that ships one feature end-to-end: Planner (Opus 5) → Coder (Sonnet 5) → Tester (Sonnet 5) → Reviewer (Opus 5), each handing structured output to the next.',
+  description: 'Four-agent team that ships one feature end-to-end: Planner (Opus 5.5) → Coder (Sonnet 5) → Tester (Sonnet 5) → Reviewer (Opus 5.5), each handing structured output to the next.',
   whenToUse: 'When you want a single well-scoped change driven through plan → implement → test → review with model-tiered agents and a read-only review gate. Parameterize via args.feature (or pass a plain string as args).',
   phases: [
-    { title: 'Plan', detail: 'Opus 5 planner turns the feature request into a concrete, file-level implementation spec' },
+    { title: 'Plan', detail: 'Opus 5.5 planner turns the feature request into a concrete, file-level implementation spec' },
     { title: 'Code', detail: 'Sonnet 5 coder implements the spec and reports a change summary + touched files' },
     { title: 'Test', detail: 'Sonnet 5 tester writes/runs tests against the spec and reports pass/fail evidence' },
-    { title: 'Review', detail: 'Opus 5 reviewer (read-only gate) returns a pass/fail verdict + blocking issues' },
+    { title: 'Review', detail: 'Opus 5.5 reviewer (read-only gate) returns a pass/fail verdict + blocking issues' },
   ],
 }
 
@@ -16,11 +16,11 @@ const cfg = (args && typeof args === 'object') ? args : {}
 const FEATURE = cfg.feature || (typeof args === 'string' ? args.trim() : '')
 if (!FEATURE) return { error: 'No feature provided. Pass args.feature (or a plain request string as args) and re-invoke.' }
 const ROOT = cfg.root || 'the current repository (your working directory)'
-// Planning + review are judgment work: 'opus' or 'fable' (fable is 2x per
-// token with half-price cache reads; at low/medium effort often competitive
-// on cost per task while scoring higher — measure).
+// Planning + review are judgment work: 'opus'; 'fable' only where Opus 5.5 at
+// higher effort still falls short (fable is 2.5x per token and its cache reads
+// cost more than Opus 5.5's).
 // Coding + testing are throughput-bound: 'sonnet'.
-const PLAN_MODEL = cfg.planModel || 'opus'          // Opus 5
+const PLAN_MODEL = cfg.planModel || 'opus'          // Opus 5.5
 const CODE_MODEL = cfg.codeModel || 'sonnet'        // Sonnet 5
 const REVIEW_MODEL = cfg.reviewModel || PLAN_MODEL  // independent review tier if you want one
 
@@ -92,7 +92,7 @@ const REVIEW_SCHEMA = {
   required: ['verdict', 'summary', 'issues', 'meetsAcceptanceCriteria', 'nextSteps'],
 }
 
-// ---- Stage 1: Plan (Opus 5) --------------------------------------------
+// ---- Stage 1: Plan (Opus 5.5) --------------------------------------------
 phase('Plan')
 log(`Planning feature: ${FEATURE.slice(0, 120)}`)
 
@@ -162,7 +162,7 @@ Return the structured test report.`
     )
     return testReport
   },
-  // Stage 4: Review (Opus 5, read-only gate)
+  // Stage 4: Review (Opus 5.5, read-only gate)
   (tests) => {
     log(`Reviewing (tests passed=${tests && tests.passed})`)
     return agent(

@@ -11,13 +11,14 @@ Use these based on the situation. Invoke with the Skill tool (e.g. `superpowers:
 |-----------|-------|
 | Designing a new feature, requirements unclear, multiple approaches possible | `superpowers:brainstorming` |
 | About to write implementation code for a non-trivial feature | `superpowers:writing-plans` |
-| Plan exists in docs/superpowers/plans/, ready to execute | `superpowers:executing-plans` |
+| Plan exists in docs/superpowers/plans/ — execute it with a fresh subagent per task, review after each | `superpowers:subagent-driven-development` |
+| Plan exists, but you are executing it inline yourself (user chose that, or no subagent tool) | `superpowers:executing-plans` |
 | Writing a new module or function with testable behavior | `superpowers:test-driven-development` |
 | A bug was not resolved after the first fix attempt; if several fixes fail, reconsider the architecture | `superpowers:systematic-debugging` |
 | Committing, opening a PR, or reporting a multi-step task done | `superpowers:verification-before-completion` |
 | Independent tasks can run concurrently — consider fanning out | `superpowers:dispatching-parallel-agents` |
 | Significant change is ready for review | `superpowers:requesting-code-review` |
-| Feature work is done, needs merge, PR, or discard | `superpowers:finishing-a-development-branch` |
+| Feature work is done, needs a merge or a PR | `superpowers:finishing-a-development-branch` |
 
 ### Orchestration: which fan-out mechanism
 
@@ -29,7 +30,7 @@ Pick by shape of the work. See the `dynamic-workflows` skill for the pattern cat
 | native `Workflow` tool | dozens–hundreds of agents, OR you want loop-until-done / adversarial cross-checking / a rerunnable script — and intermediate results should stay OUT of main context |
 | agent teams (experimental, gated by `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) | peer Claudes that must message/debate each other |
 
-Model/effort routing on fan-out: repetitive arms on `sonnet` at lower effort; judgment stages — planning, synthesis, verification — on `opus` or `fable` at the effort you have measured for that model (effort names do not mean the same amount of thinking across models). E.g. Planner and Reviewer on the judgment tier, Coder and Tester on `sonnet`. Bake routing into the workflow script when you create it, not mid-run.
+Model/effort routing on fan-out: repetitive arms on `sonnet`, or on `opus` at `low` effort — Opus 5.5 cache reads cost the same as Sonnet 5's ($0.20/MTok), so compare cost per completed task before assuming the cheaper per-token model is cheaper; judgment stages — planning, synthesis, verification — on `opus`, or `fable` where Opus fell short, at the effort you have measured for that model (effort names do not mean the same amount of thinking across models). E.g. Planner and Reviewer on the judgment tier, Coder and Tester on the cheap tier. Bake routing into the workflow script when you create it, not mid-run.
 
 Disable native workflows with `disableWorkflows: true` in settings or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
 
@@ -43,6 +44,7 @@ Designing a loop rather than firing a one-off? The `loop-engineering` skill name
 - **Cost guard** — route per Model routing below: the cheap tier for repetitive parallel arms, the judgment tier only for planning, synthesis, and verification.
 - **No irreversible unattended actions** — draft and queue, don't send and pray. (The bash-guard hook already blocks pushes/commits to protected branches.)
 - **Verification gate** — a loop reports done only when tests / acceptance criteria actually pass, and for unattended runs the judge must not be the worker itself (see Verification protocol).
+- **A turn that ends in text is a report, not completion** — on long multi-part tasks Opus 5.5 sometimes ends a turn on a status update instead of the next tool call, and in a headless or looped run the work stops there. Let `/goal`'s evaluator and the on-disk checklist decide done, not the worker's summary. When the run is visibly unattended — an active `/goal`, a `/loop` or `/schedule` routine, a headless `claude -p` task, or a prompt that says no one is watching — put status notes in the same message as your next tool call, and stop only when nothing can move without the user or before a risky or irreversible action. In an attended session, checking in with the user stays right.
 
 Harness-native loop tools: `/loop` (recurring or self-paced re-invocation) and `/schedule` (cron cloud routines). Caveats: scope each run's tools tightly, define explicit failure handling, and review the post-run logs plus the `/usage` breakdown (spend by skill/subagent/MCP).
 
@@ -66,9 +68,9 @@ Product-UI *motion* is a separate surface: building or tuning a dropdown, modal,
 
 ## Model routing
 
-Default to **claude-opus-5**. Drop to **claude-sonnet-5** for the cheap tier — repetitive parallel arms, high-volume or headless work, scheduled runs. **claude-fable-5-1** is 2x the Opus price per token ($10/$50), but its cache reads cost half Opus 5's ($0.25 vs $0.50/MTok) so long cache-heavy agentic sessions narrow the gap, and at `low`/`medium` effort it is often competitive on cost per task while scoring higher. Use it for demanding reasoning and long-horizon agentic work — multi-hour coding sessions, multistep research, document/spreadsheet/slide deliverables, vision on dense charts and PDFs — or when Opus 5 at higher effort still falls short; never under zero data retention (Fable requires 30-day retention). Switch with `/model`.
+Default to **claude-opus-5-5** ($4/$20 per MTok, cache reads $0.20). Drop to **claude-sonnet-5** ($2/$10) for the cheap tier — repetitive parallel arms, high-volume or headless work, scheduled runs. **claude-fable-5-1** costs 2.5x Opus per token ($10/$50) and more per cache read ($0.25), and Opus 5.5 performs at its level on most work; use it for demanding reasoning and long-horizon agentic work where Opus 5.5 at higher effort still falls short, never under zero data retention (Fable requires 30-day retention). Switch with `/model`.
 
-Opus 5 and Fable run safety classifiers and can decline offensive-security-adjacent work (HTTP 200, `stop_reason: refusal`). Finding vulnerabilities in source code is permitted; false positives come from compile-check phrasing (ask "are there any bugs in this program?", not "does this compile without errors?"), lesser-known languages given without context, and base64 in tool output. On a Fable refusal drop to Opus 5; on an Opus 5 refusal, **claude-opus-4-8** is the documented landing spot.
+Opus 5.5 and Fable run safety classifiers for cybersecurity, biology, and frontier-LLM development, and can decline a request (HTTP 200, `stop_reason: refusal`). Finding vulnerabilities in source code is permitted; false positives come from compile-check phrasing (ask "are there any bugs in this program?", not "does this compile without errors?"), lesser-known languages given without context, and base64 in tool output. The two carry the same class of safeguards, so switching between them doesn't help. Claude Code can reroute a declined Opus 5.5 turn itself; if a decline stands, switch to **claude-opus-4-8** for cybersecurity, **claude-opus-5** for biology or frontier-LLM work. The `reasoning_extraction` category declines prompts that push the model to reproduce its internal reasoning in the reply, and no fallback retries it — never brief a subagent, workflow agent, or skill that way; ask for the conclusion and the evidence behind it.
 
 ---
 
@@ -76,7 +78,7 @@ Opus 5 and Fable run safety classifiers and can decline offensive-security-adjac
 
 For debugging, architecture decisions, complex logic, multi-file changes, or ambiguous requirements: pin down the actual ask and acceptance criteria, and check you are solving the right problem at the right altitude rather than over-engineering. Answer open questions with evidence from the codebase rather than guessing. If contradictory patterns exist, pick one (prefer the more recent / more tested) and flag the conflict rather than silently blending them. For trivial changes (typos, single-line fixes, renames), skip this.
 
-If a task needs deeper reasoning, raise the effort level rather than expanding this prompt. Start at `high`, go to `xhigh` only for capability-sensitive coding or agentic work, then sweep down: `low`/`medium` are unusually strong on current models, and effort defaults do not transfer between models. When you have enough information to act, act — do not re-derive settled facts or survey options you will not pursue.
+If a task needs deeper reasoning, raise the effort level rather than expanding this prompt. Opus 5.5 defaults to `medium`, which matches or beats Opus 5 at `high` on coding and knowledge work, and `low` comes close on several coding evaluations; go to `high` where a measured gain justifies it, and reserve `xhigh`/`max`, where Opus 5.5 thinks much longer per turn, for problems that have shown headroom. Effort defaults do not transfer between models. When you have enough information to act, act — do not re-derive settled facts or survey options you will not pursue.
 
 ---
 
@@ -117,7 +119,7 @@ Context is your most important resource. Use subagents (Agent tool) to keep expl
 
 **Stay in main context for:** direct file edits the user requested, short targeted reads (1-2 files), conversations requiring back-and-forth, tasks where the user needs intermediate steps.
 
-**Keep in the main loop** anything a handful of tool calls would finish, and — in an attended session — review or verification of your own work. (Long or unattended runs are the documented exception: there the judge must not be the worker — see Verification protocol.) Once you have delegated, use the result: don't re-derive a subagent's research or analysis, but do check the diff yourself before claiming its *edits* landed.
+**Keep in the main loop** anything a handful of tool calls would finish, and — in an attended session — *verification* of your own work: running the checks yourself. A *code review* of a finished change is different: `superpowers:requesting-code-review` dispatches a reviewer subagent precisely so the diff and the evaluation stay out of your context. (Long or unattended runs are the documented exception for verification too: there the judge must not be the worker — see Verification protocol.) Once you have delegated, use the result: don't re-derive a subagent's research or analysis, but do check the diff yourself before claiming its *edits* landed.
 
 When you do fan out: prefer async subagents (kick them off and check results non-blocking) over blocking joins, and favor long-lived subagents that reuse cached reads over many short-lived ones.
 

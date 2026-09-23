@@ -44,13 +44,57 @@ echo ""
 
 # ── 1. Hook scripts ───────────────────────────────────────────────────────────
 mkdir -p "$PROJECT_DIR/.claude/hooks"
-find "$CC_TOOL_DIR/templates/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) \
-    -exec cp {} "$PROJECT_DIR/.claude/hooks/" \;
+# Copy each hook unless the project's copy carries local edits (its content
+# matches no version cc_tool has ever shipped) -- same blob-id test as the
+# skill refresh. The typecheck hook's own docstring tells users to raise its
+# TIMEOUT; an unconditional copy silently undid that on every update.
+python3 - "$CC_TOOL_DIR" "$PROJECT_DIR" <<'EOF'
+import hashlib, shutil, subprocess, sys
+from pathlib import Path
+
+cc_tool, project = Path(sys.argv[1]), Path(sys.argv[2])
+tdir, hdir = cc_tool / "templates" / "hooks", project / ".claude" / "hooks"
+PREFIX = "templates/hooks/"
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", str(cc_tool), *args], capture_output=True, text=True).stdout
+
+
+def blob_oid(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+shipped = {}
+for commit in git("log", "--all", "--format=%H", "--", PREFIX).split():
+    for line in git("ls-tree", "-r", commit, "--", PREFIX).splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == "blob" and path.startswith(PREFIX):
+            shipped.setdefault(path[len(PREFIX):], set()).add(parts[2])
+
+kept = []
+for src in sorted(tdir.iterdir()):
+    if not src.is_file() or src.suffix not in (".py", ".sh"):
+        continue
+    dst = hdir / src.name
+    if dst.is_file():
+        have = blob_oid(dst.read_bytes())
+        if have == blob_oid(src.read_bytes()):
+            continue
+        if have not in shipped.get(src.name, set()):
+            kept.append(src.name)
+            continue
+    shutil.copy2(src, dst)
+if kept:
+    print("  • kept locally-modified hook(s), not overwritten: " + ", ".join(kept))
+    print("    (delete the project copy to adopt the current template)")
+EOF
 find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -name "*.sh" -exec chmod +x {} \;
 
 # Prune hooks cc_tool used to ship and no longer does. Copying alone left them
-# behind forever: the settings.json hooks block is replaced wholesale, so an
-# orphan stops being registered but the file lingers as dead weight — and a
+# behind forever: cc_tool's entries in the settings.json hooks block are rebuilt
+# from the template, so an orphan stops being registered but the file lingers as dead weight — and a
 # reader can't tell it from a live guard. A file is only removed when cc_tool has
 # shipped that exact filename at some point AND the project's copy still matches
 # a version cc_tool shipped. So a project's OWN hooks (never shipped by cc_tool)
@@ -103,7 +147,7 @@ if kept:
           % ", ".join(sorted(kept)))
 EOF
 
-hook_count=$(find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) | wc -l | tr -d ' ')
+hook_count=$(find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) ! -name cc_hooklib.py | wc -l | tr -d ' ')
 echo "  ✓ .claude/hooks/ installed ($hook_count hooks)"
 
 # ── 2. settings.json (merge hooks, preserve permissions) ────────────────────
@@ -116,8 +160,63 @@ if [[ -f "$SETTINGS_FILE" ]]; then
 import json, sys
 settings = json.load(open(sys.argv[1]))
 template = json.load(open(sys.argv[2]))
-# The template's own "hooks" block is the single source of truth — no second copy to drift.
-settings["hooks"] = template["hooks"]
+# The template's "hooks" block is the source of truth for cc_tool's OWN hooks,
+# but the project may register hooks of its own and may have tuned a cc_tool
+# hook's timeout (post-edit-typecheck's docstring says to). Replacing the block
+# wholesale threw both away on every update. Merge instead:
+#   - cc_tool entries come from the template; a matching existing entry
+#     (same command) keeps the project's timeout
+#   - entries whose command is not a cc_tool hook are carried over untouched
+import os, re
+cc_hooks = set(os.listdir(os.path.join(os.path.dirname(sys.argv[2]), "hooks")))
+
+# Only a hook script under THIS project's .claude/hooks/ can be cc_tool's:
+# $CLAUDE_PROJECT_DIR/.claude/hooks/x, or a relative .claude/hooks/x. A path
+# like ~/.claude/hooks/x is the user's own global script.
+_PROJ_HOOK_RE = re.compile(
+    r"(?:\$\{?CLAUDE_PROJECT_DIR\}?\"?/|(?<![\w~./-])(?:\./)?)\.claude/hooks/([^\s\"']+)")
+
+def _script(cmd):
+    m = _PROJ_HOOK_RE.search(cmd or "")
+    return m.group(1) if m else None
+
+old_hooks = settings.get("hooks") or {}
+old_timeout = {}
+for entries in old_hooks.values():
+    for e in entries or []:
+        for h in e.get("hooks") or []:
+            if "timeout" in h:
+                old_timeout[h.get("command")] = h["timeout"]
+
+merged = {}
+for event, entries in template["hooks"].items():
+    new_entries = []
+    for e in entries:
+        e = json.loads(json.dumps(e))
+        for h in e.get("hooks") or []:
+            if h.get("command") in old_timeout:
+                h["timeout"] = old_timeout[h["command"]]
+        new_entries.append(e)
+    merged[event] = new_entries
+proj_hooks_dir = os.path.join(os.path.dirname(sys.argv[1]), "hooks")
+def _project_owned(h):
+    s = _script(h.get("command"))
+    if s is None:
+        return True                      # inline command, not a hook script at all
+    # not a cc_tool hook, and its script still exists (a retired cc_tool hook
+    # was pruned above, so its registration must not be carried forward)
+    return s not in cc_hooks and os.path.isfile(os.path.join(proj_hooks_dir, s))
+# Ownership is per hook, not per entry: a project hook added inside one of
+# cc_tool's own entries (same matcher) is split out into an entry of its own.
+for event, entries in old_hooks.items():
+    for e in entries or []:
+        mine = [h for h in (e.get("hooks") or []) if _project_owned(h)]
+        if mine:
+            kept = {k: v for k, v in e.items() if k != "hooks"}
+            kept["hooks"] = mine
+            if kept not in merged.setdefault(event, []):
+                merged[event].append(kept)
+settings["hooks"] = merged
 # Managed attribution policy (keeps Claude out of commit co-authors). Apply each
 # key only where the project hasn't set its own — never clobber user overrides,
 # so re-runs stay idempotent (same additive approach as the permissions merge).
@@ -284,7 +383,7 @@ TEMPLATE="$CC_TOOL_DIR/templates/CLAUDE_template.md"
 
 inject_snippet() {
     if [[ ! -f "$CLAUDE_MD" ]]; then
-        cat "$TEMPLATE" "$SNIPPET" > "$CLAUDE_MD"
+        { cat "$TEMPLATE"; echo; cat "$SNIPPET"; } > "$CLAUDE_MD"
         echo "  ✓ CLAUDE.md created (project template + agent guidance)"
         echo "    Fill in placeholders marked with <!-- --> before committing"
         return
@@ -305,7 +404,10 @@ if START in content and END in content:
     # Preferred path: replace exactly between the managed markers.
     pre = content[: content.index(START)]
     post = content[content.index(END) + len(END):]
-    new = pre.rstrip() + "\n\n" + snippet + "\n" + post.lstrip("\n")
+    # One blank line on each side of the block, whatever was there before, so
+    # a re-run is byte-identical.
+    tail = "\n" + post.lstrip("\n") if post.strip() else ""
+    new = (pre.rstrip() + "\n\n" if pre.strip() else "") + snippet + "\n" + tail
     action = "updated (managed block replaced)"
 elif "## AI agent tools" in content:
     # Legacy: snippet was appended without markers and is the trailing block.
@@ -324,7 +426,10 @@ EOF
 }
 
 echo ""
-read -p "Inject/update agent guidance in CLAUDE.md (superpowers + orchestration + critical rules)? [Y/n] " inject_confirm
+# `|| …=Y`: with no terminal and nothing piped in (Claude's Bash tool, cron, CI)
+# `read` hits EOF and would abort under set -e before the CLAUDE.md block. A
+# piped answer ("n") is still honoured.
+read -p "Inject/update agent guidance in CLAUDE.md (superpowers + orchestration + critical rules)? [Y/n] " inject_confirm || inject_confirm=Y
 if [[ ! "$inject_confirm" =~ ^[Nn]$ ]]; then
     inject_snippet
 fi

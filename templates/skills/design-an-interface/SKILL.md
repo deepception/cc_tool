@@ -23,7 +23,7 @@ Ask: "What does this module need to do? Who will use it?"
 
 ### 2. Generate Designs (Parallel Sub-Agents)
 
-Spawn a small number of sub-agents in parallel (three is usually right) using the Agent tool. Each must produce a **radically different** approach.
+Spawn a small number of sub-agents in parallel using the Agent tool — as many as there are genuinely distinct approaches worth seeing, not a fixed count. Each must produce a **radically different** approach.
 
 This is a deliberate exception to the delegation guidance in CLAUDE.md: the value comes from independent designs produced without sight of each other, which one agent cannot reproduce sequentially. It is not a licence to fan out on ordinary work.
 

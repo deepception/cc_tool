@@ -34,13 +34,14 @@ if claude plugin install superpowers; then
     echo "Available skills (invoke manually by telling Claude):"
     echo "  superpowers:brainstorming              design before any code"
     echo "  superpowers:writing-plans              test-first implementation plan"
-    echo "  superpowers:executing-plans            run the plan via subagents"
+    echo "  superpowers:subagent-driven-development  run the plan, a fresh subagent per task"
+    echo "  superpowers:executing-plans            run the plan inline yourself"
     echo "  superpowers:test-driven-development     strict red-green-refactor"
     echo "  superpowers:systematic-debugging       root-cause before any fix"
     echo "  superpowers:verification-before-completion  hard gate: run tests, read output"
     echo "  superpowers:dispatching-parallel-agents    independent tasks in parallel"
     echo "  superpowers:requesting-code-review     isolated code review subagent"
-    echo "  superpowers:finishing-a-development-branch  merge/PR/discard with cleanup"
+    echo "  superpowers:finishing-a-development-branch  merge/PR with cleanup"
 else
     echo ""
     echo "✗ Installation failed." >&2
