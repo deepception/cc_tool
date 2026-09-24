@@ -186,3 +186,5 @@ When updating an existing skill:
 - **Over-forceful phrasing**: `CRITICAL` / `MUST` / `ALWAYS` / anti-laziness language — see Writing style; plain imperatives read more reliably
 - **Cargo-cult prescription**: porting every enumerated step from a prior-model skill unchanged — review whether the current model's default behavior already exceeds the scaffold. Today's models are more capable unscaffolded than the ones most existing skills were written for
 - **Hardcoded fan-out floors**: "spawn 3+ agents", "always delegate X" — say *when* delegation pays instead of fixing a count; whether the current model over- or under-delegates changes per release
+- **Thinking instructions**: "think carefully", "think step by step", "ultrathink" — current models think before every reply and decide how much; effort is the control, and the line only delays the answer
+- **Asking for reasoning in the reply**: "show your reasoning", "explain your thinking step by step" — Opus 5.5 can decline it as `reasoning_extraction`, with no fallback retry; ask for what you actually need ("why this approach, in three sentences")

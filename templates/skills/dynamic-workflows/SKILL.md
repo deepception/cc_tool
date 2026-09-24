@@ -6,7 +6,7 @@ user-invocable: true
 
 # Dynamic Workflows
 
-A workflow is a harness Claude writes for THIS task: a JS script that coordinates subagents. Each agent gets its own context (intermediate results stay out of the main conversation), its own model (`sonnet` for throughput; `opus` for judgment, `fable` only where Opus 5.5 at higher effort still falls short — it is 2.5x `opus` per token; see Model routing in CLAUDE.md), and its own isolation level (worktree or none). The structure — not better prompting — is what fixes three failure modes of long single-context work:
+A workflow is a harness Claude writes for THIS task: a JS script that coordinates subagents. Each agent gets its own context (intermediate results stay out of the main conversation), its own effort level (every agent runs on Opus 5.5, forced by the project's settings, so `effort` is the cost lever: `low` for throughput arms, higher for judgment; see Orchestration in CLAUDE.md), and its own isolation level (worktree or none). The structure — not better prompting — is what fixes three failure modes of long single-context work:
 
 - **Agentic laziness** — declares done after partial progress. A loop with a stop condition keeps going.
 - **Self-preferential bias** — can't fairly judge its own work. A separate verifier agent can.
@@ -53,7 +53,7 @@ Real workflows compose 2-4 patterns. Map the failure mode you fear to the patter
 Worked examples ship in the cc_tool repo under `.claude/workflows/`:
 
 - `model-recalibration-audit.js` — fan-out research + per-component analysis with adversarial verification, wired as a pipeline.
-- `ship-pipeline.js` — model-tiered pipeline: Opus 5.5 plans and reviews, Sonnet 5 codes and tests, structured hand-offs between stages.
+- `ship-pipeline.js` — plan → code → test → review with a read-only review gate, structured hand-offs between stages, and optional per-stage effort.
 - `loop-until-clean.js` — loop-until-done sweep (stop after two dry rounds) + adversarial verification of survivors.
 
 Treat them as templates to adapt, not scripts to run verbatim — copy one into your project's `.claude/workflows/` to adapt it.

@@ -24,5 +24,6 @@ Your task is to audit all Claude Code skills installed at both project and globa
    - Clarity: Are instructions unambiguous and actionable?
    - Overlapping scopes: Does this skill duplicate another skill or CLAUDE.md content?
    - Token efficiency: Could any content move to a hook or memory instead?
+   - Dated model instructions: "think carefully"-style lines, requests to show reasoning in the reply, hardcoded model names, prices or effort levels (see the anti-patterns in `skill-engineer`)
 7. **Prioritize**: as a separate step, rank the coverage-pass findings by impact (high / medium / low).
 8. **Present findings** and ask the user what changes to implement.

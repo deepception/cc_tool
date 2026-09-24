@@ -1,12 +1,12 @@
 export const meta = {
   name: 'ship-pipeline',
-  description: 'Four-agent team that ships one feature end-to-end: Planner (Opus 5.5) → Coder (Sonnet 5) → Tester (Sonnet 5) → Reviewer (Opus 5.5), each handing structured output to the next.',
-  whenToUse: 'When you want a single well-scoped change driven through plan → implement → test → review with model-tiered agents and a read-only review gate. Parameterize via args.feature (or pass a plain string as args).',
+  description: 'Four-agent team that ships one feature end-to-end: Planner → Coder → Tester → Reviewer, all on Opus 5.5, each handing structured output to the next.',
+  whenToUse: 'When you want a single well-scoped change driven through plan → implement → test → review with separate agents and a read-only review gate. Parameterize via args.feature (or pass a plain string as args).',
   phases: [
-    { title: 'Plan', detail: 'Opus 5.5 planner turns the feature request into a concrete, file-level implementation spec' },
-    { title: 'Code', detail: 'Sonnet 5 coder implements the spec and reports a change summary + touched files' },
-    { title: 'Test', detail: 'Sonnet 5 tester writes/runs tests against the spec and reports pass/fail evidence' },
-    { title: 'Review', detail: 'Opus 5.5 reviewer (read-only gate) returns a pass/fail verdict + blocking issues' },
+    { title: 'Plan', detail: 'Planner turns the feature request into a concrete, file-level implementation spec' },
+    { title: 'Code', detail: 'Coder implements the spec and reports a change summary + touched files' },
+    { title: 'Test', detail: 'Tester writes/runs tests against the spec and reports pass/fail evidence' },
+    { title: 'Review', detail: 'Reviewer (read-only gate) returns a pass/fail verdict + blocking issues' },
   ],
 }
 
@@ -16,13 +16,12 @@ const cfg = (args && typeof args === 'object') ? args : {}
 const FEATURE = cfg.feature || (typeof args === 'string' ? args.trim() : '')
 if (!FEATURE) return { error: 'No feature provided. Pass args.feature (or a plain request string as args) and re-invoke.' }
 const ROOT = cfg.root || 'the current repository (your working directory)'
-// Planning + review are judgment work: 'opus'; 'fable' only where Opus 5.5 at
-// higher effort still falls short (fable is 2.5x per token and its cache reads
-// cost more than Opus 5.5's).
-// Coding + testing are throughput-bound: 'sonnet'.
-const PLAN_MODEL = cfg.planModel || 'opus'          // Opus 5.5
-const CODE_MODEL = cfg.codeModel || 'sonnet'        // Sonnet 5
-const REVIEW_MODEL = cfg.reviewModel || PLAN_MODEL  // independent review tier if you want one
+// Every agent runs on Opus 5.5: cc_tool's settings force the subagent model
+// (CLAUDE_CODE_SUBAGENT_MODEL_FORCE), so a per-agent model would be ignored.
+// Cost is tuned per stage with effort instead; unset means the session level.
+// e.g. args { feature, codeEffort: 'low', reviewEffort: 'high' }
+const EFFORT = { plan: cfg.planEffort, code: cfg.codeEffort, test: cfg.testEffort, review: cfg.reviewEffort }
+const withEffort = (stage, opts) => (EFFORT[stage] ? { ...opts, effort: EFFORT[stage] } : opts)
 
 // ---- schemas (the structured hand-offs between stages) ------------------
 const SPEC_SCHEMA = {
@@ -84,15 +83,16 @@ const REVIEW_SCHEMA = {
       severity: { type: 'string', enum: ['blocking', 'should-fix', 'nit'] },
       location: { type: 'string', description: 'file + line range or symbol' },
       problem: { type: 'string' },
+      showsFailure: { type: 'string', description: 'how to show it fails: a failing input, test, or command (empty for a nit)' },
       suggestion: { type: 'string' },
-    }, required: ['severity', 'location', 'problem', 'suggestion'] } },
+    }, required: ['severity', 'location', 'problem', 'showsFailure', 'suggestion'] } },
     meetsAcceptanceCriteria: { type: 'boolean' },
     nextSteps: { type: 'string', description: 'what to do given the verdict' },
   },
   required: ['verdict', 'summary', 'issues', 'meetsAcceptanceCriteria', 'nextSteps'],
 }
 
-// ---- Stage 1: Plan (Opus 5.5) --------------------------------------------
+// ---- Stage 1: Plan --------------------------------------------------
 phase('Plan')
 log(`Planning feature: ${FEATURE.slice(0, 120)}`)
 
@@ -109,7 +109,7 @@ METHOD:
 - Define acceptance criteria as observable conditions, and a test plan with concrete commands/cases.
 - Prefer the smallest change that satisfies the request; call out risks and anything ambiguous.
 Return the structured spec.`,
-  { label: 'plan:spec', model: PLAN_MODEL, schema: SPEC_SCHEMA }
+  withEffort('plan', { label: 'plan:spec', schema: SPEC_SCHEMA })
 )
 
 // ---- Stages 2-4 as a streaming pipeline: code → test → review ----------
@@ -121,7 +121,7 @@ let codeReport, testReport
 
 const result = await pipeline(
   [spec],
-  // Stage 2: Code (Sonnet 5)
+  // Stage 2: Code
   async (s) => {
     log('Implementing the spec')
     codeReport = await agent(
@@ -136,11 +136,11 @@ METHOD:
 - If you must deviate from the spec, do it deliberately and record it in deviationsFromSpec.
 - Provide the exact command(s) the tester should run in howToTest.
 Set implemented=true only if you actually changed the working tree. Return the structured summary.`,
-      { label: 'code:implement', phase: 'Code', model: CODE_MODEL, schema: CODE_SCHEMA }
+      withEffort('code', { label: 'code:implement', phase: 'Code', schema: CODE_SCHEMA })
     )
     return codeReport
   },
-  // Stage 3: Test (Sonnet 5)
+  // Stage 3: Test
   async (code) => {
     log(`Testing the change (implemented=${code && code.implemented})`)
     testReport = await agent(
@@ -158,11 +158,11 @@ METHOD:
 - Map each acceptance criterion to covered true/false. List concrete failures with the assertion that failed.
 Return the structured test report.`
       ,
-      { label: 'test:verify', phase: 'Test', model: CODE_MODEL, schema: TEST_SCHEMA }
+      withEffort('test', { label: 'test:verify', phase: 'Test', schema: TEST_SCHEMA })
     )
     return testReport
   },
-  // Stage 4: Review (Opus 5.5, read-only gate)
+  // Stage 4: Review (read-only gate)
   (tests) => {
     log(`Reviewing (tests passed=${tests && tests.passed})`)
     return agent(
@@ -180,10 +180,10 @@ ${JSON.stringify(tests, null, 2)}
 METHOD:
 - Inspect the working-tree change (e.g. read the touched files and 'git diff' read-only) against the spec and acceptance criteria.
 - verdict='pass' ONLY if: acceptance criteria are met, tests actually ran and passed (tests.ran && tests.passed), and there are no blocking correctness/security issues. Otherwise verdict='fail'.
-- List issues by severity (blocking / should-fix / nit) with concrete location and suggestion.
+- List issues by severity (blocking / should-fix / nit), each with its file and line, why it is wrong, how to show it fails (a failing input, test, or command the coder can run), and a suggestion. Mark something blocking only if you would stop the merge for it.
 - nextSteps: if fail, what the coder must change; if pass, what remains before merge (the human still commits).
 Return the structured review.`,
-      { label: 'review:gate', phase: 'Review', model: REVIEW_MODEL, schema: REVIEW_SCHEMA }
+      withEffort('review', { label: 'review:gate', phase: 'Review', schema: REVIEW_SCHEMA })
     )
   }
 )
@@ -193,7 +193,7 @@ log(`Pipeline complete — review verdict: ${review && review.verdict}`)
 
 return {
   feature: FEATURE,
-  models: { plan: PLAN_MODEL, code: CODE_MODEL, test: CODE_MODEL, review: REVIEW_MODEL },
+  effort: EFFORT,
   spec,
   code: codeReport,
   tests: testReport,

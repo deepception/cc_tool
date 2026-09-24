@@ -225,8 +225,15 @@ if isinstance(tmpl_attr, dict):
     attr = settings.setdefault("attribution", {})
     for k, v in tmpl_attr.items():
         attr.setdefault(k, v)
+# Managed env (subagents forced onto the default model): same rule — add a key
+# only where the project hasn't set it, so a project override survives updates.
+tmpl_env = template.get("env")
+if isinstance(tmpl_env, dict):
+    env = settings.setdefault("env", {})
+    for k, v in tmpl_env.items():
+        env.setdefault(k, v)
 open(sys.argv[1], "w").write(json.dumps(settings, indent=2) + "\n")
-print("  ✓ .claude/settings.json hooks + attribution updated (permissions preserved)")
+print("  ✓ .claude/settings.json hooks + attribution + env updated (permissions preserved)")
 EOF
 else
     cp "$CC_TOOL_DIR/templates/settings.json" "$SETTINGS_FILE"

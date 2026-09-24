@@ -12,8 +12,8 @@ the format changes this no-ops gracefully.
 Tunables (env vars):
   CONTEXT_USAGE_LIMIT     token budget to measure against. When unset, derived
                           from the session model — 1,000,000 for the families in
-                          NATIVE_1M_FAMILIES (Opus 5.x, Sonnet 5, Fable 5.x,
-                          Mythos 5.x, Opus 4.8, Opus 4.7), 200,000 otherwise.
+                          NATIVE_1M_FAMILIES (Opus 5.x, Sonnet 5, Opus 4.8,
+                          Opus 4.7), 200,000 otherwise.
                           Set this to override.
   CONTEXT_USAGE_WARN_PCT  warn at/above this percent (default 80)
 """
@@ -41,7 +41,7 @@ WARN_PCT = int(os.environ.get("CONTEXT_USAGE_WARN_PCT", "80"))
 # "opus-5" covers claude-opus-5 and claude-opus-5-5, but does not match
 # "claude-opus-4-5"; nor does "sonnet-5" match "claude-sonnet-4-5".
 NATIVE_1M_FAMILIES = (
-    "opus-5", "sonnet-5", "fable-5", "mythos-5",   # the lineup in use
+    "opus-5", "sonnet-5",                          # the lineup in use
     "opus-4-8", "opus-4-7",                        # still 1M in-harness
 )
 

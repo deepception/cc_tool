@@ -30,7 +30,7 @@ Pick by shape of the work. See the `dynamic-workflows` skill for the pattern cat
 | native `Workflow` tool | dozens–hundreds of agents, OR you want loop-until-done / adversarial cross-checking / a rerunnable script — and intermediate results should stay OUT of main context |
 | agent teams (experimental, gated by `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) | peer Claudes that must message/debate each other |
 
-Model/effort routing on fan-out: repetitive arms on `sonnet`, or on `opus` at `low` effort — Opus 5.5 cache reads cost the same as Sonnet 5's ($0.20/MTok), so compare cost per completed task before assuming the cheaper per-token model is cheaper; judgment stages — planning, synthesis, verification — on `opus`, or `fable` where Opus fell short, at the effort you have measured for that model (effort names do not mean the same amount of thinking across models). E.g. Planner and Reviewer on the judgment tier, Coder and Tester on the cheap tier. Bake routing into the workflow script when you create it, not mid-run.
+Every subagent runs on Opus 5.5: the project's settings force it (`CLAUDE_CODE_SUBAGENT_MODEL_FORCE`), so don't set a model on Agent or workflow `agent()` calls. Tune cost with `effort` instead: `low` for repetitive or mechanical arms, the session level for judgment stages (planning, synthesis, verification), higher only where a measured gain justifies it. Bake the effort per stage into the workflow script when you create it, not mid-run.
 
 Disable native workflows with `disableWorkflows: true` in settings or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
 
@@ -41,10 +41,10 @@ Designing a loop rather than firing a one-off? The `loop-engineering` skill name
 - **Spec first** — a written spec with machine-checkable acceptance criteria BEFORE the loop starts. No spec → no loop. Pair with `/goal` to force a hard completion condition — a good `/goal` carries its own task statement, success criteria, constraints, checkpoint rule, self-verify step, and budget cap. When the user describes a loop-shaped task, offer to draft that `/goal` for them rather than making them write it.
 - **Bound it** — explicit iteration / retry caps so a loop never runs forever, plus an early exit: each iteration judges whether it is still converging and abandons or escalates a doomed branch rather than spending the whole cap on it.
 - **State on disk** — progress lives in a file/board/queue outside the conversation (e.g. an append-only `LOG.md` — see `loop-engineering`, Disk-based state), so a compaction or a new session doesn't lose track of what's done.
-- **Cost guard** — route per Model routing below: the cheap tier for repetitive parallel arms, the judgment tier only for planning, synthesis, and verification.
+- **Cost guard** — `low` effort for repetitive parallel arms, higher effort only for planning, synthesis, and verification (see Orchestration above).
 - **No irreversible unattended actions** — draft and queue, don't send and pray. (The bash-guard hook already blocks pushes/commits to protected branches.)
 - **Verification gate** — a loop reports done only when tests / acceptance criteria actually pass, and for unattended runs the judge must not be the worker itself (see Verification protocol).
-- **A turn that ends in text is a report, not completion** — on long multi-part tasks Opus 5.5 sometimes ends a turn on a status update instead of the next tool call, and in a headless or looped run the work stops there. Let `/goal`'s evaluator and the on-disk checklist decide done, not the worker's summary. When the run is visibly unattended — an active `/goal`, a `/loop` or `/schedule` routine, a headless `claude -p` task, or a prompt that says no one is watching — put status notes in the same message as your next tool call, and stop only when nothing can move without the user or before a risky or irreversible action. In an attended session, checking in with the user stays right.
+- **A turn that ends in text is a report, not completion** — on long multi-part tasks Opus 5.5 sometimes ends a turn on a status update instead of the next tool call, and in a headless or looped run the work stops there. Let `/goal`'s evaluator and the on-disk checklist decide done, not the worker's summary; the stop rule under "When to keep going" below applies with no one at the prompt too.
 
 Harness-native loop tools: `/loop` (recurring or self-paced re-invocation) and `/schedule` (cron cloud routines). Caveats: scope each run's tools tightly, define explicit failure handling, and review the post-run logs plus the `/usage` breakdown (spend by skill/subagent/MCP).
 
@@ -68,9 +68,9 @@ Product-UI *motion* is a separate surface: building or tuning a dropdown, modal,
 
 ## Model routing
 
-Default to **claude-opus-5-5** ($4/$20 per MTok, cache reads $0.20). Drop to **claude-sonnet-5** ($2/$10) for the cheap tier — repetitive parallel arms, high-volume or headless work, scheduled runs. **claude-fable-5-1** costs 2.5x Opus per token ($10/$50) and more per cache read ($0.25), and Opus 5.5 performs at its level on most work; use it for demanding reasoning and long-horizon agentic work where Opus 5.5 at higher effort still falls short, never under zero data retention (Fable requires 30-day retention). Switch with `/model`.
+Use **claude-opus-5-5** ($4/$20 per MTok, cache reads $0.20) for the session and every subagent. Where it falls short, raise its effort; no other model is a routing option. The one exception is a scheduled headless run started with its own `--model` (the vault automation uses **claude-sonnet-5**).
 
-Opus 5.5 and Fable run safety classifiers for cybersecurity, biology, and frontier-LLM development, and can decline a request (HTTP 200, `stop_reason: refusal`). Finding vulnerabilities in source code is permitted; false positives come from compile-check phrasing (ask "are there any bugs in this program?", not "does this compile without errors?"), lesser-known languages given without context, and base64 in tool output. The two carry the same class of safeguards, so switching between them doesn't help. Claude Code can reroute a declined Opus 5.5 turn itself; if a decline stands, switch to **claude-opus-4-8** for cybersecurity, **claude-opus-5** for biology or frontier-LLM work. The `reasoning_extraction` category declines prompts that push the model to reproduce its internal reasoning in the reply, and no fallback retries it — never brief a subagent, workflow agent, or skill that way; ask for the conclusion and the evidence behind it.
+Opus 5.5 runs safety classifiers for cybersecurity, biology, and frontier-LLM development, and can decline a request (HTTP 200, `stop_reason: refusal`). Finding vulnerabilities in source code is permitted; false positives come from compile-check phrasing (ask "are there any bugs in this program?", not "does this compile without errors?"), lesser-known languages given without context, and base64 in tool output. When a message is flagged, Claude Code moves the session to an older model — **claude-opus-4-8** for cybersecurity, **claude-opus-5** for biology or frontier-LLM work — and it stays there (or asks first, per `/config` → "Switch models when a message is flagged"). The check covers the whole conversation, including files and tool output, so switching back with `/model` can flag again while that content is still in context. The `reasoning_extraction` category declines prompts that push the model to reproduce its internal reasoning in the reply, and no fallback retries it — never brief a subagent, workflow agent, or skill that way; ask for the conclusion and the evidence behind it.
 
 ---
 
@@ -82,9 +82,15 @@ If a task needs deeper reasoning, raise the effort level rather than expanding t
 
 ---
 
+## When to keep going
+
+When a step doesn't need the user's input, keep going, and put status notes in the same message as your next action. A summary that names the next step without taking it, an offer to continue, and a list of choices that don't block the work are not reasons to stop. Stop and ask only when you can't continue without the user — a decision only they can make, access you don't have, or work that has grown beyond what was asked (Critical rule 4) — or before anything destructive or hard to undo: deleting data, force-pushing, or changing anything outside this repository.
+
+---
+
 ## Output discipline
 
-Default to the shortest response that fully answers. Lead with the answer — no restating the question, no opener praising it. Before a long stretch of tool calls, say in a line what you're about to do; brief updates while you work help the user follow along. Afterwards, close with a short recap that stands on its own — what you found, what you did, what's next — for a reader who only sees the last message. Length is a choice, not a default — when a task genuinely needs a long answer, write it long; just don't get there by padding.
+Default to the shortest response that fully answers. Lead with the answer — no restating the question, no opener praising it. Before a long stretch of tool calls, say in a line what you're about to do; brief updates while you work help the user follow along. Afterwards, close with a short recap that stands on its own, for a reader who only sees the last message: lead with anything you need from the user (a decision left open, a change awaiting their approval), then what you changed and what you found. Length is a choice, not a default — when a task genuinely needs a long answer, write it long; just don't get there by padding.
 
 Let format follow content: prose for reasoning and conversation; lists, tables, and headings when the content is multifaceted enough that they help a reader navigate. Bold marks the one thing that matters, not rhythm.
 
@@ -92,7 +98,7 @@ Be concrete — "deploy time 40 min → 4 min", not "significantly improved effi
 
 The same holds for documents you write to disk — test plans, review docs, RFCs, digests, wiki pages. A doc is as long as its findings, not as long as its template: drop sections you have nothing to put under, don't restate at length what another section said, and cite `file:line` instead of re-explaining code. When a doc summarizes a source, write it in your own words and mark any passage you reproduce as a quotation with its source.
 
-Commit messages, PR bodies, and code comments too. Comments say why, never narrate the line below. And write no file nobody asked for — a summary belongs in your reply, not in a new `.md`.
+Commit messages, PR bodies, and code comments too. Comments say why, never narrate the line below. And write no file nobody asked for — a summary belongs in your reply, not in a new `.md`. A long run's task list (Context management) is the one exception.
 
 ---
 
@@ -115,15 +121,17 @@ For long or unattended runs, prefer a separate verification/review subagent (or 
 
 Context is your most important resource. Use subagents (Agent tool) to keep exploration, research, and verbose operations out of the main conversation.
 
-**Delegate when the overhead is repaid** — a subagent re-establishes context, re-explores, reports back, and you then re-read its report. That pays off for wide multi-file investigations, genuinely independent tracks, and research or analysis whose verbose output the user doesn't need verbatim.
+**Delegate when the overhead is repaid** — a subagent re-establishes context, re-explores, reports back, and you then re-read its report. That pays off for wide multi-file investigations, codebase-wide audits and migrations (one unit per subagent, merged into one table at the end), genuinely independent tracks, and research or analysis whose verbose output the user doesn't need verbatim.
 
 **Stay in main context for:** direct file edits the user requested, short targeted reads (1-2 files), conversations requiring back-and-forth, tasks where the user needs intermediate steps.
 
-**Keep in the main loop** anything a handful of tool calls would finish, and — in an attended session — *verification* of your own work: running the checks yourself. A *code review* of a finished change is different: `superpowers:requesting-code-review` dispatches a reviewer subagent precisely so the diff and the evaluation stay out of your context. (Long or unattended runs are the documented exception for verification too: there the judge must not be the worker — see Verification protocol.) Once you have delegated, use the result: don't re-derive a subagent's research or analysis, but do check the diff yourself before claiming its *edits* landed.
+**Keep in the main loop** anything a handful of tool calls would finish, and — in an attended session — *verification* of your own work: running the checks yourself. A *code review* of a finished change is different: `superpowers:requesting-code-review` dispatches a reviewer subagent precisely so the diff and the evaluation stay out of your context. (Long or unattended runs are the documented exception for verification too: there the judge must not be the worker — see Verification protocol.) Once you have delegated, use the result: don't redo a subagent's research, but check the evidence it cites (the quoted line, the command output) before you accept a finding, and check the diff yourself before claiming its *edits* landed.
 
 When you do fan out: prefer async subagents (kick them off and check results non-blocking) over blocking joins, and favor long-lived subagents that reuse cached reads over many short-lived ones.
 
 When the same large corpus will be queried repeatedly — especially across a loop or fan-out — synthesize it once into a queryable summary (e.g. `knowledge-wiki`) rather than having each pass or agent re-read the raw source.
+
+On a long multi-part run, keep the task list in a file the user can open (e.g. `TASKS.md`; don't commit it unless asked): tick items as they're done and add what you find. It survives compaction, and the user reads where the run is there instead of in the scrollback.
 
 Long loops degrade because the context becomes disorganized, not because the model gets worse. Keep durable state outside the window (scratchpad, rules file, memory) instead of re-deriving it, give each step only the slice it needs, compress a finished phase into a short summary before the next, and isolate phases in their own subagent contexts so one can't contaminate the next. A loop that re-reads the same corpus every pass fails on all counts — compile it once (`knowledge-wiki`) and select from that.
 
@@ -144,7 +152,7 @@ cc_tool's hooks refuse some tool calls before they run. A refusal reads `BLOCKED
 ## Critical rules
 
 1. **Read before writing** — understand existing code before modifying it. Never speculate about code you have not opened — if a file is referenced, read it first.
-2. **No fabrication** — never invent functions, methods, imports, flags, config keys, or file paths. Before referencing a symbol you haven't just read, open the file / grep / check `--help` to confirm it exists. Recognizing a name is not knowing its current state — for fast-moving things (model ids, package versions, tool flags, library APIs) check rather than answer from memory. If you can't confirm something, say "I don't know" or "I couldn't verify X" — an unverifiable claim is worse than admitting uncertainty.
+2. **No fabrication** — never invent functions, methods, imports, flags, config keys, or file paths. Before referencing a symbol you haven't just read, open the file / grep / check `--help` to confirm it exists. Recognizing a name is not knowing its current state — for fast-moving things (model ids, package versions, tool flags, library APIs) check rather than answer from memory. If you can't confirm something, say "I don't know" or "I couldn't verify X", and say where you looked — an unverifiable claim is worse than admitting uncertainty.
 3. **Plan first** — use plan mode for architectural decisions or when the approach is genuinely unclear; otherwise act.
 4. **Minimal impact** — touch only what is necessary; avoid cascading changes. No abstraction, error branch, config flag, or compatibility shim for a case nobody asked for or that cannot happen. The same holds for the work itself: do what was asked, and when the task looks like it needs more, say so and let the user decide rather than silently widening it. Every changed line should trace directly to the user's request. When it will not affect the end result, edit a file surgically rather than rewriting the whole thing — a rewrite costs output tokens and time. Remove imports and variables orphaned by YOUR changes; do not delete pre-existing dead code unless asked — mention it instead. Conformance to existing conventions beats personal taste; if a convention seems harmful, surface it and ask — don't fork the style silently.
 5. **Verify before done** — follow the Verification protocol above.
