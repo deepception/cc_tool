@@ -2,6 +2,10 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.0.20
+
+- **The vault's scheduled runs move to Opus 5.5.** The cron lines in `templates/vault/AUTOMATION.md` and `docs/guides/vault.md` now start `claude -p --model claude-opus-5-5`, where they used Sonnet 5. The managed block and README no longer carve out scheduled headless runs, so Opus 5.5 is the only model the setup routes to, for sessions, subagents and scheduled runs alike. Nothing else needed migrating: the local crontab has no vault jobs, and the one existing project vault (`color-analyzer`) had no Sonnet line.
+
 ## v0.0.19
 
 Changes from Anthropic's Opus 5.5 playbook for Claude and Claude Code ([Getting the most out of Opus 5.5](https://claude.dev/blog/getting-the-most-out-of-opus-5-5/), Addy Osmani, 2026-09-22), the user-facing companion to the API prompting guide v0.0.18 was built from. Most of it was already in v0.0.18: named design defaults, no "think hard" lines, no requests to show reasoning, `/goal` as the finish line. The rest lands here. Claude Code behaviour it describes was checked against the 2.1.280 binary.

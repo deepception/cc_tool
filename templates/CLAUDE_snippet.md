@@ -68,7 +68,7 @@ Product-UI *motion* is a separate surface: building or tuning a dropdown, modal,
 
 ## Model routing
 
-Use **claude-opus-5-5** ($4/$20 per MTok, cache reads $0.20) for the session and every subagent. Where it falls short, raise its effort; no other model is a routing option. The one exception is a scheduled headless run started with its own `--model` (the vault automation uses **claude-sonnet-5**).
+Use **claude-opus-5-5** ($4/$20 per MTok, cache reads $0.20) for the session and every subagent. Where it falls short, raise its effort; no other model is a routing option, scheduled headless runs included.
 
 Opus 5.5 runs safety classifiers for cybersecurity, biology, and frontier-LLM development, and can decline a request (HTTP 200, `stop_reason: refusal`). Finding vulnerabilities in source code is permitted; false positives come from compile-check phrasing (ask "are there any bugs in this program?", not "does this compile without errors?"), lesser-known languages given without context, and base64 in tool output. When a message is flagged, Claude Code moves the session to an older model — **claude-opus-4-8** for cybersecurity, **claude-opus-5** for biology or frontier-LLM work — and it stays there (or asks first, per `/config` → "Switch models when a message is flagged"). The check covers the whole conversation, including files and tool output, so switching back with `/model` can flag again while that content is still in context. The `reasoning_extraction` category declines prompts that push the model to reproduce its internal reasoning in the reply, and no fallback retries it — never brief a subagent, workflow agent, or skill that way; ask for the conclusion and the evidence behind it.
 
