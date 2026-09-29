@@ -1,9 +1,9 @@
 # Vault automation — pick ONE trigger
 
 The vault is a proactive loop: a trigger runs `/vault process` with no human in
-real time. The headless session runs on Claude Opus 5.5, like everything else
-in a cc_tool project; any subagents it starts do too (the project's settings
-force the subagent model).
+real time. The headless session runs on Claude Opus 5.5: filing and weekly
+synthesis are judgment work. Any subagents it starts default to Opus 5.5 too
+and follow the managed block's Model routing.
 
 ## Option 1 — system cron (local; recommended start)
 

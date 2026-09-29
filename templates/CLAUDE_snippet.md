@@ -30,7 +30,7 @@ Pick by shape of the work. See the `dynamic-workflows` skill for the pattern cat
 | native `Workflow` tool | dozens–hundreds of agents, OR you want loop-until-done / adversarial cross-checking / a rerunnable script — and intermediate results should stay OUT of main context |
 | agent teams (experimental, gated by `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) | peer Claudes that must message/debate each other |
 
-Every subagent runs on Opus 5.5: the project's settings force it (`CLAUDE_CODE_SUBAGENT_MODEL_FORCE`), so don't set a model on Agent or workflow `agent()` calls. Tune cost with `effort` instead: `low` for repetitive or mechanical arms, the session level for judgment stages (planning, synthesis, verification), higher only where a measured gain justifies it. Bake the effort per stage into the workflow script when you create it, not mid-run.
+A subagent with no `model` runs on Opus 5.5 (the project's `CLAUDE_CODE_SUBAGENT_MODEL`), unless its agent type's definition sets one. Set `model: "sonnet"` on an Agent or workflow `agent()` call only for an execution arm, as defined in `## Model routing` below. Tune cost within a model with `effort`: `low` only for read-only mechanical arms, the session level for judgment stages (planning, synthesis, verification), and higher only where a measured gain justifies it. Bake each stage's model and effort into the workflow script when you create it, not mid-run.
 
 Disable native workflows with `disableWorkflows: true` in settings or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
 
@@ -41,7 +41,7 @@ Designing a loop rather than firing a one-off? The `loop-engineering` skill name
 - **Spec first** — a written spec with machine-checkable acceptance criteria BEFORE the loop starts. No spec → no loop. Pair with `/goal` to force a hard completion condition — a good `/goal` carries its own task statement, success criteria, constraints, checkpoint rule, self-verify step, and budget cap. When the user describes a loop-shaped task, offer to draft that `/goal` for them rather than making them write it.
 - **Bound it** — explicit iteration / retry caps so a loop never runs forever, plus an early exit: each iteration judges whether it is still converging and abandons or escalates a doomed branch rather than spending the whole cap on it.
 - **State on disk** — progress lives in a file/board/queue outside the conversation (e.g. an append-only `LOG.md` — see `loop-engineering`, Disk-based state), so a compaction or a new session doesn't lose track of what's done.
-- **Cost guard** — `low` effort for repetitive parallel arms, higher effort only for planning, synthesis, and verification (see Orchestration above).
+- **Cost guard** — Sonnet 5.5 for spec'd parallel execution arms, Opus 5.5 for planning, synthesis, and verification (see `## Model routing`); `low` effort only for read-only mechanical arms.
 - **No irreversible unattended actions** — draft and queue, don't send and pray. (The bash-guard hook already blocks pushes/commits to protected branches.)
 - **Verification gate** — a loop reports done only when tests / acceptance criteria actually pass, and for unattended runs the judge must not be the worker itself (see Verification protocol).
 - **A turn that ends in text is a report, not completion** — on long multi-part tasks Opus 5.5 sometimes ends a turn on a status update instead of the next tool call, and in a headless or looped run the work stops there. Let `/goal`'s evaluator and the on-disk checklist decide done, not the worker's summary; the stop rule under "When to keep going" below applies with no one at the prompt too.
@@ -68,9 +68,27 @@ Product-UI *motion* is a separate surface: building or tuning a dropdown, modal,
 
 ## Model routing
 
-Use **claude-opus-5-5** ($4/$20 per MTok, cache reads $0.20) for the session and every subagent. Where it falls short, raise its effort; no other model is a routing option, scheduled headless runs included.
+Two models, split by who decides and who carries out.
 
-Opus 5.5 runs safety classifiers for cybersecurity, biology, and frontier-LLM development, and can decline a request (HTTP 200, `stop_reason: refusal`). Finding vulnerabilities in source code is permitted; false positives come from compile-check phrasing (ask "are there any bugs in this program?", not "does this compile without errors?"), lesser-known languages given without context, and base64 in tool output. When a message is flagged, Claude Code moves the session to an older model — **claude-opus-4-8** for cybersecurity, **claude-opus-5** for biology or frontier-LLM work — and it stays there (or asks first, per `/config` → "Switch models when a message is flagged"). The check covers the whole conversation, including files and tool output, so switching back with `/model` can flag again while that content is still in context. The `reasoning_extraction` category declines prompts that push the model to reproduce its internal reasoning in the reply, and no fallback retries it — never brief a subagent, workflow agent, or skill that way; ask for the conclusion and the evidence behind it.
+**claude-opus-5-5** ($4/$20 per MTok) is the session model and the default for any subagent that doesn't name a model. It does the work that takes judgment: planning and specs, root-causing a bug, architecture calls, reviewing and verifying, synthesizing what subagents found, anything ambiguous or long-horizon, and any task you can't describe with a finish line yet.
+
+**claude-sonnet-5-5** (`model: "sonnet"`, $2/$10 per MTok, half the price of Opus) does execution arms. An arm is one whose brief carries a written spec and a check that proves it is done: implementing one step of a plan, a per-file migration or rename, writing and running tests against given acceptance criteria, well-defined investigation or search sweeps. It needs the spec and the check in the brief itself, since it doesn't see the conversation.
+
+- **Opus makes the call on Sonnet's work.** Running tests is execution, so a Sonnet arm can do it. The pass/fail judgment runs on Opus, never on Sonnet: the review, the verification gate, the final "done".
+- **Keep Sonnet arms that change code at `medium` or above.** At `low`, Sonnet 5.5 sometimes reports a change done without running a check that exercises it.
+- **Escalate instead of cranking effort.** If a Sonnet arm fails its check twice, or the brief turns out ambiguous, hand the task to Opus with what was tried. Don't retry it on Sonnet, and don't push Sonnet to `xhigh` or `max`. A declined arm (`stop_reason: refusal`) hasn't failed its check, so don't re-dispatch it to Opus to get past the classifier.
+- **Omitting `model` gives Opus only for agent types that don't set one.** That covers `general-purpose`, and `Explore`/`Plan`, which inherit the session model. An agent type whose definition sets `model:` runs on that model. Pass `model: "opus"` when you give such a type judgment work. For an untyped arm, when unsure, omit `model`.
+- **`superpowers:subagent-driven-development` picks models by tier and names them explicitly.** Its "fast, cheap" and "standard" implementer tiers use `model: "sonnet"` when the task has a spec and tests. Its "most capable" implementer tier and every review, re-review and final-review dispatch use `model: "opus"`. In its fix loop, a Sonnet implementer moves to Opus from fix round 3, per the escalation rule above. Don't use `haiku`.
+- **`sonnet` means Sonnet 5.5 only on the Claude API, with Claude Code 2.1.284 or newer.** On Bedrock, Vertex and Foundry the alias still maps to Sonnet 4.5 (4.6 on Claude Platform on AWS), so keep execution arms on Opus there. If a subagent's model looks wrong, check `claude --version` and the provider.
+
+Opus 5.5 runs safety classifiers for cybersecurity, biology, and frontier-LLM development. Sonnet 5.5 is the first Sonnet with cybersecurity safeguards at that level. Either can decline a request (HTTP 200, `stop_reason: refusal`). Finding vulnerabilities in source code is permitted; false positives come from compile-check phrasing (ask "are there any bugs in this program?", not "does this compile without errors?"), lesser-known languages given without context, and base64 in tool output.
+
+When a message is flagged, Claude Code moves the session to an older model, and it stays there (or asks first, per `/config` → "Switch models when a message is flagged"):
+
+- From an Opus 5.5 session: **claude-opus-4-8** for cybersecurity, **claude-opus-5** for biology or frontier-LLM work.
+- From a Sonnet 5.5 session (`/model sonnet`, or `opusplan` outside plan mode): **claude-sonnet-5** for cybersecurity or frontier-LLM work.
+
+The check covers the whole conversation, including files and tool output, so switching back with `/model` can flag again while that content is still in context. The `reasoning_extraction` category declines prompts that push the model to reproduce its internal reasoning in the reply, and no fallback retries it — never brief a subagent, workflow agent, or skill that way; ask for the conclusion and the evidence behind it.
 
 ---
 
@@ -78,7 +96,7 @@ Opus 5.5 runs safety classifiers for cybersecurity, biology, and frontier-LLM de
 
 For debugging, architecture decisions, complex logic, multi-file changes, or ambiguous requirements: pin down the actual ask and acceptance criteria, and check you are solving the right problem at the right altitude rather than over-engineering. Answer open questions with evidence from the codebase rather than guessing. If contradictory patterns exist, pick one (prefer the more recent / more tested) and flag the conflict rather than silently blending them. For trivial changes (typos, single-line fixes, renames), skip this.
 
-If a task needs deeper reasoning, raise the effort level rather than expanding this prompt. Opus 5.5 defaults to `medium`, which matches or beats Opus 5 at `high` on coding and knowledge work, and `low` comes close on several coding evaluations; go to `high` where a measured gain justifies it, and reserve `xhigh`/`max`, where Opus 5.5 thinks much longer per turn, for problems that have shown headroom. Effort defaults do not transfer between models. When you have enough information to act, act — do not re-derive settled facts or survey options you will not pursue.
+If a task needs deeper reasoning, raise the effort level rather than expanding this prompt. Opus 5.5 defaults to `medium`, which matches or beats Opus 5 at `high` on coding and knowledge work, and `low` comes close on several coding evaluations; go to `high` where a measured gain justifies it, and reserve `xhigh`/`max`, where Opus 5.5 thinks much longer per turn, for problems that have shown headroom. Sonnet 5.5 also defaults to `medium` in Claude Code. Anthropic suggests considering Opus 5.5 before taking Sonnet to `xhigh`/`max`, so here that work goes to Opus. Effort levels do not transfer between models. When you have enough information to act, act — do not re-derive settled facts or survey options you will not pursue.
 
 ---
 

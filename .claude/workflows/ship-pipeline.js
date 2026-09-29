@@ -1,6 +1,6 @@
 export const meta = {
   name: 'ship-pipeline',
-  description: 'Four-agent team that ships one feature end-to-end: Planner → Coder → Tester → Reviewer, all on Opus 5.5, each handing structured output to the next.',
+  description: 'Four-agent team that ships one feature end-to-end: Planner (Opus 5.5) → Coder (Sonnet 5.5) → Tester (Sonnet 5.5) → Reviewer (Opus 5.5), each handing structured output to the next.',
   whenToUse: 'When you want a single well-scoped change driven through plan → implement → test → review with separate agents and a read-only review gate. Parameterize via args.feature (or pass a plain string as args).',
   phases: [
     { title: 'Plan', detail: 'Planner turns the feature request into a concrete, file-level implementation spec' },
@@ -16,12 +16,31 @@ const cfg = (args && typeof args === 'object') ? args : {}
 const FEATURE = cfg.feature || (typeof args === 'string' ? args.trim() : '')
 if (!FEATURE) return { error: 'No feature provided. Pass args.feature (or a plain request string as args) and re-invoke.' }
 const ROOT = cfg.root || 'the current repository (your working directory)'
-// Every agent runs on Opus 5.5: cc_tool's settings force the subagent model
-// (CLAUDE_CODE_SUBAGENT_MODEL_FORCE), so a per-agent model would be ignored.
-// Cost is tuned per stage with effort instead; unset means the session level.
-// e.g. args { feature, codeEffort: 'low', reviewEffort: 'high' }
+// Judgment stages run on Opus 5.5 and execution stages on Sonnet 5.5, per the
+// managed block's Model routing. The planner's spec and acceptance criteria are
+// what make code and test well-scoped enough for Sonnet, and the Opus reviewer
+// is a gate from a different model than the one that wrote the code.
+// 'opus' resolves to Opus 5.5 and 'sonnet' to Sonnet 5.5 (Claude Code >= 2.1.284,
+// Claude API; on Bedrock/Vertex/Foundry 'sonnet' is still 4.5, so pass codeModel
+// and testModel 'opus' there).
+// Override per stage, e.g. args { feature, codeModel: 'opus' } for a change too
+// tangled to spec. Effort unset means the session level. A Sonnet stage asked for
+// 'low' effort runs at 'medium' instead, since Sonnet 5.5 at 'low' can report a
+// change done without exercising it.
+const MODEL = {
+  plan: cfg.planModel || 'opus', code: cfg.codeModel || 'sonnet',
+  test: cfg.testModel || 'sonnet', review: cfg.reviewModel || 'opus',
+}
 const EFFORT = { plan: cfg.planEffort, code: cfg.codeEffort, test: cfg.testEffort, review: cfg.reviewEffort }
-const withEffort = (stage, opts) => (EFFORT[stage] ? { ...opts, effort: EFFORT[stage] } : opts)
+const stageOpts = (stage, opts) => {
+  const o = { ...opts, model: MODEL[stage] }
+  if (!EFFORT[stage]) return o
+  if (MODEL[stage] === 'sonnet' && EFFORT[stage] === 'low') {
+    log(`${stage}: 'low' effort raised to 'medium' for Sonnet`)
+    return { ...o, effort: 'medium' }
+  }
+  return { ...o, effort: EFFORT[stage] }
+}
 
 // ---- schemas (the structured hand-offs between stages) ------------------
 const SPEC_SCHEMA = {
@@ -109,7 +128,7 @@ METHOD:
 - Define acceptance criteria as observable conditions, and a test plan with concrete commands/cases.
 - Prefer the smallest change that satisfies the request; call out risks and anything ambiguous.
 Return the structured spec.`,
-  withEffort('plan', { label: 'plan:spec', schema: SPEC_SCHEMA })
+  stageOpts('plan', { label: 'plan:spec', schema: SPEC_SCHEMA })
 )
 
 // ---- Stages 2-4 as a streaming pipeline: code → test → review ----------
@@ -136,7 +155,7 @@ METHOD:
 - If you must deviate from the spec, do it deliberately and record it in deviationsFromSpec.
 - Provide the exact command(s) the tester should run in howToTest.
 Set implemented=true only if you actually changed the working tree. Return the structured summary.`,
-      withEffort('code', { label: 'code:implement', phase: 'Code', schema: CODE_SCHEMA })
+      stageOpts('code', { label: 'code:implement', phase: 'Code', schema: CODE_SCHEMA })
     )
     return codeReport
   },
@@ -158,7 +177,7 @@ METHOD:
 - Map each acceptance criterion to covered true/false. List concrete failures with the assertion that failed.
 Return the structured test report.`
       ,
-      withEffort('test', { label: 'test:verify', phase: 'Test', schema: TEST_SCHEMA })
+      stageOpts('test', { label: 'test:verify', phase: 'Test', schema: TEST_SCHEMA })
     )
     return testReport
   },
@@ -183,7 +202,7 @@ METHOD:
 - List issues by severity (blocking / should-fix / nit), each with its file and line, why it is wrong, how to show it fails (a failing input, test, or command the coder can run), and a suggestion. Mark something blocking only if you would stop the merge for it.
 - nextSteps: if fail, what the coder must change; if pass, what remains before merge (the human still commits).
 Return the structured review.`,
-      withEffort('review', { label: 'review:gate', phase: 'Review', schema: REVIEW_SCHEMA })
+      stageOpts('review', { label: 'review:gate', phase: 'Review', schema: REVIEW_SCHEMA })
     )
   }
 )
@@ -193,6 +212,7 @@ log(`Pipeline complete — review verdict: ${review && review.verdict}`)
 
 return {
   feature: FEATURE,
+  model: MODEL,
   effort: EFFORT,
   spec,
   code: codeReport,

@@ -225,13 +225,21 @@ if isinstance(tmpl_attr, dict):
     attr = settings.setdefault("attribution", {})
     for k, v in tmpl_attr.items():
         attr.setdefault(k, v)
-# Managed env (subagents forced onto the default model): same rule — add a key
+# Managed env (Opus 5.5 as the default subagent model): same rule — add a key
 # only where the project hasn't set it, so a project override survives updates.
 tmpl_env = template.get("env")
 if isinstance(tmpl_env, dict):
     env = settings.setdefault("env", {})
     for k, v in tmpl_env.items():
         env.setdefault(k, v)
+# Retired managed env: v0.0.19-v0.0.20 shipped SUBAGENT_MODEL_FORCE="1", which
+# drops every per-call model and so blocks Sonnet 5.5 execution arms. Remove
+# only that exact shipped value; any other value is the project's own choice.
+env = settings.get("env")
+if isinstance(env, dict) and env.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE") == "1":
+    del env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]
+    print("  ✓ retired CLAUDE_CODE_SUBAGENT_MODEL_FORCE (subagents may now run on Sonnet 5.5;"
+          " set it to \"true\" to keep every subagent on Opus)")
 open(sys.argv[1], "w").write(json.dumps(settings, indent=2) + "\n")
 print("  ✓ .claude/settings.json hooks + attribution + env updated (permissions preserved)")
 EOF
@@ -271,6 +279,18 @@ print("    acceptEdits and inherit the allowlist, so that hook is the enforced")
 print("    boundary for protected-branch git writes mid-run. Re-run cc-setup to")
 print('    install hooks, or set "disableWorkflows": true.')
 EOF
+fi
+
+# ── 2c. Claude Code version for model routing ────────────────────────────────
+# The managed block routes execution arms to `model: "sonnet"`. Before 2.1.284
+# that alias resolves to Sonnet 5, not Sonnet 5.5 (and on Bedrock/Vertex/Foundry
+# it stays Sonnet 4.5 regardless). Warn only; never block setup.
+CC_MIN_SONNET55="2.1.284"
+cc_ver="$(claude --version 2>/dev/null | head -1 | awk '{print $1}' || true)"
+if [ -n "$cc_ver" ] && [ "$(printf '%s\n%s\n' "$CC_MIN_SONNET55" "$cc_ver" | sort -V | head -1)" != "$CC_MIN_SONNET55" ]; then
+    echo "  ⚠ Claude Code $cc_ver: the \"sonnet\" alias still means Sonnet 5 here."
+    echo "    Run \`claude update\` (Sonnet 5.5 needs $CC_MIN_SONNET55+) before relying on"
+    echo "    the Sonnet execution arms in the managed block's Model routing."
 fi
 
 # ── 3. Skills ────────────────────────────────────────────────────────────────
