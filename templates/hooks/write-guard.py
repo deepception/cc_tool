@@ -5,7 +5,7 @@ Blocks (deny):
   - writes to system paths (/etc, /usr, /bin, /boot, /dev, /proc, /sys, …)
   - writes to the user's shell/credential dotfiles (~/.ssh/*, ~/.bashrc,
     ~/.zshrc, ~/.profile, ~/.gitconfig, ~/.aws/*, ~/.npmrc, ~/.config/gh/*)
-  - writes inside the repo's .git/ directory
+  - writes inside the repo's .git/ directory (or another worktree's)
   - secrets in the proposed content: private-key blocks, AWS/GitHub/Slack/
     Anthropic/OpenAI/Google/Stripe keys, JWTs, and `api_key = "<long literal>"`
     style assignments. Placeholder-looking values (EXAMPLE, your_, xxx, <…>,
@@ -13,9 +13,11 @@ Blocks (deny):
     belongs — and Claude Code's own Read-deny keeps it out of context).
 Asks (hands the decision to the user; a refusal in unattended runs):
   - writes outside the project root that are not scratch (/tmp, $TMPDIR, the
-    Claude scratchpad, ~/.claude/). Tune with "write_outside_repo":
-    "ask"|"warn"|"off" in .claude/guard-rules.json — set "warn" if you work
-    with additional working directories.
+    Claude scratchpad, ~/.claude/). The repository's other git worktrees
+    (`git worktree list`) count as the project, wherever they sit on disk, so
+    an orchestrator editing a sibling worktree is not asked per file. Tune
+    with "write_outside_repo": "ask"|"warn"|"off" in .claude/guard-rules.json
+    — set "warn" if you work with additional working directories.
 Warns (additionalContext, never blocks):
   - stale read: the target file changed on disk after Claude last read or
     wrote it this session (a formatter, a shell write, another agent). The
@@ -35,6 +37,7 @@ the activity log live in .git/cc_tool/ via cc_hooklib.py.
 import json
 import os
 import re
+import subprocess
 import sys
 
 try:
@@ -119,6 +122,25 @@ def _under(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(prefix + "/")
 
 
+def repo_worktrees(root: str) -> list:
+    """Real paths of every worktree of the repository `root` belongs to (main
+    and linked), or [] when git is missing, slow, or `root` is not a repo.
+
+    Only called for a path that is already outside `root` and not scratch, so
+    the subprocess is off the hot path. An empty answer falls through to the
+    outside-repo ask, which is the safe direction.
+    """
+    try:
+        out = subprocess.run(["git", "-C", root, "worktree", "list", "--porcelain"],
+                             capture_output=True, text=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [os.path.realpath(line[len("worktree "):])
+            for line in out.stdout.splitlines() if line.startswith("worktree ")]
+
+
 def check_location(root: str, path: str, settings: dict) -> None:
     real = os.path.realpath(path)
     home = _home()
@@ -143,6 +165,12 @@ def check_location(root: str, path: str, settings: dict) -> None:
     mode = settings.get("write_outside_repo", "ask")
     if mode == "off":
         return
+    for wt in repo_worktrees(root):
+        if _under(real, wt):
+            if _under(real, os.path.join(wt, ".git")):
+                deny(root, path, f"writing inside .git/ of the worktree at '{wt}'",
+                     "use git commands for repository state; hooks belong in the project's hook manager config")
+            return  # another worktree of this repository is still the project
     reason = (f"'{real}' is outside the project root ({root}); an agent working on this project "
               "normally has no business writing there")
     if mode == "warn":

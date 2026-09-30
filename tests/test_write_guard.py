@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Allow/ask/warn/deny matrix for templates/hooks/write-guard.py.
 
-Covers location rules (system paths, home dotfiles, .git/, outside-repo),
+Covers location rules (system paths, home dotfiles, .git/, outside-repo, the
+repo's other git worktrees),
 secrets in proposed content (real-looking vs placeholder), the trajectory
 warnings (stale read, red check pending) seeded through cc_hooklib, and
 project rules from .claude/guard-rules.json. Nothing is ever written by the
@@ -56,6 +57,14 @@ json.dump({"write_outside_repo": "warn", "rules": [
 ]}, open(os.path.join(WARNROOT, ".claude", "guard-rules.json"), "w"))
 HOME = os.path.expanduser("~")
 
+# Worktree fixtures. Like OUTSIDE they must not live under /tmp, or the scratch
+# rule would allow them before the worktree rule is ever consulted.
+WT_MAIN = _repo(os.path.join(REPO, "tests", ".wg-wt-main"))
+WT_LINKED = os.path.join(REPO, "tests", ".wg-wt-linked")
+_git(WT_MAIN, "add", "-A")
+_git(WT_MAIN, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-qm", "init")
+_git(WT_MAIN, "worktree", "add", "-q", "-b", "wt/linked", WT_LINKED)
+
 A_TS = os.path.join(ROOT, "src", "a.ts")
 B_TS = os.path.join(ROOT, "src", "b.ts")
 SESSION = "wg-test-session"
@@ -85,6 +94,16 @@ CASES = [
     ("L08", "location", ROOT, "Write", {"file_path": os.path.join(HOME, ".claude", "projects", "p", "memory", "m.md"), "content": "x"}, "s", A),
     ("L09", "location", ROOT, "Write", {"file_path": os.path.join(HOME, ".ssh", "config"), "content": "x"}, "s", D),
     ("L10", "location", ROOT, "Write", {"file_path": "/usr/local/bin/tool", "content": "x"}, "s", D),
+    # ── Other worktrees of the same repo count as the project ─────────────
+    ("G01", "worktree", WT_MAIN, "Edit", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "old_string": "1", "new_string": "3"}, "s", A),
+    ("G02", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(WT_LINKED, "src", "new", "c.ts"), "content": "x"}, "s", A),
+    ("G03", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_MAIN, "src", "a.ts"), "content": "x"}, "s", A),
+    ("G04", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": "x"}, "s", A),
+    ("G05", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", K),
+    ("G06", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", K),
+    ("G07", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": f'token = "{FAKE_GH}"'}, "s", D),
+    ("G08", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_MAIN, ".git", "config"), "content": "x"}, "s", D),
+    ("G09", "worktree", ROOT, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": "x"}, "s", K),
     # ── Secrets in content ────────────────────────────────────────────────
     ("S01", "secret", ROOT, "Write", {"file_path": A_TS, "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIE"}, "s", D),
     ("S02", "secret", ROOT, "Write", {"file_path": A_TS, "content": 'AWS_KEY = "AKIAIOSFODNN7EXAMPLE"'}, "s", A),
@@ -157,3 +176,5 @@ try:
 finally:
     shutil.rmtree(BASE, ignore_errors=True)
     shutil.rmtree(OUTSIDE, ignore_errors=True)
+    shutil.rmtree(WT_LINKED, ignore_errors=True)
+    shutil.rmtree(WT_MAIN, ignore_errors=True)

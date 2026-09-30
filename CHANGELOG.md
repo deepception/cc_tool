@@ -2,6 +2,24 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.0.22
+
+Fewer permission prompts. The aim is that the agent asks when it installs something or deletes something, and otherwise works. Two guards were asking for neither. Measured on two weeks of `color-analyzer` transcripts and its hook activity log (447 transcripts, 10,545 Bash calls, 1,436 edits).
+
+- **`write-guard.py`: the repo's other git worktrees count as the project.** The outside-repo ask compared the path with the project root only, so an orchestrator in the main checkout was asked for every file it edited in a sibling worktree: 217 asks in one day, every one a path under `../color-analyzer-s4-wt/`. The guard now reads `git worktree list` and treats any worktree of the same repository, main or linked, as inside. It works from either side, a session rooted in a linked worktree may edit the main checkout.
+  - The lookup runs only for a path already outside the root and not scratch, so in-project edits pay nothing. If git is missing or slow the guard falls back to asking.
+  - Secrets-in-content and project rules still apply to worktree edits, and a write into another worktree's `.git/` is denied.
+  - A worktree of a *different* repository still asks. `"write_outside_repo"` in `.claude/guard-rules.json` is unchanged.
+- **`npx` asks only when it would download.** The blanket `Bash(npx *)` ask rule is gone from `templates/settings.json`. An `ask` rule beats every `allow` rule, so it prompted on each `npx vitest run`, `npx tsc --noEmit` and `npx eslint`, 131 times in the sample, mostly as `cd <dir> && npx …`. `bash-guard.py` now makes the call:
+  - No prompt when the target is installed: `node_modules/.bin/<bin>` or `node_modules/<pkg>/package.json`, looked up from the command's directory up to the repository root. A leading `cd <literal dir> &&`, `NAME=value` prefixes and `timeout` are followed. `npx --no-install` and `npx --no` never prompt, since they cannot download.
+  - Ask when npx would fetch: a package that is not installed, a pinned spec (`pkg@latest`), a URL or git shorthand, `-p <pkg>` naming a package that is not installed, `--prefix`/`--workspace`/`--registry`, a `cd` the guard cannot resolve (`cd "$DIR"`, a directory that does not exist yet), or a command it cannot parse.
+  - Replayed against the 10,386 distinct Bash commands in the sample, old guard against new: 7 decisions changed, all `npx` runs in scratch directories that have since been deleted. Of the 147 commands that mention npx, 140 now pass without a prompt.
+  - `uvx *`, `pnpm dlx*` and `pipx run *` stay on the ask list: they fetch by design. So do all the install commands.
+- **`cc-setup` retires the old rule.** It removes the exact entry `"Bash(npx *)"` from a project's `permissions.ask` and says so. `cc-update-permissions` only adds, so the rule would otherwise have stayed forever. A project that wants every npx confirmed adds an `ask` rule on `\bnpx\b` to `.claude/guard-rules.json`.
+- **Heredoc fix in `bash-guard.py`.** In an unquoted heredoc, `\`` and `\$` are literal characters. The guard read an escaped backtick as the start of a command substitution, so a markdown report written with `cat <<EOF` that quoted a command in backticks had that command checked as if it would run. One logged report mentioning `npx playwright install` would have prompted; the same report naming `git push --force` would have been denied.
+- **Still asks, and is neither an install nor a deletion:** `git config core.hooksPath <dir>`, `crontab -e`, `terraform`/`pulumi` with auto-approve, a command over the 400,000-character analysis limit, and a write outside the repository and its worktrees. None of these fired in the sample.
+- **Tests:** bash-guard 345/345 (41 new: `X01`–`X41`), write-guard 42/42 (9 new: `G01`–`G09`).
+
 ## v0.0.21
 
 Sonnet 5.5 comes back as the execution tier, based on Anthropic's [Building with Claude Sonnet 5.5](https://claude.dev/blog/building-with-claude-sonnet-5-5/) (Addy Osmani, 2026-09-28). Sonnet 5.5 is half Opus 5.5's per-token price ($2/$10), has 1M context natively, runs at `medium` effort by default in Claude Code, and has no fast mode. The post points it at well-scoped work with "a clear spec and a way to check the result", and keeps Opus 5.5 for "complex work requiring careful judgment" and long-horizon work. v0.0.19 removed Sonnet because Sonnet 5 wasn't worth routing to over Opus 5.5 with lower effort; Sonnet 5.5 is.

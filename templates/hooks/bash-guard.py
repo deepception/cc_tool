@@ -25,6 +25,13 @@ Asks (hands the decision to the user; in an unattended run that is a refusal):
     uninstall; terraform/pulumi destroy or auto-approve; cloud CLI deletes;
     DROP / TRUNCATE / DELETE-without-WHERE when a DB client is in the command;
     redis FLUSHALL; `crontab -e`.
+  - `npx <pkg>` when <pkg> is not installed in the project it runs in (no
+    `node_modules/.bin/<pkg>` from the command's directory up to the repo
+    root), because that downloads and executes a package nobody reviewed.
+    `npx vitest`, `npx tsc`, `npx eslint` on installed dev dependencies pass
+    without a prompt, as does `npx --no-install …`, which can never download.
+    A leading `cd <literal dir> &&` is followed; a cd the guard cannot resolve
+    (`cd "$DIR"`) or a pinned spec (`pkg@version`) asks.
 
 Warns (additionalContext, never blocks):
   - shell writes into source files (`> x.ts`, `tee`, `sed -i`, `perl -pi`,
@@ -91,6 +98,7 @@ PROTECTED = {"main", "master", "production", "release"}
 MAX_COMMAND_CHARS = 400_000
 
 _CMD_FOR_LOG = ""      # set by main() so deny/ask can log what they refused
+_PAYLOAD_CWD = ""      # the Bash tool's working directory, from the hook payload
 _WARNINGS: list = []   # non-blocking notes, emitted together at the end
 
 
@@ -360,7 +368,11 @@ def _consume_heredocs(cmd, i, pending, line, out, term_index) -> int:
         if feeds_shell:
             out.append(shell_prepass(body))
         elif expands:
-            subs = "".join((a or b) + "\n" for a, b in _SUBST_RE.findall(body))
+            # `\`` and `\$` are literal characters in an unquoted heredoc, not
+            # the start of a substitution (markdown written through `cat <<EOF`
+            # is full of escaped backticks around command names).
+            live = re.sub(r"\\[`$\\]", "", body)
+            subs = "".join((a or b) + "\n" for a, b in _SUBST_RE.findall(live))
             if subs:
                 out.append(subs)
         i = min(term_end + 1, len(cmd))
@@ -1201,6 +1213,134 @@ def check_destructive(cmd: str, tokens) -> None:
         _check_git_destructive(tokens)
 
 
+# ── npx guard: ask only when it would download ────────────────────────────────
+# `npx <bin>` runs the project's own dev dependency when one is installed, and
+# silently downloads and executes a registry package when it is not. Only the
+# second is an install, so only that is handed to the user. Resolution follows
+# npm's: the nearest node_modules/.bin walking up from the command's directory,
+# which the guard stops at the repository root so a stray ~/node_modules never
+# vouches for a package.
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+_NPX_NEVER_INSTALL = {"--no-install", "--no"}
+# Options that move npx to another project or registry: the guard cannot tell
+# what is installed there, so the user decides.
+_NPX_OPAQUE = ("--prefix", "-w", "--workspace", "--workspaces", "-ws", "--registry")
+# Command position only (start, or right after an operator), so prose that
+# mentions npx inside an unparseable heredoc does not raise a prompt.
+_NPX_UNPARSEABLE_RE = re.compile(r"(?:^|[;&|(\n])[ \t]*(?:[A-Za-z_]\w*=\S*[ \t]+)*(?:\S*/)?npx(?:\s|$)")
+_NPX_SUGGESTION = ("add it to the project's devDependencies first (that install is the step to approve), "
+                   "or run the installed binary with 'npx --no-install <bin>', which never downloads")
+
+
+def _strip_assignments(seg):
+    """Drop leading `NAME=value` words: `CI=1 npx vitest` runs npx."""
+    i = 0
+    while i < len(seg) and _ASSIGN_RE.match(seg[i]):
+        i += 1
+    return seg[i:]
+
+
+def _track_cd(cwd, args):
+    """Directory after `cd <args>`, or None when it cannot be known statically
+    (a variable, `cd -`, a path that does not exist)."""
+    operands = [a for a in args if a not in ("-L", "-P", "-e", "-@", "--")]
+    if len(operands) != 1:
+        return None
+    target = operands[0]
+    if target == "-" or "$" in target or "`" in target:
+        return None
+    target = os.path.expanduser(target)
+    if not os.path.isabs(target):
+        if not cwd:
+            return None
+        target = os.path.join(cwd, target)
+    target = os.path.normpath(target)
+    return target if os.path.isdir(target) else None
+
+
+def _npx_installed(spec: str, cwd: str) -> bool:
+    """True when `npx <spec>` resolves to something already on disk."""
+    if spec.startswith(("./", "../", "/", "~/")):
+        return os.path.exists(os.path.join(cwd, os.path.expanduser(spec)))
+    scoped = spec.startswith("@")
+    if "@" in spec[1:] or ":" in spec or ("/" in spec and not scoped):
+        return False  # pinned version/tag, URL, git or github shorthand: npx may fetch it
+    home = os.path.expanduser("~")
+    d = cwd
+    while True:
+        if d == home and d != cwd:
+            return False
+        modules = os.path.join(d, "node_modules")
+        if os.path.exists(os.path.join(modules, spec, "package.json")):
+            return True
+        if not scoped and os.path.exists(os.path.join(modules, ".bin", spec)):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d or os.path.exists(os.path.join(d, ".git")):
+            return False
+        d = parent
+
+
+def _check_npx(cmd, cwd) -> None:
+    args = cmd[1:]
+    packages, target, call = [], None, False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            target = args[i + 1] if i + 1 < len(args) else None
+            break
+        if a in _NPX_NEVER_INSTALL:
+            return
+        if a in _NPX_OPAQUE or a.startswith(tuple(o + "=" for o in _NPX_OPAQUE)):
+            ask(f"'npx {a}' runs against another project or registry, so bash-guard cannot confirm "
+                "the package is already installed there", _NPX_SUGGESTION)
+        if a in ("-p", "--package"):
+            if i + 1 < len(args):
+                packages.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--package="):
+            packages.append(a.split("=", 1)[1])
+        elif a in ("-c", "--call"):
+            call = True
+            i += 2
+            continue
+        elif a.startswith("--call="):
+            call = True
+        elif not a.startswith("-"):
+            target = a
+            break
+        i += 1
+    # With -p the packages are what gets installed; the positional is only the
+    # command to run from them. `npx -c '<cmd>'` alone installs nothing.
+    specs = packages or ([] if call or target is None else [target])
+    if not specs:
+        return
+    if not cwd:
+        ask(f"bash-guard cannot tell which directory 'npx {specs[0]}' runs in (the cd before it is not a "
+            "literal, existing path), so it cannot confirm the package is installed there rather than "
+            "downloaded", "cd to a literal path, or use 'npx --no-install <bin>', which never downloads")
+    for spec in specs:
+        if not _npx_installed(spec, cwd):
+            ask(f"'npx {spec}' would download and run a package that is not installed in this project "
+                f"(nothing for it in node_modules from {cwd} up to the repository root)", _NPX_SUGGESTION)
+
+
+def check_npx(tokens) -> None:
+    cwd = _PAYLOAD_CWD or os.getcwd()
+    for seg, _gid in split_commands(tokens):
+        cmd, _w = _strip_wrappers(_strip_assignments(seg))
+        cmd = _strip_assignments(cmd)
+        if not cmd:
+            continue
+        name = _cmd_name(cmd[0])
+        if name in ("cd", "pushd"):
+            cwd = _track_cd(cwd, cmd[1:])
+        elif name == "npx":
+            _check_npx(cmd, cwd)
+
+
 # ── Shell-write bypass warning (non-blocking) ─────────────────────────────────
 # Edits that go through Write/Edit get the post-edit typecheck, the write guard
 # (secrets, confinement, stale-read), and the activity log. A `>` redirect,
@@ -1319,6 +1459,9 @@ def read_command() -> str:
             why=f"tool_input was {type(tool_input).__name__}, not an object"))
     if "command" not in tool_input:
         sys.exit(0)  # not a command-bearing tool call — nothing for this guard
+    global _PAYLOAD_CWD
+    if isinstance(data.get("cwd"), str):
+        _PAYLOAD_CWD = data["cwd"]
     cmd = tool_input["command"]
     if not isinstance(cmd, str):
         deny(_PARSE_FAIL.format(why=f"command was {type(cmd).__name__}, not a string"))
@@ -1347,6 +1490,9 @@ def main() -> None:
         # half still gets its regex fallback.
         check_git_unparseable(prepped)
         check_project_rules(cmd)
+        if _NPX_UNPARSEABLE_RE.search(prepped):
+            ask("bash-guard could not parse this command (unbalanced quotes), so it cannot confirm the "
+                "'npx' in it runs an installed package rather than downloading one", _NPX_SUGGESTION)
         flush_warnings()
         sys.exit(0)
 
@@ -1355,6 +1501,7 @@ def main() -> None:
         check_git(tokens)
     check_destructive(cmd, tokens)
     check_project_rules(cmd)
+    check_npx(tokens)
     check_write_bypass(tokens)
     flush_warnings()
     sys.exit(0)

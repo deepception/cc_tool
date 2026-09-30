@@ -240,6 +240,17 @@ if isinstance(env, dict) and env.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE") == "1":
     del env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"]
     print("  ✓ retired CLAUDE_CODE_SUBAGENT_MODEL_FORCE (subagents may now run on Sonnet 5.5;"
           " set it to \"true\" to keep every subagent on Opus)")
+# Retired managed ask rule: v0.0.3-v0.0.21 shipped "Bash(npx *)", which prompted
+# on every `npx vitest` / `npx tsc` and overrode any allow rule. bash-guard.py
+# now asks only when npx would download a package that is not installed, so the
+# blanket rule goes. Only that exact shipped entry is removed; a project that
+# wants every npx confirmed adds an ask rule to .claude/guard-rules.json.
+perms = settings.get("permissions")
+ask_rules = perms.get("ask") if isinstance(perms, dict) else None
+if isinstance(ask_rules, list) and "Bash(npx *)" in ask_rules:
+    perms["ask"] = [r for r in ask_rules if r != "Bash(npx *)"]
+    print("  ✓ retired the blanket \"Bash(npx *)\" ask rule (bash-guard.py now asks only when"
+          " npx would download a package that is not installed)")
 open(sys.argv[1], "w").write(json.dumps(settings, indent=2) + "\n")
 print("  ✓ .claude/settings.json hooks + attribution + env updated (permissions preserved)")
 EOF

@@ -2,8 +2,8 @@
 """Allow/deny matrix for templates/hooks/bash-guard.py.
 
 The cases cover protected-branch commit/push, --no-verify variants,
-secret-read probes, destructive commands, multi-line commands, heredocs, and
-malformed payloads. Expectations encode the guard's
+secret-read probes, destructive commands, npx fetch-and-run, multi-line
+commands, heredocs, and malformed payloads. Expectations encode the guard's
 INTENDED behaviour, including the bypasses that are deliberately out of scope
 (shell expansion, sh -c wrappers, base64) — those assert ALLOW on purpose, so a
 future change that appears to "fix" one will show up here as a diff to justify
@@ -79,6 +79,14 @@ def make_fixtures(base):
             open(os.path.join(d, name), "w").write("DUMMY=not-a-real-secret\n")
         os.makedirs(os.path.join(d, "certs"), exist_ok=True)
         open(os.path.join(d, "certs", "server.pem"), "w").write("DUMMY\n")
+    # npx fixtures: binaries "installed" at the repo root and in a nested app.
+    for rel in ("node_modules/.bin/vitest", "node_modules/.bin/eslint",
+                "webapp/node_modules/.bin/tsc", "node_modules/@scope/tool/package.json",
+                "node_modules/typescript/package.json"):
+        path = os.path.join(feature, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write("{}\n")
+    os.makedirs(os.path.join(feature, "webapp", "src"), exist_ok=True)
     return master, feature, other, notgit
 
 
@@ -319,7 +327,7 @@ CASES = [
     # ── Project rules (.claude/guard-rules.json) ──────────────────────────
     ("J01", "rules", RULES, "yarn add lodash", D),
     ("J02", "rules", RULES, "cat yarn.lock", A),
-    ("J03", "rules", RULES, "npx cowsay", W),
+    ("J03", "rules", RULES, "npx --no-install cowsay", W),
     ("J04", "rules", RULES, "prisma db push", K),
     ("J05", "rules", RULES, "pnpm add lodash", A),
     ("J06", "rules", BADRULES, "ls", W),
@@ -406,6 +414,48 @@ CASES = [
     ("R56", "heredoc", FEATURE, "echo $(( 1 << 2 ))\nrm -rf ~", D),
     ("R57", "heredoc", FEATURE, "cat > a.md <<-EOF\n\tgit push --force\n\tEOF\ngit status", A),
     ("R58", "fp", FEATURE, "rm .github/dependabot.yml", D),
+    # ── npx: ask only when it would download (target not installed locally) ──
+    ("X01", "npx", FEATURE, "npx vitest run src/a.test.ts", A),
+    ("X02", "npx", FEATURE, "npx cowsay hi", K),
+    ("X03", "npx", FEATURE, "cd webapp && npx tsc --noEmit", A),
+    ("X04", "npx", FEATURE, "cd webapp && npx vitest run", A),            # hoisted to the repo root
+    ("X05", "npx", FEATURE, "cd webapp/src && npx tsc --noEmit -p ..", A),
+    ("X06", "npx", FEATURE, "npx tsc --noEmit", K),                       # only webapp/ has tsc
+    ("X07", "npx", FEATURE, "NODE_ENV=test CI=1 npx vitest run", A),
+    ("X08", "npx", FEATURE, "CI=1 npx cowsay hi", K),
+    ("X09", "npx", FEATURE, "timeout 120 npx vitest run 2>&1 | tail -20", A),
+    ("X10", "npx", FEATURE, "npx --no-install cowsay hi", A),
+    ("X11", "npx", FEATURE, "npx --no cowsay hi", A),
+    ("X12", "npx", FEATURE, "npx -y cowsay hi", K),
+    ("X13", "npx", FEATURE, "npx --yes vitest run", A),
+    ("X14", "npx", FEATURE, "npx vitest@latest run", K),                  # a pinned spec may re-download
+    ("X15", "npx", FEATURE, "npx @scope/tool --help", A),
+    ("X16", "npx", FEATURE, "npx @other/tool --help", K),
+    ("X17", "npx", FEATURE, "npx @scope/tool@2 --help", K),
+    ("X18", "npx", FEATURE, "npx -p cowsay cowsay hi", K),
+    ("X19", "npx", FEATURE, "npx --package=typescript tsc -v", A),
+    ("X20", "npx", FEATURE, "npx -p typescript -p cowsay tsc -v", K),
+    ("X21", "npx", FEATURE, 'cd "$APP" && npx vitest run', K),            # cwd unknowable statically
+    ("X22", "npx", FEATURE, "cd /nonexistent-cc-tool-dir && npx vitest run", K),
+    ("X23", "npx", FEATURE, "echo npx cowsay", A),
+    ("X24", "npx", FEATURE, "git commit -m 'docs: run npx cowsay'", A),
+    ("X25", "npx", FEATURE, "npm test && npx cowsay hi", K),
+    ("X26", "npx", FEATURE, "npx -c 'vitest run'", A),
+    ("X27", "npx", FEATURE, "/usr/bin/npx cowsay hi", K),
+    ("X28", "npx", FEATURE, "(cd webapp && npx tsc --noEmit)", A),
+    ("X29", "npx", FEATURE, "npx cowsay 'unbalanced", K),                 # unparseable: cannot clear it
+    ("X30", "npx", FEATURE, "npx", A),
+    ("X31", "npx", FEATURE, "npx -- vitest run", A),
+    ("X32", "npx", FEATURE, "npx --prefix /elsewhere vitest run", K),
+    ("X33", "npx", FEATURE, "npx vitest run; npx eslint src; cd webapp && npx tsc", A),
+    ("X34", "npx", NOTGIT, "npx vitest run", K),
+    ("X35", "npx", FEATURE, "cd %s && npx vitest run" % FEATURE, A),
+    ("X36", "npx", NOTGIT, "cd %s/webapp && npx tsc --noEmit" % FEATURE, A),
+    ("X37", "npx", FEATURE, "cd .. && npx vitest run", K),
+    ("X38", "npx", FEATURE, "cat >> report.md <<EOF\nRun \\`npx playwright install chromium\\` first.\nEOF\necho ok", A),
+    ("X39", "npx", FEATURE, "cat >> report.md <<EOF\nRun `npx playwright install chromium` first.\nEOF\necho ok", K),
+    ("X40", "heredoc", FEATURE, "cat >> report.md <<EOF\nNever \\`git push --force\\` here, it costs \\$5.\nEOF\ngit status", A),
+    ("X41", "heredoc", FEATURE, "cat >> report.md <<EOF\n`git push --force origin feat`\nEOF\ngit status", D),
 ]
 
 

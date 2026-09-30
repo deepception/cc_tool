@@ -105,7 +105,6 @@
       "Bash(pnpm dlx*)",
       "Bash(yarn add*)",
       "Bash(bun add*)",
-      "Bash(npx *)",
       "Bash(pip install*)",
       "Bash(pip3 install*)",
       "Bash(uv add*)",
