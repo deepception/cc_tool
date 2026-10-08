@@ -96,6 +96,20 @@ def make_fixtures(base):
     os.symlink(os.path.join(feature, "node_modules"), os.path.join(feature, "webapp", "nm-link"))
     os.makedirs(os.path.join(feature, "lib"), exist_ok=True)
     os.symlink(os.path.join(feature, "lib"), os.path.join(feature, "build"))  # a "cache" name pointing at source
+    # A "cache" directory that holds a tracked file, and a /tmp symlink into the project.
+    os.makedirs(os.path.join(feature, "dist"), exist_ok=True)
+    open(os.path.join(feature, "dist", "keep.txt"), "w").write("tracked\n")
+    _git(feature, "add", "dist/keep.txt")
+    _git(feature, "commit", "-qm", "track dist")
+    os.symlink(os.path.join(feature, "lib"), TMP_LINK)
+    # Symlinks that leave the project: one to another (non-git) tree with a
+    # real build/ and .next/, one to the filesystem root.
+    elsewhere = os.path.join(base, "elsewhere")
+    for d in ("build", ".next"):
+        os.makedirs(os.path.join(elsewhere, d), exist_ok=True)
+        open(os.path.join(elsewhere, d, "keep.txt"), "w").write("not a cache\n")
+    os.symlink(elsewhere, os.path.join(feature, "otherlink"))
+    os.symlink("/", os.path.join(feature, "rootlink"))
     return master, feature, other, notgit
 
 
@@ -103,6 +117,7 @@ def make_fixtures(base):
 # would make every project-path deletion look disposable.
 BASE = tempfile.mkdtemp(prefix=".bashguard-matrix-", dir=os.path.join(REPO, "tests"))
 NPM_CACHE = os.path.join(BASE, "npm-cache")
+TMP_LINK = "/tmp/.cc-bashguard-link-%d" % os.getpid()
 MASTER, FEATURE, OTHER, NOTGIT = make_fixtures(BASE)
 
 CASES = [
@@ -239,14 +254,14 @@ CASES = [
     ("M09", "malformed", NOTGIT, '@@RAW@@{"session_id":"s","tool_name":"Bash","tool_input":{"command":"ls -la"}}', A),
     # ── Destructive: rm ───────────────────────────────────────────────────
     ("R01", "rm", NOTGIT, "rm -rf /", D),
-    ("R02", "rm", NOTGIT, "rm -rf ./build", A),
+    ("R02", "rm", NOTGIT, "rm -rf ./build", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("R03", "rm", NOTGIT, "rm -rf node_modules", K),
     ("R04", "rm", NOTGIT, "rm package-lock.json", D),
     ("R05", "rm", NOTGIT, "rm -rf .git", D),
     ("R06", "rm", NOTGIT, "sudo rm -rf /var/www", D),
     ("R07", "rm", NOTGIT, "rm -r src/old", K),
     ("R08", "rm", NOTGIT, "rm .github/workflows/ci.yml", D),
-    ("R09", "rm", NOTGIT, "rm -f dist/bundle.js", A),
+    ("R09", "rm", NOTGIT, "rm -f dist/bundle.js", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("R10", "rm", NOTGIT, "timeout 5 rm -rf /", D),
     ("R11", "rm", NOTGIT, "rm -rf ~", D),
     ("R12", "rm", NOTGIT, "rm -rf ~/.ssh", D),
@@ -257,7 +272,7 @@ CASES = [
     ("R17", "rm", NOTGIT, "rm -rf *", D),
     ("R18", "rm", NOTGIT, "cd build && rm -rf .", D),
     ("R19", "rm", NOTGIT, "rm -rf /tmp/cc-test-123", A),
-    ("R20", "rm", NOTGIT, "echo 'rm -rf /'", A),
+    ("R20", "rm", NOTGIT, "echo 'rm -rf /'", K),   # literal-only exemption (v0.0.26)
     # ── Destructive: processes ────────────────────────────────────────────
     ("K01", "kill", NOTGIT, "pkill node", D),
     ("K02", "kill", NOTGIT, "pkill -f 'vite dev'", A),
@@ -323,7 +338,7 @@ CASES = [
     ("I22", "infra", NOTGIT, "kubectl delete pod web-1", A),
     ("I23", "infra", NOTGIT, "crontab -e", K),
     ("I24", "infra", NOTGIT, "docker rm -f web", K),
-    ("I25", "infra", NOTGIT, "docker rm web", A),
+    ("I25", "infra", NOTGIT, "docker rm web", K),   # literal-only exemption (v0.0.26)
     # ── Shell-write bypass (warn, never block) ────────────────────────────
     ("W01", "bypass-warn", NOTGIT, "echo x > src/a.ts", W),
     ("W02", "bypass-warn", NOTGIT, "echo x > /tmp/a.ts", A),
@@ -363,7 +378,7 @@ CASES = [
     ("N16", "wrap", FEATURE, "nice -n 10 rm -rf ~", D),
     ("N17", "wrap", FEATURE, "timeout -s KILL 5 pkill node", D),
     ("N18", "find", FEATURE, "find ~ -type f -delete", D),
-    ("N19", "find", FEATURE, "find ./build -name '*.o' -delete", A),
+    ("N19", "find", FEATURE, "find ./build -name '*.o' -delete", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("N20", "fp", FEATURE, "git restore --staged .", A),
     ("N21", "fp", FEATURE, "rm .github/ISSUE_TEMPLATE/bug.md", K),
     ("N22", "fp", FEATURE, "rm .github/workflows/ci.yml", D),
@@ -395,14 +410,14 @@ CASES = [
     ("R25", "heredoc", FEATURE, "cat <<EOF\nno terminator\nrm -rf ~", D),
     ("R26", "heredoc", FEATURE, "psql <<'SQL'\nDROP TABLE users;\nSQL", K),
     ("R27", "heredoc", FEATURE, "cat <<< \"it is\"; git push --force origin feat", D),
-    ("R28", "find", FEATURE, "find . -name '*.pyc' -delete", A),
-    ("R29", "find", FEATURE, "find . -type d -name __pycache__ -exec rm -rf {} +", A),
-    ("R30", "find", FEATURE, "find build -name '*' -delete", A),
-    ("R31", "find", FEATURE, "find /var/folders/ab/T/tmp.x -name '*.log' -delete", A),
+    ("R28", "find", FEATURE, "find . -name '*.pyc' -delete", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("R29", "find", FEATURE, "find . -type d -name __pycache__ -exec rm -rf {} +", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("R30", "find", FEATURE, "find build -name '*' -delete", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("R31", "find", FEATURE, "find /var/folders/ab/cd1234/T/tmp.x -name '*.log' -delete", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("R32", "find", FEATURE, "find . -delete", D),
     ("R33", "find", FEATURE, "find . -type f -delete", D),
     ("R34", "find", FEATURE, "find / -name '*.pyc' -delete", D),
-    ("R35", "rm", FEATURE, "rm -rf /var/folders/ab/T/tmp.x", A),
+    ("R35", "rm", FEATURE, "rm -rf /var/folders/ab/cd1234/T/tmp.x", A),
     ("R36", "rm", FEATURE, "rm -rf /var/lib/app", D),
     ("R37", "hooks", FEATURE, "git config core.hooksPath", A),
     ("R38", "hooks", FEATURE, "git config get core.hooksPath", A),
@@ -482,11 +497,11 @@ CASES = [
     ("Y11", "npx", FEATURE, "for v in 1 2; do npx agent-device@$v help; done", K),
     # ── deletions ask, except scratch and regenerable caches ──────────────
     ("D01", "delete", FEATURE, "rm -rf /tmp/claude-1000/p/s/scratchpad/snap1", A),
-    ("D02", "delete", FEATURE, "S=/tmp/claude-1000/p/s/scratchpad; rm -rf $S/snap1; ls $S", A),
+    ("D02", "delete", FEATURE, "S=/tmp/claude-1000/p/s/scratchpad; rm -rf $S/snap1; ls $S", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("D03", "delete", FEATURE, "rm -rf $S/snap1", K),                            # S unknown
     ("D04", "delete", FEATURE, "rm src/old.ts", K),
-    ("D05", "delete", FEATURE, "rm -rf .next/types webapp/.next/dev/types", A),
-    ("D06", "delete", FEATURE, "rm -rf src/__pycache__ .pytest_cache", A),
+    ("D05", "delete", FEATURE, "rm -rf .next/types webapp/.next/dev/types", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("D06", "delete", FEATURE, "rm -rf src/__pycache__ .pytest_cache", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("D07", "delete", FEATURE, "find src -name '*.ts' -delete", K),
     ("D08", "delete", FEATURE, "git restore src/a.ts", K),
     ("D09", "delete", FEATURE, "git restore --staged src/a.ts", A),
@@ -495,17 +510,17 @@ CASES = [
     ("D12", "delete", FEATURE, "git checkout -b feature/y", A),
     ("D13", "delete", FEATURE, "git worktree remove ../wt", A),                  # git refuses if dirty
     ("D14", "delete", FEATURE, "git worktree remove --force ../wt", K),
-    ("D15", "delete", FEATURE, "git worktree remove --force /tmp/claude-1000/p/s/scratchpad/wt", A),
+    ("D15", "delete", FEATURE, "git worktree remove --force /tmp/claude-1000/p/s/scratchpad/wt", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("D16", "delete", FEATURE, "for w in a b; do rm -rf ../wt/$w; done", K),
-    ("D17", "delete", FEATURE, "cd /tmp && rm -rf cc-guard-probe", A),
+    ("D17", "delete", FEATURE, "cd /tmp && rm -rf cc-guard-probe", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("D18", "delete", FEATURE, "rmdir ../cav-s6", K),
     ("D19", "delete", FEATURE, "unlink src/link", K),
-    ("D20", "delete", FEATURE, "echo rm -rf src", A),
+    ("D20", "delete", FEATURE, "echo rm -rf src", K),   # literal-only exemption (v0.0.26)
     ("D21", "delete", FEATURE, "rm -f /tmp/cred.txt && rm -f e2e/.out/x.json", K),
-    ("D22", "delete", FEATURE, "cd /tmp && rm -rf ./cc-guard-v2b && ls", A),
-    ("D23", "delete", FEATURE, "rm -rf dist/ coverage/ out/ .next", A),
+    ("D22", "delete", FEATURE, "cd /tmp && rm -rf ./cc-guard-v2b && ls", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("D23", "delete", FEATURE, "rm -rf coverage/ out/ .next", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("D24", "delete", FEATURE, "rm src/a.ts 'unbalanced", K),                    # unparseable: cannot clear it
-    ("D26", "delete", FEATURE, "unlink webapp/nm-link && rm -f webapp/nm-link", A),   # only the link goes
+    ("D26", "delete", FEATURE, "unlink webapp/nm-link && rm -f webapp/nm-link", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("D27", "delete", FEATURE, "rm -rf webapp/nm-link/", K),                          # trailing slash follows it
     # ── deletion bypasses: what bash really does with the variable or path ──
     ("V01", "bypass", FEATURE, "S=/tmp/x | true; rm -rf $S/proj", K),       # pipeline assignment: subshell
@@ -516,22 +531,156 @@ CASES = [
     ("V06", "bypass", FEATURE, "for i in 1; do S=/tmp/x; done; rm -rf $S/proj", K),
     ("V07", "bypass", FEATURE, "rm -rf '$S'/x", K),                          # single quotes: literal $S
     ("V07b", "bypass", FEATURE, "S=/tmp/x; rm -rf '$S'/y", K),              # deletes ./$S/y, not /tmp/x/y
-    ("V07c", "bypass", FEATURE, "python3 -c \"print('a')\"; echo $?; S=/tmp/x; sed 's/a/b/' f; rm -rf $S/y", A),  # ' inside "…" opens nothing
+    ("V07c", "bypass", FEATURE, "S=/tmp/x; python3 -c \"print('a')\"; echo $?; sed 's/a/b/' f; rm -rf $S/y", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("V07d", "bypass", FEATURE, "S=/tmp/x; echo \"it's\" '$S'; rm -rf $S/y", K),
     ("V08", "bypass", FEATURE, "rm -rf $TMPDIR/x", K),                        # TMPDIR unset
     ("V09", "bypass", FEATURE, "rm -rf build/", K),                           # symlink followed into lib/
-    ("V10", "bypass", FEATURE, "rm -rf build", A),                            # only the link goes
+    ("V10", "bypass", FEATURE, "rm -rf build", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("V11", "bypass", FEATURE, "find . -name build -o -path '*lib*' -delete", K),
     ("V12", "bypass", FEATURE, "find webapp/../.. -name dist -delete", K),
     ("V13", "bypass", FEATURE, "find %s -name dist -delete" % os.path.dirname(FEATURE), K),
-    ("V14", "bypass", FEATURE, "find . -name '*.pyc' -delete", A),
-    ("V15", "bypass", FEATURE, "S=/tmp/x && rm -rf $S/y", A),               # same && list: S is set
-    ("V16", "bypass", FEATURE, "S=/tmp/x; true && rm -rf $S/y", A),
+    ("V14", "bypass", FEATURE, "find . -name '*.pyc' -delete", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("V15", "bypass", FEATURE, "S=/tmp/x && rm -rf $S/y", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("V16", "bypass", FEATURE, "S=/tmp/x; true && rm -rf $S/y", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("V17", "bypass", FEATURE, "npx '@x/../../tool@1.0.0'", K),
     ("V18", "bypass", FEATURE, "npx 'agent-*@0.21.20'", K),                  # glob chars in the name
-    ("D25", "delete", FEATURE, "rm -rf /tmp/cc-guard-x 2>/dev/null; rmdir /tmp/cc-guard-y 2>/dev/null", A),
+    # ── second review: how bash really expands, splits, scopes and runs ───
+    ("W01", "bypass2", FEATURE, "rm -rf /tmp/{x,..%s/lib}" % FEATURE, K),         # brace expansion
+    ("W02", "bypass2", FEATURE, 'S="/tmp/x lib"; rm -rf $S', K),                   # word splitting
+    ("W03", "bypass2", FEATURE, "rm -rf %s*/" % TMP_LINK[:-3], K),                  # glob matches a symlink out of /tmp
+    ("W04", "bypass2", FEATURE, "pushd /tmp; popd; rm -rf lib", K),
+    ("W05", "bypass2", FEATURE, "if false; then cd /tmp; fi; rm -rf lib", K),
+    ("W06", "bypass2", FEATURE, "cd /tmp | true; rm -rf lib", K),                   # cd in a pipeline: subshell
+    ("W07", "bypass2", FEATURE, "f(){ cd %s; }; cd /tmp; f; rm -rf lib" % FEATURE, K),
+    ("W08", "bypass2", FEATURE, "S=/tmp/x; printf -v S %s lib; rm -rf $S", K),
+    ("W09", "bypass2", FEATURE, "S=/tmp/x; eval S=lib; rm -rf $S", K),
+    ("W10", "bypass2", FEATURE, "S=/tmp/x; unset S; rm -rf $S/lib", K),
+    ("W11", "bypass2", FEATURE, "cd /tmp; builtin cd %s; rm -rf lib" % FEATURE, K),
+    ("W12", "bypass2", FEATURE, "find . | xargs rm -rf", K),
+    ("W13", "bypass2", FEATURE, "find . -name '*.ts' -execdir rm {} +", K),
+    ("W14", "bypass2", FEATURE, "rsync -a --delete /tmp/empty/ lib/", K),
+    ("W15", "bypass2", FEATURE, "git rm -r lib", K),
+    ("W16", "bypass2", FEATURE, "rm -rf dist", K),                                  # holds a tracked file
+    ("W17", "bypass2", FEATURE, "find . -name dist -exec rm -rf {} +", K),
+    ("W18", "bypass2", FEATURE, "S=/tmp/x; source ./env.sh; rm -rf $S/y", K),
+    ("W19", "bypass2", FEATURE, "S=/tmp/x; read S < f; rm -rf $S", K),
+    ("W20", "bypass2", FEATURE, "CDPATH=/tmp; cd lib; rm -rf x", K),
+    ("W21", "bypass2", FEATURE, "git rm --cached lib/x", A),
+    ("W22", "bypass2", FEATURE, "pushd /tmp && rm -rf cc-guard-x; popd", K),           # pushd: not a prefix cd
+    ("W23", "bypass2", FEATURE, "rsync -a --delete lib/ /tmp/cc-guard-mirror/", K),   # literal-only exemption (v0.0.26)
+    ("W24", "bypass2", FEATURE, "rm -rf /tmp/cc-guard-a /tmp/cc-guard-nomatch-*", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("W26", "bypass2", FEATURE, "f(){ if true; then S=%s; fi; }; S=/tmp/x; f; rm -rf $S/lib" % FEATURE, K),
+    ("W27", "bypass2", FEATURE, "f(){ eval cd %s; }; cd /tmp; f; rm -rf lib" % FEATURE, K),
+    ("W28", "bypass2", FEATURE, "f(){ g; }; g(){ cd %s; }; cd /tmp; f; rm -rf lib" % FEATURE, K),
+    ("W29", "bypass2", FEATURE, "pw(){ npx --yes agent-device@0.21.20 \"$@\"; }; pw a; pw b; cd webapp && npx tsc --noEmit", A),
+    ("W30", "bypass2", FEATURE, "S=/tmp/x; p(){ echo hi; }; p; rm -rf $S/y", K),        # any function: unknown
+    ("CA01", "case", FEATURE, "case x in a) S=/tmp/foo;; b) rm -rf $S/proj;; esac", K),
+    ("CA02", "case", FEATURE, "case x in a) S=/tmp/foo;& b) rm -rf $S/proj;; esac", K),
+    ("CA03", "case", FEATURE, "case x in a) S=/tmp/foo;;& b) rm -rf $S/proj;; esac", K),
+    ("CA04", "case", FEATURE, "case x in a) S=/tmp/foo;; b) ;; esac; rm -rf $S/proj", K),
+    ("CA05", "case", FEATURE, "S=/tmp/x; case y in a) S=lib;; esac; rm -rf $S", K),
+    ("CA06", "case", FEATURE, "S=/tmp/x; case y in a) echo;; esac; rm -rf $S/z", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("CA07", "case", FEATURE, "case x in a) V=0.21.20;; b) npx agent-device@$V;; esac", K),
+    ("PF01", "prefix", FEATURE, "S=/tmp/x; ls; S2=/tmp/y; rm -rf $S/a", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("PF02", "prefix", FEATURE, "S=/tmp/x; ls; S=lib; rm -rf $S", K),
+    ("PF03", "prefix", FEATURE, "S=/tmp/x; echo ${S:=lib}; rm -rf $S", K),
+    ("PF04", "prefix", FEATURE, "S=/tmp/x; rm -rf ${S}/a $S/b", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("PF05", "prefix", FEATURE, "cd /nonexistent-cc-dir; rm -rf x", K),                     # failed cd: stays put
+    ("PF06", "prefix", FEATURE, "export S=/tmp/x && rm -rf $S/a", K),
+    ("PF07", "prefix", FEATURE, "S=/tmp/x S2=$S/y; rm -rf $S2", K),                         # values must be literal
+    ("W31", "bypass2", FEATURE, "f(){ cd %s; }; false && f(){ :; }; cd /tmp; f; rm -rf lib" % FEATURE, K),
+    ("W32", "bypass2", FEATURE, "f(){ cd %s; }; (f(){ :; }); cd /tmp; f; rm -rf lib" % FEATURE, K),
+    ("W33", "bypass2", FEATURE, "f(){ cd %s; }; if true; then f(){ :; }; fi; cd /tmp; f; rm -rf lib" % FEATURE, K),
+    ("W34", "bypass2", FEATURE, "f() ( cd /tmp ); { S=/tmp/x; }; cd %s; f; rm -rf lib" % FEATURE, K),
+    ("W36", "bypass2", FEATURE, "cd webapp && pw(){ npx --yes agent-device@0.21.20 \"$@\"; }; pw a; npx tsc --noEmit", A),  # first definition: nothing to merge
+    ("W37", "bypass2", FEATURE, "pw(){ cd /tmp; }; true && pw(){ :; }; cd webapp; pw; npx tsc --noEmit", K),        # merged with the cd body
+    ("W35", "bypass2", FEATURE, "f(){ cd %s; }; f(){ :; }; cd /tmp; f; rm -rf cc-guard-x" % FEATURE, K),  # functions: unknown for deletions
+    ("W25", "bypass2", FEATURE, "S=/tmp/x && T=/tmp/z && rm -rf $S/y $T", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("W25b", "bypass2", FEATURE, "S=/tmp/x && rm -rf $S/y; T=/tmp/z; rm -rf $T", K),   # literal-only exemption (v0.0.26)
+    ("W25c", "bypass2", FEATURE, "ls && T=/tmp/z && rm -rf $T/a; rm -rf $T/b", K),      # ls may fail: T unset after ;
+    ("E01", "order", FEATURE, "set -e; W=/tmp/x; rm -rf $W/a", K),   # literal-only exemption (v0.0.26)
+    ("E02", "order", FEATURE, "ls; L=/tmp/x; rm -rf $L/a", K),   # literal-only exemption (v0.0.26)
+    ("E03", "order", FEATURE, "rm -rf $S/a; S=/tmp/x", K),                                # used before it is set
+    ("E04", "order", FEATURE, "S=/tmp/x; for i in 1 2; do rm -rf $S/a; S=lib; done", K),  # next pass sees S=lib
+    ("E05", "order", FEATURE, "cd webapp && ls && rm -rf .next/types && cd .. && ls", K),   # literal-only exemption (v0.0.26)
+    ("E06", "order", FEATURE, "ls && cd /tmp; rm -rf lib", K),                             # cd may not have run
+    ("E07", "order", FEATURE, "S=/tmp/x; (S=lib); rm -rf $S/a", K),                        # strict: any nested assignment counts
+    ("E08", "order", FEATURE, "S=/tmp/x; { S=lib; }; rm -rf $S", K),
+    ("E10", "order", FEATURE, "set -P; cd webapp/nm-link/..; rm -rf lib", K),     # physical cd: lands elsewhere
+    ("E11", "order", FEATURE, "cd webapp/nm-link/..; rm -rf lib", K),             # symlink before ..: ambiguous
+    ("E12", "order", FEATURE, "trap 'cd /tmp' DEBUG; rm -rf lib", K),
+    ("E13", "order", FEATURE, "set -e; cd webapp; rm -rf .next", K),              # plain set -e is fine
+    ("E14", "order", FEATURE, "set -eP; cd webapp; rm -rf .next", K),
+    ("E09", "order", FEATURE, "S=/tmp/x; echo ${S:=lib}; rm -rf $S", K),
+    # ── v0.0.26: detection by word scan, literal-only exemption ───────────
+    ("L01", "literal", FEATURE, "sh -c 'rm -rf /x'", K),
+    ("L02", "literal", FEATURE, "env -S 'rm -rf x'", K),
+    ("L03", "literal", FEATURE, "rsync -a --delete a/ b/", K),
+    ("L04", "literal", FEATURE, "rm -rf /tmp/foo/x", A),
+    ("L05", "literal", FEATURE, "rm -rf .next", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("L06", "literal", FEATURE, "ls && cd webapp && rm -rf .next", K),                     # cd not leading
+    ("L07", "literal", FEATURE, "git -c alias.x='!rm -rf lib' x", K),
+    ("L08", "literal", FEATURE, "find . -name '*.pyc' -exec sh -c 'rm -rf lib' \\;", K),
+    ("L09", "literal", FEATURE, "find . -name '*.pyc' -exec rm {} +", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("L10", "literal", FEATURE, "busybox rm -rf lib", K),
+    ("L11", "literal", FEATURE, "timeout 60 nice -n 5 rm -rf /tmp/cc-x", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("L12", "literal", FEATURE, "rm -rf ~/x", K),                                           # ~ is $HOME, which a command can change
+    ("L13", "literal", FEATURE, "rm -rf ~+/lib ~-/lib", K),
+    ("L14", "literal", FEATURE, "git commit -m 'rm the old helper'", A),                   # a message is never run
+    ("L15", "literal", FEATURE, "git rm --cached lib/x && rm -rf /tmp/cc-y", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("L16", "literal", FEATURE, "printf 'rm -rf lib' | sh", K),
+    ("L17", "literal", FEATURE, "rm -rf \"$(echo lib)\"", K),
+    ("L18", "literal", FEATURE, "xargs -a list.txt rm -f", K),
+    ("L19", "literal", FEATURE, "command -p rm -rf lib", K),
+    ("L20", "literal", FEATURE, "rm -rf /tmp/cc-a; rm lib/x", K),
+    ("L21", "literal", FEATURE, "S=/tmp/cc-x; rm -rf $S/a ${S}/b; ls $S", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("L22", "literal", FEATURE, "S=/tmp/cc-x; S=lib; rm -rf $S", K),                        # reassigned
+    ("L23", "literal", FEATURE, "S=/tmp/cc-x; IFS=/; rm -rf $S", K),                        # IFS changes splitting
+    ("L24", "literal", FEATURE, "S=/tmp/cc-x; read S < f; rm -rf $S", K),
+    ("L25", "literal", FEATURE, "S=/tmp/cc-x; f(){ :; }; rm -rf $S", K),
+    ("L26", "literal", FEATURE, "ls; S=/tmp/cc-x; rm -rf $S", K),                           # not leading
+    ("L27", "literal", FEATURE, "S=/tmp/cc-x | true; rm -rf $S/a", K),                      # piped: a subshell
+    ("L28", "literal", FEATURE, "cd webapp && rm -rf .next", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("L29", "literal", FEATURE, "cd webapp && S=/tmp/x; rm -rf $S", K),                     # cd may fail: S unset
+    ("L30", "literal", FEATURE, "cd webapp/nm-link/.. && rm -rf lib", K),                   # .. in a cd: physical/logical
+    ("L31", "literal", FEATURE, "git -C lib worktree remove --force /tmp/cc-wt", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("L32", "literal", FEATURE, "git -C lib worktree remove --force wt", K),
+    ("L33", "literal", FEATURE, "S=/tmp/cc-x; echo ${S:=lib}; rm -rf $S", K),
+    ("L35", "literal", FEATURE, "IFS=/; S=/tmp/cc-x; rm -rf $S", K),
+    ("L36", "literal", FEATURE, "S=/tmp/cc-x HOME=/tmp; rm -rf $S", K),
+    ("L37", "literal", FEATURE, "cd - && rm -rf lib", K),                                   # $OLDPWD, even if ./- exists
+    ("L38", "literal", FEATURE, "cd -P && rm -rf lib", K),
+    ("S01", "floor", FEATURE, "rm -rf /tmp", K),
+    ("S02", "floor", FEATURE, "rm -rf /tmp/", K),
+    ("S03", "floor", FEATURE, "rm -rf /tmp/*", K),
+    ("S04", "floor", FEATURE, "rm -rf /tmp/claude-1000", K),
+    ("S05", "floor", FEATURE, "rm -rf /tmp/claude-1000/*", K),
+    ("S06", "floor", FEATURE, "rm -rf /tmp/claude-1000/-home-u-proj", K),               # every session of a project
+    ("S07", "floor", FEATURE, "rm -rf /tmp/claude-1000/-home-u-proj/sess/scratchpad/x", A),
+    ("S08", "floor", FEATURE, "rm -rf /tmp/cc-guard-x /tmp/cc-guard-x/*", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("S09", "floor", FEATURE, "rm -rf /var/tmp", D),                                     # system-path rule
+    ("S14", "floor", FEATURE, "rm -rf /tmp/c*", K),
+    ("S15", "floor", FEATURE, "rm -rf /var/folders/ab/cd1234/T", K),
+    ("S10", "cdlink", FEATURE, "cd otherlink && rm -rf build", K),
+    ("S11", "cdlink", FEATURE, "cd rootlink && rm -rf .next", K),
+    ("S12", "cdlink", FEATURE, "rm -rf otherlink/build", K),
+    ("S13", "cdlink", FEATURE, "cd webapp && rm -rf .next", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
+    ("M01", "minimal", FEATURE, "rm -rf /tmp/cc-x", A),
+    ("M02", "minimal", FEATURE, "rm -rf /tmp/claude-1000/-home-u-p/sess/scratchpad/x /tmp/cc-y", A),
+    ("M03", "minimal", FEATURE, "  rm -f -- /tmp/cc-x", A),
+    ("M04", "minimal", FEATURE, "rm -rf /tmp/cc-x/../..", K),                               # .. in the path
+    ("M05", "minimal", FEATURE, "rm -rf /tmp/cc-x; ls", K),                                 # not alone
+    ("M06", "minimal", FEATURE, 'rm -rf "/tmp/cc-x"', K),                                   # quoted
+    ("M07", "minimal", FEATURE, "rm -rf /tmp/cc-x lib", K),                                 # one path is not scratch
+    ("M08", "minimal", FEATURE, "rm -rf %s/" % TMP_LINK, K),                                # symlink out of /tmp
+    ("M09", "minimal", FEATURE, "rm -rf /tmp/cc-x*", K),                                    # glob
+    ("M10", "minimal", FEATURE, "rm -rf /tmp/cc-x\nrm -rf lib", K),
+    ("M11", "minimal", FEATURE, "git status && git log -1", A),                             # no deletion at all
+    ("L34", "literal", FEATURE, "S=/tmp/../home; rm -rf $S", K),                             # .. in the value
+    ("D25", "delete", FEATURE, "rm -rf /tmp/cc-guard-x 2>/dev/null; rmdir /tmp/cc-guard-y 2>/dev/null", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("Y12", "npx", FEATURE, "(cd webapp && npx tsc --noEmit); cd webapp && npx tsc --noEmit", A),  # subshell cd does not leak
-    ("Y13", "npx", FEATURE, "pw(){ (cd webapp && npx tsc \"$@\"); }; pw -v; npx vitest run", A),
+    ("Y13", "npx", FEATURE, "pw(){ (cd webapp && npx tsc \"$@\"); }; pw -v; pw --noEmit", A),
+    ("Y13b", "npx", FEATURE, "pw(){ (cd webapp && npx tsc \"$@\"); }; pw -v; npx vitest run", A),  # pw's cd is in a subshell
     ("Y14", "npx", FEATURE, "X=$(cd webapp && pwd); npx vitest run", A),
 ]
 
@@ -598,3 +747,5 @@ try:
     sys.exit(main())
 finally:
     shutil.rmtree(BASE, ignore_errors=True)
+    if os.path.islink(TMP_LINK):
+        os.unlink(TMP_LINK)

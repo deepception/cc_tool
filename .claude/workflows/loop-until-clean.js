@@ -1,7 +1,7 @@
 export const meta = {
   name: 'loop-until-clean',
   description: 'Loop-until-done sweep: repeatedly fan out finder agents over a target until TWO consecutive rounds surface nothing new, then adversarially verify the survivors and return only the confirmed set.',
-  whenToUse: 'When the work is open-ended and you cannot know up front how many passes it takes (find all instances of X, hunt remaining issues, sweep until clean). The stop condition is "no new findings", not a fixed iteration count. Parameterize via args.target / args.find / args.maxRounds.',
+  whenToUse: 'When the work is open-ended and you cannot know up front how many passes it takes (find all instances of X, hunt remaining issues, sweep until clean). The stop condition is "no new findings", not a fixed iteration count. Parameterize via args.target / args.find / args.maxRounds (args.finderModel: \'haiku\' for a locate-only find).',
   phases: [
     { title: 'Sweep', detail: 'Each round fans out finder agents over the target; dedup against everything seen so far' },
     { title: 'Verify', detail: 'Adversarially verify the de-duplicated survivors; keep only confirmed findings' },
@@ -17,6 +17,13 @@ const ROOT = cfg.root || 'the current repository (your working directory)'
 const FINDERS_PER_ROUND = cfg.findersPerRound || 3   // parallel finders each round
 const MAX_ROUNDS = cfg.maxRounds || 6                // absolute safety cap on rounds
 const DRY_ROUNDS_TO_STOP = cfg.dryRoundsToStop || 2  // stop after N consecutive empty rounds
+// Finders inherit the session model (Opus) unless told otherwise. Pass
+// finderModel: 'haiku' when FIND is a locate-only pattern ("every call to X",
+// "every TODO") rather than a judgment ("bugs"); Haiku 5.5 is a twentieth of
+// Sonnet's price but weak at judging code. Verifiers always stay on the session model.
+// Default FIND ("bugs…") is judgment, so finderModel is ignored without an explicit find.
+const FINDER_MODEL = cfg.find ? (cfg.finderModel || undefined) : undefined
+if (cfg.finderModel && !cfg.find) log(`finderModel '${cfg.finderModel}' ignored: the default find is a judgment sweep, so finders stay on the session model`)
 
 // Token-budget guard: only consulted if the host populated `budget.total`.
 // We keep looping only while a healthy fraction of the budget remains.
@@ -82,7 +89,7 @@ while (round < MAX_ROUNDS && dryRounds < DRY_ROUNDS_TO_STOP && budgetHealthy()) 
 
   const roundResults = (await parallel(
     Array.from({ length: FINDERS_PER_ROUND }, (_, i) => () =>
-      agent(finderPrompt(i + 1), { label: `find:r${round}-f${i + 1}`, schema: FIND_SCHEMA }))
+      agent(finderPrompt(i + 1), { label: `find:r${round}-f${i + 1}`, schema: FIND_SCHEMA, ...(FINDER_MODEL && { model: FINDER_MODEL }) }))
   )).filter(Boolean)
 
   const roundFindings = roundResults.flatMap(r => (r && r.findings) || [])

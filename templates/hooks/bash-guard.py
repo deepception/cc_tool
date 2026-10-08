@@ -20,26 +20,27 @@ Blocks:
 
 Asks (hands the decision to the user; in an unattended run that is a refusal).
 The rule is: ask before an install or a deletion, nowhere else.
-  - deletions: `rm`/`rmdir`/`unlink`/`find -delete` of anything that is not
-    scratch (/tmp, $TMPDIR, the Claude scratchpad) or a regenerable cache
-    (__pycache__, .next, build/, dist/ …); `git checkout -- <paths>`, `git
-    restore <paths>`, `git worktree remove --force`, `git reset --hard`, `git
-    clean -f`, `git checkout .`, `git branch -D`, `git stash drop|clear`,
-    history rewrites; `rm -r node_modules`/`.venv`; docker prune / `rm -f` /
-    `down -v`; `kubectl delete --all` / drain; helm uninstall; terraform/pulumi
-    destroy or auto-approve; cloud CLI deletes; DROP / TRUNCATE /
-    DELETE-without-WHERE when a DB client is in the command; redis FLUSHALL;
-    `crontab -e`.
+  - deletions: any `rm`/`rmdir`/`unlink`/`shred` word or `-delete` /
+    `--delete…` flag anywhere in the command (wrappers, `sh -c`, git aliases
+    and xargs included), unless the whole command is `rm [-flags]
+    /absolute/path …` with every path written literally and really located
+    strictly below a scratch root (not /tmp itself nor a shared level such as
+    /tmp/claude-<uid>); `git rm`, `git checkout -- <paths>`, `git restore
+    <paths>`, `git worktree remove --force`, `git reset --hard`, `git clean
+    -f`, `git checkout .`, `git branch -D`, `git stash drop|clear`, history
+    rewrites; docker prune / `rm -f` / `down -v`; `kubectl delete --all` /
+    drain; helm uninstall; terraform/pulumi destroy or auto-approve; cloud CLI
+    deletes; DROP / TRUNCATE / DELETE-without-WHERE when a DB client is in the
+    command; redis FLUSHALL; `crontab -e`.
   - installs: `npx <pkg>` when <pkg> is not on disk, because that downloads
     and executes a package nobody reviewed. Installed dev dependencies (`npx
     vitest`, `npx tsc`) pass, as does an exact pinned version already in npx's
     cache (`npx agent-device@0.21.20`) and `npx --no-install …`. An unpinned
     or tagged spec that is not installed (`npx pkg`, `pkg@latest`) asks.
-  - `cd <dir>`, `( … )` subshells and literal assignments earlier in the same
-    command (`S=/tmp/x; rm -rf $S/y`, `V=1.2.3; npx pkg@$V`) are followed, but
-    only where bash is certain to have run them (see walk_commands); a
-    directory or variable the guard cannot resolve counts as not scratch and
-    not installed.
+  - Deletions follow nothing: no variables, no `cd`, no caches (see
+    check_deletes). npx follows variables, `cd` and subshells (see
+    walk_commands), since a wrong guess there costs a download, not files; a
+    directory or variable it cannot resolve counts as not installed.
 
 Warns (additionalContext, never blocks):
   - shell writes into source files (`> x.ts`, `tee`, `sed -i`, `perl -pi`,
@@ -1231,6 +1232,8 @@ _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 _SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "}", "done", "fi"}
 _DECLARERS = {"export", "local", "readonly", "declare", "typeset"}
 _SINGLE_QUOTED_DOLLAR = False  # set by main(): the raw command has a $ inside '…'
+_PREPPED = ""                  # set by main(): the command after shell_prepass
+_SPLITS_OR_GLOBS = re.compile(r"[\s*?\[{]")
 _VAR_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
@@ -1280,7 +1283,9 @@ def _expand(tok: str, env: dict):
 
     def sub(m):
         val = env.get(m.group(1) or m.group(2))
-        if val is None:
+        # Unquoted, bash would word-split or glob a value with spaces or
+        # wildcards; shlex has dropped the quotes, so either way it's unknown.
+        if val is None or _SPLITS_OR_GLOBS.search(val):
             unknown.append(m.group(0))
             return ""
         return val
@@ -1301,7 +1306,10 @@ def _track_cd(cwd, args):
         if not cwd:
             return None
         target = os.path.join(cwd, target)
+    raw = target
     target = os.path.normpath(target)
+    if ".." in raw.split(os.sep) and os.path.realpath(target) != os.path.realpath(raw):
+        return None  # `link/..`: logical (default) and physical (set -P) cd disagree
     return target if os.path.isdir(target) else None
 
 
@@ -1323,93 +1331,192 @@ def _scoped_segments(tokens):
 
 _OPENERS = {"if", "while", "until", "for", "select", "case", "{"}
 _CLOSERS = {"fi", "done", "esac", "}"}
+_CWD = "\0cwd"     # the working directory rides in env, so it obeys the same rules
+_DIRS = "\0dirs"   # pushd/popd stack (a tuple, so subshell copies don't share it)
+# Commands that can set or clear variables (or the directory) in ways the walk
+# does not model. After one of these, every variable and the cwd are unknown.
+_OPAQUE_CMDS = {"eval", "source", ".", "shopt", "let", "exec", "trap", "alias", "enable",
+                "mapfile", "readarray", "getopts", "printf", "declare", "typeset", "local", "readonly",
+                "export", "unset", "read", "builtin"}
+_FUNC_DEF_RE = re.compile(r"(?:^|[\s;&|(){}])(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\s*\))")
 
 
 def walk_commands(tokens):
     """Yield (simple command, cwd or None, variables) in execution order.
 
-    A variable counts as known only where bash is certain to have assigned it
-    before the command runs. An assignment is dropped (the name becomes
-    unknown) when it sits in a pipeline or a backgrounded command (both run in
-    a subshell), inside an if/loop/case/brace body (it may not run), or after
-    `&&`/`||` once the and-or list ends (`false && S=x; rm $S` runs rm with S
-    unset). Inside its own `&&` chain it holds, since the rest of the chain
-    runs only if the assignment did. `( … )` scopes cwd and variables.
+    A variable or the working directory counts as known only where bash is
+    certain to have set it before the command runs:
+      - not in a pipeline element or a backgrounded command (both subshells);
+      - inside an if/case/brace body, only for the rest of that body (it
+        may not run), and never in a loop body (each pass starts where the
+        last one left off);
+      - after `&&`/`||` only within the rest of the same and-or list
+        (`false && S=x; rm $S` runs rm with S unset), and never after `||`;
+      - `( … )` and `$( … )` scope both;
+      - a command the walk does not model (eval, source, read, printf -v,
+        unset, builtin, …) makes everything unknown from there on, and a
+        function definition anywhere makes everything unknown from the start,
+        since the walk cannot tell when its body runs.
     """
-    cwd = _PAYLOAD_CWD or os.getcwd()
-    env = {"HOME": os.path.expanduser("~")}
+    env = {"HOME": os.path.expanduser("~"), _CWD: _PAYLOAD_CWD or os.getcwd(), _DIRS: ()}
     if os.environ.get("TMPDIR"):
         env["TMPDIR"] = os.environ["TMPDIR"]
+    # A function's body is walked where it is defined, as a body that may not
+    # run; what it can set (outside its own subshells) is recorded, and a call
+    # forgets exactly that. A body that runs something the walk does not model
+    # (eval, another function …) makes its calls forget everything.
+    functions = {a or b for a, b in _FUNC_DEF_RE.findall(_PREPPED)}
+    effects: dict = {}     # function name -> names its body sets, or None for "anything"
+    opaque_fns: set = set()  # functions whose body runs something the walk does not model
+    defining = None        # name whose body the next `{` / `(` opens
+    pending_def = None     # (name, defined conditionally?, previous effects or "absent")
     stack: list = []
-    depth = 0             # if/loop/case/brace nesting: assignments there may not run
-    list_or = False       # an `||` in the current and-or list
-    list_and = False      # an `&&` in the current and-or list
-    conditional: set = set()   # names assigned after &&/|| in this list
-    last_assigned: list = []   # names assigned by the previous simple command
-    after_pipe = False
-    for kind, seg in _scoped_segments(tokens):
+    bodies: list = []   # open if/case/brace/loop bodies: [kind, names set inside]
+    list_or = list_and = after_pipe = False
+    conditional: set = set()
+    last_set: list = []
+
+    def forget_all():
+        for k in list(env):
+            if k != _DIRS:
+                env[k] = None
+        env[_DIRS] = ()
+
+    def in_function_body():
+        return next((b[2] for b in reversed(bodies) if len(b) > 2), None)
+
+    def call(fname):
+        names = effects.get(fname)
+        if names is None:
+            forget_all()
+        else:
+            for n in names:
+                env[n] = None
+
+    segments = list(_scoped_segments(tokens))
+    for i, (kind, seg) in enumerate(segments):
         if kind == "op":
+            if defining is not None and seg != "()":
+                defining = None  # `f() ( … )` or similar: no brace body to learn from; calls stay opaque
             for ch in seg:
                 if ch == "(":
-                    stack.append((cwd, dict(env), depth))
+                    stack.append((dict(env), [[b[0], set(b[1])] + b[2:] for b in bodies],
+                                  dict(effects), set(opaque_fns)))
                 elif ch == ")" and stack:
-                    cwd, env, depth = stack.pop()
+                    env, bodies, effects, opaque_fns = stack.pop()  # a subshell's definitions die with it
             op = seg.strip("()")
-            if op in ("|", "|&") or (op == "&"):
-                for name in last_assigned:
+            if op in ("|", "|&", "&"):
+                for name in last_set:
                     env[name] = None   # pipeline element / background job: a subshell
             after_pipe = op in ("|", "|&")
             if op == "&&":
                 list_and = True
             elif op == "||":
                 list_or = True
-                for name in conditional | set(last_assigned):
+                for name in conditional | set(last_set):
                     env[name] = None
-            elif op in (";", "\n", "&", ";;") or not op:
+            elif op in (";", "\n", "&", ";;", ";&", ";;&") or not op:
                 for name in conditional:
                     env[name] = None
                 conditional, list_and, list_or = set(), False, False
-            last_assigned = []
+            last_set = []
             continue
-        last_assigned = []
+        last_set = []
         words = list(seg)
+        nxt = segments[i + 1] if i + 1 < len(segments) else ("op", "")
+        if (len(words) == 1 and nxt[0] == "op" and nxt[1].startswith("()")) or words[:1] == ["function"]:
+            defining = words[-1]  # `name()` / `function name`: a definition, not a call
+            # Defined conditionally (inside a body, after &&/||, in a pipeline):
+            # a later call may reach this body or the previous one, so the two
+            # are merged when the body closes. (Subshell definitions are undone
+            # by the subshell snapshot.)
+            pending_def = (defining, bool(bodies or list_and or list_or or after_pipe),
+                           effects[defining] if defining in effects else "absent")
+            effects[defining] = None   # until its body has been walked
+            continue
         while words and words[0] in _SHELL_KEYWORDS | _OPENERS | _CLOSERS:
-            if words[0] in _OPENERS:
-                depth += 1
-            elif words[0] in _CLOSERS:
-                depth = max(0, depth - 1)
+            w = words[0]
+            if w in _OPENERS:
+                bodies.append([w, set(), defining, pending_def] if defining and w == "{" else [w, set()])
+                defining = None
+            elif w in _CLOSERS and bodies:
+                body = bodies.pop()
+                for name in body[1]:
+                    env[name] = None
+                if bodies:
+                    bodies[-1][1] |= body[1]   # what a nested body may set, its parent may too
+                if len(body) > 2:
+                    fname, conditional_def, prev = body[3]
+                    new = None if fname in opaque_fns else set(body[1])
+                    if conditional_def and prev != "absent":
+                        new = None if new is None or prev is None else new | prev
+                    effects[fname] = new
+            elif w in ("else", "elif") and bodies:
+                for name in bodies[-1][1]:
+                    env[name] = None   # the other branch: what `then` set never happened
+                bodies[-1][1] = set()
             words = words[1:]
         if words and words[0] in ("for", "select", "case"):
-            depth += 1  # the loop variable is handled below; the body may not run
+            bodies.append([words[0], set()])
         if not words:
             continue
-        env["PWD"] = cwd
+        in_loop = any(b[0] in ("while", "until", "for", "select", "case") for b in bodies)
+        certain = not after_pipe and not list_or and not in_loop
+
+        def assign(name, value):
+            env[name] = value if certain else None
+            if list_and:
+                conditional.add(name)
+            if bodies:
+                bodies[-1][1].add(name)
+            last_set.append(name)
+
+        env["PWD"] = env[_CWD]
         body = words[1:] if words[0] in _DECLARERS else words
         if body and all(_ASSIGN_RE.match(t) for t in body):
             for t in body:
                 name, val = t.split("=", 1)
-                name = name.rstrip("+")
-                certain = depth == 0 and not after_pipe and not list_or
-                env[name] = _expand(val, env) if certain else None
-                if list_and:
-                    conditional.add(name)
-                last_assigned.append(name)
+                assign(name.rstrip("+"), _expand(val, env))
             continue
         cmd, _w = _strip_wrappers(_strip_assignments(words))
         cmd = _strip_assignments(cmd)
         if not cmd:
             continue
         name = _cmd_name(cmd[0])
-        if name in ("cd", "pushd"):
-            cwd = _track_cd(cwd, [_expand(a, env) for a in cmd[1:]])
+        fn = in_function_body()
+        if name in _OPAQUE_CMDS or cmd[0] in functions:
+            if fn is not None:
+                opaque_fns.add(fn)   # walked, not run: remember that a call can do anything
+                yield cmd, env[_CWD], env
+                continue
+            if cmd[0] in functions and name not in _OPAQUE_CMDS:
+                call(cmd[0])
+                yield cmd, env[_CWD], env
+                continue
+            forget_all()
+            yield cmd, None, env
+            continue
+        if name in ("cd", "pushd", "popd"):
+            cwd = env[_CWD]
+            relative_cdpath = "CDPATH" in env or os.environ.get("CDPATH")
+            if name == "popd":
+                dirs = env[_DIRS]
+                assign(_CWD, dirs[-1] if dirs else None)
+                env[_DIRS] = dirs[:-1]
+            else:
+                args = [_expand(a, env) for a in cmd[1:]]
+                plain = [a for a in args if a not in ("-L", "-P", "-e", "-@", "--")]
+                if relative_cdpath and plain and plain[0] and not plain[0].startswith(("/", "./", "../", "~")):
+                    new = None   # CDPATH may send a relative cd somewhere else
+                else:
+                    new = _track_cd(cwd, args)
+                if name == "pushd":
+                    env[_DIRS] = env[_DIRS] + (cwd,) if certain else ()
+                assign(_CWD, new)
             continue
         if name in ("for", "select") and len(cmd) > 1:
             env[cmd[1]] = None  # loop variable: a different value each pass
-        elif name == "read":
-            for a in cmd[1:]:
-                if not a.startswith("-"):
-                    env[a] = None
-        yield cmd, cwd, env
+        yield cmd, env[_CWD], env
 
 
 # ── npx guard: ask only when it would download ────────────────────────────────
@@ -1546,23 +1653,39 @@ def check_npx(tokens) -> None:
             _check_npx(cmd, cwd, env)
 
 
-# ── Deletion guard: deleting anything that is not scratch asks ────────────────
+# ── Deletion guard: every deletion asks, except one literal scratch form ──────
 # cc_tool's rule for prompts: the agent asks before it installs something or
 # deletes something, and nowhere else. The deny tier above still refuses the
-# catastrophic forms (a root, home, the repo, .git, lockfiles, CI). Everything
-# else that deletes files or throws away uncommitted work asks, except where
-# nothing of value can be lost: the agent's own scratch space (/tmp, $TMPDIR,
-# the Claude scratchpad) and regenerable caches (__pycache__, .next, build/ …).
+# catastrophic forms (a root, home, the repo, .git, lockfiles, CI).
+#
+# v0.0.23–v0.0.26 tried to exempt more (variables, cd, caches, find), deciding
+# from a parse of the command that a deletion was harmless. Five review rounds
+# each found a new way for that parse and bash to disagree, every one a
+# deletion that went through without asking. So the exemption is now a single
+# shape that needs no shell semantics at all:
+#
+#     the whole command is `rm [-flags] /absolute/path …`, every path written
+#     out literally (no quotes, $, globs, ~, braces, backslashes), and every
+#     path's real location strictly below a scratch root (/tmp, $TMPDIR, the
+#     Claude scratchpad) but not one of its shared levels (/tmp itself,
+#     /tmp/claude-<uid>, /tmp/claude-<uid>/<project>, the macOS T/ levels).
+#
+# Everything else that deletes asks. Detection is a word scan, not a parse:
+# any rm/rmdir/unlink/shred word, or a -delete / --delete… /
+# --remove-source-files flag, anywhere in the command (wrappers, sh -c, env -S,
+# xargs, git aliases included) counts; git commit messages are skipped. git's
+# own discards (rm, checkout -- / restore <paths>, worktree remove --force)
+# ask as well.
 _DELETE_UNPARSEABLE_RE = re.compile(
     r"(?:^|[;&|(\n])[ \t]*(?:[A-Za-z_]\w*=\S*[ \t]+)*(?:\S*/)?(?:rm|rmdir|unlink)(?:\s|$)")
 _SCRATCH_ROOTS = ("/tmp", "/var/tmp", "/var/folders", "/private/tmp", "/private/var/folders")
-_CACHE_PARTS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next", ".nuxt", ".turbo",
-                ".parcel-cache", ".dart_tool", ".gradle", "build", "dist", "out", "coverage", ".coverage",
-                "htmlcov", ".tox", ".nox", ".eggs", ".cache", ".svelte-kit", ".expo", "target"}
-_CACHE_FILE_RE = re.compile(r"(?:\.py[co]|\.o|\.class|\.tsbuildinfo|\.DS_Store)$")
-_FIND_CACHE_NAMES = {"*.pyc", "*.pyo", "*.o", "*.class", ".DS_Store", "*.tsbuildinfo"} | _CACHE_PARTS
-_DELETE_SUGGESTION = ("confirm the deletion with the user, or move scratch work under the session scratchpad "
-                      "(/tmp/…), where deletions need no approval")
+_DELETERS = {"rm", "rmdir", "unlink", "shred"}
+_DELETE_FLAG_RE = re.compile(r"^(?:-delete|--delete(?:-\w+)*|--remove-source-files)$")
+_SCRATCH_FLOOR_RE = re.compile(r"^(?:/private)?/tmp/claude-\d+(?:/[^/]+)?$|^(?:/private)?/var/folders(?:/[^/]+){0,3}$")
+# The one exempt shape, matched on the raw command text.
+_EXEMPT_RM_RE = re.compile(r"^[ \t]*rm(?:[ \t]+-[A-Za-z]+)*(?:[ \t]+--)?((?:[ \t]+/[A-Za-z0-9._+@%,:/=-]+)+)[ \t]*$")
+_DELETE_SUGGESTION = ("confirm the deletion with the user. Only a plain `rm <absolute path under the session "
+                      "scratchpad or /tmp/<dir>>`, alone on its line, runs without approval")
 
 
 def _scratch_roots():
@@ -1577,44 +1700,20 @@ def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def _disposable(path: str, cwd=None) -> bool:
-    """Scratch space or a regenerable cache: deleting it loses nothing.
-
-    Judged on the real path, so `build/` that is a symlink into src/ is src/.
-    Cache names count only below the project (or the command's directory),
-    never in the ancestors of it: a repo checked out under ~/build/ is not a
-    cache."""
-    real = os.path.realpath(path)
-    if any(_within(real, r) for r in _scratch_roots()):
+def _scratch_floor(real: str) -> bool:
+    """True for a scratch root or one of its shared upper levels."""
+    if real in {os.path.realpath(r) for r in _scratch_roots()} or real in _SCRATCH_ROOTS:
         return True
-    for base in {os.path.realpath(b) for b in (lib.repo_root() if lib else "", cwd or "") if b}:
-        if _within(real, base) and real != base:
-            parts = os.path.relpath(real, base).split(os.sep)
-            return any(p in _CACHE_PARTS for p in parts) or bool(_CACHE_FILE_RE.search(parts[-1]))
-    return False
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir and _within(os.path.realpath(tmpdir), real):
+        return True   # TMPDIR itself or one of its ancestors
+    return bool(_SCRATCH_FLOOR_RE.match(real))
 
 
-def _undisposable(targets, cwd, env):
-    """The targets (as written) that are not provably scratch or cache."""
-    out = []
-    for raw in targets:
-        t = _expand(raw, env)
-        if t is None:
-            out.append(raw)
-            continue
-        t = os.path.expanduser(t)
-        if not os.path.isabs(t):
-            if not cwd:
-                out.append(raw)
-                continue
-            t = os.path.join(cwd, t)
-        # Removing a symlink removes only the link (a trailing slash would
-        # follow it into the target, so that form is not exempt).
-        if os.path.islink(t) and not t.endswith("/"):
-            continue
-        if not _disposable(t, cwd):
-            out.append(raw)
-    return out
+def _scratch_path(path: str) -> bool:
+    """Strictly below a scratch root and not a shared level, on the real path."""
+    real = os.path.realpath(path)
+    return not _scratch_floor(real) and any(_within(real, r) for r in _scratch_roots())
 
 
 def _ask_delete(what: str, targets) -> None:
@@ -1622,64 +1721,71 @@ def _ask_delete(what: str, targets) -> None:
     ask(f"{what} {shown}", _DELETE_SUGGESTION)
 
 
-def _find_delete_targets(cmd):
-    """Roots of a `find … -delete` / `-exec rm`, or [] when its -name tests
-    select only regenerable caches (find . -name '*.pyc' -delete)."""
-    roots = []
-    for t in cmd[1:]:
-        if t.startswith(("-", "(", "!")):
-            break
-        roots.append(t)
-    names = [cmd[i + 1] for i, t in enumerate(cmd[:-1]) if t in ("-name", "-iname")]
-    # The exemption needs a plain conjunction of -name tests: an -o / -not /
-    # -path / -regex can select files the names don't describe.
-    widening = {"-o", "-or", "-not", "!", ",", "-path", "-ipath", "-wholename", "-iwholename",
-                "-regex", "-iregex", "-lname", "-ilname", "-samefile", "-inum", "-links", "-L", "-follow"}
-    local = all(not os.path.isabs(r) and ".." not in os.path.normpath(r).split(os.sep) for r in roots)
-    if names and local and not widening & set(cmd) and all(_quoted(n) in _FIND_CACHE_NAMES for n in names):
-        return []
-    return roots or ["."]
+def _words_of(tok: str):
+    """A token split the way a nested shell would see it, stripped of the
+    punctuation that can sit around a command word (`!rm`, `'rm`, `(rm`)."""
+    for w in re.split(r"[\s;&|()`=!]+", tok):
+        w = w.strip("'\"{}")
+        if w:
+            yield w
+
+
+def _delete_markers(tokens) -> list:
+    """Every token that deletes something (by index)."""
+    skip = set()
+    for i, tok in enumerate(tokens):
+        if tok in ("-m", "--message") and i + 1 < len(tokens) and any(
+                _cmd_name(t) == "git" for t in tokens[max(0, i - 6):i]):
+            skip.add(i + 1)   # a commit message is text, never run
+    out = []
+    for i, tok in enumerate(tokens):
+        if i in skip or _is_op(tok):
+            continue
+        if any(_cmd_name(w) in _DELETERS or _DELETE_FLAG_RE.match(w) for w in _words_of(tok)):
+            out.append(i)
+    return out
+
+
+def _exempt_rm(cmd: str) -> bool:
+    """The one shape that deletes without asking (see the comment above)."""
+    m = _EXEMPT_RM_RE.match(cmd)
+    if not m:
+        return False
+    paths = m.group(1).split()
+    return bool(paths) and all(".." not in p.split("/") and _scratch_path(p) for p in paths)
 
 
 def check_deletes(tokens) -> None:
-    for cmd, cwd, env in walk_commands(tokens):
-        name = _cmd_name(cmd[0])
-        if name in ("rm", "rmdir", "unlink"):
-            args = cmd[1:]
+    # git's own discards first: they ask with a specific message
+    for sub, _gopts, args, _repo in (git_invocations(tokens) if any(_cmd_name(t) == "git" for t in tokens) else []):
+        if sub == "worktree" and args[:1] == ["remove"] and (
+                "--force" in args or any("f" in _short_flags(a) for a in args[1:])):
+            _ask_delete("'git worktree remove --force' deletes the worktree and any uncommitted work in",
+                        [a for a in args[1:] if not a.startswith("-")])
+        elif sub == "rm" and "--cached" not in args:
+            _ask_delete("'git rm' deletes from the working tree", [a for a in args if not a.startswith("-")])
+        elif sub in ("checkout", "restore"):
             if "--" in args:
-                k = args.index("--")
-                targets = [a for a in args[:k] if not a.startswith("-")] + args[k + 1:]
+                paths = args[args.index("--") + 1:]
+            elif sub == "restore":
+                paths = [a for a in args if not a.startswith("-")]
             else:
-                targets = [a for a in args if not a.startswith("-")]
-            # a bare number is the fd of a redirect (`rm x 2>/dev/null`), not a file
-            kept = _undisposable([t for t in targets if not t.isdigit()], cwd, env)
-            if kept:
-                _ask_delete(f"'{name}' deletes", kept)
-        elif name == "find" and ("-delete" in cmd or ("-exec" in cmd and any(
-                _cmd_name(t) in ("rm", "rmdir", "unlink") for t in cmd))):
-            kept = _undisposable(_find_delete_targets(cmd), cwd, env)
-            if kept:
-                _ask_delete("'find … -delete' deletes files under", kept)
-        elif name == "git":
-            for sub, gopts, args, _repo in git_invocations(cmd):
-                repo_dir = next((v for o, v in gopts if o == "-C" and v), None)
-                where = cwd if repo_dir is None else _track_cd(cwd, [_expand(repo_dir, env)])
-                in_scratch = bool(where) and _disposable(where, where)
-                if sub == "worktree" and args[:1] == ["remove"] and (
-                        "--force" in args or any("f" in _short_flags(a) for a in args[1:])):
-                    kept = _undisposable([a for a in args[1:] if not a.startswith("-")], where, env)
-                    if kept:
-                        _ask_delete("'git worktree remove --force' deletes the worktree and any uncommitted "
-                                    "work in", kept)
-                elif sub in ("checkout", "restore") and not in_scratch:
-                    if "--" in args:
-                        paths = args[args.index("--") + 1:]
-                    elif sub == "restore":
-                        paths = [a for a in args if not a.startswith("-")]
-                    else:
-                        paths = []  # `git checkout <branch>` switches branches; nothing is discarded
-                    if paths and not _restore_staged_only(sub, args):
-                        _ask_delete(f"'git {sub}' discards uncommitted changes to", paths)
+                paths = []  # `git checkout <branch>` switches branches; nothing is discarded
+            if paths and not _restore_staged_only(sub, args):
+                _ask_delete(f"'git {sub}' discards uncommitted changes to", paths)
+    markers = _delete_markers(tokens)
+    if not markers:
+        return
+    # `git rm --cached` only unstages: its `rm` is the git subcommand word
+    git_cached = {i for i in markers if tokens[i] == "rm" and i > 0 and _cmd_name(tokens[i - 1]) == "git"
+                  and "--cached" in tokens[i:]}
+    if not set(markers) - git_cached:
+        return
+    if _exempt_rm(_CMD_FOR_LOG):
+        return
+    shown = [tokens[m] for m in markers if m not in git_cached]
+    ask("this command deletes something (" + ", ".join("'" + _quoted(t)[:50] + "'" for t in shown[:3]) +
+        "). Deletions ask unless the whole command is `rm <absolute path under scratch>`", _DELETE_SUGGESTION)
 
 
 # ── Shell-write bypass warning (non-blocking) ─────────────────────────────────
@@ -1824,8 +1930,9 @@ def main() -> None:
         )
 
     prepped = shell_prepass(cmd)
-    global _SINGLE_QUOTED_DOLLAR
+    global _SINGLE_QUOTED_DOLLAR, _PREPPED
     _SINGLE_QUOTED_DOLLAR = _has_single_quoted_dollar(prepped)
+    _PREPPED = prepped
     tokens = tokenize(prepped)
     if tokens is None:
         # Unparseable shell string (e.g. unbalanced quotes). The secret scan

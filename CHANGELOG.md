@@ -2,6 +2,55 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.0.24
+
+Claude Haiku 5.5 (`claude-haiku-5-5`, released 2026-10-07) becomes a third routing tier, **for read-only mechanical arms only.** It costs $0.10/$0.50 per MTok for prompts up to 100K tokens and $0.50/$2.50 above that, which is a twentieth of Sonnet 5.5. Context is 1M and effort defaults to `medium`. Anthropic positions it for summaries, extraction and classification, and as a subagent next to Opus and Sonnet. It does not position it for agentic coding: Terminal-Bench 4.0 gives Haiku 5.5 39.2% against Sonnet 5.5's 70.6%. In Claude Code the `haiku` alias resolves to it from 2.1.293, on the Claude API only. Bedrock, Vertex, Foundry and gateways still map it to Haiku 4.5.
+
+- **Managed block, `## Model routing`: "three models".** Haiku gets arms that read a lot, return a little and change nothing: locating code, extracting or summarizing from logs, transcripts, docs and fetched pages, and classifying items against given categories. Its output feeds an Opus or Sonnet step. It never writes, fixes, tests or reviews code, and it is never the verdict. Its rules:
+  - Each brief states what a complete answer is. The CLI ships Haiku-5.5-specific early-stopping guidance, so the model is known to stop short.
+  - Each arm stays under 100K tokens of context, because above that the price is 5x.
+  - Thin output moves up to Sonnet rather than taking Haiku past `high`.
+  - No security-sensitive sweeps go to Haiku. Its cyber safeguards still block penetration testing.
+- **`Explore` locate-only calls get `model: "haiku"`.** Since CLI 2.1.198 the built-in `Explore` inherits the session model instead of running on Haiku, so every "where is X" search has run on Opus. Sonnet's description no longer claims search sweeps; Sonnet keeps investigations that run code or weigh what they find.
+- **Cost guard, orchestration paragraph, effort note** name the Haiku tier. `superpowers:subagent-driven-development` still never uses `haiku`, now with the reason: every one of its tiers writes or judges code.
+- **`dynamic-workflows`:** `model: 'haiku'` for read-only mechanical stages. Haiku stages keep the `medium` default, get a countable finish line, and are sharded below 100K tokens.
+- **`loop-until-clean.js`:** new optional `args.finderModel`. Pass `'haiku'` when `find` is a locate-only pattern ("every call to X"), not a judgment ("bugs"). It is ignored, with a log line, when `find` is left at its default ("bugs…"), since that is a judgment sweep. Verifiers stay on the session model. Unset, nothing changes.
+- **`knowledge-wiki`:** long sources can be digested by a `model: "haiku"` agent (claims, entities and terms with citations, sharded above ~100K tokens). The session still writes pages, cross-links and dedupes.
+- **`context-usage.py`:** `haiku-5` joins the native-1M families. The CLI registry has `claude-haiku-5-5` at `window:1e6, native_1m`, so a `/model haiku` session no longer warns at 80% of 200K. `claude-haiku-4-5` still maps to 200K.
+- **`cc-setup`:** warns when Claude Code is older than 2.1.293, where `haiku` still means Haiku 4.5.
+- **Unchanged:**
+  - `ship-pipeline.js` has no read-only stage, so its plan, code, test and review stages stay on Opus and Sonnet.
+  - The vault's scheduled runs stay on Opus: filing and synthesis are judgment.
+  - Claude Code's own background calls that use the default Haiku model moved to 5.5 with CLI 2.1.293, without cc_tool.
+
+### bash-guard: the deletion exemption shrinks to one literal shape
+
+v0.0.23 let `bash-guard.py` skip the ask for scratch and cache deletions, based on its own reading of the command's variables, `cd`, caches and `find`. Five security-review rounds each found another way for that reading and bash to disagree. Each disagreement was a deletion that went through without asking: `case` arms, `cd -`, wrappers and nested shells, `rm -rf /tmp/*`, a `cd` through a symlink out of the project. The guard no longer exempts anything it would have to interpret.
+
+- **The only deletion that runs without asking:** the whole command is `rm [-flags] [--] /absolute/path …`, alone on its line, with every path written literally.
+  - No quotes, `$`, globs, `~`, braces, backslashes or `..`.
+  - Each path's real location must be strictly below a scratch root (`/tmp`, `$TMPDIR`, the session scratchpad).
+  - It must not be one of the shared levels, since deleting one of those wipes every session's scratch. Those are `/tmp` itself, `/tmp/claude-<uid>`, `/tmp/claude-<uid>/<project>`, and the macOS `/var/folders/…/T` levels.
+- **Deletion detection is a word scan, not a parse.**
+  - Any `rm`/`rmdir`/`unlink`/`shred` word, or a `-delete`/`--delete…`/`--remove-source-files` flag, anywhere in the command counts as a deletion and asks.
+  - That includes inside `sh -c '…'`, `env -S '…'`, `printf '…' | sh`, `xargs`, a git `!` alias, `busybox`, or any unknown wrapper.
+  - Commit messages (`git commit -m …`) are skipped.
+- **Everything else that deletes asks:**
+  - `cd …; rm` and `S=…; rm $S`;
+  - `find -delete`/`-exec rm` and `.next`/`__pycache__` cleanups;
+  - `rsync --delete`;
+  - git's own discards: `git rm` without `--cached`, `checkout --`/`restore <paths>`, and `worktree remove --force`, scratch worktrees included.
+  `rm -rf /` and the other catastrophic forms are still denied.
+- **Known false positives**, which ask harmlessly: the word `rm` as text, as in `echo "rm …"` or `grep rm`.
+- **npx keeps its walker** for the pinned-package exemption, since a wrong guess there costs an unprompted run of a package already on disk, not deleted files. The walker now follows bash's scoping:
+  - An assignment or `cd` holds only where bash would apply it: not in a pipeline, a background job, an `else` branch or another `case` arm, and in loop bodies not at all.
+  - A function call forgets what that function's body can set.
+  - `npx` names must be valid npm package names.
+- **Replay** on the 5,555 distinct Bash commands from `eis` and `color-analyzer` (2026-09-30 to 10-05):
+  - Against v0.0.23: 23 more asks over six days (3 + 8 + 12 across the review rounds), all of them genuine deletions. Examples are scratch worktree removals, scratch deletions through a variable, `__pycache__` cleanups via `find`, and `git rm` of tracked files. That works out to roughly four extra prompts a day.
+  - Against v0.0.22: 155 asks gone (pinned `npx` tools found in the cache), 47 deletion asks added.
+- **Tests:** bash-guard 539/539, write-guard 43/43.
+
 ## v0.0.23
 
 The prompt rule is now explicit: **the agent asks before it installs something or deletes something, and nowhere else.** v0.0.22 still asked about things that are neither and refused deletions outright. Measured on `eis` and `color-analyzer` from the v0.0.22 rollout (2026-09-30) to 2026-10-05: 455 transcripts, 7,825 tool calls, 5,553 of them Bash, plus both hook activity logs.

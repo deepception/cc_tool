@@ -12,8 +12,8 @@ the format changes this no-ops gracefully.
 Tunables (env vars):
   CONTEXT_USAGE_LIMIT     token budget to measure against. When unset, derived
                           from the session model — 1,000,000 for the families in
-                          NATIVE_1M_FAMILIES (Opus 5.x, Sonnet 5.x, Opus 4.8,
-                          Opus 4.7), 200,000 otherwise.
+                          NATIVE_1M_FAMILIES (Opus 5.x, Sonnet 5.x, Haiku 5.5,
+                          Opus 4.8, Opus 4.7), 200,000 otherwise.
                           Set this to override.
   CONTEXT_USAGE_WARN_PCT  warn at/above this percent (default 80)
 """
@@ -40,9 +40,10 @@ WARN_PCT = int(os.environ.get("CONTEXT_USAGE_WARN_PCT", "80"))
 # Family substrings, so Bedrock/Vertex-prefixed and date-suffixed ids match.
 # "opus-5" covers claude-opus-5 and claude-opus-5-5, but does not match
 # "claude-opus-4-5"; "sonnet-5" likewise covers claude-sonnet-5-5 (a
-# `model: "sonnet"` subagent) without matching "claude-sonnet-4-5".
+# `model: "sonnet"` subagent) without matching "claude-sonnet-4-5", and
+# "haiku-5" covers claude-haiku-5-5 (`/model haiku`) but not claude-haiku-4-5.
 NATIVE_1M_FAMILIES = (
-    "opus-5", "sonnet-5",                          # the lineup in use
+    "opus-5", "sonnet-5", "haiku-5",               # the lineup in use
     "opus-4-8", "opus-4-7",                        # still 1M in-harness
 )
 

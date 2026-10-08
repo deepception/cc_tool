@@ -54,7 +54,7 @@ Project-local and git-trackable, default under `.wiki/`:
 4. **Refresh `index.md`**: add or update the one-line summary for every page changed or created.
 5. **Append to `log.md`**: a dated line naming the source ingested and the pages touched.
 
-Ingest one source at a time so edits stay surgical and reviewable.
+Ingest one source at a time so edits stay surgical and reviewable. For a long source, such as a paper, a large scrape or a whole module, steps 1–2 can go to an Agent call with `model: "haiku"`. Ask it for a structured digest: key claims, entities, terms and definitions, each with its `raw/` path and section or line. Shard a source above ~100K tokens across several such calls. You then write the source page from the digest and do steps 3–5 yourself, since cross-linking and deduplication are judgment.
 
 ### Query (answer from the wiki)
 

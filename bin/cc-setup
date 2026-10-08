@@ -304,15 +304,22 @@ EOF
 fi
 
 # ── 2c. Claude Code version for model routing ────────────────────────────────
-# The managed block routes execution arms to `model: "sonnet"`. Before 2.1.284
-# that alias resolves to Sonnet 5, not Sonnet 5.5 (and on Bedrock/Vertex/Foundry
-# it stays Sonnet 4.5 regardless). Warn only; never block setup.
+# The managed block routes execution arms to `model: "sonnet"` and read-only
+# mechanical arms to `model: "haiku"`. Before 2.1.284 "sonnet" resolves to
+# Sonnet 5, and before 2.1.293 "haiku" resolves to Haiku 4.5 (on Bedrock/Vertex/
+# Foundry both stay on the older models regardless). Warn only; never block setup.
 CC_MIN_SONNET55="2.1.284"
+CC_MIN_HAIKU55="2.1.293"
 cc_ver="$(claude --version 2>/dev/null | head -1 | awk '{print $1}' || true)"
-if [ -n "$cc_ver" ] && [ "$(printf '%s\n%s\n' "$CC_MIN_SONNET55" "$cc_ver" | sort -V | head -1)" != "$CC_MIN_SONNET55" ]; then
+cc_older_than() { [ "$(printf '%s\n%s\n' "$1" "$cc_ver" | sort -V | head -1)" != "$1" ]; }
+if [ -n "$cc_ver" ] && cc_older_than "$CC_MIN_SONNET55"; then
     echo "  ⚠ Claude Code $cc_ver: the \"sonnet\" alias still means Sonnet 5 here."
     echo "    Run \`claude update\` (Sonnet 5.5 needs $CC_MIN_SONNET55+) before relying on"
     echo "    the Sonnet execution arms in the managed block's Model routing."
+elif [ -n "$cc_ver" ] && cc_older_than "$CC_MIN_HAIKU55"; then
+    echo "  ⚠ Claude Code $cc_ver: the \"haiku\" alias still means Haiku 4.5 here."
+    echo "    Run \`claude update\` (Haiku 5.5 needs $CC_MIN_HAIKU55+) before relying on"
+    echo "    the Haiku read-only arms in the managed block's Model routing."
 fi
 
 # ── 3. Skills ────────────────────────────────────────────────────────────────
