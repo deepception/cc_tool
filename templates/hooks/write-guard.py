@@ -11,14 +11,15 @@ Blocks (deny):
     style assignments. Placeholder-looking values (EXAMPLE, your_, xxx, <…>,
     ${…}) pass, as do writes to `.env*` files (that is where a real value
     belongs — and Claude Code's own Read-deny keeps it out of context).
-Asks (hands the decision to the user; a refusal in unattended runs):
-  - writes outside the project root that are not scratch (/tmp, $TMPDIR, the
-    Claude scratchpad, ~/.claude/). The repository's other git worktrees
-    (`git worktree list`) count as the project, wherever they sit on disk, so
-    an orchestrator editing a sibling worktree is not asked per file. Tune
-    with "write_outside_repo": "ask"|"warn"|"off" in .claude/guard-rules.json
-    — set "warn" if you work with additional working directories.
 Warns (additionalContext, never blocks):
+  - writes outside the project root that are not scratch (/tmp, $TMPDIR, the
+    Claude scratchpad, ~/.claude/), e.g. a sibling repository the user asked
+    the session to work on. The repository's other git worktrees (`git
+    worktree list`) count as the project, wherever they sit on disk, and get
+    no note at all. cc_tool asks only before installs and deletions, and the
+    denials above already cover the system paths and dotfiles that matter, so
+    the default is a note, not a prompt. Set "write_outside_repo": "ask" in
+    .claude/guard-rules.json to be asked per file again, or "off" for silence.
   - stale read: the target file changed on disk after Claude last read or
     wrote it this session (a formatter, a shell write, another agent). The
     edit is probably built on an old picture of the file — re-read first.
@@ -162,7 +163,7 @@ def check_location(root: str, path: str, settings: dict) -> None:
     tmpdir = os.environ.get("TMPDIR", "")
     if any((real + "/").startswith(h) for h in _SCRATCH_ALLOW) or (tmpdir and _under(real, os.path.realpath(tmpdir))):
         return
-    mode = settings.get("write_outside_repo", "ask")
+    mode = settings.get("write_outside_repo", "warn")
     if mode == "off":
         return
     for wt in repo_worktrees(root):
@@ -173,11 +174,11 @@ def check_location(root: str, path: str, settings: dict) -> None:
             return  # another worktree of this repository is still the project
     reason = (f"'{real}' is outside the project root ({root}); an agent working on this project "
               "normally has no business writing there")
-    if mode == "warn":
-        warn(reason + ". Confirm this is intended.")
-    else:
+    if mode == "ask":
         ask(root, path, reason, 'set "write_outside_repo": "warn" in .claude/guard-rules.json if you work '
                               "across several directories")
+    else:
+        warn(reason + ". Confirm this is intended.")
 
 
 def _placeholder(match_text: str, line: str) -> bool:

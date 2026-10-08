@@ -158,7 +158,7 @@ def file_mtime(path: str) -> float:
 #      "reason": "This repo uses pnpm.", "suggestion": "pnpm install …",
 #      "negate": ["\\byarn\\.lock\\b"], "enabled": true}
 #   ],
-#    "write_outside_repo": "ask|warn|off"}
+#    "write_outside_repo": "warn|ask|off"}   (default warn)
 #
 # tool: "Bash", "Write", "Edit", "MultiEdit", or "*" (or a list of those).
 # field: "command" (Bash), "file_path" / "content" (write tools). Default is

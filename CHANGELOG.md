@@ -2,6 +2,35 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.0.23
+
+The prompt rule is now explicit: **the agent asks before it installs something or deletes something, and nowhere else.** v0.0.22 still asked about things that are neither and refused deletions outright. Measured on `eis` and `color-analyzer` from the v0.0.22 rollout (2026-09-30) to 2026-10-05: 455 transcripts, 7,825 tool calls, 5,553 of them Bash, plus both hook activity logs.
+
+- **Pinned `npx` tools already on disk no longer ask.** About 160 of the asks in that window were `npx --yes @playwright/cli@0.1.22`, `npx agent-device@0.21.20`, `npx hyperframes@0.8.120` and `npx serve@14.2.6`, run by the `agent-e2e` and `hyperframes-movie` skills over and over. The user turned down two of those prompts. An exact version that is already installed locally, or already in npx's own cache (`~/.npm/_npx`, or `$npm_config_cache`), runs from disk without a download, so `bash-guard.py` lets it through.
+  - A first-time fetch still asks.
+  - So do an unpinned name or a tag (`npx pkg`, `pkg@latest`) that isn't installed, since npx may fetch a newer release.
+- **The guard follows literal variables and subshells.** `V=0.1.22; npx pkg@$V`, `S=/tmp/…/scratchpad; rm -rf $S/x` and `cd $S && …` resolve when the assignment appears earlier in the same command. `( … )` and `$( … )` no longer leak their `cd` into what follows. Loop variables, `$(…)` values and unset names stay unknown, and unknown counts as "ask".
+- **Deletions ask instead of being refused.** The template's deny rules `Bash(rm -rf *)`, `Bash(git reset --hard *)`, `Bash(git clean -fd*)`, `Bash(git checkout .)`, `Bash(git checkout -- *)` and `Bash(git branch -D *)` refused every deletion, scratch included. In the sample, 11 calls were refused this way: worktree and branch cleanup at the end of a run, `rm -rf $S/snap1` in the scratchpad, and `rm -rf .next/types`. Agents then routed around the refusal or handed the step back to the user.
+  - `bash-guard.py` now asks for `rm`/`rmdir`/`unlink`/`find -delete`, `git checkout -- <paths>`, `git restore <paths>` and `git worktree remove --force`. That is in addition to the asks it already had (`reset --hard`, `clean -f`, `branch -D`, `stash drop` …).
+  - No ask when nothing of value can be lost: the target is scratch (`/tmp`, `$TMPDIR`, the session scratchpad), a regenerable cache (`__pycache__`, `.next`, `build/`, `dist/`, `coverage/` …), or a symlink, since only the link goes. The catastrophic forms (a root, home, the repo, `.git`, lockfiles, CI) are still denied.
+  - `git worktree remove` without `--force` passes, because git itself refuses to remove a dirty worktree.
+- **Writes outside the repository warn instead of asking.** In `eis`, a session asked to fix the sibling `Fansuld/energy_monitoring` repo was prompted for every file, and the user rejected one. `write-guard.py` now defaults to `"write_outside_repo": "warn"`: the model gets a note and the write goes ahead. System paths, shell and credential dotfiles, `.git/` and secrets in content are still denied. Set `"ask"` in `.claude/guard-rules.json` to be asked per file again.
+- **`.env.example` is not a secret.** `bash-guard.py` refused `grep KEY .env.example` (and `.sample`, `.template`, `.dist`). This was test case F12, written down as a known false positive; it hit `eis` three times. The settings `Read(.env.*)` deny is unchanged.
+- **`cc-setup` retires the old rules.** It removes those exact deny strings, plus `Bash(rm -rf:*)` from the first release, alongside v0.0.22's `Bash(npx *)` ask, and prints what it removed. Any other spelling a project wrote itself stays.
+- **Managed block, `## When a hook blocks you`, new rule 6.** It tells the model to keep throwaway files in the scratchpad, to pin `npx` tools to exact versions, to batch real deletions into one command, and to run git elsewhere with `git -C <dir>` rather than `cd <dir> && git`. Claude Code asks for a `cd` into another directory followed by `git` in every permission mode but auto, and no cc_tool rule can change that.
+- **Replay.** The 5,555 distinct Bash commands from the sample were run through the v0.0.22 guard and this one. 155 asks are gone, every one a pinned `npx` tool now found in the cache. 24 new asks appear, all deletions of project files, worktrees or symlinks behind variables. Most of the asks that remain are `npx` runs whose `cd` target has since been deleted, which the replay cannot resolve; at the time those directories existed. The hardening below changed none of these decisions.
+- **Not changed, and not cc_tool's to change:**
+  - Edits under `.claude/skills/` are a Claude Code protected path. Allow rules can't pre-approve them: auto mode sends them to its classifier, and the other modes prompt.
+  - Auto mode itself starts prompting again after 3 classifier blocks in a row or 20 in a session. The sample had 2.
+- **Hardened before release.** Removing the `rm -rf` deny rule left the variable tracking as the only thing between `rm -rf $S/…` and a prompt. A security review of the first cut found nine ways to mislead it, reproduced as tests `V01`–`V18`. Each of these used to pass silently and now asks:
+  - An assignment that bash may never perform: in a pipeline or a backgrounded command (both run in a subshell), inside `if`/loop/brace bodies, or after a `&&`/`||` once its and-or list ends. In all of these `S` stays unset and `rm -rf $S/proj` is `rm -rf /proj`. Inside its own `&&` chain the assignment still holds.
+  - An unset `$TMPDIR`, which is no longer assumed to be `/tmp`.
+  - A `$` inside single quotes anywhere in the command. shlex drops the quotes, so the guard can't tell `'$S'` (literal) from `"$S"` (expanded). A quote-aware scan finds these; a `'` inside `"…"` doesn't count.
+  - A "cache" path that is a symlink followed with a trailing slash (`rm -rf build/` when `build` points at `src/`). Cache names are now judged on the real path, and only below the project, so a repo checked out under `~/build/` isn't treated as a cache.
+  - `find -name <cache> -delete` with `-o`/`-path`/`-regex`, or with a root outside the command's directory.
+  - An `npx` name that isn't a valid npm package name, such as one with glob characters or `..`.
+- **Tests:** bash-guard 407/407 (new `Y01`–`Y14`, `D01`–`D27`, `V01`–`V18`; `R07`, `G09`, `N21` now ask, and `F12` passes). The bash fixtures moved out of `/tmp`, which now counts as scratch, and run with `TMPDIR` unset. write-guard 43/43 (outside-repo cases now warn; new `L06b` checks the `"ask"` setting).
+
 ## v0.0.22
 
 Fewer permission prompts. The aim is that the agent asks when it installs something or deletes something, and otherwise works. Two guards were asking for neither. Measured on two weeks of `color-analyzer` transcripts and its hook activity log (447 transcripts, 10,545 Bash calls, 1,436 edits).

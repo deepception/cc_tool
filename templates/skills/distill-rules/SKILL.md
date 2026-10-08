@@ -13,7 +13,7 @@ Prose in `CLAUDE.md` is hopeful; a hook rule is enforced. This skill reads the p
 
 ```json
 {
-  "write_outside_repo": "ask",
+  "write_outside_repo": "warn",
   "rules": [
     {
       "id": "use-pnpm",
@@ -50,7 +50,7 @@ Prose in `CLAUDE.md` is hopeful; a hook rule is enforced. This skill reads the p
 }
 ```
 
-Fields: `id` (unique, kebab-case), `regex` (Python `re`), `reason` are required. `tool` defaults to `Bash`; `field` defaults to `command` for Bash and `file_path` for write tools. `flags` (`i`, `m`, `s`) default to none. `negate` lists exception regexes; any match suppresses the rule. `enabled: false` keeps a rule on disk without enforcing it. `source` is for humans: quote the sentence the rule came from. `write_outside_repo` (`ask` | `warn` | `off`) tunes write-guard's confinement check.
+Fields: `id` (unique, kebab-case), `regex` (Python `re`), `reason` are required. `tool` defaults to `Bash`; `field` defaults to `command` for Bash and `file_path` for write tools. `flags` (`i`, `m`, `s`) default to none. `negate` lists exception regexes; any match suppresses the rule. `enabled: false` keeps a rule on disk without enforcing it. `source` is for humans: quote the sentence the rule came from. `write_outside_repo` (`warn`, the default, | `ask` | `off`) tunes write-guard's confinement check; `ask` brings back a prompt per file written outside the repository and its worktrees.
 
 ## The lexical ladder (binding)
 

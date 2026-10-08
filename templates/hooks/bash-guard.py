@@ -18,20 +18,28 @@ Blocks:
     (`npm config set registry`, writes to `.npmrc`/`pip.conf`), `mkfs`/`dd
     of=/dev/…`, `chmod 777`, shutdown.
 
-Asks (hands the decision to the user; in an unattended run that is a refusal):
-  - `git reset --hard`, `git clean -f`, `git checkout .`, `git branch -D`,
-    `git stash drop|clear`, history rewrites; `rm -r node_modules`/`.venv`/…;
-    docker prune / `rm -f` / `down -v`; `kubectl delete --all` / drain; helm
-    uninstall; terraform/pulumi destroy or auto-approve; cloud CLI deletes;
-    DROP / TRUNCATE / DELETE-without-WHERE when a DB client is in the command;
-    redis FLUSHALL; `crontab -e`.
-  - `npx <pkg>` when <pkg> is not installed in the project it runs in (no
-    `node_modules/.bin/<pkg>` from the command's directory up to the repo
-    root), because that downloads and executes a package nobody reviewed.
-    `npx vitest`, `npx tsc`, `npx eslint` on installed dev dependencies pass
-    without a prompt, as does `npx --no-install …`, which can never download.
-    A leading `cd <literal dir> &&` is followed; a cd the guard cannot resolve
-    (`cd "$DIR"`) or a pinned spec (`pkg@version`) asks.
+Asks (hands the decision to the user; in an unattended run that is a refusal).
+The rule is: ask before an install or a deletion, nowhere else.
+  - deletions: `rm`/`rmdir`/`unlink`/`find -delete` of anything that is not
+    scratch (/tmp, $TMPDIR, the Claude scratchpad) or a regenerable cache
+    (__pycache__, .next, build/, dist/ …); `git checkout -- <paths>`, `git
+    restore <paths>`, `git worktree remove --force`, `git reset --hard`, `git
+    clean -f`, `git checkout .`, `git branch -D`, `git stash drop|clear`,
+    history rewrites; `rm -r node_modules`/`.venv`; docker prune / `rm -f` /
+    `down -v`; `kubectl delete --all` / drain; helm uninstall; terraform/pulumi
+    destroy or auto-approve; cloud CLI deletes; DROP / TRUNCATE /
+    DELETE-without-WHERE when a DB client is in the command; redis FLUSHALL;
+    `crontab -e`.
+  - installs: `npx <pkg>` when <pkg> is not on disk, because that downloads
+    and executes a package nobody reviewed. Installed dev dependencies (`npx
+    vitest`, `npx tsc`) pass, as does an exact pinned version already in npx's
+    cache (`npx agent-device@0.21.20`) and `npx --no-install …`. An unpinned
+    or tagged spec that is not installed (`npx pkg`, `pkg@latest`) asks.
+  - `cd <dir>`, `( … )` subshells and literal assignments earlier in the same
+    command (`S=/tmp/x; rm -rf $S/y`, `V=1.2.3; npx pkg@$V`) are followed, but
+    only where bash is certain to have run them (see walk_commands); a
+    directory or variable the guard cannot resolve counts as not scratch and
+    not installed.
 
 Warns (additionalContext, never blocks):
   - shell writes into source files (`> x.ts`, `tee`, `sed -i`, `perl -pi`,
@@ -461,7 +469,7 @@ def split_commands(tokens):
 _SECRET_PATH_RE = re.compile(
     r"""(?:^|/|~/)        # path boundary
         (?:
-            \.env(?:\.[^/\s]+)?    # .env, .env.local, .env.production …
+            \.env(?:\.(?!(?:example|sample|template|dist)$)[^/\s]+)?  # .env, .env.local … (not .env.example)
           | id_rsa[^/\s]*          # id_rsa, id_rsa.pub …
           | \.git-credentials
           | \.npmrc
@@ -1213,23 +1221,17 @@ def check_destructive(cmd: str, tokens) -> None:
         _check_git_destructive(tokens)
 
 
-# ── npx guard: ask only when it would download ────────────────────────────────
-# `npx <bin>` runs the project's own dev dependency when one is installed, and
-# silently downloads and executes a registry package when it is not. Only the
-# second is an install, so only that is handed to the user. Resolution follows
-# npm's: the nearest node_modules/.bin walking up from the command's directory,
-# which the guard stops at the repository root so a stray ~/node_modules never
-# vouches for a package.
+# ── Command walk: working directory and literal variables ─────────────────────
+# The npx and deletion checks need to know where a simple command runs and what
+# its `$VAR` arguments are. Agents write `S=/tmp/…/scratchpad; rm -rf $S/x` and
+# `V=0.1.22; npx pkg@$V`, so a literal assignment earlier in the same command is
+# followed, as is `cd <dir>`. Anything the walk cannot know (`$(…)`, a loop
+# variable, an unset name) resolves to None and the caller treats it as unknown.
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
-_NPX_NEVER_INSTALL = {"--no-install", "--no"}
-# Options that move npx to another project or registry: the guard cannot tell
-# what is installed there, so the user decides.
-_NPX_OPAQUE = ("--prefix", "-w", "--workspace", "--workspaces", "-ws", "--registry")
-# Command position only (start, or right after an operator), so prose that
-# mentions npx inside an unparseable heredoc does not raise a prompt.
-_NPX_UNPARSEABLE_RE = re.compile(r"(?:^|[;&|(\n])[ \t]*(?:[A-Za-z_]\w*=\S*[ \t]+)*(?:\S*/)?npx(?:\s|$)")
-_NPX_SUGGESTION = ("add it to the project's devDependencies first (that install is the step to approve), "
-                   "or run the installed binary with 'npx --no-install <bin>', which never downloads")
+_SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "}", "done", "fi"}
+_DECLARERS = {"export", "local", "readonly", "declare", "typeset"}
+_SINGLE_QUOTED_DOLLAR = False  # set by main(): the raw command has a $ inside '…'
+_VAR_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _strip_assignments(seg):
@@ -1240,16 +1242,61 @@ def _strip_assignments(seg):
     return seg[i:]
 
 
+def _has_single_quoted_dollar(cmd: str) -> bool:
+    """True when a `$` sits inside single quotes, outside double quotes (a `'`
+    inside "…" is literal and opens nothing)."""
+    quote = None
+    i = 0
+    while i < len(cmd):
+        c = cmd[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            elif c == "$":
+                return True
+        elif c == "\\":
+            i += 1  # escaped character, outside single quotes
+        elif quote == '"':
+            if c == '"':
+                quote = None
+        elif c in ("'", '"'):
+            quote = c
+        i += 1
+    return False
+
+
+def _expand(tok: str, env: dict):
+    """`tok` with `$NAME`/`${NAME}` substituted from `env`, or None when any
+    reference is unknown or the token holds a command substitution.
+
+    shlex has already removed the quotes, so `'$S'` (literal in bash) and
+    `"$S"` (expanded) look the same here. When the raw command single-quotes a
+    `$` anywhere, every `$` token is treated as unknowable."""
+    if "`" in tok or "$(" in tok:
+        return None
+    if "$" in tok and _SINGLE_QUOTED_DOLLAR:
+        return None
+    unknown = []
+
+    def sub(m):
+        val = env.get(m.group(1) or m.group(2))
+        if val is None:
+            unknown.append(m.group(0))
+            return ""
+        return val
+    out = _VAR_REF_RE.sub(sub, tok)
+    if unknown or "$" in out:  # $1, $@, $? and friends stay unknown too
+        return None
+    return out
+
+
 def _track_cd(cwd, args):
-    """Directory after `cd <args>`, or None when it cannot be known statically
-    (a variable, `cd -`, a path that does not exist)."""
+    """Directory after `cd <args>` (already expanded), or None when it cannot be
+    known statically (`cd -`, a path that does not exist)."""
     operands = [a for a in args if a not in ("-L", "-P", "-e", "-@", "--")]
-    if len(operands) != 1:
+    if len(operands) != 1 or operands[0] is None or operands[0] == "-":
         return None
-    target = operands[0]
-    if target == "-" or "$" in target or "`" in target:
-        return None
-    target = os.path.expanduser(target)
+    target = os.path.expanduser(operands[0])
     if not os.path.isabs(target):
         if not cwd:
             return None
@@ -1258,30 +1305,190 @@ def _track_cd(cwd, args):
     return target if os.path.isdir(target) else None
 
 
+def _scoped_segments(tokens):
+    """('cmd', words) for each simple command and ('op', token) for each shell
+    operator between them, in order."""
+    cur: list = []
+    for tok in tokens:
+        if _is_op(tok):
+            if cur:
+                yield "cmd", cur
+                cur = []
+            yield "op", tok
+        else:
+            cur.append(tok)
+    if cur:
+        yield "cmd", cur
+
+
+_OPENERS = {"if", "while", "until", "for", "select", "case", "{"}
+_CLOSERS = {"fi", "done", "esac", "}"}
+
+
+def walk_commands(tokens):
+    """Yield (simple command, cwd or None, variables) in execution order.
+
+    A variable counts as known only where bash is certain to have assigned it
+    before the command runs. An assignment is dropped (the name becomes
+    unknown) when it sits in a pipeline or a backgrounded command (both run in
+    a subshell), inside an if/loop/case/brace body (it may not run), or after
+    `&&`/`||` once the and-or list ends (`false && S=x; rm $S` runs rm with S
+    unset). Inside its own `&&` chain it holds, since the rest of the chain
+    runs only if the assignment did. `( … )` scopes cwd and variables.
+    """
+    cwd = _PAYLOAD_CWD or os.getcwd()
+    env = {"HOME": os.path.expanduser("~")}
+    if os.environ.get("TMPDIR"):
+        env["TMPDIR"] = os.environ["TMPDIR"]
+    stack: list = []
+    depth = 0             # if/loop/case/brace nesting: assignments there may not run
+    list_or = False       # an `||` in the current and-or list
+    list_and = False      # an `&&` in the current and-or list
+    conditional: set = set()   # names assigned after &&/|| in this list
+    last_assigned: list = []   # names assigned by the previous simple command
+    after_pipe = False
+    for kind, seg in _scoped_segments(tokens):
+        if kind == "op":
+            for ch in seg:
+                if ch == "(":
+                    stack.append((cwd, dict(env), depth))
+                elif ch == ")" and stack:
+                    cwd, env, depth = stack.pop()
+            op = seg.strip("()")
+            if op in ("|", "|&") or (op == "&"):
+                for name in last_assigned:
+                    env[name] = None   # pipeline element / background job: a subshell
+            after_pipe = op in ("|", "|&")
+            if op == "&&":
+                list_and = True
+            elif op == "||":
+                list_or = True
+                for name in conditional | set(last_assigned):
+                    env[name] = None
+            elif op in (";", "\n", "&", ";;") or not op:
+                for name in conditional:
+                    env[name] = None
+                conditional, list_and, list_or = set(), False, False
+            last_assigned = []
+            continue
+        last_assigned = []
+        words = list(seg)
+        while words and words[0] in _SHELL_KEYWORDS | _OPENERS | _CLOSERS:
+            if words[0] in _OPENERS:
+                depth += 1
+            elif words[0] in _CLOSERS:
+                depth = max(0, depth - 1)
+            words = words[1:]
+        if words and words[0] in ("for", "select", "case"):
+            depth += 1  # the loop variable is handled below; the body may not run
+        if not words:
+            continue
+        env["PWD"] = cwd
+        body = words[1:] if words[0] in _DECLARERS else words
+        if body and all(_ASSIGN_RE.match(t) for t in body):
+            for t in body:
+                name, val = t.split("=", 1)
+                name = name.rstrip("+")
+                certain = depth == 0 and not after_pipe and not list_or
+                env[name] = _expand(val, env) if certain else None
+                if list_and:
+                    conditional.add(name)
+                last_assigned.append(name)
+            continue
+        cmd, _w = _strip_wrappers(_strip_assignments(words))
+        cmd = _strip_assignments(cmd)
+        if not cmd:
+            continue
+        name = _cmd_name(cmd[0])
+        if name in ("cd", "pushd"):
+            cwd = _track_cd(cwd, [_expand(a, env) for a in cmd[1:]])
+            continue
+        if name in ("for", "select") and len(cmd) > 1:
+            env[cmd[1]] = None  # loop variable: a different value each pass
+        elif name == "read":
+            for a in cmd[1:]:
+                if not a.startswith("-"):
+                    env[a] = None
+        yield cmd, cwd, env
+
+
+# ── npx guard: ask only when it would download ────────────────────────────────
+# `npx <bin>` runs the project's own dev dependency when one is installed, and
+# silently downloads and executes a registry package when it is not. Only the
+# second is an install, so only that is handed to the user. Resolution follows
+# npm's: the nearest node_modules walking up from the command's directory, which
+# the guard stops at the repository root so a stray ~/node_modules never vouches
+# for a package. A pinned exact version (`pkg@1.2.3`) that is already in npx's
+# own cache (~/.npm/_npx) runs from there without a download, so it passes too;
+# an unpinned name or a tag (`@latest`) may fetch a newer release, so it asks.
+_NPX_NEVER_INSTALL = {"--no-install", "--no"}
+# Options that move npx to another project or registry: the guard cannot tell
+# what is installed there, so the user decides.
+_NPX_OPAQUE = ("--prefix", "-w", "--workspace", "--workspaces", "-ws", "--registry")
+# Command position only (start, or right after an operator), so prose that
+# mentions npx inside an unparseable heredoc does not raise a prompt.
+_NPX_UNPARSEABLE_RE = re.compile(r"(?:^|[;&|(\n])[ \t]*(?:[A-Za-z_]\w*=\S*[ \t]+)*(?:\S*/)?npx(?:\s|$)")
+_EXACT_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$")
+_NPX_SUGGESTION = ("add it to the project's devDependencies first (that install is the step to approve), "
+                   "pin an exact version that is already cached, or run the installed binary with "
+                   "'npx --no-install <bin>', which never downloads")
+
+
+def _split_spec(spec: str):
+    """'@scope/pkg@1.2.3' -> ('@scope/pkg', '1.2.3'); 'pkg' -> ('pkg', None)."""
+    at = spec.find("@", 1)
+    return (spec, None) if at < 0 else (spec[:at], spec[at + 1:])
+
+
+def _version_at(package_json: str) -> str:
+    try:
+        with open(package_json, encoding="utf-8") as fh:
+            return str(json.load(fh).get("version") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+_NPM_NAME_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*$")
+
+
+def _npx_cached(name: str, version: str) -> bool:
+    """True when npx's own cache already holds exactly name@version."""
+    import glob
+    cache = os.environ.get("npm_config_cache") or os.path.join(os.path.expanduser("~"), ".npm")
+    pattern = os.path.join(glob.escape(cache), "_npx", "*", "node_modules", name, "package.json")
+    return any(_version_at(p) == version for p in glob.glob(pattern))
+
+
 def _npx_installed(spec: str, cwd: str) -> bool:
     """True when `npx <spec>` resolves to something already on disk."""
     if spec.startswith(("./", "../", "/", "~/")):
         return os.path.exists(os.path.join(cwd, os.path.expanduser(spec)))
-    scoped = spec.startswith("@")
-    if "@" in spec[1:] or ":" in spec or ("/" in spec and not scoped):
-        return False  # pinned version/tag, URL, git or github shorthand: npx may fetch it
+    name, version = _split_spec(spec)
+    scoped = name.startswith("@")
+    if not _NPM_NAME_RE.match(name):
+        return False  # not a valid package name: nothing local or cached can vouch for it
+    if ":" in spec or ("/" in name and not scoped) or (version is not None and not _EXACT_VERSION_RE.match(version)):
+        return False  # tag (@latest), range, URL, git or github shorthand: npx may fetch it
     home = os.path.expanduser("~")
     d = cwd
     while True:
         if d == home and d != cwd:
-            return False
+            break
         modules = os.path.join(d, "node_modules")
-        if os.path.exists(os.path.join(modules, spec, "package.json")):
-            return True
-        if not scoped and os.path.exists(os.path.join(modules, ".bin", spec)):
+        manifest = os.path.join(modules, name, "package.json")
+        if version is None:
+            if os.path.exists(manifest) or (not scoped and os.path.exists(os.path.join(modules, ".bin", name))):
+                return True
+        elif _version_at(manifest) == version:
             return True
         parent = os.path.dirname(d)
         if parent == d or os.path.exists(os.path.join(d, ".git")):
-            return False
+            break
         d = parent
+    return version is not None and _npx_cached(name, version)
 
 
-def _check_npx(cmd, cwd) -> None:
+def _check_npx(cmd, cwd, env) -> None:
     args = cmd[1:]
     packages, target, call = [], None, False
     i = 0
@@ -1321,24 +1528,158 @@ def _check_npx(cmd, cwd) -> None:
         ask(f"bash-guard cannot tell which directory 'npx {specs[0]}' runs in (the cd before it is not a "
             "literal, existing path), so it cannot confirm the package is installed there rather than "
             "downloaded", "cd to a literal path, or use 'npx --no-install <bin>', which never downloads")
-    for spec in specs:
+    for raw in specs:
+        spec = _expand(raw, env)
+        if spec is None:
+            ask(f"bash-guard cannot resolve 'npx {raw}' (a variable it cannot see the value of), so it "
+                "cannot confirm that exact package is already on disk", "write the version literally, or "
+                "assign it earlier in the same command (V=1.2.3; npx pkg@$V)")
         if not _npx_installed(spec, cwd):
             ask(f"'npx {spec}' would download and run a package that is not installed in this project "
-                f"(nothing for it in node_modules from {cwd} up to the repository root)", _NPX_SUGGESTION)
+                f"(nothing for it in node_modules from {cwd} up to the repository root, nor that exact "
+                "version in the npx cache)", _NPX_SUGGESTION)
 
 
 def check_npx(tokens) -> None:
-    cwd = _PAYLOAD_CWD or os.getcwd()
-    for seg, _gid in split_commands(tokens):
-        cmd, _w = _strip_wrappers(_strip_assignments(seg))
-        cmd = _strip_assignments(cmd)
-        if not cmd:
+    for cmd, cwd, env in walk_commands(tokens):
+        if _cmd_name(cmd[0]) == "npx":
+            _check_npx(cmd, cwd, env)
+
+
+# ── Deletion guard: deleting anything that is not scratch asks ────────────────
+# cc_tool's rule for prompts: the agent asks before it installs something or
+# deletes something, and nowhere else. The deny tier above still refuses the
+# catastrophic forms (a root, home, the repo, .git, lockfiles, CI). Everything
+# else that deletes files or throws away uncommitted work asks, except where
+# nothing of value can be lost: the agent's own scratch space (/tmp, $TMPDIR,
+# the Claude scratchpad) and regenerable caches (__pycache__, .next, build/ …).
+_DELETE_UNPARSEABLE_RE = re.compile(
+    r"(?:^|[;&|(\n])[ \t]*(?:[A-Za-z_]\w*=\S*[ \t]+)*(?:\S*/)?(?:rm|rmdir|unlink)(?:\s|$)")
+_SCRATCH_ROOTS = ("/tmp", "/var/tmp", "/var/folders", "/private/tmp", "/private/var/folders")
+_CACHE_PARTS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next", ".nuxt", ".turbo",
+                ".parcel-cache", ".dart_tool", ".gradle", "build", "dist", "out", "coverage", ".coverage",
+                "htmlcov", ".tox", ".nox", ".eggs", ".cache", ".svelte-kit", ".expo", "target"}
+_CACHE_FILE_RE = re.compile(r"(?:\.py[co]|\.o|\.class|\.tsbuildinfo|\.DS_Store)$")
+_FIND_CACHE_NAMES = {"*.pyc", "*.pyo", "*.o", "*.class", ".DS_Store", "*.tsbuildinfo"} | _CACHE_PARTS
+_DELETE_SUGGESTION = ("confirm the deletion with the user, or move scratch work under the session scratchpad "
+                      "(/tmp/…), where deletions need no approval")
+
+
+def _scratch_roots():
+    roots = list(_SCRATCH_ROOTS)
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        roots.append(os.path.realpath(tmpdir))
+    return roots
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _disposable(path: str, cwd=None) -> bool:
+    """Scratch space or a regenerable cache: deleting it loses nothing.
+
+    Judged on the real path, so `build/` that is a symlink into src/ is src/.
+    Cache names count only below the project (or the command's directory),
+    never in the ancestors of it: a repo checked out under ~/build/ is not a
+    cache."""
+    real = os.path.realpath(path)
+    if any(_within(real, r) for r in _scratch_roots()):
+        return True
+    for base in {os.path.realpath(b) for b in (lib.repo_root() if lib else "", cwd or "") if b}:
+        if _within(real, base) and real != base:
+            parts = os.path.relpath(real, base).split(os.sep)
+            return any(p in _CACHE_PARTS for p in parts) or bool(_CACHE_FILE_RE.search(parts[-1]))
+    return False
+
+
+def _undisposable(targets, cwd, env):
+    """The targets (as written) that are not provably scratch or cache."""
+    out = []
+    for raw in targets:
+        t = _expand(raw, env)
+        if t is None:
+            out.append(raw)
             continue
+        t = os.path.expanduser(t)
+        if not os.path.isabs(t):
+            if not cwd:
+                out.append(raw)
+                continue
+            t = os.path.join(cwd, t)
+        # Removing a symlink removes only the link (a trailing slash would
+        # follow it into the target, so that form is not exempt).
+        if os.path.islink(t) and not t.endswith("/"):
+            continue
+        if not _disposable(t, cwd):
+            out.append(raw)
+    return out
+
+
+def _ask_delete(what: str, targets) -> None:
+    shown = ", ".join(_quoted(t) for t in targets[:4]) + (" …" if len(targets) > 4 else "")
+    ask(f"{what} {shown}", _DELETE_SUGGESTION)
+
+
+def _find_delete_targets(cmd):
+    """Roots of a `find … -delete` / `-exec rm`, or [] when its -name tests
+    select only regenerable caches (find . -name '*.pyc' -delete)."""
+    roots = []
+    for t in cmd[1:]:
+        if t.startswith(("-", "(", "!")):
+            break
+        roots.append(t)
+    names = [cmd[i + 1] for i, t in enumerate(cmd[:-1]) if t in ("-name", "-iname")]
+    # The exemption needs a plain conjunction of -name tests: an -o / -not /
+    # -path / -regex can select files the names don't describe.
+    widening = {"-o", "-or", "-not", "!", ",", "-path", "-ipath", "-wholename", "-iwholename",
+                "-regex", "-iregex", "-lname", "-ilname", "-samefile", "-inum", "-links", "-L", "-follow"}
+    local = all(not os.path.isabs(r) and ".." not in os.path.normpath(r).split(os.sep) for r in roots)
+    if names and local and not widening & set(cmd) and all(_quoted(n) in _FIND_CACHE_NAMES for n in names):
+        return []
+    return roots or ["."]
+
+
+def check_deletes(tokens) -> None:
+    for cmd, cwd, env in walk_commands(tokens):
         name = _cmd_name(cmd[0])
-        if name in ("cd", "pushd"):
-            cwd = _track_cd(cwd, cmd[1:])
-        elif name == "npx":
-            _check_npx(cmd, cwd)
+        if name in ("rm", "rmdir", "unlink"):
+            args = cmd[1:]
+            if "--" in args:
+                k = args.index("--")
+                targets = [a for a in args[:k] if not a.startswith("-")] + args[k + 1:]
+            else:
+                targets = [a for a in args if not a.startswith("-")]
+            # a bare number is the fd of a redirect (`rm x 2>/dev/null`), not a file
+            kept = _undisposable([t for t in targets if not t.isdigit()], cwd, env)
+            if kept:
+                _ask_delete(f"'{name}' deletes", kept)
+        elif name == "find" and ("-delete" in cmd or ("-exec" in cmd and any(
+                _cmd_name(t) in ("rm", "rmdir", "unlink") for t in cmd))):
+            kept = _undisposable(_find_delete_targets(cmd), cwd, env)
+            if kept:
+                _ask_delete("'find … -delete' deletes files under", kept)
+        elif name == "git":
+            for sub, gopts, args, _repo in git_invocations(cmd):
+                repo_dir = next((v for o, v in gopts if o == "-C" and v), None)
+                where = cwd if repo_dir is None else _track_cd(cwd, [_expand(repo_dir, env)])
+                in_scratch = bool(where) and _disposable(where, where)
+                if sub == "worktree" and args[:1] == ["remove"] and (
+                        "--force" in args or any("f" in _short_flags(a) for a in args[1:])):
+                    kept = _undisposable([a for a in args[1:] if not a.startswith("-")], where, env)
+                    if kept:
+                        _ask_delete("'git worktree remove --force' deletes the worktree and any uncommitted "
+                                    "work in", kept)
+                elif sub in ("checkout", "restore") and not in_scratch:
+                    if "--" in args:
+                        paths = args[args.index("--") + 1:]
+                    elif sub == "restore":
+                        paths = [a for a in args if not a.startswith("-")]
+                    else:
+                        paths = []  # `git checkout <branch>` switches branches; nothing is discarded
+                    if paths and not _restore_staged_only(sub, args):
+                        _ask_delete(f"'git {sub}' discards uncommitted changes to", paths)
 
 
 # ── Shell-write bypass warning (non-blocking) ─────────────────────────────────
@@ -1483,6 +1824,8 @@ def main() -> None:
         )
 
     prepped = shell_prepass(cmd)
+    global _SINGLE_QUOTED_DOLLAR
+    _SINGLE_QUOTED_DOLLAR = _has_single_quoted_dollar(prepped)
     tokens = tokenize(prepped)
     if tokens is None:
         # Unparseable shell string (e.g. unbalanced quotes). The secret scan
@@ -1493,6 +1836,9 @@ def main() -> None:
         if _NPX_UNPARSEABLE_RE.search(prepped):
             ask("bash-guard could not parse this command (unbalanced quotes), so it cannot confirm the "
                 "'npx' in it runs an installed package rather than downloading one", _NPX_SUGGESTION)
+        if _DELETE_UNPARSEABLE_RE.search(prepped):
+            ask("bash-guard could not parse this command (unbalanced quotes), so it cannot tell what the "
+                "'rm' in it deletes", _DELETE_SUGGESTION)
         flush_warnings()
         sys.exit(0)
 
@@ -1502,6 +1848,7 @@ def main() -> None:
     check_destructive(cmd, tokens)
     check_project_rules(cmd)
     check_npx(tokens)
+    check_deletes(tokens)
     check_write_bypass(tokens)
     flush_warnings()
     sys.exit(0)

@@ -164,6 +164,7 @@ cc_tool's hooks refuse some tool calls before they run. A refusal reads `BLOCKED
 3. **A destructive op on a shared target is also an intent check.** Force-pushing, dropping data, deleting a branch, wiping a volume: confirm the user actually asked for this before reaching for the safe form.
 4. **Never loosen a guard to get through.** Editing the hook scripts, the `deny` list in `.claude/settings.json`, or `.claude/guard-rules.json` to unblock yourself is the canonical gate-gaming move. If a rule is wrong for this repo, say so and let the user change it (`distill-rules` skill for project rules).
 5. **A warning is information, not noise.** `[write-guard] stale read` means the file changed on disk since you last read it: re-read before editing. `red check pending` means your last edit to another file left errors: fix that first. `[post-edit-typecheck] NOT CHECKED` means silence was not a pass: run the check yourself before reporting done.
+6. **Write commands that don't need the user.** The user is asked before installs and deletions, nowhere else. Keep throwaway files in the session scratchpad, where deleting needs no approval. Run git elsewhere with `git -C <dir> …`, not `cd <dir> && git …`: Claude Code asks for a `cd` into another directory followed by `git` in every mode but auto. Pin `npx` tools to an exact version (`npx pkg@1.2.3`) so a cached copy runs without a prompt. Batch the deletions a task really needs, such as branch and worktree cleanup, into one command at the end, so the user approves them once.
 
 ---
 

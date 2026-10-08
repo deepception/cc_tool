@@ -56,6 +56,9 @@ json.dump({"write_outside_repo": "warn", "rules": [
      "regex": r"\bconsole\.log\(", "action": "warn", "reason": "Use the logger."},
 ]}, open(os.path.join(WARNROOT, ".claude", "guard-rules.json"), "w"))
 HOME = os.path.expanduser("~")
+ASKROOT = _repo(os.path.join(BASE, "repo_ask"))
+os.makedirs(os.path.join(ASKROOT, ".claude"), exist_ok=True)
+json.dump({"write_outside_repo": "ask"}, open(os.path.join(ASKROOT, ".claude", "guard-rules.json"), "w"))
 
 # Worktree fixtures. Like OUTSIDE they must not live under /tmp, or the scratch
 # rule would allow them before the worktree rule is ever consulted.
@@ -89,7 +92,8 @@ CASES = [
     ("L03", "location", ROOT, "Edit", {"file_path": os.path.join(HOME, ".bashrc"), "old_string": "a", "new_string": "b"}, "s", D),
     ("L04", "location", ROOT, "Write", {"file_path": os.path.join(ROOT, ".git", "config"), "content": "x"}, "s", D),
     ("L05", "location", ROOT, "Write", {"file_path": "/tmp/cc-wg-test/notes.txt", "content": "x"}, "s", A),
-    ("L06", "location", ROOT, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", K),
+    ("L06", "location", ROOT, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", W),
+    ("L06b", "location", ASKROOT, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", K),
     ("L07", "location", WARNROOT, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", W),
     ("L08", "location", ROOT, "Write", {"file_path": os.path.join(HOME, ".claude", "projects", "p", "memory", "m.md"), "content": "x"}, "s", A),
     ("L09", "location", ROOT, "Write", {"file_path": os.path.join(HOME, ".ssh", "config"), "content": "x"}, "s", D),
@@ -99,11 +103,11 @@ CASES = [
     ("G02", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(WT_LINKED, "src", "new", "c.ts"), "content": "x"}, "s", A),
     ("G03", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_MAIN, "src", "a.ts"), "content": "x"}, "s", A),
     ("G04", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": "x"}, "s", A),
-    ("G05", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", K),
-    ("G06", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", K),
+    ("G05", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", W),
+    ("G06", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", W),
     ("G07", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": f'token = "{FAKE_GH}"'}, "s", D),
     ("G08", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_MAIN, ".git", "config"), "content": "x"}, "s", D),
-    ("G09", "worktree", ROOT, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": "x"}, "s", K),
+    ("G09", "worktree", ROOT, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": "x"}, "s", W),
     # ── Secrets in content ────────────────────────────────────────────────
     ("S01", "secret", ROOT, "Write", {"file_path": A_TS, "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIE"}, "s", D),
     ("S02", "secret", ROOT, "Write", {"file_path": A_TS, "content": 'AWS_KEY = "AKIAIOSFODNN7EXAMPLE"'}, "s", A),
@@ -131,7 +135,7 @@ CASES = [
     ("M01", "malformed", ROOT, "Write", "@@RAW@@not json", "s", A),
     ("M02", "malformed", ROOT, "Write", "@@RAW@@{\"tool_input\": null}", "s", A),
     ("M03", "malformed", ROOT, "Write", {"content": "no path"}, "s", A),
-    ("L09", "location", ROOT, "Write", {"file_path": os.path.join(OUTSIDE, "tmp", "evil.py"), "content": "x"}, "s", K),
+    ("L11", "location", ROOT, "Write", {"file_path": os.path.join(OUTSIDE, "tmp", "evil.py"), "content": "x"}, "s", W),
 ]
 
 

@@ -61,7 +61,7 @@ For back-and-forth work where you read each reply before sending the next, `/fas
 
 Per-stage routing inside workflows and the on-fan-out effort guidance live in the managed block (`## Model routing` and `### Orchestration`).
 
-**Long runs.** Opus 5.5 works longer on its own and sometimes stops to report instead of continuing. The managed block's `## When to keep going` tells it to keep going unless it needs you, and to stop before anything destructive. cc_tool's permission `ask`/`deny` lists and the bash and write guards stay on as the check behind that. If you'd rather pair-program, with a one-line plan and a go-ahead before each task, say so in your project's part of `CLAUDE.md`, above the managed marker. Give a long task in one message with its finish line ("done means: every endpoint uses the new client and the suite passes"). You can type follow-ups while it works rather than restarting.
+**Long runs.** Opus 5.5 works longer on its own and sometimes stops to report instead of continuing. The managed block's `## When to keep going` tells it to keep going unless it needs you, and to stop before anything destructive. cc_tool's permission `ask`/`deny` lists and the bash and write guards stay on as the check behind that. They are tuned to ask you only before an install or a deletion; everything else either runs or is refused outright. If you'd rather pair-program, with a one-line plan and a go-ahead before each task, say so in your project's part of `CLAUDE.md`, above the managed marker. Give a long task in one message with its finish line ("done means: every endpoint uses the new client and the suite passes"). You can type follow-ups while it works rather than restarting.
 
 ## Day-to-day use
 
