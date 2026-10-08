@@ -89,12 +89,14 @@ still covers git commit/push. A payload it simply has no opinion on (no
 `command` key, empty command) exits 0 silently.
 """
 import bisect
+import fnmatch
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import time
 
 try:
     import cc_hooklib as lib
@@ -1336,9 +1338,49 @@ _DIRS = "\0dirs"   # pushd/popd stack (a tuple, so subshell copies don't share i
 # Commands that can set or clear variables (or the directory) in ways the walk
 # does not model. After one of these, every variable and the cwd are unknown.
 _OPAQUE_CMDS = {"eval", "source", ".", "shopt", "let", "exec", "trap", "alias", "enable",
-                "mapfile", "readarray", "getopts", "printf", "declare", "typeset", "local", "readonly",
-                "export", "unset", "read", "builtin"}
-_FUNC_DEF_RE = re.compile(r"(?:^|[\s;&|(){}])(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\s*\))")
+                "declare", "typeset", "local", "readonly", "export", "builtin"}
+# Assign only the names they are given (read E PW, unset X, printf -v X …).
+_NAMED_ASSIGNERS = {"read", "mapfile", "readarray", "getopts", "unset"}
+_READ_VALUE_OPTS = {"-a", "-d", "-i", "-n", "-N", "-p", "-t", "-u", "-C", "-c", "-O", "-s"}
+
+
+def _named_targets(cmd) -> set:
+    """The variable names a read/mapfile/getopts/unset/printf -v call sets."""
+    name = _cmd_name(cmd[0])
+    out: set = set()
+    args = cmd[1:]
+    if name == "printf":
+        if "-v" in args and args.index("-v") + 1 < len(args):
+            out.add(args[args.index("-v") + 1])
+        return out
+    k = 0
+    while k < len(args):
+        if args[k] in _READ_VALUE_OPTS:
+            if args[k] == "-a" and k + 1 < len(args):
+                out.add(args[k + 1])
+            k += 2
+            continue
+        if not args[k].startswith("-"):
+            out.add(args[k])
+        k += 1
+    if name == "read" and not out:
+        out.add("REPLY")
+    return out
+def _defined_functions(tokens) -> set:
+    """Names defined as shell functions, read from the token structure (a
+    bare word followed by the `()` operator, or `function name`), so `f()`
+    inside a quoted python -c string is not a definition."""
+    out = set()
+    for i, t in enumerate(tokens or ()):
+        if _is_op(t):
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+        prev = tokens[i - 1] if i > 0 else ""
+        if nxt.startswith("()") and (not prev or _is_op(prev) or prev in ("{", "}")):
+            out.add(t)
+        elif t == "function" and nxt and not _is_op(nxt) and (not prev or _is_op(prev)):
+            out.add(nxt)
+    return out
 
 
 def walk_commands(tokens):
@@ -1365,7 +1407,7 @@ def walk_commands(tokens):
     # run; what it can set (outside its own subshells) is recorded, and a call
     # forgets exactly that. A body that runs something the walk does not model
     # (eval, another function …) makes its calls forget everything.
-    functions = {a or b for a, b in _FUNC_DEF_RE.findall(_PREPPED)}
+    functions = _defined_functions(tokens)
     effects: dict = {}     # function name -> names its body sets, or None for "anything"
     opaque_fns: set = set()  # functions whose body runs something the walk does not model
     defining = None        # name whose body the next `{` / `(` opens
@@ -1373,6 +1415,7 @@ def walk_commands(tokens):
     stack: list = []
     bodies: list = []   # open if/case/brace/loop bodies: [kind, names set inside]
     list_or = list_and = after_pipe = False
+    list_assigns_only = True   # everything so far in this and-or list was a plain assignment
     conditional: set = set()
     last_set: list = []
 
@@ -1419,6 +1462,7 @@ def walk_commands(tokens):
                 for name in conditional:
                     env[name] = None
                 conditional, list_and, list_or = set(), False, False
+                list_assigns_only = True
             last_set = []
             continue
         last_set = []
@@ -1465,8 +1509,8 @@ def walk_commands(tokens):
 
         def assign(name, value):
             env[name] = value if certain else None
-            if list_and:
-                conditional.add(name)
+            if list_and and not list_assigns_only:
+                conditional.add(name)   # `S=x && T=y` cannot fail, so T stays set after the list
             if bodies:
                 bodies[-1][1].add(name)
             last_set.append(name)
@@ -1478,12 +1522,24 @@ def walk_commands(tokens):
                 name, val = t.split("=", 1)
                 assign(name.rstrip("+"), _expand(val, env))
             continue
+        list_assigns_only = False
         cmd, _w = _strip_wrappers(_strip_assignments(words))
         cmd = _strip_assignments(cmd)
         if not cmd:
             continue
         name = _cmd_name(cmd[0])
         fn = in_function_body()
+        if name in _NAMED_ASSIGNERS or (name == "printf" and "-v" in cmd):
+            for n in _named_targets(cmd):
+                env[n] = None
+                last_set.append(n)
+                if bodies:
+                    bodies[-1][1].add(n)
+            yield cmd, env[_CWD], env
+            continue
+        if name in ("export", "readonly") and all(re.match(r"^[A-Za-z_]\w*$", a) for a in cmd[1:]):
+            yield cmd, env[_CWD], env   # `export NAME`: marks it, changes nothing
+            continue
         if name in _OPAQUE_CMDS or cmd[0] in functions:
             if fn is not None:
                 opaque_fns.add(fn)   # walked, not run: remember that a call can do anything
@@ -1498,7 +1554,9 @@ def walk_commands(tokens):
             continue
         if name in ("cd", "pushd", "popd"):
             cwd = env[_CWD]
-            relative_cdpath = "CDPATH" in env or os.environ.get("CDPATH")
+            # also a `CDPATH=… cd x` prefix, which _strip_assignments removed above
+            relative_cdpath = ("CDPATH" in env or os.environ.get("CDPATH")
+                               or any(t.startswith(("CDPATH=", "CDPATH+=")) for t in words))
             if name == "popd":
                 dirs = env[_DIRS]
                 assign(_CWD, dirs[-1] if dirs else None)
@@ -1788,6 +1846,411 @@ def check_deletes(tokens) -> None:
         "). Deletions ask unless the whole command is `rm <absolute path under scratch>`", _DELETE_SUGGESTION)
 
 
+
+# ── Deletion words bash builds ────────────────────────────────────────────────
+# The scan above finds `rm` written out. Bash can also build the word at run
+# time: `{rm,-rf,x}` (brace expansion), `r?m` / `/bin/r[m]` (pathname
+# expansion), `$'\x72m'` (ANSI-C quoting), `r\m`, `${X}m`. Earlier versions
+# chased these through the command structure, a shell or runner at a time, and
+# each review found another carrier: `xargs --process-slot-var V sh -c …`,
+# `mksh -c`, `env -S`, `echo … | sh`, `bash <<< …`.
+#
+# This check does not look at structure. It reads every word of the raw
+# command text, inside quotes and nested strings too, works out what bash could
+# expand that word to, and asks when an expansion is a deletion command. So the
+# carrier does not matter: any shell, runner, pipe or here-string.
+#
+# What counts as "could expand to": a brace expansion that yields the word; a
+# glob or `$var`/`$(…)` pattern that matches it and still carries at least one
+# literal letter (`r?m`, `${X}m`); an escape that decodes to it. A bare `*` or
+# `$X` carries no letter and is left alone; a command word like that is the
+# command-word check's job.
+_ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+_PARAM_RE = re.compile(r"\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]|`[^`]*`")
+_FRAGMENT_SPLIT_RE = re.compile(r"[\s;&|()<>`]+")   # `…` bodies are their own words, like $( … )
+_MAX_EXPANSIONS = 512
+_ANSI_ESC = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r",
+             "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _decode_ansi_c(body: str) -> str:
+    r"""bash's $'…' escapes: \xHH, \NNN octal, \uHHHH, \UHHHHHHHH, \cX and the letters."""
+    out, i = [], 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\" or i + 1 >= len(body):
+            out.append(ch)
+            i += 1
+            continue
+        nx = body[i + 1]
+        m = (re.match(r"x([0-9a-fA-F]{1,2})", body[i + 1:]) or re.match(r"u([0-9a-fA-F]{1,4})", body[i + 1:])
+             or re.match(r"U([0-9a-fA-F]{1,8})", body[i + 1:]))
+        if m:
+            try:
+                out.append(chr(int(m.group(1), 16)))
+            except (ValueError, OverflowError):
+                pass
+            i += 1 + len(m.group(0))
+            continue
+        m = re.match(r"([0-7]{1,3})", body[i + 1:])
+        if m:
+            out.append(chr(int(m.group(1), 8) & 0xFF))
+            i += 1 + len(m.group(0))
+            continue
+        if nx == "c" and i + 2 < len(body):
+            out.append(chr(ord(body[i + 2]) & 0x1F))
+            i += 3
+            continue
+        out.append(_ANSI_ESC.get(nx, "\\" + nx))
+        i += 2
+    return "".join(out)
+
+
+class _TooComplex(Exception):
+    """The built-word scan ran out of its time budget."""
+
+
+_BUILT_DEADLINE = [0.0]
+
+
+def _budget() -> None:
+    if time.monotonic() > _BUILT_DEADLINE[0]:
+        raise _TooComplex
+
+
+def _brace_span(s: str):
+    """(start, end, alternatives) of the first brace group bash would expand, or None.
+
+    Braces are matched in one pass with a stack. A draft rescanned from every
+    `{`, which was quadratic: 20,000 unclosed `{` took 6.8 s, past the hook's
+    3 s timeout, and a hook that times out lets the command run."""
+    stack, pairs = [], {}
+    for j, ch in enumerate(s):
+        if ch == "{" and not (j > 0 and s[j - 1] == "$"):
+            stack.append(j)
+        elif ch == "}" and stack:
+            pairs[stack.pop()] = j
+    for i in sorted(pairs):
+        _budget()
+        j = pairs[i]
+        inner = s[i + 1:j]
+        parts, depth, last = [], 0, 0
+        for k, ch in enumerate(inner):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append(inner[last:k])
+                last = k + 1
+        if parts:
+            parts.append(inner[last:])
+            return i, j, parts
+        seq = re.fullmatch(r"(-?\w+)\.\.(-?\w+)(?:\.\.-?\d+)?", inner)
+        if seq:
+            a, b = seq.group(1), seq.group(2)
+            if len(a) == 1 and len(b) == 1 and a.isalpha() and b.isalpha():
+                lo, hi = sorted((ord(a), ord(b)))
+                return i, j, [chr(k) for k in range(lo, hi + 1)][:128]
+            if a.lstrip("-").isdigit() and b.lstrip("-").isdigit():
+                lo, hi = sorted((int(a), int(b)))
+                return i, j, [str(k) for k in range(lo, min(hi, lo + 127) + 1)]
+    return None
+
+
+def _brace_expand(s: str, out: list) -> None:
+    _budget()
+    if len(out) >= _MAX_EXPANSIONS:
+        return
+    span = _brace_span(s)
+    if span is None:
+        out.append(s)
+        return
+    a, b, parts = span
+    for alt in parts:
+        _brace_expand(s[:a] + alt + s[b + 1:], out)
+        if len(out) >= _MAX_EXPANSIONS:
+            return
+
+
+def _built_deleter(frag: str):
+    """The deletion command `frag` can expand to without being written out, or None."""
+    decoded = _ANSI_C_RE.sub(lambda m: _decode_ansi_c(m.group(1)), frag)
+    unquoted = decoded.replace('"', "").replace("'", "")
+    plain = re.sub(r"\\(.)", r"\1", unquoted)
+    # Quotes at the edge of a word only delimit a string ('rm the old helper');
+    # quotes inside it (r''m) are what build a new word.
+    raw_base = frag.strip("'\"").rsplit("/", 1)[-1]
+    expansions: list = []
+    _brace_expand(plain, expansions)
+    for e in expansions:
+        for word in _FRAGMENT_SPLIT_RE.split(e):          # a decoded escape can carry spaces
+            base = word.rsplit("/", 1)[-1]
+            if not base:
+                continue
+            if _PARAM_RE.search(base) or any(ch in base for ch in "*?["):
+                pattern = _PARAM_RE.sub("*", base)
+                # `[m]` is one literal letter; a wider class is not
+                letters = re.findall(r"[A-Za-z]", re.sub(r"\[([A-Za-z])\]", r"\1", re.sub(r"\[[^\]]{2,}\]", "", pattern)))
+                if not letters:
+                    continue                                 # `*`, `$X`: no literal letter
+                if not _PARAM_RE.search(base) and "/" not in word and len(letters) < 2:
+                    # A pure glob matches files, not commands on PATH: `s*` / `\s*` (a sed
+                    # regex) only reaches `shred` through a file planted here. Directory
+                    # globs (`/bin/r[m]`) and two-letter ones (`r?m`) still count.
+                    continue
+                hit = next((d for d in sorted(_DELETERS) if fnmatch.fnmatchcase(d, pattern)), None)
+                if hit:
+                    return hit
+            elif base in _DELETERS and raw_base != base:
+                # Any change from the raw word counts: braces, escapes, backslashes and
+                # quotes too. `r''m` or `$'r'm` inside a string piped to a shell reaches
+                # that shell as `rm`; a draft that compared after removing quotes let it by.
+                return base
+    return None
+
+
+def check_built_deleters(text: str) -> None:
+    _BUILT_DEADLINE[0] = time.monotonic() + 0.8
+    try:
+        _check_built_deleters(text)
+    except _TooComplex:
+        ask("this command is too complex for bash-guard to check, within its time limit, for deletion "
+            "commands that bash would build at run time (brace, glob or escape expansion)",
+            "split it into simpler commands, or write any deletion out plainly")
+
+
+def _check_built_deleters(text: str) -> None:
+    # No commit-message exemption: matched on raw text, it also blanked `$(…)` inside
+    # a double-quoted message (which bash runs first) and "git … -m" inside a string
+    # piped to sh. A message whose words expand to a deleter asks, rarely.
+    # $'…' first, on the whole text: its body can hold spaces, so splitting into
+    # words before decoding would cut `$'\x72m -rf x'` apart and never decode it.
+    for m in _ANSI_C_RE.finditer(text):
+        _budget()
+        # Checked even when nothing is escaped: shlex reads `$'rm -rf x'` as the one
+        # word `$rm -rf x`, so the written-out scan above never sees that `rm`.
+        decoded = _decode_ansi_c(m.group(1))
+        for word in _FRAGMENT_SPLIT_RE.split(decoded):
+            base = word.rsplit("/", 1)[-1]
+            hit = base if base in _DELETERS else (_built_deleter(word) if word else None)
+            if hit:
+                ask(f"'{m.group(0)[:60]}' becomes '{hit}' when bash (or a shell it is handed to) "
+                    "runs it, so this command deletes something without writing the command out",
+                    "write the deletion out plainly (rm <path>) so it can be reviewed; " + _DELETE_SUGGESTION)
+    text = _ANSI_C_RE.sub(lambda m: "'" + _decode_ansi_c(m.group(1)).replace("'", "") + "'", text)
+    for frag in _FRAGMENT_SPLIT_RE.split(text):
+        _budget()
+        if not frag or not re.search(r"[{}*?\[\\$'\"]", frag):
+            continue                                         # nothing for bash to expand
+        hit = _built_deleter(frag)
+        if hit:
+            ask(f"'{frag[:60]}' expands to '{hit}' when bash (or a shell it is handed to) runs it, "
+                "so this command deletes something without writing the command out",
+                "write the deletion out plainly (rm <path>) so it can be reviewed; " + _DELETE_SUGGESTION)
+
+# ── Command words bash builds itself ──────────────────────────────────────────
+# The deletion scan looks for the word `rm`; bash can build that word at run
+# time: `$'\x72m'`, `{rm,-rf,x}`, `r?m` or `/bin/r[m]` (pathname expansion),
+# `${X}m`, `$P`, `$(echo rm)`. v0.0.25 tried to resolve `$P` from the
+# command's own assignments; review found that per-name tracking failing open
+# again, so there is no resolution at all now: the word that runs must be
+# written out plainly.
+#
+# Checked: the first word of every simple command, at any depth: inside
+# `$( … )`, `<( … )` / `>( … )`, `sh -c '…'`, `eval '…'`, behind `coproc`,
+# and the command that xargs, find -exec, parallel, watch, timeout-style
+# runners and the like are handed. A plain word is letters, digits and
+# `_./+@%:,=-`, optionally starting with `~/` when nothing in the command can
+# touch HOME; `[`, `[[`, `!`, `{`, `}` pass; `case` patterns are skipped.
+#
+# Threat-model bound, stated once: a guard that reads command text cannot see
+# what an interpreter decides at run time. `python3 -c 'shutil.rmtree(…)'`,
+# `perl -e rmtree`, `node -e 'fs.rmSync(…)'`, `mv x /dev/null`, `truncate
+# -s0`, `: > f` delete or empty files without any of these words. Those are
+# left to Claude Code's own permission layer and auto-mode classifier.
+_GLOB_OR_BRACE_RE = re.compile(r"[*?\[\]{}]")
+_PLAIN_COMMAND_WORD_RE = re.compile(r"^[A-Za-z0-9_./+@%:,=-]+$")
+_SHELL_WORDS_OK = {"[", "[[", "]]", "!", "{", "}", "((", "))"}
+_NESTED_SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+# Commands that run their first operand as a command (options skipped; the
+# value-taking options below consume their value).
+_RUNNERS = {"xargs": {"-I", "-i", "-L", "-l", "-n", "-P", "-s", "-d", "-E", "-e", "-a", "--arg-file",
+                      "--delimiter", "--max-args", "--max-procs", "--replace"},
+            "parallel": {"-j", "--jobs", "-S", "--sshlogin", "-a", "--arg-file", "-I"},
+            "watch": {"-n", "--interval", "-d"},
+            "flock": {"-w", "--wait", "-E", "-c"},
+            "setsid": set(), "stdbuf": {"-i", "-o", "-e"}, "chroot": set(), "unshare": set(),
+            "taskset": set(), "strace": {"-o", "-e", "-p", "-s"}, "ltrace": {"-o", "-e"},
+            "busybox": set(), "nsenter": {"-t", "--target"}, "runuser": {"-u", "-g"},
+            "systemd-run": {"-u", "--unit", "-p", "--property"}, "coproc": set()}
+_HOME_TOUCHERS = {"read", "mapfile", "readarray", "unset", "eval", "source", ".", "declare", "typeset",
+                  "local", "export", "readonly", "printf", "let", "trap", "alias"}
+
+
+def _simple_commands_at(tokens):
+    """(token index range, command words) for each simple command, keywords,
+    leading assignments and wrappers stripped."""
+    start = 0
+    for i in range(len(tokens) + 1):
+        if i == len(tokens) or _is_op(tokens[i]):
+            words = list(tokens[start:i])
+            while words and words[0] in _SHELL_KEYWORDS | _OPENERS | _CLOSERS | {"coproc"}:
+                words = words[1:]
+            cmd, _w = _strip_wrappers(_strip_assignments(words))
+            cmd = _strip_assignments(cmd)
+            if cmd:
+                yield range(start, i), cmd
+            start = i + 1
+
+
+def _plain_word(w: str, home_safe: bool) -> bool:
+    if w in _SHELL_WORDS_OK:
+        return True
+    if w.startswith("~/"):
+        return home_safe and bool(_PLAIN_COMMAND_WORD_RE.match(w[2:])) and not _GLOB_OR_BRACE_RE.search(w)
+    return bool(_PLAIN_COMMAND_WORD_RE.match(w)) and not _GLOB_OR_BRACE_RE.search(w)
+
+
+def _runner_index(cmd):
+    """Index in `cmd` of the command a runner is handed, or None."""
+    name = _cmd_name(cmd[0])
+    if name == "find":
+        for k, t in enumerate(cmd):
+            if t in ("-exec", "-execdir", "-ok", "-okdir") and k + 1 < len(cmd):
+                return k + 1
+        return None
+    if name not in _RUNNERS:
+        return None
+    takes_value = _RUNNERS[name]
+    args = cmd[1:]
+    k = 0
+    if name == "flock" and args:
+        k = 1   # flock <lockfile> <command>
+    while k < len(args):
+        a = args[k]
+        if a == "--":
+            return k + 2 if k + 1 < len(args) else None
+        if a.startswith("-"):
+            k += 2 if a in takes_value else 1
+            continue
+        if name == "watch" or name == "taskset" and re.match(r"^[0-9a-fx,-]+$", a):
+            if name == "taskset":
+                k += 1
+                continue
+        return k + 1
+    return None
+
+
+def _command_word_problem(tokens, depth=0):
+    """The first command word bash could build into something else, or None."""
+    if depth > 3:
+        return "(nested too deep)"
+    commands = list(_simple_commands_at(tokens))
+    home_safe = not any(re.search(r"(?<![$\w{])HOME\b", t) for t in tokens if not _is_op(t)) and not any(
+        _cmd_name(c[0]) in _HOME_TOUCHERS for _s, c in commands)
+    in_case = 0
+    for span, cmd in commands:
+        prev = tokens[span.start - 1] if span.start > 0 else ""
+        nxt = tokens[span.stop] if span.stop < len(tokens) else ""
+        raw_first = tokens[span.start] if span.start < len(tokens) else ""
+        if raw_first == "case" or cmd[0] == "case":
+            in_case += 1
+            continue        # `case <word> in <pattern>`: data, not a command
+        if "esac" in tokens[span.start:span.stop]:
+            in_case = max(0, in_case - 1)
+        if in_case and nxt.startswith(")"):
+            continue        # a case pattern such as `*.txt)`
+        if prev and any(c in prev for c in "<>") and "(" not in prev:
+            continue        # the word after > / < / << is a redirect target; <( … ) is not skipped
+        w = cmd[0]
+        if w == "$":
+            continue        # `$` opens a $( … ) whose inner command is checked on its own
+        problem = _cmd_problem(cmd, home_safe, depth)
+        if problem:
+            return problem
+    return None
+
+
+_FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
+# bash/sh options that take a value, so the word after them is not the -c code
+_SHELL_VALUE_OPTS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+
+
+def _shell_code(cmd):
+    """The string a shell runs with -c, also when -c sits in a cluster (-lc, -ec,
+    -xec) or behind -o/-O options; None when the shell runs a script file."""
+    k = 1
+    while k < len(cmd):
+        a = cmd[k]
+        if a in _SHELL_VALUE_OPTS:
+            k += 2
+            continue
+        if a == "--" or not a.startswith(("-", "+")):
+            return None
+        if a.startswith("-") and not a.startswith("--") and "c" in a[1:]:
+            return cmd[k + 1] if k + 1 < len(cmd) else None
+        k += 1
+    return None
+
+
+def _handed_commands(cmd):
+    """Every command `cmd` hands to something else to run: each find action
+    (-exec/-execdir/-ok/-okdir, also the tail of one split off by `\\;`) and
+    the command a runner such as xargs/setsid/watch is given."""
+    out = []
+    starts = [k for k, t in enumerate(cmd) if t in _FIND_ACTIONS and (k == 0 or _cmd_name(cmd[0]) == "find")]
+    for k in starts:
+        end = next((j for j in range(k + 1, len(cmd)) if cmd[j] in ("+", ";") or cmd[j] in _FIND_ACTIONS),
+                   len(cmd))
+        out.append(cmd[k + 1:end])
+    if _cmd_name(cmd[0]) in _RUNNERS and _cmd_name(cmd[0]) != "find":
+        idx = _runner_index(cmd)
+        if idx is not None:
+            out.append(cmd[idx:])
+    return [h for h in out if h]
+
+
+def _cmd_problem(cmd, home_safe, depth):
+    """The first non-plain command word in one simple command, in the code it
+    hands a shell or eval, or in any command it hands a runner or find action.
+    Recursion is what closes `xargs sh -c '…'`, `find … -exec true \\; -exec …`
+    and `xargs xargs …`: each handed command gets the full check, not just a
+    look at its first word."""
+    if depth > 6:
+        return "(nested too deep)"
+    w = cmd[0]
+    if w in _FIND_ACTIONS:
+        pass            # the tail of a find split off at `\\;`: checked as a handed command below
+    elif w == "{}":
+        return None     # find -exec {} / xargs -I{} {}: the found item, unchanged behaviour
+    elif not _plain_word(w, home_safe):
+        return w
+    name = _cmd_name(w)
+    code = " ".join(cmd[1:]) if name == "eval" else (_shell_code(cmd) if name in _NESTED_SHELLS else None)
+    if code:
+        inner = tokenize(shell_prepass(code))
+        if inner is None:
+            return code[:40]
+        problem = _command_word_problem(inner, depth + 1)
+        if problem:
+            return problem
+    for handed in _handed_commands(cmd):
+        problem = _cmd_problem(handed, home_safe, depth + 1)
+        if problem:
+            return problem
+    return None
+
+
+def check_command_words(tokens) -> None:
+    problem = _command_word_problem(tokens)
+    if problem:
+        ask(f"the command word '{_quoted(problem)[:60]}' is not written out plainly (a variable, quoting, "
+            "a glob or a brace), so bash-guard cannot tell what runs",
+            "write the command name out (rm, python3, ./script.sh); for a repeated long command define a "
+            "shell function, e.g. pw(){ npx --yes @playwright/cli@1.2.3 \"$@\"; }")
+
+
 # ── Shell-write bypass warning (non-blocking) ─────────────────────────────────
 # Edits that go through Write/Edit get the post-edit typecheck, the write guard
 # (secrets, confinement, stale-read), and the activity log. A `>` redirect,
@@ -1943,6 +2406,7 @@ def main() -> None:
         if _NPX_UNPARSEABLE_RE.search(prepped):
             ask("bash-guard could not parse this command (unbalanced quotes), so it cannot confirm the "
                 "'npx' in it runs an installed package rather than downloading one", _NPX_SUGGESTION)
+        check_built_deleters(prepped)
         if _DELETE_UNPARSEABLE_RE.search(prepped):
             ask("bash-guard could not parse this command (unbalanced quotes), so it cannot tell what the "
                 "'rm' in it deletes", _DELETE_SUGGESTION)
@@ -1956,6 +2420,8 @@ def main() -> None:
     check_project_rules(cmd)
     check_npx(tokens)
     check_deletes(tokens)
+    check_built_deleters(prepped)
+    check_command_words(tokens)
     check_write_bypass(tokens)
     flush_warnings()
     sys.exit(0)

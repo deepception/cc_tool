@@ -140,7 +140,7 @@ CASES = [
     ("C15", "commit", MASTER, "sh -c 'git commit -m x'", A),                     # inherent gap
     ("C16", "commit", MASTER, "env GIT_AUTHOR_NAME=x git commit -m 'x'", D),
     ("C17", "commit", MASTER, "git\tcommit -m 'x'", D),
-    ("C18", "commit", MASTER, "git${IFS}commit -m 'x'", A),                      # inherent gap
+    ("C18", "commit", MASTER, "git${IFS}commit -m 'x'", K),                      # gap closed: built command word asks
     # ── --no-verify ────────────────────────────────────────────────────────
     ("N01", "noverify", FEATURE, "git push --no-verify origin feature/x", D),
     ("N02", "noverify", FEATURE, "git commit --no-verify -m 'x'", D),
@@ -676,6 +676,150 @@ CASES = [
     ("M09", "minimal", FEATURE, "rm -rf /tmp/cc-x*", K),                                    # glob
     ("M10", "minimal", FEATURE, "rm -rf /tmp/cc-x\nrm -rf lib", K),
     ("M11", "minimal", FEATURE, "git status && git log -1", A),                             # no deletion at all
+    ("CW01", "cmdword", FEATURE, "$'\\x72m' -rf ~/.cache/zz-probe", K),                       # ANSI-C quoting
+    ("CW02", "cmdword", FEATURE, "{rm,-rf,~/.cache/zz-probe}", K),                           # brace expansion
+    ("CW03", "cmdword", FEATURE, "r?m -rf ~/.cache/zz-probe", K),                            # glob
+    ("CW04", "cmdword", FEATURE, "/bin/r[m] -rf ~/.cache/zz-probe", K),
+    ("CW05", "cmdword", FEATURE, "X=r; ${X}m -rf lib", K),
+    ("CW06", "cmdword", FEATURE, "$(echo rm) -rf lib", K),
+    ("CW07", "cmdword", FEATURE, "sh -c 'r?m -rf lib'", K),                                  # nested shell
+    ("CW08", "cmdword", FEATURE, "eval '{rm,-rf,lib}'", K),
+    ("CW09", "cmdword", FEATURE, "P=backend/.venv/bin/python; $P -m pytest -q", K),   # v0.0.26: no value resolution for command words
+    ("CW10", "cmdword", FEATURE, "P=/usr/bin/python3; read P; $P x", K),                     # reassignable
+    ("CW11", "cmdword", FEATURE, "P=/bin/r?m; $P -rf lib", K),                               # glob in the value
+    ("CW12", "cmdword", FEATURE, "$UNSET_TOOL -rf lib", K),                                  # not assigned here
+    ("CW13", "cmdword", FEATURE, "[ -f x ] && [[ -d y ]] && echo ok", A),
+    ("CW15", "cmdword", FEATURE, "HF=/tmp/cc/hf/bin/hyperframes; $HF init x; find . -name y; ls .", K),   # v0.0.26: no value resolution for command words
+    ("CW16", "cmdword", FEATURE, "~/android-sdk/platform-tools/adb devices", A),
+    ("CW17", "cmdword", FEATURE, "HOME=/tmp/h; ~/bin/tool", K),
+    ("CW18", "cmdword", FEATURE, "for f in a b; do printf '%s %s\\n' $f $(grep -c x $f); done", A),
+    ("CW19", "cmdword", FEATURE, "P=/usr/bin/python3; . ./env.sh; $P x", K),          # sourced file may reassign P
+    ("CW20", "cmdword", FEATURE, "S=/tmp/cc; HF=$S/hf/bin/hyperframes; $HF render x", K),   # v0.0.26: no value resolution for command words
+    ("CW21", "cmdword", FEATURE, "S=/tmp/cc; X=$S/bin/rm; $X -rf lib", K),
+    ("CW22", "cmdword", FEATURE, "X=$UNSET/bin/tool; $X", K),
+    ("CW23", "cmdword", FEATURE, 'P="npx --yes @playwright/cli@0.1.22 -s=gate"; $P open x; $P close', K),   # v0.0.26: no value resolution for command words
+    ("CW24", "cmdword", FEATURE, 'P="npx --yes cowsay"; $P hi', K),                       # npx through a variable: checked
+    ("CW25", "cmdword", FEATURE, 'G="git -C /tmp/cc-x"; $G status', K),   # v0.0.26: no value resolution for command words
+    ("CW26", "cmdword", FEATURE, 'X="rm -rf"; $X lib', K),
+    ("CW27", "cmdword", FEATURE, 'X="sh -c"; $X "r?m lib"', K),
+    ("CW28", "cmdword", FEATURE, 'X="ls *"; $X', K),                                     # globs when split
+    ("CW29", "cmdword", FEATURE, 'A=~/android-sdk/platform-tools/adb; $A devices', K),   # v0.0.26: no value resolution for command words
+    ("CW30", "cmdword", FEATURE, 'P="npx --yes @playwright/cli@0.1.22"; read E PW < /tmp/c; $P fill x "$PW"', K),   # v0.0.26: no value resolution for command words
+    ("CW31", "cmdword", FEATURE, 'P=/usr/bin/python3; read -p x P; $P y', K),
+    ("CW32", "cmdword", FEATURE, 'P=/usr/bin/python3; printf -v P %s rm; $P -rf lib', K),
+    ("CW33", "cmdword", FEATURE, 'P=/usr/bin/python3; unset P; $P x', K),
+    ("CW34", "cmdword", FEATURE, 'export P=/usr/bin/python3; $P x', K),   # v0.0.26: no value resolution for command words
+    ("CW35", "cmdword", FEATURE, 'P=/usr/bin/python3; declare -n P=Q; $P x', K),
+    ("CW36", "cmdword", FEATURE, 'A=/tmp/cc/ad.sh; $A snap | python3 -c "import sys,json; print(json.load(sys.stdin).keys())"', K),   # v0.0.26: no value resolution for command words
+    ("CW37", "cmdword", FEATURE, 'export X=1 && AD="npx --yes agent-device@0.21.20"; $AD help', K),   # v0.0.26: no value resolution for command words
+    ("CW38", "cmdword", FEATURE, 'ls && AD="npx --yes cowsay"; $AD', K),                     # ls may fail: AD unknown
+    ("CW39", "cmdword", FEATURE, 'cd webapp && P="npx --yes @playwright/cli@0.1.22"; $P open', K),   # v0.0.26: no value resolution for command words
+    ("CW40", "cmdword", FEATURE, 'cd webapp && P="npx --yes cowsay"; $P', K),
+    ("CW41", "cmdword", FEATURE, 'ls && P="npx --yes @playwright/cli@0.1.22"; P=$Q; $P open', K),    # one value unknown
+    ("CW42", "cmdword", FEATURE, 'V=0.21.20; AD="npx --yes agent-device@$V"; export GEMINI_KEY; $AD help', K),   # v0.0.26: no value resolution for command words
+    ("CW43", "cmdword", FEATURE, 'T=r; X="${T}m -rf"; $X lib', K),                         # composes rm
+    ("CW44", "cmdword", FEATURE, 'D=/tmp/cc; X=$D/bin/tool; $X run', K),   # v0.0.26: no value resolution for command words
+    ("CW45", "cmdword", FEATURE, 'local P=/usr/bin/python3; $P x', K),                        # local can take flags: opaque
+    # ── v0.0.26 parser-differential review of command-word extraction ────
+    ("PD01", "pdiff", FEATURE, "cat <($'\\x72m' -rf lib)", K),                              # process substitution
+    ("PD02", "pdiff", FEATURE, "diff <(ls) >(r?m -rf lib)", K),
+    ("PD03", "pdiff", FEATURE, "find . | xargs $'\\x72m' -rf", K),                           # runner target
+    ("PD04", "pdiff", FEATURE, "find . -name x -exec $'\\x72m' {} +", K),
+    ("PD05", "pdiff", FEATURE, "find . -name '*.log' | xargs -I{} cp {} /tmp/cc-x", A),
+    ("PD06", "pdiff", FEATURE, "coproc $'\\x72m' -rf lib", K),
+    ("PD07", "pdiff", FEATURE, "case $f in *.txt) echo t;; *) echo o;; esac", A),          # patterns are data
+    ("PD08", "pdiff", FEATURE, "watch -n 5 ls", A),
+    ("PD09", "pdiff", FEATURE, "watch -n 5 $'\\x72m' -rf lib", K),
+    ("PD10", "pdiff", FEATURE, "timeout 5 $'\\x72m' -rf lib", K),
+    ("PD11", "pdiff", FEATURE, "cat <<'EOF'\n$'\\x72m' -rf lib\nEOF\nls", A),               # heredoc body is data
+    ("PD12", "pdiff", FEATURE, "[[ -f x ]] && (( n > 3 )) && echo y", A),
+    ("PD13", "pdiff", FEATURE, "function f { ls; }; f", A),
+    ("PD14", "pdiff", FEATURE, "ls # $'\\x72m' -rf lib", A),                                  # comment
+    ("PD15", "pdiff", FEATURE, "r\\\nm -rf lib", K),                                         # line continuation joins to rm
+    ("PD16", "pdiff", FEATURE, 'pw(){ npx --yes agent-device@0.21.20 "$@"; }; pw help; pw close', A),  # the function idiom
+    ("PD17", "pdiff", FEATURE, "parallel $'\\x72m' ::: a b", K),
+    ("PD18", "pdiff", FEATURE, "flock /tmp/cc.lock $'\\x72m' -rf lib", K),
+    ("PD19", "pdiff", FEATURE, "echo $(r?m -rf lib)", K),                                      # command substitution
+    ("PD20", "pdiff", FEATURE, "x=$({rm,-rf,lib})", K),
+    # Security review of the v0.0.26 draft: a shell reached through a `~/…` path
+    # skipped the nested-shell check, so the inner string was never inspected.
+    ("TS01", "tilde", FEATURE, "~/../../usr/bin/bash -c '{rm,-rf,lib}'", K),
+    ("TS02", "tilde", FEATURE, "~/../../usr/bin/bash -c 'r?m -rf lib'", K),
+    ("TS03", "tilde", FEATURE, "~/../../usr/bin/bash -c \"$'\\x72m' -rf lib\"", K),
+    ("TS04", "tilde", FEATURE, "~/bin/bash -c '{rm,-rf,lib}'", K),
+    ("TS05", "tilde", FEATURE, "~/../../usr/bin/xargs '{rm,-rf}' < f", K),
+    ("TS06", "tilde", FEATURE, "HOME=/usr; ~/bin/rm -rf lib", K),
+    ("TS07", "tilde", FEATURE, "~/.local/bin/uv run pytest", A),
+    ("TS08", "tilde", FEATURE, "~/android-sdk/platform-tools/adb devices", A),
+    # Commit review of v0.0.26: a command handed to a shell, eval, runner or
+    # find action was only checked on its first word, so a built `rm` inside it ran.
+    ("HC01", "handed", FEATURE, "xargs sh -c '{rm,-rf,lib}' < f", K),
+    ("HC02", "handed", FEATURE, "find . -exec sh -c '{rm,-rf,lib}' \\;", K),
+    ("HC03", "handed", FEATURE, "setsid bash -c '{rm,-rf,lib}'", K),
+    ("HC04", "handed", FEATURE, "watch -n 1 eval '{rm,-rf,lib}'", K),
+    ("HC05", "handed", FEATURE, "find . -exec true \\; -exec {rm,-rf} {} \\;", K),
+    ("HC06", "handed", FEATURE, "find . -name x -execdir true \\; -execdir r?m {} \\;", K),
+    ("HC07", "handed", FEATURE, "find . -exec true {} + -ok '$X' {} \\;", K),
+    ("HC08", "handed", FEATURE, "xargs xargs '{rm,-rf}' < f", K),
+    ("HC09", "handed", FEATURE, "xargs -I sh sh -c '{rm,-rf,lib}' < f", K),
+    ("HC10", "handed", FEATURE, "bash -lc '{rm,-rf,lib}'", K),
+    ("HC11", "handed", FEATURE, "sh -ec '{rm,-rf,lib}'", K),
+    ("HC12", "handed", FEATURE, "bash -o pipefail -c '{rm,-rf,lib}'", K),
+    ("HC13", "handed", FEATURE, "find . -name '*.pyc' -exec ls {} \\;", A),
+    ("HC14", "handed", FEATURE, "xargs grep -l TODO < files.txt", A),
+    ("HC15", "handed", FEATURE, "bash -lc 'make test'", A),
+    ("HC16", "handed", FEATURE, "find . -name '*.log' -exec grep -l ERR {} + -exec wc -l {} +", A),
+    ("HC17", "handed", FEATURE, "bash scripts/run.sh -c x", A),
+    # Built deletion words, found by expanding every word of the raw text, so
+    # the carrier (shell, runner, pipe, here-string) does not matter.
+    ("BW01", "built", FEATURE, "xargs --process-slot-var V sh -c '{rm,-rf,lib}' < f", K),
+    ("BW02", "built", FEATURE, "flock -n /tmp/l sh -c '{rm,-rf,lib}'", K),
+    ("BW03", "built", FEATURE, "strace -E VAR=1 sh -c '{rm,-rf,lib}'", K),
+    ("BW04", "built", FEATURE, "parallel --tmpdir /tmp/x sh -c '{rm,-rf,lib}' ::: a", K),
+    ("BW05", "built", FEATURE, "mksh -c '{rm,-rf,lib}'", K),
+    ("BW06", "built", FEATURE, "fish -c '{rm,-rf,lib}'", K),
+    ("BW07", "built", FEATURE, "bash5.2 -c '{rm,-rf,lib}'", K),
+    ("BW08", "built", FEATURE, "env -S \"sh -c '{rm,-rf,lib}'\"", K),
+    ("BW09", "built", FEATURE, "echo '{rm,-rf,lib}' | sh", K),
+    ("BW10", "built", FEATURE, "bash <<< '{rm,-rf,lib}'", K),
+    ("BW11", "built", FEATURE, "source <(echo '{rm,-rf,lib}')", K),
+    ("BW12", "built", FEATURE, "echo $'\\x72m -rf lib' | sh", K),
+    ("BW13", "built", FEATURE, "echo $'rm -rf lib' | sh", K),                 # shlex reads $'…' as one $word
+    ("BW14", "built", FEATURE, "$'\\162\\155' -rf lib", K),
+    ("BW15", "built", FEATURE, "r\\m -rf lib", K),
+    ("BW16", "built", FEATURE, "X=r; echo \"${X}m -rf lib\" | sh", K),
+    ("BW17", "built", FEATURE, "{q..s}m -rf lib", K),
+    ("BW18", "built", FEATURE, "/bin/r[m] -rf lib", K),
+    ("BW19", "built", FEATURE, "{un,}link f", K),
+    ("BW20", "built", FEATURE, "ls *", A),
+    ("BW21", "built", FEATURE, "echo $HOME/$USER", A),
+    ("BW22", "built", FEATURE, "mv file.{txt,bak}", A),
+    ("BW23", "built", FEATURE, "git commit -m 'docs: list r* helpers'", A),
+    ("BW24", "built", FEATURE, "find . -name '*.dart' -newer pubspec.yaml", A),
+    ("BW25", "built", FEATURE, "awk '{print $1}' f", A),
+    ("BW26", "built", FEATURE, "ls r*", A),                                   # a bare glob matches files, not PATH
+    ("BW27", "built", FEATURE, "git diff | sed 's/^\\([+-]\\)\\s*/\\1/'", A),  # replay false positive: \s* is not shred
+    # No commit-message exemption: bash runs $(…) and `…` inside a double-quoted
+    # message first, and "git … -m" can be text piped to a shell.
+    ("BW28", "built", FEATURE, "git commit -m \"$({rm,-rf,lib})\"", K),
+    ("BW29", "built", FEATURE, "git commit -m \"`{rm,-rf,lib}`\"", K),
+    ("BW30", "built", FEATURE, "git commit --message=\"$({rm,-rf,lib})\"", K),
+    ("BW31", "built", FEATURE, "echo \"git x -m '{rm,-rf,lib}'\" | sh", K),
+    ("BW32", "built", FEATURE, "git commit -m 'chore: drop sh* scripts'", K),   # accepted false positive
+    # Quote-splitting: quotes inside a word build it; edge quotes only delimit.
+    ("BW33", "built", FEATURE, "echo \"r''m -rf lib\" | sh", K),
+    ("BW34", "built", FEATURE, "echo 'r\"\"m -rf lib' | sh", K),
+    ("BW35", "built", FEATURE, "echo \"$'r'm -rf lib\" | bash", K),
+    ("BW36", "built", FEATURE, "bash <<< \"'r''m' -rf lib\"", K),
+    ("BW37", "built", FEATURE, "git commit -m \"fix: handle {a,b} paths\"", A),
+    # Hostile size: braces are matched in one pass; past the time budget it asks, never times out.
+    ("BW38", "built", FEATURE, "echo " + "{" * 60000 + "a", A),
+    ("BW39", "built", FEATURE, "echo " + "{" * 15000 + "x" + "}" * 15000, K),
+    # npx walker: a CDPATH= prefix on cd can send it elsewhere, so the cwd is unknown.
+    ("NX01", "npx", FEATURE, "CDPATH=/tmp cd webapp && npx tsc --noEmit", K),
+    ("NX02", "npx", FEATURE, "CDPATH+=:/tmp cd webapp && npx tsc --noEmit", K),
+    ("NX03", "npx", FEATURE, "cd webapp && npx tsc --noEmit", A),
+    ("CW14", "cmdword", FEATURE, "P=xrmx; IFS=x; $P -rf lib", K),                            # IFS splits $P into rm
     ("L34", "literal", FEATURE, "S=/tmp/../home; rm -rf $S", K),                             # .. in the value
     ("D25", "delete", FEATURE, "rm -rf /tmp/cc-guard-x 2>/dev/null; rmdir /tmp/cc-guard-y 2>/dev/null", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt
     ("Y12", "npx", FEATURE, "(cd webapp && npx tsc --noEmit); cd webapp && npx tsc --noEmit", A),  # subshell cd does not leak
