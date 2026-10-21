@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+  </head>
+  <body>
+    <template>
+      <style>
+        /*@brand*/
+        /*@end*/
+        /* Copy this file to compositions/<file>.html and replace __ID__ with the scene id everywhere:
+           GSAP selectors are document-wide, so every id/class a script touches carries the scene prefix. */
+        #root {
+          position: absolute;
+          inset: 0;
+          overflow: hidden;
+          font-family: "Sans", sans-serif;
+          color: var(--c-ink);
+          background: var(--c-paper); /* drop the background for a scene with ground: "aura" */
+        }
+        .__ID__-stage {
+          position: absolute;
+          inset: 0;
+        }
+        .__ID__-eyebrow {
+          position: absolute;
+          left: 120px;
+          top: 300px;
+          font-size: 28px;
+          font-weight: 600;
+          letter-spacing: 0.18em;
+          text-transform: uppercase;
+          color: var(--c-accent-deep);
+        }
+        .__ID__-h {
+          position: absolute;
+          left: 116px;
+          top: 360px;
+          width: 1200px;
+          font-family: "Display", serif;
+          font-weight: 400;
+          font-size: 150px;
+          line-height: 1.08;
+          letter-spacing: -0.03em;
+        }
+        .__ID__-h em {
+          font-style: italic;
+          color: var(--c-accent-deep);
+        }
+      </style>
+
+      <div id="root" data-composition-id="__ID__" data-width="1920" data-height="1080">
+        <div class="__ID__-stage" id="__ID__-stage">
+          <p class="__ID__-eyebrow" id="__ID__-eyebrow">Eyebrow</p>
+          <p class="__ID__-h" id="__ID__-h1">Headline <em>here.</em></p>
+        </div>
+      </div>
+
+      <script>
+        // Timing comes from scripts/schedule.py: build.py rewrites every /*@…*/ number below.
+        const B = 60 / /*@bpm*/ 128;
+        const LEN = /*@beats*/ 12 * B; // for a "seconds" scene: const LEN = /*@beats*/ 6;
+        const tl = gsap.timeline({ paused: true });
+
+        const CHROMA_ON = "-14px 0px 0px rgba(0,212,255,0.75), 14px 0px 0px rgba(224,64,251,0.75)";
+        const CHROMA_OFF = "0px 0px 0px rgba(0,212,255,0), 0px 0px 0px rgba(224,64,251,0)";
+        // Signature entrance: rise, unblur, settle (expo.out, never bounce).
+        const blurUp = (el, at, d = 0.9, y = 26) =>
+          tl.fromTo(el, { opacity: 0, y, filter: "blur(10px)" }, { opacity: 1, y: 0, filter: "blur(0px)", duration: d, ease: "expo.out" }, at);
+        // Beat slam for a headline or word: big, blurred, colour-split → crisp.
+        const slam = (el, at, from = 1.4) =>
+          tl.fromTo(
+            el,
+            { opacity: 0, scale: from, filter: "blur(14px)", textShadow: CHROMA_ON, transformOrigin: "0% 50%" },
+            { opacity: 1, scale: 1, filter: "blur(0px)", textShadow: CHROMA_OFF, duration: 0.32, ease: "expo.out" },
+            at,
+          );
+        // Impact shake on the stage (three sequential .to — never a repeated fromTo).
+        const shake = (at, amp = 14) => {
+          tl.to("#__ID__-stage", { x: -amp, y: amp * 0.5, duration: 0.035, ease: "none" }, at);
+          tl.to("#__ID__-stage", { x: amp * 0.7, y: -amp * 0.4, duration: 0.045, ease: "none" }, at + 0.035);
+          tl.to("#__ID__-stage", { x: 0, y: 0, duration: 0.16, ease: "power3.out" }, at + 0.08);
+        };
+        // Beat accent during a reading hold: objects nod, text stays still.
+        const nod = (sel, at, dy = -18) =>
+          tl.to(sel, { y: dy, duration: 0.1, ease: "power2.out", stagger: { each: 0.06, yoyo: true, repeat: 1 } }, at);
+
+        blurUp("#__ID__-eyebrow", /*@cue:eyebrow*/ 0 * B, 0.6, 14);
+        slam("#__ID__-h1", /*@cue:title*/ 0 * B);
+
+        window.__timelines["__ID__"] = tl;
+      </script>
+    </template>
+  </body>
+</html>

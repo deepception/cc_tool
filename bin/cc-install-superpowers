@@ -1,52 +1,109 @@
 #!/usr/bin/env bash
-# cc-install-superpowers: Install Superpowers as a global Claude Code plugin.
-# Run this once. After installation, Superpowers skills are active in all projects.
+# cc-install-superpowers: Install Superpowers as a global Claude Code plugin from Anthropic's
+# official marketplace (anthropics/claude-plugins-official, plugin id
+# superpowers@claude-plugins-official). Run this once. After installation, Superpowers skills
+# are active in all projects.
+#
+# Migration: cc_tool up to v0.0.25 installed Superpowers from obra/superpowers as its own
+# marketplace (superpowers@superpowers-dev). Two installs of the same plugin register every
+# superpowers:* skill twice, so an install from any other marketplace is replaced: the official
+# one is installed first, then the old one is uninstalled, then its marketplace is removed if
+# no other installed plugin comes from it.
 set -euo pipefail
+
+OFFICIAL_MP="claude-plugins-official"
+OFFICIAL_ID="superpowers@$OFFICIAL_MP"
 
 if ! command -v claude &>/dev/null; then
     echo "Error: 'claude' CLI not found. Install Claude Code first." >&2
     exit 1
 fi
 
-# Check if already installed
-if claude plugin list 2>/dev/null | grep -q "superpowers"; then
-    echo "✓ Superpowers already installed"
+# Installed plugin ids, one per line (e.g. superpowers@superpowers-dev).
+installed_ids() {
+    claude plugin list 2>/dev/null | grep -oE '[A-Za-z0-9._-]+@[A-Za-z0-9._-]+' | sort -u || true
+}
+
+ids="$(installed_ids)"
+has_official=false
+grep -qxF "$OFFICIAL_ID" <<<"$ids" && has_official=true
+legacy_ids="$(grep -E '^superpowers@' <<<"$ids" | grep -vxF "$OFFICIAL_ID" || true)"
+
+if $has_official && [[ -z "$legacy_ids" ]]; then
+    echo "✓ Superpowers already installed ($OFFICIAL_ID)"
     echo "  To update: cc-update"
     exit 0
 fi
 
-# Ensure obra/superpowers marketplace is registered
-if ! claude plugin marketplace list 2>/dev/null | grep -q "superpowers"; then
-    echo "Adding obra/superpowers marketplace..."
-    if ! claude plugin marketplace add obra/superpowers 2>&1; then
-        echo ""
-        echo "✗ Failed to add superpowers marketplace." >&2
-        echo "  Try manually: claude plugin marketplace add obra/superpowers" >&2
+if [[ -n "$legacy_ids" ]]; then
+    echo "Found Superpowers installed from another marketplace:"
+    sed 's/^/  /' <<<"$legacy_ids"
+    echo "cc_tool now installs it from Anthropic's official marketplace ($OFFICIAL_ID)."
+    echo "Both at once would register every superpowers:* skill twice, so the old install is replaced."
+    echo ""
+fi
+
+if ! $has_official; then
+    if ! claude plugin marketplace list 2>/dev/null | grep -qF "$OFFICIAL_MP"; then
+        echo "Adding anthropics/claude-plugins-official marketplace..."
+        if ! claude plugin marketplace add anthropics/claude-plugins-official 2>&1; then
+            echo "" >&2
+            echo "✗ Failed to add marketplace." >&2
+            echo "  Try manually: claude plugin marketplace add anthropics/claude-plugins-official" >&2
+            exit 1
+        fi
+    fi
+
+    echo "Installing Superpowers plugin ($OFFICIAL_ID)..."
+    if ! claude plugin install "$OFFICIAL_ID"; then
+        echo "" >&2
+        echo "✗ Installation failed." >&2
+        [[ -n "$legacy_ids" ]] && echo "  The old install was left in place, so Superpowers still works." >&2
+        echo "  Try manually:" >&2
+        echo "    claude plugin marketplace add anthropics/claude-plugins-official" >&2
+        echo "    claude plugin install $OFFICIAL_ID" >&2
         exit 1
     fi
 fi
 
-echo "Installing Superpowers plugin..."
-if claude plugin install superpowers; then
-    echo ""
-    echo "✓ Superpowers installed."
-    echo ""
-    echo "Available skills (invoke manually by telling Claude):"
-    echo "  superpowers:brainstorming              design before any code"
-    echo "  superpowers:writing-plans              test-first implementation plan"
-    echo "  superpowers:subagent-driven-development  run the plan, a fresh subagent per task"
-    echo "  superpowers:executing-plans            run the plan inline yourself"
-    echo "  superpowers:test-driven-development     strict red-green-refactor"
-    echo "  superpowers:systematic-debugging       root-cause before any fix"
-    echo "  superpowers:verification-before-completion  hard gate: run tests, read output"
-    echo "  superpowers:dispatching-parallel-agents    independent tasks in parallel"
-    echo "  superpowers:requesting-code-review     isolated code review subagent"
-    echo "  superpowers:finishing-a-development-branch  merge/PR with cleanup"
-else
-    echo ""
-    echo "✗ Installation failed." >&2
-    echo "  Try manually:" >&2
-    echo "    claude plugin marketplace add obra/superpowers" >&2
-    echo "    claude plugin install superpowers" >&2
+# Replace the old install only after the official one is in, so a failed install never
+# leaves the machine without Superpowers.
+migration_failed=false
+while IFS= read -r old_id; do
+    [[ -n "$old_id" ]] || continue
+    echo "Uninstalling $old_id..."
+    if ! claude plugin uninstall "$old_id"; then
+        migration_failed=true
+        echo "✗ Could not uninstall $old_id. Remove it by hand, or superpowers:* skills load twice:" >&2
+        echo "    claude plugin uninstall $old_id   (add --scope project if it was installed per project)" >&2
+        continue
+    fi
+    old_mp="${old_id#*@}"
+    remaining="$(installed_ids)"
+    marketplaces="$(claude plugin marketplace list 2>/dev/null || true)"
+    if [[ "$old_mp" != "$OFFICIAL_MP" ]] && ! grep -q "@${old_mp}\$" <<<"$remaining" \
+       && grep -qF "$old_mp" <<<"$marketplaces"; then
+        echo "Removing the $old_mp marketplace (no installed plugin uses it any more)..."
+        claude plugin marketplace remove "$old_mp" \
+            || echo "⚠️  Could not remove marketplace $old_mp (harmless). Remove it with: claude plugin marketplace remove $old_mp"
+    fi
+done <<<"$legacy_ids"
+
+echo ""
+if $migration_failed; then
+    echo "⚠️  $OFFICIAL_ID installed, but an old Superpowers install is still present (see above)."
     exit 1
 fi
+echo "✓ Superpowers installed ($OFFICIAL_ID). Restart Claude Code to apply."
+echo ""
+echo "Available skills (invoke manually by telling Claude):"
+echo "  superpowers:brainstorming              design before any code"
+echo "  superpowers:writing-plans              test-first implementation plan"
+echo "  superpowers:subagent-driven-development  run the plan, a fresh subagent per task"
+echo "  superpowers:executing-plans            run the plan inline yourself"
+echo "  superpowers:test-driven-development     strict red-green-refactor"
+echo "  superpowers:systematic-debugging       root-cause before any fix"
+echo "  superpowers:verification-before-completion  hard gate: run tests, read output"
+echo "  superpowers:dispatching-parallel-agents    independent tasks in parallel"
+echo "  superpowers:requesting-code-review     isolated code review subagent"
+echo "  superpowers:finishing-a-development-branch  merge/PR with cleanup"

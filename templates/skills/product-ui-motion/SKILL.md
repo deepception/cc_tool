@@ -99,10 +99,12 @@ colour transitions that aid comprehension, drop movement. Gate hover motion behi
 
 ## Precedence over the global taste skills
 
-The taste-skill family (`design-taste-frontend`, `redesign-existing-projects`,
-`high-end-visual-design`) carries landing-page motion advice that is wrong at product
-scale. Those files are third-party and npx-managed — not editable here. On these three
-points this skill wins:
+The classic taste skills (`high-end-visual-design` above all, and older pre-v2 copies of
+`design-taste-frontend`) carry landing-page motion advice that is wrong at product scale.
+`design-taste-frontend` v2 dropped these three points, and its app-screen rules (motion is
+feedback, nothing performs an entrance) agree with this skill. Those files are third-party
+and npx-managed, not editable here. On these three points, and on any duration or easing a
+taste skill gives for product UI, this skill wins:
 
 | Taste skill says | For product UI |
 |---|---|

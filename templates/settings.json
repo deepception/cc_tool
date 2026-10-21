@@ -26,17 +26,12 @@
       "Read(**/secrets/**)",
       "Read(**/*credentials*)",
       "Read(~/.ssh/**)",
-      "Write(~/.ssh/**)",
       "Edit(~/.ssh/**)",
       "Read(~/.aws/**)",
-      "Write(~/.aws/**)",
       "Edit(~/.aws/**)",
       "Read(~/.config/gh/**)",
-      "Write(**/*.pem)",
       "Edit(**/*.pem)",
-      "Write(**/*.key)",
       "Edit(**/*.key)",
-      "Write(**/id_rsa*)",
       "Edit(**/id_rsa*)",
       "Edit(**/uv.lock)",
       "Edit(**/package-lock.json)",
@@ -52,7 +47,6 @@
       "Bash(git filter-branch *)",
       "Bash(git filter-repo *)",
       "Read(~/.config/gcloud/**)",
-      "Write(~/.config/gcloud/**)",
       "Edit(~/.config/gcloud/**)",
       "Read(~/.boto)",
       "Read(/etc/boto.cfg)",
@@ -135,6 +129,120 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Elicitation": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "ElicitationResult": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -187,6 +295,43 @@
             "type": "command",
             "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/activity-log.py",
             "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
+            "timeout": 2,
+            "async": true
           }
         ]
       }

@@ -1,6 +1,6 @@
 ---
 name: no-ai-slop
-description: Edit a draft the user wrote into sharper, more human writing while preserving their personal voice, or name the AI-slop patterns in it without rewriting. Use when the user hands over their own prose — an essay, post, newsletter, email, or announcement — and wants it clearer, more direct, more opinionated, or less AI-sounding, or asks whether it reads as AI. Not for code, code comments, or this repo's own documentation.
+description: Edit a draft the user wrote into sharper, more human writing while preserving their personal voice, or name the AI-slop patterns in it without rewriting. Use when the user hands over their own prose (an essay, post, newsletter, email, or announcement) and wants it clearer, more direct, more opinionated, or less AI-sounding, or asks whether it reads as AI. Not for code, code comments, a web page's visual design (design-director), or this repo's own documentation.
 ---
 
 # No AI slop
@@ -89,7 +89,7 @@ Often-empty phrases: it's worth noting, it's important to note, at the end of th
 
 ## cc_tool additions
 
-Not part of upstream. Checked against github.com/yetone/kill-ai-slop, which catalogues a separate, mostly visual/CSS taxonomy of AI slop (gradients, glassmorphism, card spam) — out of scope here; see cc_tool's design-taste skills for that. Its one prose-relevant finding not already covered above:
+Not part of upstream. Checked against github.com/yetone/kill-ai-slop, which catalogues a separate, mostly visual/CSS taxonomy of AI slop (gradients, glassmorphism, card spam), out of scope here; that belongs to `design-director` and the taste skills it routes to. Its one prose-relevant finding not already covered above:
 
 **More words to cut.** Also banned outright: seamless, effortless, blazing-fast, next-level, unlock the power of, say goodbye to.
 

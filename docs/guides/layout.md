@@ -10,6 +10,14 @@ cc_tool/
     cc-vault                     scaffold a self-writing vault (single-inbox autonomous note processing)
     cc-devcontainer              drop .devcontainer/ to sandbox Claude Code in Docker
     cc-token                     generate/refresh CLAUDE_CODE_OAUTH_TOKEN on host (for sandboxed containers)
+    cc-dash                      local read-only dashboard of Claude Code sessions (Python stdlib server on 127.0.0.1)
+  lib/cc_dash/                   cc-dash internals, standard library only
+    pricing.py                   per-model prices and the per-message cost estimate
+    parser.py                    incremental JSONL reader and per-transcript accumulator
+    store.py                     transcript discovery, subagent and workflow linkage, guard-log attribution, JSON payloads
+    server.py                    HTTP server: loopback bind, Host-header check, fixed asset map, CLI flags
+    attention.py                 open alerts for /api/alerts: tails the attention hook's log, resolve rules, session registry, transcript fallback
+    web/                         the page: index.html, app.css, app.js, alerts.js/.css (toasts, bell drawer, title badge), alerts-worker.js (background-tab poller); no CDN, no network
     cc-update-project            update an existing project (hooks + skills + permissions)
     cc-update                    update global plugins (Superpowers + security-guidance)
     cc-update-permissions        [internal] deny/ask merge helper, called by cc-update-project
@@ -49,6 +57,8 @@ cc_tool/
       pick-ui-library/SKILL.md                task-to-library lookup for common UI mechanics: toasts, DnD, virtualization, forms (MIT, emilkowalski/skills)
       scroll-world/SKILL.md                   scroll-scrubbed AI-video "fly through the world" landing page pipeline (MIT, oso95/scroll-world)
         references/, LICENSE                  Higgsfield/Monid prompts + scrub engine + knockout script (vendored verbatim); needs paid external services, not bundled
+      hyperframes-movie/SKILL.md              build a HyperFrames Studio launch/promo/explainer film and iterate it against 8 measured gates (explicit /hyperframes-movie only)
+        reference.md, scripts/, templates/      pacing model + motion vocabulary; build, reading-audit, rhythm and playback gates; schedule, score and scene templates
       improve-codebase-architecture/SKILL.md  surface deep-module refactor opportunities as GitHub-issue RFCs (MIT, mattpocock/skills)
       triage/SKILL.md                         GitHub issue triage: bug/enhancement x 5-state machine, verify-before-label, agent-brief handoff (derived from mattpocock/skills)
       app-qa/SKILL.md                         full QA engagement orchestrator: e2e + UI/UX review + frontend review over shared discovery, up to three docs
@@ -67,9 +77,13 @@ cc_tool/
       context-usage.py           Stop: warn when session context window passes 80% (suggest /compact)
       post-edit-typecheck.py     PostToolUse Edit|Write|MultiEdit: fast project check (tsc/cargo; ruff file-scoped for Python) after source edits, surface errors inline; tsc timeouts back off for 30 min via a marker in .git/ and report NOT CHECKED (once) instead of staying silent; missing tsc reported once per session; red/green recorded in session state
       activity-log.py            PostToolUse (every tool): one JSON line per tool call in .git/cc_tool/activity.jsonl (guards append their deny/ask/warn there too; rotates at 5 MB); records file mtimes after Read/Edit/Write for the stale-read check
+      attention.py               PermissionRequest, Notification, PostToolUse/Failure/Batch, UserPromptSubmit, Stop, SubagentStop, StopFailure, Elicitation(Result), SessionEnd (async except SessionEnd): one JSON line per event in ${XDG_STATE_HOME:-~/.local/state}/cc_tool/attention.jsonl (0700/0600, no symlinks followed, rotates at 5 MB) for cc-dash alerts; silent, never blocks
   tests/
     test_bash_guard.py           allow/ask/warn/deny matrix for bash-guard.py (stdlib only, self-contained fixtures)
     test_write_guard.py          matrix for write-guard.py: location, secrets-in-content, trajectory warnings, project rules
+    test_cc_dash.py              cc-dash parser, cost and subagent linkage on fake transcripts, incremental reads, server Host/traversal checks
+    test_attention_hook.py       attention.py: event lines per hook event, file modes, rotation, symlink/hard-link/FIFO refusal, silence, garbage input, latency, settings registration
+    test_cc_dash_alerts.py       /api/alerts: open/resolve state machine, out-of-order lines, staleness, registry, transcript fallback and dedupe, rotation, shape, timing
   .claude/
     workflows/                   saved Workflow definitions (run via the Workflow tool)
       model-recalibration-audit.js  re-audit this setup against a new Claude model
@@ -84,6 +98,9 @@ cc_tool/
 ```bash
 python3 tests/test_bash_guard.py        # ~200 cases, a few seconds, exits non-zero on any deviation
 python3 tests/test_write_guard.py       # write-guard.py matrix
+python3 tests/test_cc_dash.py           # cc-dash: parser, aggregation, server security
+python3 tests/test_attention_hook.py    # attention hook: event log, modes, refusals
+python3 tests/test_cc_dash_alerts.py    # cc-dash alerts: state machine, endpoint, timing
 ```
 
 ## Project guard rules

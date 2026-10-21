@@ -1,0 +1,146 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+  </head>
+  <body>
+    <template>
+      <style>
+        #root {
+          position: absolute;
+          inset: 0;
+          overflow: hidden;
+          pointer-events: none;
+        }
+        #fx-canvas {
+          position: absolute;
+          inset: 0;
+          display: block;
+          visibility: hidden; /* shown only while a flood or flash is on screen (see the timeline) */
+          width: 100%;
+          height: 100%;
+        }
+      </style>
+
+      <!-- Liquid flood transitions and beat flashes over every scene; transparent between events.
+           Event times come from build.py (scenes with enter "flood" / "flash", and FLASHES). -->
+      <div id="root" data-composition-id="fx-top" data-width="1920" data-height="1080" data-duration="60">
+        <canvas id="fx-canvas" width="1920" height="1080"></canvas>
+      </div>
+
+      <script type="module">
+        import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.181.2/+esm";
+        THREE.ColorManagement.enabled = false;
+
+        const TOTAL = /*@total*/ 60;
+        // [cut time, colour a, colour b, colour c, direction x, direction y, noise seed]
+        const FLOODS = /*@data:FLOODS*/[]/*@end*/;
+        // [time, strength 0–1]
+        const FLASHES = /*@data:FLASHES*/[]/*@end*/;
+
+        const canvas = document.getElementById("fx-canvas");
+        const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: false, preserveDrawingBuffer: true });
+        renderer.setPixelRatio(1);
+        renderer.setSize(1920, 1080, false);
+        renderer.setClearColor(0x000000, 0);
+        const scene = new THREE.Scene();
+        const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+        const uniforms = {
+          uTime: { value: 0 }, uHead: { value: -1 }, uTail: { value: -1 }, uSeed: { value: 0 }, uFlash: { value: 0 },
+          uDir: { value: new THREE.Vector2(0.8, 0.6) },
+          uA: { value: new THREE.Color("#8e3a6f") }, uB: { value: new THREE.Color("#c77ba8") }, uC: { value: new THREE.Color("#5fd4ee") },
+        };
+        scene.add(
+          new THREE.Mesh(
+            new THREE.PlaneGeometry(2, 2),
+            new THREE.ShaderMaterial({
+              uniforms,
+              transparent: true,
+              vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+              fragmentShader: `
+                precision highp float;
+                varying vec2 vUv;
+                uniform float uTime, uHead, uTail, uSeed, uFlash;
+                uniform vec2 uDir;
+                uniform vec3 uA, uB, uC;
+                float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+                float noise(vec2 p) {
+                  vec2 i = floor(p), f = fract(p);
+                  vec2 u = f * f * (3.0 - 2.0 * f);
+                  return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y);
+                }
+                float fbm(vec2 p) { float v = 0.0, a = 0.5; for (int i = 0; i < 5; i++) { v += a * noise(p); p = p * 2.03 + 11.0; a *= 0.5; } return v; }
+                float fbm3(vec2 p) { float v = 0.0, a = 0.5; for (int i = 0; i < 3; i++) { v += a * noise(p); p = p * 2.03 + 11.0; a *= 0.5; } return v; }
+                void main() {
+                  vec2 p = vUv * vec2(1.7778, 1.0);
+                  vec2 d = normalize(uDir);
+                  float v = dot(vUv - 0.5, d) / (0.5 * (abs(d.x) + abs(d.y))) * 0.5 + 0.5;
+                  float n = fbm(p * 2.6 + uSeed + vec2(uTime * 0.6, -uTime * 0.4));
+                  float vv = v + (n - 0.5) * 0.42;
+                  float m = (1.0 - smoothstep(uHead - 0.012, uHead + 0.012, vv)) * smoothstep(uTail - 0.012, uTail + 0.012, vv);
+                  // glossy paint: shade from a smooth low-octave field, hot rim on the leading edge
+                  vec2 sp = p * 1.4 + uSeed + vec2(uTime * 0.3, -uTime * 0.2);
+                  float s0 = fbm3(sp);
+                  vec3 nrm = normalize(vec3(-(fbm3(sp + vec2(0.01, 0.0)) - s0) * 14.0, -(fbm3(sp + vec2(0.0, 0.01)) - s0) * 14.0, 1.0));
+                  vec3 L = normalize(vec3(-0.4, 0.5, 0.8));
+                  float diff = clamp(dot(nrm, L), 0.0, 1.0);
+                  float spec = pow(clamp(dot(reflect(-L, nrm), vec3(0.0, 0.0, 1.0)), 0.0, 1.0), 40.0);
+                  vec3 col = mix(uA, uB, smoothstep(0.1, 0.9, n + (v - uTail) * 0.35));
+                  col = mix(col, uC, smoothstep(0.62, 0.95, n));
+                  col = col * (0.62 + 0.5 * diff) + vec3(1.0, 0.95, 1.0) * spec * 0.6;
+                  col += vec3(1.0, 0.96, 1.0) * (1.0 - smoothstep(0.0, 0.035, abs(vv - uHead))) * 0.45;
+                  float fl = uFlash * (1.0 - 0.5 * length(vUv - 0.5));
+                  float a = max(m, fl);
+                  gl_FragColor = vec4(col * m + vec3(fl) * (1.0 - m), a);
+                }`,
+            }),
+          ),
+        );
+
+        const st = { t: 0, head: -0.6, tail: -0.6, flash: 0, a: "#8e3a6f", b: "#c77ba8", c: "#5fd4ee", dx: 0.8, dy: 0.6, seed: 0 };
+        const render = () => {
+          uniforms.uTime.value = st.t;
+          uniforms.uHead.value = st.head;
+          uniforms.uTail.value = st.tail;
+          uniforms.uFlash.value = st.flash;
+          uniforms.uSeed.value = st.seed;
+          uniforms.uDir.value.set(st.dx, st.dy);
+          uniforms.uA.value.set(st.a);
+          uniforms.uB.value.set(st.b);
+          uniforms.uC.value.set(st.c);
+          renderer.render(scene, camera);
+        };
+        const tl = gsap.timeline({ paused: true, onUpdate: render });
+        tl.to(st, { t: TOTAL, duration: TOTAL, ease: "none" }, 0);
+        // A flood covers the cut at `cut` (head sweeps in over 0.38 s), then drains out the far side.
+        FLOODS.forEach(([cut, a, b, c, dx, dy, seed]) => {
+          const t0 = cut - 0.36;
+          tl.set(st, { head: -0.6, tail: -0.6, a, b, c, dx, dy, seed }, t0 - 0.01);
+          tl.to(st, { head: 1.6, duration: 0.38, ease: "power2.in" }, t0);
+          tl.to(st, { tail: 1.6, duration: 0.42, ease: "power2.out" }, cut + 0.02);
+          tl.set(st, { head: -0.6, tail: -0.6 }, cut + 0.46);
+        });
+        FLASHES.forEach(([at, amt]) => {
+          tl.to(st, { flash: amt, duration: 0.03, ease: "none" }, at);
+          tl.to(st, { flash: 0, duration: 0.2, ease: "power2.out" }, at + 0.03);
+        });
+        // The canvas exists only while it paints: between events it would sit over every scene as an
+        // opaque raster in the layout audit's eyes, and it costs GPU for nothing.
+        const windows = [...FLOODS.map(([cut]) => [cut - 0.38, cut + 0.48]), ...FLASHES.map(([at]) => [at - 0.01, at + 0.25])]
+          .sort((x, y) => x[0] - y[0])
+          .reduce((acc, w) => {
+            const last = acc[acc.length - 1];
+            if (last && w[0] <= last[1]) last[1] = Math.max(last[1], w[1]);
+            else acc.push([...w]);
+            return acc;
+          }, []);
+        windows.forEach(([a, b]) => {
+          tl.set("#fx-canvas", { visibility: "visible" }, Math.max(0, a));
+          tl.set("#fx-canvas", { visibility: "hidden" }, b);
+        });
+        render();
+        window.__timelines["fx-top"] = tl;
+      </script>
+    </template>
+  </body>
+</html>

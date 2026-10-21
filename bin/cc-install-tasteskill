@@ -1,58 +1,108 @@
 #!/usr/bin/env bash
-# cc-install-tasteskill: Install a curated subset of taste-skill (Leonxlnx/taste-skill, MIT)
-# as global (user-level) Claude Code skills. Run once; the design-director project skill
-# (templates/skills/design-director/) routes among the installed variants.
-# Excluded on purpose: gpt-tasteskill + stitch-skill (other-platform variants),
-# taste-skill-v1 (legacy), image-to-code + imagegen-* + brandkit (need an image-generation tool).
+# cc-install-tasteskill: Install the taste-skill design skills (MIT) as global (user-level)
+# Claude Code skills. Run once; the design-director project skill
+# (templates/skills/design-director/) routes among them.
+#
+# Upstream split in October 2026 (taste-skill v2):
+#   Leonxlnx/taste-skill           holds one skill, design-taste-frontend (v2): a scripted run
+#                                  (Node 22+, Chrome for its inspector, network for open-collection
+#                                  pictures) for pages and, since v2.1, app screens.
+#   Leonxlnx/taste-skill-classics  the pre-v2 style skills, now opt-in (disable-model-invocation):
+#                                  Claude cannot load them itself, the user runs /minimalist-ui etc.
+# Installed: design-taste-frontend, plus the classics minimalist-ui, industrial-brutalist-ui and
+# high-end-visual-design as user-invoked styles.
+# Retired, and removed if an older cc_tool installed them:
+#   redesign-existing-projects  folded into design-taste-frontend v2 (audit-first redesign mode);
+#                               an old copy keeps claiming redesigns that v2 now owns.
+#   full-output-enforcement     removed upstream, and it contradicts the managed CLAUDE.md block's
+#                               "shortest response that fully answers" output discipline.
+# Excluded on purpose: gpt-taste + stitch-design-taste (other-platform variants),
+# design-taste-frontend-v1 / -v2-experimental (superseded), imagegen-* + brandkit + image-to-code
+# (Leonxlnx/imagegen-skills, need an image-generation tool). Also not the taste-skill Claude Code
+# plugin (taste-skill@taste-skill): with it and these npx skills both installed,
+# design-taste-frontend loads twice.
 set -euo pipefail
 
-TASTE_SKILLS=(
-    design-taste-frontend
-    minimalist-ui
-    industrial-brutalist-ui
-    high-end-visual-design
-    redesign-existing-projects
-    full-output-enforcement
-)
+MAIN_REPO="Leonxlnx/taste-skill"
+MAIN_SKILLS=(design-taste-frontend)
+CLASSICS_REPO="Leonxlnx/taste-skill-classics"
+CLASSIC_SKILLS=(minimalist-ui industrial-brutalist-ui high-end-visual-design)
+RETIRED_SKILLS=(redesign-existing-projects full-output-enforcement)
+SKILLS_DIR="$HOME/.claude/skills"
 
 if ! command -v npx &>/dev/null; then
     echo "Error: 'npx' not found. Install Node.js first." >&2
     exit 1
 fi
 
-# Check if already installed (global skills are linked into ~/.claude/skills)
-if [[ -e "$HOME/.claude/skills/design-taste-frontend" ]]; then
+# v2 ships scripts/; a pre-v2 copy is a lone SKILL.md.
+main_current() { [[ -e "$SKILLS_DIR/design-taste-frontend/scripts/draw.mjs" ]]; }
+# A classic installed from taste-skill-classics carries disable-model-invocation; one left
+# over from the pre-split taste-skill repo does not, and Claude would still auto-load it.
+classic_current() { grep -q '^disable-model-invocation: true' "$SKILLS_DIR/$1/SKILL.md" 2>/dev/null; }
+
+need_main=false
+main_current || need_main=true
+need_classics=()
+for s in "${CLASSIC_SKILLS[@]}"; do
+    classic_current "$s" || need_classics+=("$s")
+done
+retired_present=()
+for s in "${RETIRED_SKILLS[@]}"; do
+    [[ -e "$SKILLS_DIR/$s" ]] && retired_present+=("$s")
+done
+
+if ! $need_main && [[ ${#need_classics[@]} -eq 0 && ${#retired_present[@]} -eq 0 ]]; then
     echo "✓ taste-skill already installed globally"
     echo "  To update: cc-update"
     exit 0
 fi
 
-SKILL_FLAGS=()
-for s in "${TASTE_SKILLS[@]}"; do
-    SKILL_FLAGS+=(--skill "$s")
-done
-
-echo "Installing taste-skill design skills globally (Leonxlnx/taste-skill)..."
 # The skills CLI exits non-zero if ANY detected agent rejects global install
-# (e.g. PromptScript), even when the Claude Code install succeeded — so verify
-# by checking the installed directory, not the exit code.
-npx -y skills add Leonxlnx/taste-skill -g -y --agent claude-code "${SKILL_FLAGS[@]}" || true
+# (e.g. PromptScript), even when the Claude Code install succeeded, so verify
+# by checking the installed directories, not the exit code.
+if $need_main; then
+    echo "Installing design-taste-frontend (v2) globally from $MAIN_REPO..."
+    npx -y skills add "$MAIN_REPO" -g -y --agent claude-code --skill "${MAIN_SKILLS[@]}" || true
+fi
+if [[ ${#need_classics[@]} -gt 0 ]]; then
+    echo "Installing classic style skills globally from $CLASSICS_REPO: ${need_classics[*]}..."
+    flags=()
+    for s in "${need_classics[@]}"; do flags+=(--skill "$s"); done
+    npx -y skills add "$CLASSICS_REPO" -g -y --agent claude-code "${flags[@]}" || true
+fi
+if [[ ${#retired_present[@]} -gt 0 ]]; then
+    echo "Removing retired taste skills: ${retired_present[*]}"
+    echo "  (redesign-existing-projects is part of design-taste-frontend v2 now;"
+    echo "   full-output-enforcement was removed upstream and fights the CLAUDE.md output rules)"
+    npx -y skills remove -g -y "${retired_present[@]}" || true
+fi
 
-if [[ -e "$HOME/.claude/skills/design-taste-frontend" ]]; then
+failed=false
+main_current || failed=true
+for s in "${CLASSIC_SKILLS[@]}"; do classic_current "$s" || failed=true; done
+for s in "${RETIRED_SKILLS[@]}"; do [[ -e "$SKILLS_DIR/$s" ]] && failed=true; done
+
+if ! $failed; then
     echo ""
-    echo "✓ taste-skill installed (global). Variants:"
-    echo "  design-taste-frontend       default anti-slop landing/portfolio skill (3 dials)"
-    echo "  minimalist-ui               clean editorial (Notion/Linear) style"
-    echo "  industrial-brutalist-ui     raw Swiss/terminal aesthetic"
-    echo "  high-end-visual-design      expensive soft/premium agency look"
-    echo "  redesign-existing-projects  audit-first upgrade of existing UIs"
-    echo "  full-output-enforcement     no-truncation output discipline"
+    echo "✓ taste-skill installed (global):"
+    echo "  design-taste-frontend      v2 art-direction run for pages and app screens; Claude loads it itself"
+    echo "  /minimalist-ui             clean editorial (Notion/Linear) style          (opt-in: you type it)"
+    echo "  /industrial-brutalist-ui   raw Swiss/terminal aesthetic                   (opt-in: you type it)"
+    echo "  /high-end-visual-design    soft, expensive agency look                    (opt-in: you type it)"
     echo ""
     echo "  The design-director skill (installed per-project by cc-setup) routes among these."
+    node_major="$(node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || true)"
+    if [[ -z "$node_major" || "$node_major" -lt 22 ]]; then
+        echo "  Note: design-taste-frontend's inspector needs Node 22+ and Chrome/Chromium; without them it"
+        echo "  falls back to lint only (Node 18+)."
+    fi
 else
     echo ""
-    echo "✗ Installation failed. Try manually:" >&2
-    echo "  npx -y skills add Leonxlnx/taste-skill -g -y --agent claude-code \\" >&2
-    printf '      --skill %s\n' "${TASTE_SKILLS[@]}" >&2
+    echo "✗ Installation incomplete. Try manually:" >&2
+    echo "  npx -y skills add $MAIN_REPO -g -y --agent claude-code --skill design-taste-frontend" >&2
+    echo "  npx -y skills add $CLASSICS_REPO -g -y --agent claude-code \\" >&2
+    printf '      --skill %s\n' "${CLASSIC_SKILLS[@]}" >&2
+    echo "  npx -y skills remove -g -y ${RETIRED_SKILLS[*]}" >&2
     exit 1
 fi

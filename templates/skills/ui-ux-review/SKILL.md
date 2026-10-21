@@ -4,7 +4,8 @@ description: >-
   Reviews a running app's user experience by walking through every screen (or
   command/endpoint surface) and writing severity-tagged findings to
   docs/UI-UX-REVIEW.md. Use when the user asks for a UI review, UX walkthrough,
-  design QA, or a "does the app feel right" pass on a live app.
+  design QA, or a "does the app feel right" pass on a live app. A visual-design
+  critique of a landing or marketing page goes to design-director instead.
 user-invocable: true
 argument-hint: [app-path-or-description]
 ---

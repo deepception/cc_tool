@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>cc-dash</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='1' width='14' height='14' rx='3.5' fill='%23171715'/%3E%3Crect x='4' y='9' width='2' height='3' rx='.6' fill='%23fcfcfb'/%3E%3Crect x='7' y='6' width='2' height='6' rx='.6' fill='%23fcfcfb'/%3E%3Crect x='10' y='4' width='2' height='8' rx='.6' fill='%23fcfcfb'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/alerts.css"><!-- alerts: toasts, drawer, title badge -->
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="top-in">
+    <a class="brand" href="#/live" aria-label="cc-dash home">
+      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="1" y="1" width="14" height="14" rx="3.5" class="brand-bg"/><rect x="4" y="9" width="2" height="3" rx=".6" class="brand-fg"/><rect x="7" y="6" width="2" height="6" rx=".6" class="brand-fg"/><rect x="10" y="4" width="2" height="8" rx=".6" class="brand-fg"/></svg>
+      <span>cc-dash</span>
+    </a>
+    <nav class="tabs" aria-label="Views">
+      <a href="#/live" data-view="live">Live <span class="count" id="live-count" hidden></span></a>
+      <a href="#/sessions" data-view="sessions">Sessions</a>
+      <a href="#/overview" data-view="overview">Overview</a>
+    </nav>
+    <div class="top-right">
+      <span class="scope" id="scope"></span>
+      <span class="sync" id="sync" role="status" aria-live="polite"></span>
+      <button class="icon-btn" id="theme" type="button" aria-label="Theme: follow system" title="Theme (t)"></button>
+      <button class="icon-btn" id="help-btn" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
+    </div>
+  </div>
+</header>
+<main id="main" tabindex="-1"></main>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+<dialog class="help" id="help">
+  <h2>Keyboard</h2>
+  <dl>
+    <dt><kbd>l</kbd> <kbd>s</kbd> <kbd>o</kbd></dt><dd>Live, Sessions, Overview</dd>
+    <dt><kbd>v</kbd></dt><dd>Live: switch between agents and sessions</dd>
+    <dt><kbd>/</kbd></dt><dd>Search sessions</dd>
+    <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Move down and up a list</dd>
+    <dt><kbd>Enter</kbd></dt><dd>Open the selected row</dd>
+    <dt><kbd>Esc</kbd></dt><dd>Back, or clear the search</dd>
+    <dt><kbd>1</kbd> to <kbd>5</kbd></dt><dd>Session tabs</dd>
+    <dt><kbd>e</kbd></dt><dd>Expand or collapse every tool group</dd>
+    <dt><kbd>t</kbd></dt><dd>Cycle theme: system, light, dark</dd>
+    <dt><kbd>a</kbd></dt><dd>Alerts: what your agents are waiting on</dd>
+  </dl>
+  <div class="help-foot"><button class="btn" id="help-close" type="button">Close</button></div>
+</dialog>
+<script src="/dom.js"></script>
+<script src="/timeline.js"></script>
+<script src="/app.js"></script>
+<script src="/alerts.js"></script><!-- alerts: polls /api/alerts -->
+</body>
+</html>

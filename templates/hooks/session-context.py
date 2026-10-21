@@ -49,7 +49,7 @@ if (project_dir / ".git").exists():
     if dirty:
         line += f" ({dirty} uncommitted changes)"
     if branch in PROTECTED:
-        line += " — protected branch: create a feature branch before committing"
+        line += "; protected branch: create a feature branch before committing"
     parts.append(line)
     if recent:
         parts.append("Recent commits:\n" + "\n".join(f"  {l}" for l in recent.splitlines()))

@@ -157,8 +157,8 @@ def _note_once(key: str, text: str) -> None:
 def _not_checked(tool: str, why: str) -> None:
     """NOT CHECKED is a no-verdict, not a pass — say so instead of staying silent,
     so the model does not mistake silence for a clean result."""
-    _note(f"NOT CHECKED: `{tool}` {why}. Silence from this hook is not a clean result — "
-          "run the project's own check before reporting the change verified.")
+    _note(f"NOT CHECKED: `{tool}` {why}. Silence from this hook is not a clean result. "
+          "Run the project's own check before reporting the change verified.")
 
 
 def _surface(tool: str, output: str) -> None:

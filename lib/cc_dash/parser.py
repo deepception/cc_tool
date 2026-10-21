@@ -1,0 +1,651 @@
+"""Incremental JSONL reading and the per-transcript accumulator.
+
+A transcript is append-only while its session runs, so each file is read once
+and afterwards only from the last consumed byte. The cache key is
+(size, mtime_ns, inode); a file that shrank or was replaced is re-read from 0.
+A trailing line without its newline is left for the next pass unless it is
+already valid JSON. Malformed lines are counted and skipped.
+
+One Claude Code API message is spread over several `assistant` records (one
+per content block) that repeat the same `message.id` and `usage`, so usage is
+counted once per message id.
+"""
+import json
+import os
+import re
+from datetime import datetime
+
+from . import pricing
+
+CHUNK = 8 * 1024 * 1024
+MAX_EVENTS = 8000          # per transcript; past this the oldest timeline events are dropped
+TEXT_PROMPT = 1200
+TEXT_ASSIST = 600
+TEXT_TARGET = 200
+TEXT_ERROR = 400
+ACTIVE_GAP = 1800          # a pause longer than this between records is idle time, not work
+
+# Record types that carry nothing the dashboard shows. Checked against the raw
+# line prefix so json.loads never runs on them (some are large).
+_SKIP_PREFIXES = tuple(b'{"type":"%s"' % t for t in (
+    b"bridge-session", b"atis-latch", b"queue-operation", b"file-history-snapshot",
+    b"file-history-delta", b"api-request-blob", b"api-request", b"api-request-shape",
+    b"mode", b"permission-mode", b"last-prompt",
+))
+
+_SPAWN_TOOLS = {"Agent", "Task"}
+_TAG_STRIP = re.compile(r"<(ide_opened_file|ide_selection|system-reminder|ide_diagnostics)>.*?</\1>", re.S)
+_CMD_NAME = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
+_CMD_ARGS = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
+_TN_SUMMARY = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.S)
+_TN_STATUS = re.compile(r"<status>\s*(.*?)\s*</status>", re.S)
+_WF_NAME = re.compile(r"""\bname\s*:\s*['"]([^'"]{1,80})['"]""")
+HOME = os.path.expanduser("~")
+
+
+def parse_ts(s):
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def clip(s, n):
+    s = s if isinstance(s, str) else ("" if s is None else str(s))
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def tilde(p):
+    if isinstance(p, str) and HOME and p.startswith(HOME + "/"):
+        return "~" + p[len(HOME):]
+    return p
+
+
+def tool_target(name, ti):
+    """A one-line summary of what a tool call acted on."""
+    if not isinstance(ti, dict):
+        return ""
+    if name == "Bash":
+        return clip(ti.get("command"), TEXT_TARGET)
+    if name in _SPAWN_TOOLS:
+        return clip(ti.get("description") or ti.get("prompt"), TEXT_TARGET)
+    if name == "Workflow":
+        return clip(workflow_name(ti), TEXT_TARGET)
+    if name == "AskUserQuestion":  # the first question (alerts show it; the timeline too)
+        qs = ti.get("questions")
+        q = qs[0] if isinstance(qs, list) and qs and isinstance(qs[0], dict) else {}
+        return clip(q.get("question"), TEXT_TARGET)
+    for key in ("file_path", "notebook_path", "path", "pattern", "url", "query", "skill",
+                "description", "prompt", "command", "message"):
+        v = ti.get(key)
+        if isinstance(v, str) and v:
+            return clip(tilde(v), TEXT_TARGET)
+    for v in ti.values():
+        if isinstance(v, str) and v:
+            return clip(v, TEXT_TARGET)
+    return ""
+
+
+def workflow_name(ti):
+    if not isinstance(ti, dict):
+        return ""
+    for key in ("name", "workflow", "workflowName"):
+        if isinstance(ti.get(key), str) and ti[key]:
+            return ti[key]
+    m = _WF_NAME.search(ti.get("script") or "")
+    if m:
+        return m.group(1)
+    sp = ti.get("scriptPath") or ti.get("path") or ""
+    if isinstance(sp, str) and sp:
+        return os.path.basename(sp).split(".")[0]
+    return "workflow"
+
+
+def _content_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                out.append(b.get("text") or "")
+            elif isinstance(b, str):
+                out.append(b)
+        return "\n".join(out)
+    return ""
+
+
+def classify_user(rec, accept_sidechain):
+    """('prompt'|'command'|'notify'|'peer'|'interrupt'|'compact', text) or None."""
+    if rec.get("isMeta"):
+        return None
+    if rec.get("isSidechain") and not accept_sidechain:
+        return None
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content")
+    if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+        return None
+    text = _content_text(content)
+    has_image = isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "image" for b in content)
+    origin = rec.get("origin") if isinstance(rec.get("origin"), dict) else {}
+    okind = origin.get("kind")
+    head = text.lstrip()[:200]
+    if okind == "task-notification" or head.startswith("<task-notification"):
+        m = _TN_SUMMARY.search(text) or _TN_STATUS.search(text)
+        return ("notify", clip(m.group(1) if m else "Background task update", TEXT_ASSIST))
+    if okind in ("peer", "coordinator") or head.startswith("Another Claude session sent"):
+        return ("peer", clip(text, TEXT_ASSIST))
+    if "<command-name>" in head:
+        m = _CMD_NAME.search(text)
+        a = _CMD_ARGS.search(text)
+        name = m.group(1) if m else "/command"
+        if not name.startswith("/"):
+            name = "/" + name
+        return ("command", clip(name + (" " + a.group(1) if a and a.group(1) else ""), TEXT_ASSIST))
+    if head.startswith("<local-command") or head.startswith("Caveat:"):
+        return None
+    if head.startswith("[Request interrupted"):
+        return ("interrupt", "")
+    if head.startswith("This session is being continued"):
+        return ("compact", "")
+    text = _TAG_STRIP.sub("", text).strip()
+    if not text and not has_image:
+        return None
+    if not text:
+        text = "[image]"
+    return ("prompt", clip(text, TEXT_PROMPT))
+
+
+def _result_text(block):
+    c = block.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+class Acc:
+    """Everything the dashboard needs from one transcript file, built record by record."""
+
+    def __init__(self, path, kind="main"):
+        self.path = path
+        self.kind = kind                      # "main" or "sub"
+        self.session_id = ""
+        self.agent_id = ""
+        self.cwd = ""
+        self.branch = ""
+        self.version = ""
+        self.entrypoint = ""
+        self.first_ts = None
+        self.last_ts = None
+        self.active_secs = 0.0                # sum of gaps under ACTIVE_GAP between records
+        self.ai_title = ""
+        self.custom_title = ""
+        self.agent_name = ""
+        self.summary = ""
+        self.first_prompt = ""
+        self.cost_state = None
+        self.bad_lines = 0
+        self.prompts = 0
+        self.api_msgs = 0
+        self.tool_calls = 0
+        self.tool_errors = 0
+        self.blocked = 0
+        self.api_errors = 0
+        self.interrupts = 0
+        self.compactions = 0
+        self.fallbacks = 0
+        self.last_stop = ""
+        self.last_role = ""                   # "assistant" or "user": who wrote the latest message record
+        self.last_kind = ""                   # what the latest turn-relevant record was: "assistant", "tool_result",
+                                              # or a classify_user kind ("prompt", "notify", "interrupt", ...)
+        self.last_msg_stop = ""               # stop_reason on the latest assistant record ("" while streaming blocks)
+        self.msg_order = []                   # message ids in first-seen order (burn rate over the last minutes)
+        self.msg_ts = {}                      # message id -> timestamp of its first record
+        self.last_text = ""
+        self.last_tool = None                 # {"name","target","t"}
+        self.handed_back = False
+        self.last_model = ""
+        self.models = {}                      # model -> msg count
+        self.usage = {}                       # model -> [msgs, in, out, cread, cw5, cw1h, cost]
+        self.msg_usage = {}                   # message id -> (model, (in,out,cr,cw5,cw1h), cost, hour)
+        self.hours = {}                       # epoch hour -> {"c": {family: cost}, "tok", "tools", "err", "msgs"}
+        self.tools = {}                       # tool -> [calls, errors, dur_sum, dur_n]
+        self.pending = {}                     # tool_use id -> its timeline event (dict)
+        self.spawns = []                      # Agent/Task/Workflow calls
+        self.spawn_by_id = {}
+        self.tool_ts = []                     # timestamps of tool calls (guard-event attribution)
+        self.events = []
+        self.dropped_events = 0
+        self._last_text_mid = None
+
+    # ── helpers ────────────────────────────────────────────────────────────
+    def _hour(self, t):
+        h = int(t // 3600)
+        b = self.hours.get(h)
+        if b is None:
+            b = self.hours[h] = {"c": {}, "m": {}, "tok": 0, "tools": 0, "err": 0, "msgs": 0}
+        return b
+
+    def _event(self, ev):
+        self.events.append(ev)
+        if len(self.events) > MAX_EVENTS + MAX_EVENTS // 4:
+            cut = len(self.events) - MAX_EVENTS
+            del self.events[:cut]
+            self.dropped_events += cut
+        return ev
+
+    def model_main(self):
+        if not self.models:
+            return ""
+        return max(self.models.items(), key=lambda kv: kv[1])[0]
+
+    def totals(self):
+        inp = out = cr = cw = msgs = 0
+        cost = 0.0
+        unpriced = 0
+        for m, u in self.usage.items():
+            msgs += u[0]
+            inp += u[1]
+            out += u[2]
+            cr += u[3]
+            cw += u[4] + u[5]
+            if pricing.has_price(m):
+                cost += u[6]
+            else:
+                unpriced += u[1] + u[2] + u[3] + u[4] + u[5]
+        return {"input": inp, "output": out, "cache_read": cr, "cache_write": cw,
+                "tokens": inp + out + cr + cw, "cost": cost, "unpriced_tokens": unpriced, "msgs": msgs}
+
+    # ── the record handler ─────────────────────────────────────────────────
+    def feed(self, rec):
+        if not isinstance(rec, dict):
+            return
+        t = rec.get("type")
+        if t == "assistant":
+            self._assistant(rec)
+        elif t == "user":
+            self._user(rec)
+        elif t == "system":
+            self._system(rec)
+        elif t == "ai-title":
+            self.ai_title = clip(rec.get("aiTitle"), 200)
+        elif t == "custom-title":
+            self.custom_title = clip(rec.get("customTitle"), 200)
+        elif t == "agent-name":
+            self.agent_name = clip(rec.get("agentName"), 120)
+        elif t == "summary":
+            self.summary = clip(rec.get("summary"), 200)
+        elif t == "cost-state":
+            if isinstance(rec.get("totalCostUSD"), (int, float)):
+                self.cost_state = {"total": rec["totalCostUSD"],
+                                   "models": {m: (u or {}).get("costUSD") for m, u in (rec.get("modelUsage") or {}).items()
+                                              if isinstance(u, dict)}}
+        else:
+            return
+        if t in ("assistant", "user", "system"):
+            ts = parse_ts(rec.get("timestamp"))
+            if ts:
+                if self.first_ts is None or ts < self.first_ts:
+                    self.first_ts = ts
+                if self.last_ts is None or ts > self.last_ts:
+                    if self.last_ts is not None and ts - self.last_ts < ACTIVE_GAP:
+                        self.active_secs += ts - self.last_ts
+                    self.last_ts = ts
+            if not self.session_id and rec.get("sessionId"):
+                self.session_id = rec["sessionId"]
+            if not self.agent_id and rec.get("agentId"):
+                self.agent_id = rec["agentId"]
+            if not self.cwd and isinstance(rec.get("cwd"), str):
+                self.cwd = rec["cwd"]
+            if rec.get("gitBranch"):
+                self.branch = rec["gitBranch"]
+            if rec.get("version"):
+                self.version = rec["version"]
+            if rec.get("entrypoint") and not self.entrypoint:
+                self.entrypoint = rec["entrypoint"]
+
+    def _assistant(self, rec):
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            return
+        ts = parse_ts(rec.get("timestamp"))
+        model = msg.get("model") or ""
+        mid = msg.get("id") or rec.get("requestId") or rec.get("uuid") or ""
+        synthetic = model.startswith("<")
+        if model and not synthetic:
+            self.last_model = model
+        u = msg.get("usage")
+        if not synthetic and isinstance(u, dict) and mid:
+            cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else None
+            cw_total = int(u.get("cache_creation_input_tokens") or 0)
+            if cc is not None:
+                cw1h = int(cc.get("ephemeral_1h_input_tokens") or 0)
+                cw5 = int(cc.get("ephemeral_5m_input_tokens") or 0)
+                if cw1h + cw5 < cw_total:
+                    cw5 += cw_total - cw1h - cw5
+            else:
+                cw5, cw1h = cw_total, 0
+            tup = (int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+                   int(u.get("cache_read_input_tokens") or 0), cw5, cw1h)
+            prev = self.msg_usage.get(mid)
+            if prev is None or prev[1] != tup:
+                cost = pricing.message_cost(model, *tup, speed=u.get("speed") or "")
+                hour = int(ts // 3600) if ts else (prev[3] if prev else 0)
+                if prev is not None:
+                    self._apply_usage(prev[0], prev[1], prev[2], prev[3], -1)
+                else:
+                    self.api_msgs += 1
+                    self.models[model] = self.models.get(model, 0) + 1
+                    if ts:
+                        self.msg_order.append(mid)
+                        self.msg_ts[mid] = ts
+                self.msg_usage[mid] = (model, tup, cost, hour)
+                self._apply_usage(model, tup, cost, hour, 1)
+        content = msg.get("content")
+        if msg.get("stop_reason"):
+            self.last_stop = msg["stop_reason"]
+        self.last_role = "assistant"
+        self.last_kind = "assistant"
+        self.last_msg_stop = msg.get("stop_reason") or ""
+        if not isinstance(content, list):
+            return
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text":
+                txt = (b.get("text") or "").strip()
+                if not txt:
+                    continue
+                self.last_text = clip(txt, TEXT_ASSIST)
+                if self._last_text_mid == mid and self.events and self.events[-1].get("k") == "text":
+                    ev = self.events[-1]
+                    ev["text"] = clip(ev["text"] + "\n\n" + txt, TEXT_ASSIST)
+                else:
+                    self._event({"k": "text", "t": ts, "text": clip(txt, TEXT_ASSIST),
+                                 "model": pricing.display_name(model) if model else ""})
+                    self._last_text_mid = mid
+            elif bt == "tool_use":
+                self._tool_use(b, ts)
+
+    def _apply_usage(self, model, tup, cost, hour, sign):
+        """Add (sign=1) or remove (sign=-1) one message's usage."""
+        u = self.usage.get(model)
+        if u is None:
+            u = self.usage[model] = [0, 0, 0, 0, 0, 0, 0.0]
+        u[0] += sign
+        for i in range(5):
+            u[i + 1] += sign * tup[i]
+        if cost is not None:
+            u[6] += sign * cost
+        if not hour:
+            return
+        b = self.hours.get(hour)
+        if b is None:
+            b = self.hours[hour] = {"c": {}, "m": {}, "tok": 0, "tools": 0, "err": 0, "msgs": 0}
+        b["tok"] += sign * sum(tup)
+        b["msgs"] += sign
+        mu = b["m"].get(model)
+        if mu is None:
+            mu = b["m"][model] = [0, 0.0]
+        mu[0] += sign * sum(tup)
+        if cost is not None:
+            mu[1] += sign * cost
+            fam = pricing.family(model)
+            b["c"][fam] = b["c"].get(fam, 0.0) + sign * cost
+
+    def _tool_use(self, b, ts):
+        name = b.get("name") or "?"
+        ti = b.get("input") if isinstance(b.get("input"), dict) else {}
+        tid = b.get("id") or ""
+        self.tool_calls += 1
+        st = self.tools.get(name)
+        if st is None:
+            st = self.tools[name] = [0, 0, 0.0, 0]
+        st[0] += 1
+        if ts:
+            self.tool_ts.append(ts)
+            self._hour(ts)["tools"] += 1
+        target = tool_target(name, ti)
+        ev = {"k": "tool", "t": ts, "name": name, "target": target, "id": tid, "status": "pending"}
+        if name in _SPAWN_TOOLS or name == "Workflow":
+            sp = {"id": tid, "t": ts, "tool": name,
+                  "kind": "workflow" if name == "Workflow" else "agent",
+                  "description": clip(ti.get("description") if name != "Workflow" else workflow_name(ti), 200),
+                  "subagent_type": ti.get("subagent_type") or ("workflow" if name == "Workflow" else "general-purpose"),
+                  "model_requested": ti.get("model") or "",
+                  "background": bool(ti.get("run_in_background")),
+                  "status": "pending", "agent_id": "", "run_id": "", "resolved_model": "",
+                  "total_tokens": None, "duration_ms": None, "tool_uses": None, "error": ""}
+            self.spawns.append(sp)
+            self.spawn_by_id[tid] = sp
+            ev["spawn"] = True
+        if name == "SubagentHandback":
+            self.handed_back = True
+            msg = ti.get("message")
+            if isinstance(msg, str) and msg.strip():
+                # The subagent's final report travels in the tool input; show it as its last word.
+                self.last_text = clip(msg, TEXT_ASSIST)
+                self._event({"k": "text", "t": ts, "text": clip(msg, TEXT_PROMPT), "report": True,
+                             "model": pricing.display_name(self.last_model) if self.last_model else ""})
+                self._last_text_mid = None
+                return
+        self._event(ev)
+        if tid:
+            self.pending[tid] = ev
+        self.last_tool = {"name": name, "target": target, "t": ts}
+
+    def _user(self, rec):
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            return
+        ts = parse_ts(rec.get("timestamp"))
+        content = msg.get("content")
+        self.last_role = "user"
+        if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+            tur = rec.get("toolUseResult") if len(results) == 1 else None
+            for b in results:
+                self._tool_result(b, ts, tur)
+            self.last_kind = "tool_result"
+            return
+        c = classify_user(rec, accept_sidechain=(self.kind == "sub"))
+        if c is None:
+            return
+        kind, text = c
+        self.last_kind = kind
+        if kind == "prompt":
+            self.prompts += 1
+            if not self.first_prompt:
+                self.first_prompt = clip(text, 300)
+        elif kind == "interrupt":
+            self.interrupts += 1
+        elif kind == "compact":
+            self.compactions += 1
+        self._last_text_mid = None
+        self._event({"k": kind, "t": ts, "text": text})
+
+    def _tool_result(self, b, ts, tur):
+        tid = b.get("tool_use_id") or ""
+        ev = self.pending.pop(tid, None)
+        is_err = b.get("is_error") is True or b.get("is_error") == "true"
+        text = _result_text(b)
+        blocked = "BLOCKED:" in text[:400] and ("hook error" in text[:200] or text.lstrip().startswith("BLOCKED:"))
+        name = ev["name"] if ev else ""
+        if ev is not None:
+            ev["status"] = "error" if is_err else "ok"
+            if blocked:
+                ev["status"] = "blocked"
+            if is_err:
+                ev["err"] = clip(text, TEXT_ERROR)
+            if ts and ev.get("t"):
+                ev["dur"] = round(max(0.0, ts - ev["t"]), 2)
+                st = self.tools.get(name)
+                if st:
+                    st[2] += ev["dur"]
+                    st[3] += 1
+        if is_err:
+            self.tool_errors += 1
+            if blocked:
+                self.blocked += 1
+            st = self.tools.get(name)
+            if st:
+                st[1] += 1
+            if ts:
+                self._hour(ts)["err"] += 1
+        sp = self.spawn_by_id.get(tid)
+        if sp is not None:
+            if is_err:
+                sp["status"] = "error"
+                sp["error"] = clip(text, TEXT_ERROR)
+            if isinstance(tur, dict):
+                st = tur.get("status")
+                if st:
+                    sp["status"] = {"async_launched": "running"}.get(st, st)
+                sp["agent_id"] = tur.get("agentId") or sp["agent_id"]
+                sp["run_id"] = tur.get("runId") or sp["run_id"]
+                sp["resolved_model"] = tur.get("resolvedModel") or sp["resolved_model"]
+                if isinstance(tur.get("totalTokens"), int):
+                    sp["total_tokens"] = tur["totalTokens"]
+                if isinstance(tur.get("totalDurationMs"), (int, float)):
+                    sp["duration_ms"] = tur["totalDurationMs"]
+                if isinstance(tur.get("totalToolUseCount"), int):
+                    sp["tool_uses"] = tur["totalToolUseCount"]
+                if tur.get("workflowName"):
+                    sp["description"] = clip(tur["workflowName"], 200)
+            elif sp["status"] == "pending" and not is_err:
+                sp["status"] = "completed"
+
+    def _system(self, rec):
+        st = rec.get("subtype")
+        ts = parse_ts(rec.get("timestamp"))
+        if st == "api_error":
+            self.api_errors += 1
+            err = rec.get("error") if isinstance(rec.get("error"), dict) else {}
+            text = err.get("formatted") or err.get("message") or "API error"
+            attempt = rec.get("retryAttempt")
+            if attempt:
+                text += f" (retry {attempt}/{rec.get('maxRetries', '?')})"
+            if ts:
+                self._hour(ts)["err"] += 1
+            self._event({"k": "error", "t": ts, "text": clip(text, TEXT_ERROR)})
+        elif st == "compact_boundary":
+            self.compactions += 1
+            meta = rec.get("compactMetadata") if isinstance(rec.get("compactMetadata"), dict) else {}
+            pre = meta.get("preTokens")
+            self._event({"k": "compact", "t": ts,
+                         "text": f"Context compacted ({meta.get('trigger', 'auto')}"
+                                 + (f", {pre:,} tokens before" if isinstance(pre, int) else "") + ")"})
+        elif st == "model_refusal_fallback":
+            self.fallbacks += 1
+            self._event({"k": "fallback", "t": ts,
+                         "text": f"Flagged on {pricing.display_name(rec.get('originalModel') or '')}, "
+                                 f"switched to {pricing.display_name(rec.get('fallbackModel') or '')}"})
+
+
+class FileCache:
+    """path -> (signature, offset, acc). Re-reads only appended bytes."""
+
+    def __init__(self):
+        self.entries = {}
+        self.bytes_read = 0
+
+    def get(self, path, make_acc, st=None):
+        """Return (acc, changed). `make_acc()` builds a fresh accumulator."""
+        try:
+            st = st or os.stat(path)
+        except OSError:
+            self.entries.pop(path, None)
+            return None, False
+        sig = (st.st_size, st.st_mtime_ns, st.st_ino)
+        e = self.entries.get(path)
+        if e is not None and e["sig"] == sig:
+            return e["acc"], False
+        if e is None or st.st_ino != e["sig"][2] or st.st_size < e["offset"]:
+            e = {"sig": None, "offset": 0, "acc": make_acc()}
+            self.entries[path] = e
+        self._consume(path, e, st.st_size)
+        e["sig"] = sig
+        return e["acc"], True
+
+    def _consume(self, path, e, size):
+        acc = e["acc"]
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            return
+        with fh:
+            fh.seek(e["offset"])
+            carry = b""
+            remaining = size - e["offset"]
+            while remaining > 0:
+                chunk = fh.read(min(CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                self.bytes_read += len(chunk)
+                buf = carry + chunk
+                cut = buf.rfind(b"\n")
+                if cut < 0:
+                    carry = buf
+                    continue
+                # buf starts exactly at e["offset"]: carry was never counted.
+                self._lines(acc, buf[:cut])
+                e["offset"] += cut + 1
+                carry = buf[cut + 1:]
+            # e["offset"] counts bytes up to the last newline; a complete JSON
+            # tail without a newline is consumed too, a partial one waits.
+            if carry.strip():
+                try:
+                    rec = json.loads(carry)
+                except ValueError:
+                    return
+                acc.feed(rec)
+                e["offset"] += len(carry)
+
+    @staticmethod
+    def _lines(acc, data):
+        for line in data.split(b"\n"):
+            if not line or line.startswith(_SKIP_PREFIXES):
+                continue
+            if b'"attachment":{' in line[:160] and line.startswith(b'{"parentUuid"'):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                acc.bad_lines += 1
+                continue
+            acc.feed(rec)
+
+
+class LineLog:
+    """Accumulator for a cc_tool activity.jsonl: keeps the guard decisions only."""
+
+    def __init__(self):
+        self.events = []
+        self.tool_lines = 0
+        self.bad_lines = 0
+
+    def feed(self, rec):
+        if not isinstance(rec, dict):
+            return
+        kind = rec.get("kind")
+        if kind == "tool":
+            self.tool_lines += 1
+            return
+        if kind not in ("deny", "ask", "warn"):
+            return
+        ts = rec.get("ts")
+        if not isinstance(ts, (int, float)):
+            return
+        self.events.append({"t": float(ts), "kind": kind, "hook": rec.get("hook") or "",
+                            "tool": rec.get("tool") or "",
+                            "target": clip(tilde(rec.get("command") or rec.get("path") or ""), TEXT_TARGET),
+                            "message": clip(rec.get("message"), TEXT_ERROR)})

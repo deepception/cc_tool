@@ -248,12 +248,18 @@ if isinstance(env, dict) and env.get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE") == "1":
 #    every deletion outright, scratch included, so agents routed around them or
 #    handed the step back to the user. The hook asks instead, skips scratch and
 #    regenerable caches, and still denies the catastrophic forms.
+#  - deny "Write(path)" rules (retired in v0.1.0) never matched anything: Claude Code
+#    matches only Edit(path) for file permission checks, and Edit rules cover every
+#    file-editing tool. Each path keeps its Edit(path) rule, so no protection is lost;
+#    the dead entries only made every session start print one warning apiece.
 # Only these exact shipped strings are removed; anything a project wrote itself,
 # in any other spelling, stays.
 _RETIRED = {
     "ask": ["Bash(npx *)"],
     "deny": ["Bash(rm -rf *)", "Bash(rm -rf:*)", "Bash(git reset --hard *)", "Bash(git clean -fd*)",
-             "Bash(git checkout .)", "Bash(git checkout -- *)", "Bash(git branch -D *)"],
+             "Bash(git checkout .)", "Bash(git checkout -- *)", "Bash(git branch -D *)",
+             "Write(~/.ssh/**)", "Write(~/.aws/**)", "Write(**/*.pem)", "Write(**/*.key)",
+             "Write(**/id_rsa*)", "Write(~/.config/gcloud/**)"],
 }
 perms = settings.get("permissions")
 for section, retired in _RETIRED.items():
@@ -261,7 +267,8 @@ for section, retired in _RETIRED.items():
     gone = [r for r in retired if isinstance(rules, list) and r in rules]
     if gone:
         perms[section] = [r for r in rules if r not in gone]
-        print("  ✓ retired %s rule(s) now handled by bash-guard.py: %s" % (section, ", ".join(gone)))
+        print("  ✓ retired %s rule(s) (replaced by bash-guard.py, or never matched by Claude Code): %s"
+              % (section, ", ".join(gone)))
 open(sys.argv[1], "w").write(json.dumps(settings, indent=2) + "\n")
 print("  ✓ .claude/settings.json hooks + attribution + env updated (permissions preserved)")
 EOF

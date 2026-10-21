@@ -1,13 +1,13 @@
 # Self-writing vault
 
 Your raw thinking about this project, filed and cross-linked by Claude on a
-schedule. The rules below are the contract — you and Claude both follow them.
+schedule. The rules below are the contract: you and Claude both follow them.
 
-1. **One inlet.** New thoughts go ONLY into `inbox/` — voice transcripts, quick
+1. **One inlet.** New thoughts go ONLY into `inbox/`: voice transcripts, quick
    notes, half-ideas, no sorting at capture time. If filing a note takes a
    decision, it doesn't get filed; the inbox removes the decision.
 2. **`raw/` is immutable.** Processing moves each inbox original into `raw/`
-   with a date prefix. Nothing ever edits a file in `raw/` — cleaned-up,
+   with a date prefix. Nothing ever edits a file in `raw/`. Cleaned-up,
    distilled versions live in `notes/`; the original stays as you said it.
 3. **Backlinks over notes.** A note with no connections is just a file. Every
    note Claude files gets at least three `[[backlinks]]`, at least one of them
@@ -27,7 +27,7 @@ schedule. The rules below are the contract — you and Claude both follow them.
 | `notes/` | distilled, cross-linked notes | Claude |
 | `daily/` | per-run digests (`YYYY-MM-DD.md`) | Claude |
 | `synthesis/` | weekly synthesis (`YYYY-Www.md`) | Claude |
-| `index.md` | one line per note — the routing table | Claude |
+| `index.md` | one line per note (the routing table) | Claude |
 | `log.md` | append-only run ledger | Claude |
 
 Operations: `/vault process` · `/vault synthesize` · `/vault health` (see the

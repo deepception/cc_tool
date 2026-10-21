@@ -3,10 +3,11 @@ name: pick-ui-library
 description: >-
   Task-to-library lookup for common UI/product needs — toasts, command palettes, drag
   and drop, virtualization, global state, class-name/variant composition, theming,
-  forms, charts, date pickers, OTP inputs, animated numbers, syntax highlighting.
-  Use before hand-rolling any of these, or when picking which npm package solves a
-  UI task. For icons and overall design systems (Fluent/Material/Carbon/Radix/shadcn)
-  see design-taste-frontend instead; for motion/interaction craft see product-ui-motion.
+  forms, charts, date pickers, OTP inputs, animated numbers, syntax highlighting,
+  icons, and which design system (Fluent/Material/Carbon/Radix/shadcn) fits a new
+  product. Use before hand-rolling any of these, or when picking which npm package
+  solves a UI task. Visual direction goes to design-director; motion and interaction
+  craft to product-ui-motion.
 user-invocable: true
 ---
 
@@ -31,11 +32,16 @@ Most "should I build this myself" questions for common UI mechanics already have
 | OTP / PIN code input | `input-otp` | Paste, auto-advance, backspace, screen-reader labeling |
 | Animated numbers / counters | `number-flow` | Digit-roll animation, locale-aware formatting |
 | Code syntax highlighting | `shiki` | VS Code-quality grammars, no runtime highlighting jank |
+| Icons | `@phosphor-icons/react` (then `hugeicons-react`, `@radix-ui/react-icons`, `@tabler/icons-react`) | Consistent stroke and grid; never hand-draw SVG icon paths. One family per project, so an existing icon dependency wins |
 
 Not covered here — use these instead:
-- **Icons** → `design-taste-frontend` §3.C (Phosphor / Hugeicons / Radix icons / Tabler, in priority order).
-- **Accessible primitives** (dropdown, dialog, popover, tabs, tooltip) and the overall component/design system → `design-taste-frontend` §2.A's brief-to-system map.
+- **Accessible primitives** (dropdown, dialog, popover, tabs, tooltip) → the project's design system (below); Radix primitives when it has none.
+- **Visual direction, type, colour** → `design-director`.
 - **Motion, gesture physics, spring configs** → `product-ui-motion`.
+
+## Design system for a new product
+
+An existing app keeps the system it has: one system per project, never a second one mixed in. For a new product, match the brief and install the official package rather than recreating its CSS: enterprise or Microsoft-style SaaS → `@fluentui/react-components`; Material-flavored → `@material/web`; IBM-style B2B analytics → `@carbon/react`; Shopify admin → Polaris; Atlassian-style → `@atlaskit/*`; GitHub-style devtool → `@primer/react`; UK or US public sector → `govuk-frontend` / `uswds`; modern accessible React foundation → `@radix-ui/themes`; SaaS where you own the components → shadcn/ui, restyled, never shipped in its default state. (Condensed from taste-skill's pre-v2 brief-to-system map, MIT.)
 
 ## Common mismatches
 
@@ -51,6 +57,6 @@ Signals that a hand-rolled implementation should be replaced with a library from
 
 1. Identify the task from the brief or the code being written.
 2. Check the lookup table, then the "not covered here" cross-references, before assuming nothing fits.
-3. Check the project's manifest for an existing dependency that already does the job — including one not in this table — before adding a new one. `design-taste-frontend` §3.F covers this verification discipline in depth; this skill only adds the task→library mapping.
+3. Check the project's manifest for an existing dependency that already does the job (including one not in this table) before adding a new one.
 4. Recommend **one** library with the install command, not a menu of alternatives. If the project already uses a competing library for the same job, follow the existing one instead of introducing a second.
 5. If nothing here fits and no existing dependency covers it, say so rather than forcing a match — some things are genuinely fine to hand-roll (a copy-to-clipboard button, a simple modal wrapper around a native primitive).

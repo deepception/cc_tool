@@ -199,7 +199,7 @@ def check_secrets(root: str, path: str, contents: list) -> None:
                 line = text[start:end if end != -1 else len(text)]
                 if _placeholder(m.group(0), line):
                     continue
-                deny(root, path, f"the proposed content contains what looks like a real secret ({label}) — "
+                deny(root, path, f"the proposed content contains what looks like a real secret ({label}); "
                                  f"line: {line.strip()[:80]!r}",
                      "read it from an environment variable or a gitignored .env file; if this is a "
                      "fixture, make it obviously fake (EXAMPLE/xxx)")

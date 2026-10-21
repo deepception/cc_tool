@@ -17,7 +17,7 @@ Brief description of what this project does, its tech stack, and primary purpose
 
 <!--
 For LARGE codebases: keep THIS root file lean (big picture + pointers + gotchas only).
-Put local conventions in a CLAUDE.md inside the relevant subdirectory — Claude loads
+Put local conventions in a CLAUDE.md inside the relevant subdirectory. Claude loads
 every CLAUDE.md on the path from the file it's editing up to the repo root. A bloated
 root file is loaded into every session regardless of relevance.
 -->
@@ -26,7 +26,7 @@ root file is loaded into every session regardless of relevance.
 
 <!-- Link important docs that Claude should read before making changes. -->
 
-- @path/to/important-doc.md — description
+- @path/to/important-doc.md: description
 
 ---
 
@@ -127,9 +127,9 @@ Prefer running single test files over the full suite for faster feedback.
 
 1. Make the smallest change that solves the problem
 2. Run formatter and linter after editing code
-3. Run relevant tests after changes — prefer single test files over full suite
-4. Confirm the change works — run the relevant tests, or exercise it directly if untested. State the actual command run and the tail of its real output (e.g. the `N passed in Xs` line); "tests pass" with no pasted output is a skipped step.
-5. No fabrication — never reference a function, flag, config key, or path you have not confirmed exists (full rule: "No fabrication" under Critical rules below)
+3. Run relevant tests after changes: prefer single test files over full suite
+4. Confirm the change works: run the relevant tests, or exercise it directly if untested. State the actual command run and the tail of its real output (e.g. the `N passed in Xs` line); "tests pass" with no pasted output is a skipped step.
+5. No fabrication: never reference a function, flag, config key, or path you have not confirmed exists (full rule: "No fabrication" under Critical rules below)
 6. Never commit files containing secrets (.env, credentials, API keys)
 
 ### Git Conventions
@@ -144,16 +144,16 @@ Prefer running single test files over the full suite for faster feedback.
 
 <!-- Optional. Delete this subsection if you don't want auto-offered loops in this project. -->
 
-When a task you just did by hand is clearly going to recur (PR babysitting, test-suite or deploy monitoring, triage of incoming items), offer to turn it into a loop rather than waiting to be asked — name the trigger, the verifiable end state, and where its state would live, then let the user confirm before creating anything. The model usually drafts a loop spec better than a hand-written one, so offer to draft the `/goal` prompt. A well-formed `/goal` has all six of:
+When a task you just did by hand is clearly going to recur (PR babysitting, test-suite or deploy monitoring, triage of incoming items), offer to turn it into a loop rather than waiting to be asked. Name the trigger, the verifiable end state, and where its state would live, then let the user confirm before creating anything. The model usually drafts a loop spec better than a hand-written one, so offer to draft the `/goal` prompt. A well-formed `/goal` has all six of:
 
 - one-line task statement
 - 3-5 measurable success criteria
 - constraints that hold throughout
-- a checkpoint rule — when to pause vs run through
+- a checkpoint rule: when to pause vs run through
 - a self-verify instruction (verifier is not the worker; see Verification protocol)
 - a max budget guard (token or iteration cap)
 
-Default checkpoint rule: "Pause only when work needs my input — destructive actions, scope changes, or items only I can provide." For a recurring version of a one-off task, offer `/loop <interval>` instead. Follow the `loop-engineering` skill for the anatomy and the "Safe autonomous loops" gates; start with one loop, verify it end-to-end, then expand.
+Default checkpoint rule: "Pause only when work needs my input: destructive actions, scope changes, or items only I can provide." For a recurring version of a one-off task, offer `/loop <interval>` instead. Follow the `loop-engineering` skill for the anatomy and the "Safe autonomous loops" gates; start with one loop, verify it end-to-end, then expand.
 
 ---
 

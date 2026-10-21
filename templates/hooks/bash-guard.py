@@ -2339,7 +2339,7 @@ def check_project_rules(cmd: str) -> None:
 _PARSE_FAIL = (
     "bash-guard could not read the tool payload ({why}), so it cannot check this "
     "command for protected-branch writes or secret reads. Refusing rather than "
-    "letting it through unchecked — check the hook or re-run the command."
+    "letting it through unchecked. Check the hook or re-run the command."
 )
 
 
@@ -2436,5 +2436,5 @@ if __name__ == "__main__":
         # enforced boundary, that is the wrong direction.
         deny(
             f"bash-guard failed while checking this command ({type(exc).__name__}: {exc}). "
-            "Refusing rather than running it unchecked — fix the hook, then retry."
+            "Refusing rather than running it unchecked. Fix the hook, then retry."
         )

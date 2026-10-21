@@ -12,28 +12,34 @@ if ! command -v claude &>/dev/null; then
 fi
 
 echo "Updating Superpowers plugin..."
-if claude plugin marketplace update superpowers-dev 2>&1 \
-   && claude plugin update superpowers@superpowers-dev 2>&1; then
+# Anything other than exactly the official install (missing, or an old
+# superpowers@superpowers-dev from cc_tool <= v0.0.25) goes through the installer,
+# which installs the official plugin and removes the old one.
+sp_ids="$(claude plugin list 2>/dev/null | grep -oE 'superpowers@[A-Za-z0-9._-]+' | sort -u || true)"
+if [[ "$sp_ids" != "superpowers@claude-plugins-official" ]]; then
+    "$CC_TOOL_DIR/bin/cc-install-superpowers" || echo "⚠️  Superpowers install/migration failed (see above)"
+fi
+if claude plugin marketplace update claude-plugins-official 2>&1 \
+   && claude plugin update superpowers@claude-plugins-official 2>&1; then
     echo "✓ Superpowers updated (restart Claude Code to apply)"
 else
     echo "⚠️  Superpowers update failed. Try manually:"
-    echo "  claude plugin marketplace update superpowers-dev"
-    echo "  claude plugin update superpowers@superpowers-dev"
+    echo "  claude plugin marketplace update claude-plugins-official"
+    echo "  claude plugin update superpowers@claude-plugins-official"
 fi
 
 echo ""
 echo "Checking taste-skill design skills..."
-if [[ -d "$HOME/.claude/skills/design-taste-frontend" ]]; then
-    # Note: `skills update -g` updates ALL global skills managed by the skills CLI, not just taste-skill.
-    if npx -y skills update -g -y 2>&1; then
-        echo "✓ global skills updated (incl. taste-skill)"
-    else
-        echo "⚠️  taste-skill update failed (non-fatal). Update manually:"
-        echo "  npx -y skills update -g -y"
-    fi
+# The installer is idempotent: it installs what is missing, moves pre-split copies to
+# their current repos (taste-skill v2, taste-skill-classics) and removes retired skills.
+# Plain `skills update` cannot do that: it leaves skills deleted upstream in place.
+"$CC_TOOL_DIR/bin/cc-install-tasteskill" || echo "⚠️  taste-skill install failed (non-fatal)"
+# Note: `skills update -g` updates ALL global skills managed by the skills CLI, not just taste-skill.
+if npx -y skills update -g -y 2>&1; then
+    echo "✓ global skills updated (incl. taste-skill)"
 else
-    echo "  Not installed — installing now..."
-    "$CC_TOOL_DIR/bin/cc-install-tasteskill" || echo "⚠️  taste-skill install failed (non-fatal)"
+    echo "⚠️  taste-skill update failed (non-fatal). Update manually:"
+    echo "  npx -y skills update -g -y"
 fi
 
 echo ""

@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""cc-dash: local, read-only dashboard of your Claude Code sessions.
+
+Reads ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/ (transcripts and subagent
+transcripts) and each repo's .git/cc_tool/activity.jsonl (guard catches),
+serves a single page on 127.0.0.1, opens the browser, and runs until Ctrl-C.
+Writes nothing. Python 3 standard library only.
+
+Usage: cc-dash [--port 7878] [--no-open] [--days 7] [--project <text>]
+"""
+import os
+import sys
+
+sys.dont_write_bytecode = True  # "writes nothing" includes __pycache__ next to lib/
+# Same convention as cc-setup's CC_TOOL_DIR: the repo is this script's parent's
+# parent. realpath so a symlinked cc-dash still finds lib/.
+CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(CC_TOOL_DIR, "lib"))
+
+from cc_dash.server import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())
