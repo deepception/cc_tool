@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""cc-dash: local, read-only dashboard of your Claude Code sessions.
+"""cc-dash: local dashboard of your Claude Code sessions.
 
 Reads ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/ (transcripts and subagent
 transcripts) and each repo's .git/cc_tool/activity.jsonl (guard catches),
-serves a single page on 127.0.0.1, opens the browser, and runs until Ctrl-C.
-Writes nothing. Python 3 standard library only.
+serves a single page on 127.0.0.1, opens a one-time pairing link in the
+browser, and runs until Ctrl-C. Read-only and writes nothing, unless --control
+(control mode: approve, deny, answer and message agents; it writes only under
+${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/). Python 3 standard library only.
 
-Usage: cc-dash [--port 7878] [--no-open] [--days 7] [--project <text>]
+Usage: cc-dash [--port 7878] [--no-open] [--days 7] [--project <text>] [--control [--control-wait 300]]
 """
 import os
 import sys

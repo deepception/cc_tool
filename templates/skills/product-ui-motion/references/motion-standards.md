@@ -5,7 +5,7 @@ knowing, and how to review motion. Cite exact values from here rather than appro
 
 ## Springs
 
-Springs have no duration — they settle from their parameters, and they keep velocity
+Springs have no duration. They settle from their parameters and keep velocity
 when interrupted, which is why gesture-driven motion wants them and `@keyframes` never.
 
 Two parameterisations, and they are **not interchangeable**:
@@ -19,14 +19,14 @@ Two parameterisations, and they are **not interchangeable**:
 ```
 
 Default to critically damped (`bounce: 0` / ζ = 1.0). Add bounce only when the gesture
-itself carried momentum — a flick, a throw, a drag release. Overshoot on a menu that
+itself carried momentum (a flick, a throw, a drag release). Overshoot on a menu that
 faded in reads as a mistake; overshoot on a card you threw reads as physics. Subtle
 means `bounce: 0.1–0.3`, or ζ ≈ 0.8 (`damping: 16` at `stiffness: 100, mass: 1`).
 
-Apple publishes damping/response pairs for its own interactions — move/reposition
+Apple publishes damping/response pairs for its own interactions: move/reposition
 `1.0 / 0.4`, rotation `0.8 / 0.4`, drawer `0.8 / 0.3`. **Do not paste those response
 values into Motion's `duration`.** Response is the oscillator period; `duration` is
-perceptual settle time. Map `bounce ≈ 1 − damping`, then tune duration by eye — it
+perceptual settle time. Map `bounce ≈ 1 − damping`, then tune duration by eye; it
 lands above the response figure, not equal to it.
 
 The package is `motion`; `framer-motion` is the legacy name:
@@ -36,14 +36,14 @@ import { useSpring } from 'motion/react';
 ```
 
 For decorative mouse-tracking, interpolate through a spring rather than binding the
-value straight to pointer position — direct binding has no momentum and reads as
+value straight to pointer position, since direct binding has no momentum and reads as
 artificial. Only do this where the motion is decorative; on a graph someone is reading,
 none is better.
 
 ## Sequencing
 
 **Stagger** group entrances by 30–80ms per item. Longer reads as slow. Stagger is
-decorative — never block interaction while it plays.
+decorative, so never block interaction while it plays.
 
 **Asymmetric timing.** Slow where the user is deciding, fast where the system responds.
 A hold-to-confirm fills over 2s linear and snaps back in 200ms `ease-out`. Symmetric
@@ -54,10 +54,10 @@ is confirming, not presenting.
 
 ## Techniques
 
-**`clip-path: inset(t r b l)`** — each value eats in from that side. Reveal-on-scroll
+**`clip-path: inset(t r b l)`**: each value eats in from that side. Reveal-on-scroll
 (`inset(0 0 100% 0)` → `inset(0 0 0 0)`), hold-to-delete fills, before/after sliders,
 and seamless tab colour transitions (duplicate the tab list, style the copy active, clip
-it) — all without extra DOM.
+it), all without extra DOM.
 
 **Percentage translates** are relative to the element's own size, so `translateY(100%)`
 moves an element by its own height whatever that is. Prefer them over pixel values for
@@ -65,9 +65,9 @@ toasts and drawers.
 
 **Blur to mask a crossfade.** When two states visibly overlap during a swap despite
 tuned easing, a `filter: blur(2px)` during the transition blends them into one perceived
-transformation. Keep blur under 20px — it is expensive, especially in Safari.
+transformation. Keep blur under 20px, since it is expensive, especially in Safari.
 
-**`scale()` scales children** — font, icons, content. That is the feature that makes
+**`scale()` scales children**, including font, icons and content. That is the feature that makes
 press feedback feel physical.
 
 **WAAPI** gives JS control at CSS performance for programmatic motion:
@@ -79,7 +79,7 @@ el.animate([{ clipPath: 'inset(0 0 100% 0)' }, { clipPath: 'inset(0 0 0 0)' }],
 
 **Skip the delay on adjacent tooltips.** In a toolbar, the first tooltip should wait out
 the normal activation delay, but once the user is already moving between triggers,
-follow-up tooltips should appear instantly — the delay's job (avoid firing on transient
+follow-up tooltips should appear instantly, because the delay's job (avoid firing on transient
 mouse-overs) is already satisfied. Track a shared "recently active" flag and switch
 adjacent triggers to `transition-duration: 0ms` (e.g. via a `[data-instant]` attribute)
 for both the delay and the animation while it's set.
@@ -88,8 +88,8 @@ for both the delay and the animation while it's set.
 
 Motion's `x` / `y` / `scale` shorthands compose into a `transform` recomputed per frame
 on the main thread, so they stutter while the page is loading or scripting. The library
-hands work to the compositor only in a narrow case — a single, uninterrupted,
-non-layout animation of a supported property with no `onUpdate` — and `motion/react`
+hands work to the compositor only in a narrow case: a single, uninterrupted,
+non-layout animation of a supported property with no `onUpdate`. `motion/react`
 narrows it further. The rule that survives regardless of version: **CSS or WAAPI for
 predetermined motion, JS springs for dynamic, interruptible, gesture-driven motion.**
 Re-check motion.dev/docs/performance before citing a mechanism; this is one library's
@@ -100,7 +100,7 @@ styles for every child. Set `transform` on the element directly.
 
 ## Reviewing motion
 
-Report findings as one table — paired before/after is denser than prose and shows its
+Report findings as one table. Paired before/after is denser than prose and shows its
 own reasoning:
 
 | Before | After | Why |
@@ -116,13 +116,13 @@ When proposing fixes, prefer earlier moves to later ones: **delete** the animati
 (stagger, blur, `@starting-style`) → **accessibility and cohesion**.
 
 Include a short **"considered and rejected"** list alongside any set of motion
-suggestions — places that could animate and deliberately should not, each with the
+suggestions. It names places that could animate and deliberately should not, each with the
 reason. A motion review that only adds motion is a wishlist.
 
 ## Feel-checking what code can't tell you
 
 Whether a crossfade reads as one object, whether a spring's bounce is right, whether two
-coordinated properties drift — none of this is visible in a diff. Say so rather than
+coordinated properties drift: none of this is visible in a diff. Say so rather than
 guessing, and check it:
 
 - Play it at 2–5× duration, or use the DevTools animation inspector.
@@ -135,14 +135,14 @@ guessing, and check it:
 Match motion to the product's personality: a playful component can be bouncier, a dense
 dashboard stays crisp and fast. The easing, the duration, the visual design and the copy
 should read as one decision. Opacity paired with height in an entering list has no
-formula — adjust until it settles.
+formula, so adjust until it settles.
 
 ## Multimodal feedback (motion + sound + haptics)
 
 When a channel beyond motion is available, three rules keep it from feeling bolted on:
 
 - **Causality.** Fire feedback on the actual causal event (the drop lands, the toggle
-  commits) — not on the animation that represents it.
+  commits), not on the animation that represents it.
 - **Harmony.** Visual, sound, and haptic must land on the same frame. A haptic pulse that
   fires before a lagging CSS transition finishes breaks the illusion of one physical
   event.
@@ -150,4 +150,4 @@ When a channel beyond motion is available, three rules keep it from feeling bolt
   every minor interaction trains users to ignore it.
 
 Treat haptics as progressive enhancement, not a universal rule: the Vibration API has
-real support only on Android Chrome — no iOS Safari, no desktop.
+real support only on Android Chrome, with none on iOS Safari or desktop.

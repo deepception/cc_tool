@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import pricing  # noqa: E402
 from cc_dash.parser import Acc, FileCache  # noqa: E402
 from cc_dash.server import make_server  # noqa: E402
+from dash_pairing import auto_cookie  # noqa: E402  (tests/dash_pairing.py: every request carries the pairing cookie)
 from cc_dash.store import Store, activity_logs  # noqa: E402
 
 RESULTS = []
@@ -297,6 +298,7 @@ def test_server():
     port = srv.port
     th = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
     th.start()
+    auto_cookie(srv)
     try:
         s, h, b = _req(port, "/")
         check("server: index served", s == 200 and b"<title>cc-dash</title>" in b and "Content-Security-Policy" in h)

@@ -380,7 +380,7 @@ class Attention:
         return out
 
     # ── the payload ────────────────────────────────────────────────────────
-    def payload(self):
+    def payload(self, annotate=None):
         store = self.store
         store.refresh()
         with self.lock, store.lock:   # store.lock: a refresh on another thread mutates the transcript accumulators
@@ -405,8 +405,11 @@ class Attention:
                 out.append(row)
         if store.project:
             out = [r for r in out if store.project in (r.get("_cwd_raw") or "").lower()]
+        if annotate is not None:
+            annotate(out)          # control mode: which open request each alert is
         for r in out:
             r.pop("_cwd_raw", None)
+            r.pop("_match", None)
         out.sort(key=lambda r: -r["since_ts"])
         return {"alerts": out, "now": iso(now), "now_ts": now,
                 "log": {"dir": tilde(self.tail.dir), "bad_lines": self.tail.bad_lines}}
@@ -452,7 +455,7 @@ class Attention:
             "since_ts": a["since_ts"], "age": max(0.0, now - a["since_ts"]),
             "agent_type": a.get("agent_type"), "agent_label": _agent_label(s, a["agent_id"], a.get("agent_type")),
             "session_title": title, "worktree": worktree, "notified": a.get("notified", False),
-            "_cwd_raw": cwd,
+            "_cwd_raw": cwd, "_match": (sid, a["agent_id"], key[3] or None, key[4]) if key[0] == "tool" and source == "hook" else None,
         }
 
     def _derived(self, sessions, reg, skip, now):
@@ -582,5 +585,5 @@ def for_store(store):
     return att
 
 
-def alerts_payload(store):
-    return for_store(store).payload()
+def alerts_payload(store, annotate=None):
+    return for_store(store).payload(annotate)

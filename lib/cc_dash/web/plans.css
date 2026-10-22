@@ -1,0 +1,106 @@
+/* cc-dash plans (plans.js). app.css tokens and components only: cards,
+   panels, tables, pills (the status language), kpis, .now and .card-foot
+   come from app.css; this file adds the progress bar, the plan chip, the
+   plan list's groups and the task rows of the plan page. */
+
+/* The one progress bar: segments (milestones, or tasks) on the grid tone, each
+   filled in ink by its share of done steps; 2px gaps like .share. */
+.pl-bar { display: flex; gap: var(--sp-0h); height: 8px; min-width: 0; }
+.pl-seg { position: relative; flex: 1 1 0; min-width: 2px; overflow: hidden; border-radius: var(--r-xxs); background: var(--grid); }
+.pl-fill { display: block; height: 100%; background: var(--series-main); }
+.pl-bar.big { height: 12px; }
+.pl-bar.big .pl-seg { border-radius: var(--r-xs); }
+.pl-bar.mini { width: 40px; height: 4px; flex: none; gap: 1px; }
+.pl-bar.mini .pl-seg { border-radius: 1px; min-width: 1px; }
+
+.pl-prog { display: grid; gap: var(--sp-1h); min-width: 0; }
+.pl-prog-l { display: flex; align-items: baseline; gap: var(--sp-2); font-size: var(--fs-12); min-width: 0; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pl-prog-l b { font-weight: 500; color: var(--ink); }
+.pl-code { font-family: var(--mono); font-size: .94em; background: var(--sunk); border-radius: var(--r-s); padding: 0 var(--sp-1); }
+
+/* The chip on Live rows and session headers: an app.css .tag with the mini bar. */
+.tag.pl-chip { display: inline-flex; align-items: center; gap: var(--sp-1h); font-family: var(--font); line-height: 16px; padding: 1px var(--sp-1h); color: var(--ink-2); max-width: 360px; transition: border-color var(--t-fast) ease, color var(--t-fast) ease; }
+.tag.pl-chip:hover { border-color: var(--line-2); color: var(--ink); }
+.tag.pl-chip > .ellipsis { min-width: 0; }
+/* On a Live row the compact chip never truncates: the row's meta line wraps it onto its own line instead. */
+.a-meta:has(> .pl-chip) { flex-wrap: wrap; row-gap: var(--sp-1); }
+.tag.pl-chip.compact > .ellipsis, .a-meta > .tag.pl-chip.compact { flex: none; }
+
+/* ── The Plans page: running plans as cards, the rest in quiet groups ─── */
+.sec-h { display: flex; align-items: baseline; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+.pl-who { display: inline-flex; align-items: center; gap: var(--sp-2); min-width: 0; font-weight: 400; }
+.pl-grid .now-text { color: var(--ink); }
+.pl-card .card-foot .mono { max-width: 50%; }
+.pl-group-h { width: 100%; justify-content: flex-start; align-items: center; gap: var(--sp-2); padding-bottom: var(--sp-4); border: 0; background: none; text-align: left; font: inherit; color: inherit; cursor: pointer; border-radius: var(--r-l); transition: background-color var(--t-fast) ease; }
+.pl-group-h.open { padding-bottom: 0; }
+.pl-group-h:hover { background: var(--hover); }
+.pl-group-h:focus-visible { outline-offset: -2px; }
+.pl-group-h .chev { width: 12px; height: 12px; color: var(--ink-4); flex: none; transition: transform var(--t-pop) var(--ease); }
+.pl-group-h.open .chev { transform: rotate(90deg); }
+.pl-more { display: flex; justify-content: center; }
+.pl-goal { display: block; color: var(--ink-2); max-width: 980px; margin: calc(-1 * var(--sp-1)) 0 var(--sp-3); }
+.pl-table { table-layout: fixed; min-width: 860px; }
+.pl-table th:nth-child(1) { width: 34%; } .pl-table th:nth-child(2) { width: 150px; } .pl-table th:nth-child(3) { width: 220px; } .pl-table th:nth-child(5) { width: 104px; }
+.pl-table .pl-cell-t { font-weight: 500; color: var(--ink); }
+.pl-table .pl-now { white-space: normal; min-width: 0; }
+.pl-table .pl-now > * { display: block; }
+.pl-table .pl-now > .faint { font-size: var(--fs-11); }
+
+/* Milestones under the plan page's bar */
+.pl-ms { list-style: none; margin: var(--sp-3) 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: var(--sp-1h) var(--sp-4); font-size: var(--fs-12); }
+.pl-ms li { display: inline-flex; align-items: baseline; gap: var(--sp-1h); min-width: 0; }
+.pl-ms-t { max-width: 240px; color: var(--ink-2); }
+
+/* Tasks done over time */
+.pl-chart { margin-top: var(--sp-4); }
+.pl-line { fill: none; stroke: var(--series-main); stroke-width: 2; stroke-linejoin: round; }
+.pl-dot { fill: var(--series-main); stroke: var(--surface); stroke-width: 2; pointer-events: none; }
+
+/* Task rows: <details>, the open state survives polls */
+.pl-tasks { padding-top: var(--sp-2); }
+.pl-task { border-bottom: 1px solid var(--line); }
+.pl-task:last-child { border-bottom: 0; }
+.pl-task-h { display: grid; grid-template-columns: 12px 72px minmax(0, 1fr) 48px 132px 172px 76px; gap: var(--sp-3); align-items: center;
+  padding: var(--sp-2h) var(--sp-1); cursor: pointer; list-style: none; border-radius: var(--r-m); transition: background-color var(--t-fast) ease; }
+.pl-task-h::-webkit-details-marker { display: none; }
+.pl-task-h:hover { background: var(--hover); }
+.pl-task-h:focus-visible { outline-offset: -2px; }
+.pl-tid { color: var(--ink-3); white-space: nowrap; }
+.pl-ttl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pl-task.cur .pl-ttl { font-weight: 600; }
+.pl-task.c-pending .pl-ttl { color: var(--ink-2); }
+.pl-steps-n, .pl-cm { text-align: right; font-size: var(--fs-12); }
+.pl-agent { display: inline-flex; align-items: center; gap: var(--sp-1h); min-width: 0; font-size: var(--fs-12); color: var(--ink-2); }
+.pl-when { font-size: var(--fs-12); color: var(--ink-2); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+.pl-task.c-working .pl-when { color: var(--good); }
+.pl-task.c-needs .pl-when { color: var(--warn); }
+.pl-task-b { display: grid; gap: var(--sp-3); padding: var(--sp-1) var(--sp-1) var(--sp-4) calc(12px + var(--sp-3) + var(--sp-1)); }
+.pl-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-1); }
+.pl-steps li { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; gap: var(--sp-2); align-items: baseline; font-size: var(--fs-12); color: var(--ink); }
+.pl-steps li .sg { align-self: center; }
+.pl-steps li.on { color: var(--ink-3); }
+.pl-sub h3 { font-size: var(--fs-12); font-weight: 500; color: var(--ink-3); margin-bottom: var(--sp-1); }
+.pl-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-1); }
+.pl-list li { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-12); min-width: 0; }
+.pl-list li > .ellipsis { flex: 0 1 auto; }
+.pl-src { font-size: var(--fs-12); }
+
+@media (max-width: 900px) {
+  .pl-task-h { grid-template-columns: 12px 64px minmax(0, 1fr) 40px 150px; }
+  .pl-task-h .pl-agent, .pl-task-h .pl-cm { display: none; }
+}
+@media (max-width: 640px) {
+  .pl-task-h { grid-template-columns: 12px minmax(0, 1fr) auto; row-gap: var(--sp-0h); }
+  .pl-task-h .pl-tid { grid-column: 2; font-size: var(--fs-12); }
+  .pl-task-h .pl-ttl { grid-column: 2 / span 2; white-space: normal; }
+  .pl-task-h .pl-steps-n { display: none; }
+  .pl-task-h .pl-when { grid-column: 3; grid-row: 1; }
+  .pl-task-b { padding-left: var(--sp-5); }
+  .pl-list li { flex-wrap: wrap; gap: var(--sp-0h) var(--sp-3); }
+  .tag.pl-chip { max-width: 100%; }
+  .pl-table { min-width: 0; }
+  .pl-table th:nth-child(n+4), .pl-table td:nth-child(n+4), .pl-table th:nth-child(2), .pl-table td:nth-child(2) { display: none; }
+  .pl-table th:nth-child(1) { width: auto; } .pl-table th:nth-child(3) { width: 132px; }
+  .pl-table .pl-cell-t { white-space: normal; }
+  .pl-card .card-foot .mono { display: none; }
+}

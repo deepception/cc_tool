@@ -2,6 +2,55 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.2.0
+
+`cc-dash` becomes a place to act on your agents, not only watch them, and cc_tool's routing advice becomes something agents follow. Each track was led by its own agent, reviewed before merge, and finished with one cohesion pass over the whole dashboard.
+
+**Upgrading:** run `cc-update-project` in each project (two new hooks: `dash-control.py`, `route-nudge.py`), and re-run `./install.sh` once for the `ccdash` shortcut. Every `cc-dash` run now pairs the browser (see Security); on Linux this is automatic for your own browser.
+
+### Act on agents from the dashboard: `cc-dash --control`
+
+- **Approve or deny** a permission prompt (a deny can carry a reason Claude reads), **allow for this session** (Claude Code's own suggested rule, scoped to the session, never `setMode`), **answer** AskUserQuestion (options, multi-select, free text), **approve or reject a plan** with feedback, and **stop** a turn at its next tool call. One decision card serves the toast, the alert drawer and the session page; the terminal prompt stays live and the first answer wins (the card then reads "Answered in the terminal").
+- **Message any session or subagent.** Main threads get it over the session's inbox socket (an idle session starts a turn within about 2 s; mid-turn it lands after the running tool); subagents and sessions without a socket get it from the hooks after the next tool call or at turn end. Each message shows Queued, Delivered and Seen. The receiving session frames it as a note from another Claude session, not a typed prompt.
+- **Guards stay final.** Deny rules and bash-guard refusals never reach the dashboard. A bash-guard "ask", a `permissions.ask` match (matched with bash-guard's own parser, failing closed) and any command that cannot be checked need "approve" typed, never a click. Decisions are bound to a hash of the exact call, commands are never edited, there is no approve-all, approvals are rate-limited (6 per 10 s), and every action goes to `~/.local/state/cc_tool/control/audit.jsonl` and the session's Control history.
+- Off by default. The new `dash-control.py` hook costs about 1.6 ms per event when no dashboard runs. Verified end to end against real interactive Claude sessions (approve about 0.2 s from click to applied, terminal-first detected in about 0.4 s).
+
+### Security
+
+- **Every `cc-dash` run pairs the browser.** v0.1.0 let any local user read every transcript from 127.0.0.1. Now each launch has a token, kept in port-scoped storage and sent on every `/api` request; writes also check Origin, Sec-Fetch-Site, Content-Type and Host. No cookie (cookies are not port-scoped).
+- **On Linux your own browser pairs itself:** the server reads the kernel socket table and accepts a connection owned by the user who started `cc-dash`, so there is no secret link and no "re-pair" after a restart. Elsewhere a one-time link is opened through a private 0600 page (never in any process's arguments), placed where snap and Flatpak browsers can read it.
+
+### Projects: Overview, Plans and Docs together
+
+- **Navigation is Live · Sessions · Projects.** Projects holds a project's Overview, Plans and Docs under one picker in the page title; the project stays picked across them, in the URL and across reloads (`o`, `p`, `d`).
+- **Docs** renders each project's Markdown and HTML read-only: a tree grouped into Vault, Plans & specs, Docs, Project root, Skills and Other, a Recently changed list, file filter and bounded full-text search, front matter, Obsidian wikilinks, a table of contents and backlinks, and live reload in place. HTML opens in a sandboxed frame with its own CSP that cannot reach the dashboard or its token, even with "Allow scripts". Only files inside resolved projects are served: traversal, outside symlinks, dotfiles, secret files and FIFOs are refused, and live-looking credentials are redacted.
+- **Plans** tracks Superpowers plans and checkbox task lists across projects and worktrees: status, a milestone bar, "13 of 14 tasks done · 91% of steps", the current or first open task and who is on it, and an estimate once two tasks are timed. Progress comes from checkboxes, the subagent-driven-development ledger, todo lists or finished implementer subagents, and each plan says which. Task times count working time only, so a resumed subagent's idle hours no longer inflate them. A plan's page lists tasks with steps, tick times, the subagents that ran them and their commits, and a progress chart.
+- **Routing panel** on the Overview: cost by work type and model, the share of agents whose model was picked by default, the Opus effort mix, the cost of re-sending expired context and of contexts over 300K, and the flagged agents with the most to save.
+
+### Sessions, agents and the numbers
+
+- **Agents tab:** the full agent tree at any depth (subagents of subagents, workflow runs), an expandable table with own and with-subagents figures, cost by depth, a model × effort matrix, thinking share, an icicle of where the cost went, and a nested timeline.
+- **Effort** is read from Claude Code's records (each reply's own `effort`, else its `api-request` record) and shown on session headers, agent pages, Live rows and the Overview; an assumed effort (inherited or the model default) is a dashed chip.
+- **Tokens mean new tokens** (input, cache writes, output) everywhere, with cache reads shown apart and a Context tile (the last call's size). Before, a running agent's "Tokens" was about 98% context re-read from cache.
+- **Subagent output is no longer undercounted.** Subagent transcripts often keep only the usage from when a reply started, so output read about 10 tokens per reply; it is now estimated from the reply's content, priced, and marked "≥". On the session that built this release, cost moved from $144.54 to $158.39.
+- **Live:** an Agents board (every working agent as a tree under its session, with state, model, a tool-call spark, tokens and burn rate), "Your turn" kept apart from "Needs a decision", and a readable tool-call rate ("6 calls/min", failed calls in red, a per-minute tooltip with the top tools). The burn rate is always $/min.
+- **One design system and status language** across every view (Working, Your turn, Needs a decision, Blocked, Stalled, Done, Failed, Paused), WCAG AA contrast in light and dark, a header that fits a 360 px phone, no flicker on polls (checked with a MutationObserver), and a sync bar in place of "Updated just now".
+- Subagent reports and replies render as Markdown in timelines, and a finished subagent no longer offers Stop.
+
+### Routing and cost guidance
+
+- **Managed block: name `model` and `effort` on every Agent and workflow `agent()` call.** A usage analysis over 30 days found 234 subagents on Opus only because no model was named, "Implement Task N" arms on Opus, and half of Opus messages at `xhigh` because subagents inherit the session's effort. Plan tasks with tests go to `sonnet` at `medium`; when unsure, name `opus`.
+- **Managed block: cache and context cost more than the model does.** Orchestrate from the main session or a workflow instead of idle executor subagents (each wake re-sends the whole context once the 5-minute cache expires), give writers scoped briefs, split before about 300K tokens, start fresh after a long break, and avoid `/model` switches on a large context.
+- **New `route-nudge.py` hook** (PreToolUse, `Agent|Task`): when a call names no model it adds one line naming the default it will run on and the routing rule, plus an effort hint above `medium`. It never asks or denies.
+- README: subagents inherit the session effort, so keep a user-level `effortLevel` at `medium` and raise it per session.
+
+### Toolkit
+
+- **`ccdash`:** `install.sh` adds a one-line shell function that starts `cc-dash` in the background and returns the prompt (`ccdash`, or `ccdash --control`), replacing a dashboard already running.
+- **`cc-setup` adds `.taste-skill/` to the project's `.gitignore`.**
+- **Project skills no longer contain em-dashes** (about 490 rewritten by hand); only verbatim-vendored scroll-world files and one functional line keep them. Every skill's frontmatter is now valid YAML (nine were not, two of them unparseable). `tests/test_templates.py` guards both.
+- **Tests:** 18 suites. New: `test_cc_dash_control`, `test_control_hook`, `test_cc_dash_docs`, `test_cc_dash_plans`, `test_cc_dash_tree`, `test_cc_dash_rate`, `test_cc_dash_routing`, `test_route_nudge`, `test_cc_dash_localpair`.
+
 ## v0.1.0
 
 Five tracks in one release: an observability dashboard, the two open GitHub issues, a design-skill audit after taste-skill's October split, and the `hyperframes-movie` skill. The first four were each led by their own agent and reviewed before merge; the skill was written in the color-analyzer project and vendored unchanged.

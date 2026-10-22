@@ -1,0 +1,47 @@
+/* cc-dash routing (routing.js). app.css tokens and components only: the panel,
+   h3, the compact table, hbars, the .tag effort chip, .pill.warn and .insight
+   come from app.css. This file lays them out inside one panel. */
+
+/* Four plain stats across the top, the .kpi type scale without its tile frame. */
+.route-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--sp-4) var(--sp-6); }
+.route-stat { min-width: 0; }
+.route-stat .label { color: var(--ink-3); font-size: var(--fs-12); }
+.route-stat .value { font-size: var(--fs-20); font-weight: 600; letter-spacing: -.018em; line-height: 1.25; margin-top: var(--sp-0h); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.route-stat .note { color: var(--ink-3); font-size: var(--fs-12); margin-top: var(--sp-0h); }
+
+/* Each block under the stats: a hairline above, then its own small heading. */
+.route-grid { margin-top: var(--sp-5); padding-top: var(--sp-5); border-top: 1px solid var(--line); gap: var(--sp-6); }
+.route-sec { min-width: 0; }
+.route-sec + .route-sec { margin-top: var(--sp-5); padding-top: var(--sp-5); border-top: 1px solid var(--line); }
+.route-grid .route-sec + .route-sec { margin-top: 0; padding-top: 0; border-top: 0; }
+.route-grid + .route-sec { margin-top: var(--sp-5); padding-top: var(--sp-5); border-top: 1px solid var(--line); }
+.route-sec > h3 { margin-bottom: var(--sp-2); }
+.route-sec-h { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-4); margin-bottom: var(--sp-2); flex-wrap: wrap; }
+.route-sec-h > h3 { margin: 0; }
+.route-sec-h .muted { font-size: var(--fs-12); }
+.route-bars { margin-top: var(--sp-3); }
+
+.route-table { table-layout: auto; }
+.route-table th { position: static; }
+.route-table td.r .pill { height: auto; padding: 1px var(--sp-1h); font-variant-numeric: tabular-nums; }
+.route-n { margin-left: var(--sp-1h); min-width: 2.5ch; display: inline-block; font-size: var(--fs-11); }
+.route-top { min-width: 640px; }
+.route-top tr[tabindex]:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.route-top td:first-child { max-width: 360px; }
+.route-name { display: flex; align-items: baseline; gap: var(--sp-2); min-width: 0; }
+.route-why { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
+.panel-b .route-top td:nth-child(4) { white-space: normal; }
+
+/* Phone width: the work-type table drops its total and stacks each count under its cost; the
+   flagged list drops model, effort and cost (all in the agent's timeline) so it fits without scrolling. */
+@media (max-width: 640px) {
+  .route-stats { grid-template-columns: minmax(0, 1fr); }
+  .route-table th, .route-table td { padding-left: var(--sp-2); padding-right: var(--sp-2); }
+  .route-matrix th:last-child, .route-matrix td:last-child { display: none; }
+  .route-matrix .route-n { display: block; margin: 0; text-align: right; }
+  .route-top { min-width: 0; }
+  .route-top th:nth-child(2), .route-top td:nth-child(2), .route-top th:nth-child(3), .route-top td:nth-child(3), .route-top th:nth-child(5), .route-top td:nth-child(5) { display: none; }
+  .route-top td:first-child { max-width: 150px; }
+  .route-name { flex-direction: column; gap: 0; }
+  .route-name .p-label { white-space: normal; }
+}

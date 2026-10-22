@@ -17,7 +17,9 @@ cc_tool/
     store.py                     transcript discovery, subagent and workflow linkage, guard-log attribution, JSON payloads
     server.py                    HTTP server: loopback bind, Host-header check, fixed asset map, CLI flags
     attention.py                 open alerts for /api/alerts: tails the attention hook's log, resolve rules, session registry, transcript fallback
-    web/                         the page: index.html, app.css, app.js, alerts.js/.css (toasts, bell drawer, title badge), alerts-worker.js (background-tab poller); no CDN, no network
+    routing.py                   /api/routing: who picked each subagent's model and effort, work-type heuristic, cache-expiry rewrites, flags against the managed block's routing
+    docs.py                      Docs view: per-project file tree, search, one-time HTML frame tickets; path allowlisting, secret refusal, redaction
+    web/                         the page: index.html, app.css, app.js, alerts.js/.css (toasts, bell drawer, title badge), alerts-worker.js (background-tab poller), markdown.js (pure Markdown renderer), docs.js/.css (Docs view), routing.js/.css (the Overview's Routing panel); no CDN, no network
     cc-update-project            update an existing project (hooks + skills + permissions)
     cc-update                    update global plugins (Superpowers + security-guidance)
     cc-update-permissions        [internal] deny/ask merge helper, called by cc-update-project
@@ -73,6 +75,7 @@ cc_tool/
       session-context.py         SessionStart: git state, sensitive files, vault state, detected quality commands
       bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, --no-verify, secret-file reads via grep/awk/xargs/inline interpreters, destructive commands (rm -rf on roots/.git/lockfiles/CI, sudo rm, pkill <name>, push --force, curl|sh, env|curl, registry redirection, mkfs/dd, chmod 777); ask only before installs and deletions: deleting anything that is not scratch or an untracked regenerable cache (rm / rmdir / find -delete / xargs rm / rsync --delete, git rm, checkout -- / restore <paths>, worktree remove --force, reset --hard, clean -f, branch -D, stash drop, docker prune, kubectl delete --all, terraform destroy, DROP-TRUNCATE-DELETE-without-WHERE), and `npx <pkg>` when the package is not on disk (installed dev dependencies and exact versions already in the npx cache run without a prompt); warn on shell writes into source files (> / tee / sed -i / patch / git apply); applies project rules
       write-guard.py             PreToolUse Edit|Write|MultiEdit: deny writes to system paths, shell/credential dotfiles, .git/; deny real-looking secrets in content (keys, tokens, JWTs, credential assignments; placeholders and .env* pass); warn on writes outside the repo (tunable to ask; the repo's other git worktrees count as inside); warn on stale reads (file changed on disk since last read) and on a red check pending in another file; applies project rules
+      route-nudge.py             PreToolUse Agent|Task: one line of additionalContext when the call names no `model` (and, above medium session effort, no `effort`); never asks, denies or prints for a call that names a model
       big-file-guard.py          PreToolUse Read: warn on files >200KB without offset/limit
       context-usage.py           Stop: warn when session context window passes 80% (suggest /compact)
       post-edit-typecheck.py     PostToolUse Edit|Write|MultiEdit: fast project check (tsc/cargo; ruff file-scoped for Python) after source edits, surface errors inline; tsc timeouts back off for 30 min via a marker in .git/ and report NOT CHECKED (once) instead of staying silent; missing tsc reported once per session; red/green recorded in session state
@@ -82,8 +85,11 @@ cc_tool/
     test_bash_guard.py           allow/ask/warn/deny matrix for bash-guard.py (stdlib only, self-contained fixtures)
     test_write_guard.py          matrix for write-guard.py: location, secrets-in-content, trajectory warnings, project rules
     test_cc_dash.py              cc-dash parser, cost and subagent linkage on fake transcripts, incremental reads, server Host/traversal checks
+    test_route_nudge.py          route-nudge.py: the line on a missing model, silence with one, default resolution, effort suffix, garbage input, latency, settings registration, cc-setup and cc-update-project rollout
+    test_cc_dash_routing.py      cc-dash routing: work-type rules, model source, effort, expiry rewrites, flags and savings, scope, endpoint auth, the panel in a browser (content, no churn on polls)
     test_attention_hook.py       attention.py: event lines per hook event, file modes, rotation, symlink/hard-link/FIFO refusal, silence, garbage input, latency, settings registration
     test_cc_dash_alerts.py       /api/alerts: open/resolve state machine, out-of-order lines, staleness, registry, transcript fallback and dedupe, rotation, shape, timing
+    test_cc_dash_docs.py         Docs view: project allowlist, traversal/symlink/secret refusal, size caps, tree sections, search bounds, HTML sandbox CSP, renderer (node), hostile-doc browser check
   .claude/
     workflows/                   saved Workflow definitions (run via the Workflow tool)
       model-recalibration-audit.js  re-audit this setup against a new Claude model
@@ -101,6 +107,9 @@ python3 tests/test_write_guard.py       # write-guard.py matrix
 python3 tests/test_cc_dash.py           # cc-dash: parser, aggregation, server security
 python3 tests/test_attention_hook.py    # attention hook: event log, modes, refusals
 python3 tests/test_cc_dash_alerts.py    # cc-dash alerts: state machine, endpoint, timing
+python3 tests/test_cc_dash_docs.py      # cc-dash Docs view: path safety, sandbox, renderer
+python3 tests/test_cc_dash_routing.py   # cc-dash Routing panel: classifier, flags, rewrites, endpoint, browser
+python3 tests/test_route_nudge.py       # route-nudge hook: nudge, silence, effort suffix, rollout
 ```
 
 ## Project guard rules

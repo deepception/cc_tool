@@ -1,4 +1,4 @@
-"""The cc-dash HTTP server: 127.0.0.1 only, GET only, fixed asset map.
+"""The cc-dash HTTP server: 127.0.0.1 only, GET only (plus control mode's POSTs), fixed asset map.
 
 Transcripts hold secrets (commands, file contents, tokens pasted into
 prompts), so the server
@@ -8,6 +8,12 @@ prompts), so the server
   - serves a fixed set of named files from web/ and nothing else; the request path is
     looked up in a dict, never joined onto a directory,
   - sends no CORS headers and a CSP that allows only its own origin.
+
+Every /api/* request needs this launch's token (auth.py: paired through a
+one-time code, sent as X-CC-Dash-Token, never a cookie). With --control
+(control.py) it also serves /api/control/*, whose POSTs also need Content-Type
+application/json and an Origin equal to the dashboard's own. Without --control
+those paths are 404 and every POST but /api/pair is 405.
 """
 import argparse
 import errno
@@ -21,6 +27,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import attention
+from . import plans   # plan progress (/api/plans)
+from .auth import Auth, local_pairing_supported
+from .control import MAX_BODY, Control
+from .docs import Docs, DocsError
 from .store import Store, config_dir
 from .parser import tilde
 
@@ -30,15 +40,35 @@ ASSETS = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/dom.js": ("dom.js", "text/javascript; charset=utf-8"),
+    "/auth.js": ("auth.js", "text/javascript; charset=utf-8"),   # pairing and the X-CC-Dash-Token
     "/timeline.js": ("timeline.js", "text/javascript; charset=utf-8"),
     "/app.css": ("app.css", "text/css; charset=utf-8"),
     # alerts (attention.py): toast stack, alert drawer, title badge, desktop notifications
     "/alerts.js": ("alerts.js", "text/javascript; charset=utf-8"),
     "/alerts.css": ("alerts.css", "text/css; charset=utf-8"),
     "/alerts-worker.js": ("alerts-worker.js", "text/javascript; charset=utf-8"),
+    # control mode (--control): action cards, message composer
+    "/control.js": ("control.js", "text/javascript; charset=utf-8"),
+    "/control.css": ("control.css", "text/css; charset=utf-8"),
+    # Docs view (docs.py): Markdown renderer and the reader
+    "/markdown.js": ("markdown.js", "text/javascript; charset=utf-8"),
+    "/docs.js": ("docs.js", "text/javascript; charset=utf-8"),
+    "/docs.css": ("docs.css", "text/css; charset=utf-8"),
+    # plans (plans.py): plan list, plan detail, the Live and Overview hooks
+    "/plans.js": ("plans.js", "text/javascript; charset=utf-8"),
+    "/plans.css": ("plans.css", "text/css; charset=utf-8"),
+    # session Agents tab (tree.py): recursive agent tree, its charts, the effort chip
+    "/agents.js": ("agents.js", "text/javascript; charset=utf-8"),
+    # Overview's Routing panel (routing.py): who picked each agent's model and effort
+    "/routing.js": ("routing.js", "text/javascript; charset=utf-8"),
+    "/routing.css": ("routing.css", "text/css; charset=utf-8"),
 }
-CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
-       "connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+# img-src blob: is for Docs images (fetched with the token, shown as object URLs);
+# frame-src 'self' is for the sandboxed HTML preview at /docs-frame/<ticket>, whose
+# own response sets a stricter CSP with the `sandbox` directive (docs.py).
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "
+       "connect-src 'self'; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; "
+       "frame-ancestors 'none'")
 DEFAULT_PORT = 7878
 
 
@@ -56,7 +86,7 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").strip().lower()
         return host in self.server.allowed_hosts
 
-    def _send(self, code, body, ctype, extra=None):
+    def _send(self, code, body, ctype, extra=None, csp=CSP):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
@@ -66,7 +96,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Content-Security-Policy", csp)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -89,15 +119,34 @@ class Handler(BaseHTTPRequestHandler):
         path = parts.path
         q = {k: v[0] for k, v in parse_qs(parts.query).items()}
         store = self.server.store
+        ctl = getattr(self.server, "control", None)
+        auth = getattr(self.server, "auth", None)
         try:
             if path in ASSETS:
                 name, ctype = ASSETS[path]
                 with open(os.path.join(WEB, name), "rb") as fh:
                     return self._send(200, fh.read(), ctype)
+            if path == "/pair":                 # the shell; the page reads #code= and POSTs /api/pair
+                with open(os.path.join(WEB, "index.html"), "rb") as fh:
+                    return self._send(200, fh.read(), "text/html; charset=utf-8")
+            if path.startswith("/docs-frame/"):     # a one-time ticket from /api/docs/frame, no token
+                return self._docs_frame(path[len("/docs-frame/"):])
+            # Every data endpoint needs this launch's token in X-CC-Dash-Token (auth.py).
+            sess = auth.session(self.headers) if auth is not None else None
+            if sess is None:
+                if path.startswith("/api/"):
+                    return self._json(401, {"error": "Not paired.", "repair": True})
+                return self._deny(404, "Not found.")
             if path == "/api/meta":
-                return self._json(200, store.meta())
+                meta = store.meta()
+                meta["control"] = {"enabled": ctl is not None, "paired": True}
+                return self._json(200, meta)
             if path == "/api/alerts":  # open "needs you" alerts, see attention.py
-                return self._json(200, attention.alerts_payload(store))
+                return self._json(200, attention.alerts_payload(store, ctl.annotate if ctl else None))
+            if ctl is not None and path == "/api/control/state":
+                return self._json(200, ctl.state(q.get("session", "")[:100]))
+            if path.startswith("/api/docs/"):
+                return self._docs(path, q)
             if path == "/api/live":
                 return self._json(200, store.live_payload())
             if path == "/api/sessions":
@@ -105,12 +154,19 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/overview":
                 # A filter value compared with project labels, never a path.
                 return self._json(200, store.overview_payload(q.get("project", "")))
+            if path == "/api/routing":          # routing.py: who chose each agent's model and effort
+                return self._json(200, store.routing_payload(q.get("project", "")))
             if path == "/api/session":
                 p = store.session_payload(q.get("id", ""))
+                return self._json(200, p) if p else self._json(404, {"error": "No session with that id in the lookback window."})
+            if path == "/api/session/tree":     # the recursive agent tree (tree.py)
+                p = store.tree_payload(q.get("id", ""))
                 return self._json(200, p) if p else self._json(404, {"error": "No session with that id in the lookback window."})
             if path == "/api/agent":
                 p = store.agent_payload(q.get("session", ""), q.get("id", ""))
                 return self._json(200, p) if p else self._json(404, {"error": "No subagent with that id in this session."})
+            if path in ("/api/plans", "/api/plans/detail"):   # plans.py: plan progress and milestones
+                return self._plans(path, q, store)
         except BrokenPipeError:
             return None
         except Exception as e:  # noqa: BLE001 - one bad transcript must not take the server down
@@ -120,12 +176,136 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(500, {"error": f"{type(e).__name__}: {e}"})
         return self._deny(404, "Not found.")
 
+    def _docs(self, path, q):
+        """GET /api/docs/{projects,tree,file,search,asset,frame}: see docs.py for what may be read."""
+        docs = self.server.docs
+        project = q.get("project", "")
+        try:
+            if path == "/api/docs/projects":
+                return self._json(200, {"projects": [dict(p, root=tilde(p["root"])) for p in docs.projects()]})
+            if path == "/api/docs/tree":
+                return self._json(200, docs.tree(project))
+            if path == "/api/docs/file":
+                return self._json(200, docs.file(project, q.get("path", ""), q.get("known", "")[:64]))
+            if path == "/api/docs/search":
+                return self._json(200, docs.search(project, q.get("q", "")))
+            if path == "/api/docs/frame":
+                return self._json(200, docs.frame_ticket(project, q.get("path", ""), q.get("scripts") == "1"))
+            if path == "/api/docs/asset":
+                data, ctype = docs.asset(project, q.get("path", ""))
+                return self._send(200, data, ctype, {"Content-Disposition": "attachment"},
+                                  csp="default-src 'none'; sandbox")
+        except DocsError as e:
+            return self._json(e.status, {"error": e.msg})
+        return self._deny(404, "Not found.")
+
+    def _docs_frame(self, ticket):
+        """A project's HTML document for the sandboxed preview frame, with its own strict CSP."""
+        site = (self.headers.get("Sec-Fetch-Dest") or "").lower()
+        if site and site != "iframe":
+            return self._deny(403, "This preview only opens inside the cc-dash Docs view.")
+        try:
+            body, csp = self.server.docs.frame(ticket[:100])
+        except DocsError as e:
+            return self._send(e.status, e.msg + "\n", "text/plain; charset=utf-8",
+                              csp="default-src 'none'; frame-ancestors 'self'; sandbox")
+        return self._send(200, body, "text/html; charset=utf-8", csp=csp)
+    def _plans(self, path, q, store):
+        """GET /api/plans?project=[&all=1] and /api/plans/detail?project=&path= (plans.py checks the path)."""
+        al = attention.alerts_payload(store)["alerts"]
+        eng = plans.for_store(store)
+        if path == "/api/plans":
+            return self._json(200, eng.payload(q.get("project", ""), al, everything=q.get("all") == "1"))
+        p = eng.detail(q.get("project", "")[:200], q.get("path", "")[:1024], al)
+        return self._json(200, p) if p else self._json(404, {"error": "No plan at that path in that project."})
+
+    def _read_body(self):
+        """The JSON object body, or (status, error) when there is none."""
+        try:
+            n = int(self.headers.get("Content-Length") or "-1")
+        except ValueError:
+            n = -1
+        if n < 0 or n > MAX_BODY:
+            return None, (413 if n > MAX_BODY else 411, {"error": "Body missing or too large."})
+        try:
+            body = json.loads(self.rfile.read(n) or b"null")
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            return None, (400, {"error": "The body must be a JSON object."})
+        return body, None
+
+    def _pair(self, auth):
+        """POST /api/pair {"code"}: spend a pairing code for this launch's token."""
+        why = auth.check_origin(self.headers, (self.headers.get("Host") or "").strip().lower())
+        if why:
+            return self._json(403, {"error": "Refused: bad " + why + "."})
+        body, err = self._read_body()
+        if err:
+            return self._json(*err)
+        token = auth.exchange(body.get("code"))
+        if token is None:
+            return self._json(403, {"error": "This pairing link has expired or was already used. Press Enter in the "
+                                             "terminal running cc-dash for a new one, or restart cc-dash."})
+        return self._json(200, {"token": token})
+
+    def _pair_local(self, auth):
+        """POST /api/pair-local {}: a token for a browser run by this same user (Linux)."""
+        why = auth.check_origin(self.headers, (self.headers.get("Host") or "").strip().lower())
+        if why:
+            return self._json(403, {"error": "Refused: bad " + why + "."})
+        _body, err = self._read_body()
+        if err:
+            return self._json(*err)
+        token = auth.exchange_local(self.client_address)
+        if token is None:
+            return self._json(403, {"error": "This browser does not run as the user who started cc-dash."})
+        return self._json(200, {"token": token})
+
     def _no_body(self):
         if not self._host_ok():
             return self._deny(421, "Misdirected request.")
+        if getattr(self.server, "control", None) is None and urlsplit(self.path).path.startswith("/api/control/"):
+            return self._deny(404, "Not found.")
         self._deny(405, "cc-dash is read-only.")
 
-    do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _no_body
+    POSTS = ("/api/control/decide", "/api/control/message", "/api/control/cancel", "/api/control/stop")
+
+    def do_POST(self):
+        ctl = getattr(self.server, "control", None)
+        auth = getattr(self.server, "auth", None)
+        path = urlsplit(self.path).path
+        if not self._host_ok():
+            return self._deny(421, "Misdirected request.")
+        if path == "/api/pair" and auth is not None:
+            return self._pair(auth)
+        if path == "/api/pair-local" and auth is not None and local_pairing_supported():
+            return self._pair_local(auth)
+        if ctl is None or auth is None or path not in self.POSTS:
+            return self._no_body()
+        why = auth.check_write(self.headers, (self.headers.get("Host") or "").strip().lower())
+        if why == "token":
+            return self._json(401, {"error": "Not paired.", "repair": True})
+        if why:
+            return self._json(403, {"error": "Refused: bad " + why + "."})
+        client = auth.client(self.headers)
+        body, err = self._read_body()
+        if err:
+            return self._json(*err)
+        try:
+            if path == "/api/control/decide":
+                code, out = ctl.decide(client, body)
+            elif path == "/api/control/message":
+                code, out = ctl.message(client, body)
+            elif path == "/api/control/stop":
+                code, out = ctl.stop_turn(client, body)
+            else:
+                code, out = ctl.cancel(client, body)
+        except Exception as e:  # noqa: BLE001 - report, never take the server down
+            code, out = 500, {"error": f"{type(e).__name__}: {e}"}
+        return self._json(code, out)
+
+    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _no_body
 
 
 class DashServer(ThreadingHTTPServer):
@@ -136,9 +316,12 @@ class DashServer(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", port), Handler)
         self.store = store
         self.verbose = verbose
+        self.control = None
         real = self.server_address[1]
         self.port = real
         self.allowed_hosts = {f"127.0.0.1:{real}", f"localhost:{real}"}
+        self.auth = Auth(real)
+        self.docs = Docs(store)
 
 
 def make_server(port, store, verbose=False, fallback=True):
@@ -154,15 +337,24 @@ def make_server(port, store, verbose=False, fallback=True):
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="cc-dash",
-        description="Local, read-only dashboard of your Claude Code sessions, subagents, tokens, "
-                    "cost and cc_tool guard catches. Serves on 127.0.0.1 until Ctrl-C.")
+        description="Local dashboard of your Claude Code sessions, subagents, tokens, cost and cc_tool guard "
+                    "catches (read-only unless --control). Serves on 127.0.0.1 until Ctrl-C; open the printed "
+                    "pairing link to use it.")
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
                    help=f"port to listen on (default {DEFAULT_PORT}; a free port is used if it is taken)")
     p.add_argument("--no-open", action="store_true", help="do not open the browser")
     p.add_argument("--days", type=float, default=7, help="lookback window in days (default 7)")
     p.add_argument("--project", default="", help="only sessions whose working directory contains this text")
     p.add_argument("--verbose", action="store_true", help="log each request to stderr")
+    p.add_argument("--control", action="store_true",
+                   help="control mode: approve or deny permission prompts, answer questions and plans, and send "
+                        "messages to sessions from the dashboard (needs the dash-control.py hook; pair with the "
+                        "printed link)")
+    p.add_argument("--control-wait", type=float, default=300, metavar="SECS",
+                   help="control mode: how long a waiting permission hook waits for the dashboard (default 300)")
     a = p.parse_args(argv)
+    if not (5 <= a.control_wait <= 590):
+        p.error("--control-wait must be 5-590 seconds")
     if a.days <= 0:
         p.error("--days must be positive")
     if not (0 <= a.port <= 65535):
@@ -193,16 +385,56 @@ def main(argv=None):
     except OSError as e:
         print(f"cc-dash: cannot listen on 127.0.0.1:{a.port}: {e.strerror}", file=sys.stderr)
         return 1
-    url = f"http://127.0.0.1:{srv.port}/"
     if srv.port != a.port and a.port:
         print(f"cc-dash: port {a.port} is busy, using {srv.port}.")
-    print(f"cc-dash: serving {url}  (Ctrl-C to stop)")
+    if a.control:
+        try:
+            # CC_DASH_CONTROL_TRANSPORT=hook: messages only through the hooks (no inbox socket), for testing.
+            srv.control = Control(store, srv.port, wait=a.control_wait,
+                                  sockets=os.environ.get("CC_DASH_CONTROL_TRANSPORT") != "hook")
+            srv.control.start()
+        except OSError as e:
+            print(f"cc-dash: cannot start control mode: {e}", file=sys.stderr)
+            srv.server_close()
+            return 1
+        print("cc-dash: control mode is on: approvals, answers, plans and messages from the dashboard.")
+        print(f"cc-dash: audit log {tilde(srv.control.audit_path)}")
+    code = srv.auth.new_code()
+    print("cc-dash: serving http://127.0.0.1:%d/  (Ctrl-C to stop). Open this link to pair a browser "
+          "(it works once, for 60 s):\n  %s" % (srv.port, srv.auth.pair_url(code)))
+    if sys.stdin is not None and sys.stdin.isatty():
+        print("cc-dash: press Enter here for a new pairing link.")
+        threading.Thread(target=_pair_on_enter, args=(srv,), daemon=True).start()
+    threading.Thread(target=_expire_codes, args=(srv,), daemon=True).start()
     if not a.no_open:
-        threading.Timer(0.3, lambda: webbrowser.open(url)).start()
+        # Open a 0600 file that redirects to the link, never the link itself: a
+        # URL handed to the browser lands in argv, which other users can read.
+        try:
+            # On Linux the page pairs itself (POST /api/pair-local, checked against
+            # the socket's owner), so the plain URL is enough and works in sandboxed
+            # (snap, Flatpak) browsers that cannot follow a file:// redirect.
+            target = ("http://127.0.0.1:%d/" % srv.port) if local_pairing_supported() \
+                else "file://" + srv.auth.pair_file(code)
+            threading.Timer(0.3, lambda: webbrowser.open(target)).start()
+        except OSError as e:
+            print(f"cc-dash: could not open the browser ({e}); open the link above.", file=sys.stderr)
     try:
         srv.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("\ncc-dash: stopped.")
     finally:
+        if srv.control is not None:
+            srv.control.stop()
         srv.server_close()
     return 0
+
+
+def _pair_on_enter(srv):
+    for _line in sys.stdin:
+        print("cc-dash: new pairing link (works once, for 60 s):\n  " + srv.auth.pair_url())
+
+
+def _expire_codes(srv):
+    while True:
+        time.sleep(10)
+        srv.auth.cleanup()          # also deletes the pairing file of an expired code

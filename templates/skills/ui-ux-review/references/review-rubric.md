@@ -12,7 +12,7 @@ Severity measures user impact, not implementation effort.
 
 ## Doc structure
 
-    # <App> — UI/UX Review (<date>)
+    # <App>: UI/UX Review (<date>)
 
     Based on a full walkthrough of <build/profile>, <role>, <viewport>, <theme>, <locale>.
     Severity: 🔴 must fix, 🟡 should fix, 🔵 polish.
@@ -33,7 +33,7 @@ Severity measures user impact, not implementation effort.
 
 - One finding per bullet: bold lead stating the problem, then the observed evidence, then the concrete suggestion. "(observed covering the first KPI card)" beats "sometimes overlaps".
 - Copy findings name the exact strings ("Terminowosc dostaw" → "Terminowość dostaw"); a diacritics sweep names every instance found.
-- Praise inline with ✅ where deserved — it calibrates the criticism.
+- Praise inline with ✅ where deserved, since it calibrates the criticism.
 
 ## Beyond-happy-path checklist
 
@@ -42,9 +42,9 @@ Severity measures user impact, not implementation effort.
 - Both themes: grey-on-grey, unreadable, or unstyled regions?
 - Viewport ≤1280px: clipping, missing horizontal-scroll affordances?
 - i18n: leaks from other locales, missing diacritics, date/number formats per locale, native-widget placeholder formats.
-- Empty states: every list/dashboard with no data — guidance, or a blank void?
+- Empty states: every list/dashboard with no data. Guidance, or a blank void?
 - Loading states: skeletons/spinners on slow fetches?
-- Error states: backend down, failed save — visible feedback or silence?
+- Error states: backend down, failed save. Visible feedback or silence?
 
 ## Adaptation by app type
 

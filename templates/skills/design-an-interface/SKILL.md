@@ -23,7 +23,7 @@ Ask: "What does this module need to do? Who will use it?"
 
 ### 2. Generate Designs (Parallel Sub-Agents)
 
-Spawn a small number of sub-agents in parallel using the Agent tool — as many as there are genuinely distinct approaches worth seeing, not a fixed count. Each must produce a **radically different** approach.
+Spawn a small number of sub-agents in parallel using the Agent tool, as many as there are genuinely distinct approaches worth seeing, not a fixed count. Each must produce a **radically different** approach.
 
 This is a deliberate exception to the delegation guidance in CLAUDE.md: the value comes from independent designs produced without sight of each other, which one agent cannot reproduce sequentially. It is not a licence to fan out on ordinary work.
 
@@ -32,7 +32,7 @@ Prompt template for each sub-agent:
 
 Design an interface for: [module description]
 
-Before generating, inspect the project's existing interfaces, types, and naming conventions so the design speaks the codebase's vocabulary, not generic defaults — but your structural approach must still differ radically per your constraint below.
+Before generating, inspect the project's existing interfaces, types, and naming conventions so the design speaks the codebase's vocabulary, not generic defaults, but your structural approach must still differ radically per your constraint below.
 
 Requirements: [gathered requirements]
 
@@ -80,5 +80,5 @@ Often the best design combines insights from multiple options. Ask:
 
 ## Anti-Patterns
 
-- Don't implement — this is purely about interface shape.
+- Don't implement; this is purely about interface shape.
 - Judge designs on shape and depth, not on implementation effort.

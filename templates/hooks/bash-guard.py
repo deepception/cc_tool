@@ -110,6 +110,7 @@ MAX_COMMAND_CHARS = 400_000
 
 _CMD_FOR_LOG = ""      # set by main() so deny/ask can log what they refused
 _PAYLOAD_CWD = ""      # the Bash tool's working directory, from the hook payload
+_SESSION_ID = ""       # the payload's session_id (cc-dash's "asked" marker is keyed by it)
 _WARNINGS: list = []   # non-blocking notes, emitted together at the end
 
 
@@ -150,6 +151,13 @@ def ask(reason: str, suggestion: str = "") -> None:
     or a command the guard cannot analyse)."""
     msg = _fmt(reason, suggestion).replace("BLOCKED:", "NEEDS APPROVAL:", 1)
     _log("ask", msg)
+    if lib:
+        # cc-dash control mode: tell the dashboard's approval card why this asked
+        # (a no-op unless `cc-dash --control` holds a fresh lease).
+        try:
+            lib.guard_ask_mark(_SESSION_ID, _CMD_FOR_LOG, msg)
+        except Exception:  # noqa: BLE001
+            pass
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -2369,9 +2377,11 @@ def read_command() -> str:
             why=f"tool_input was {type(tool_input).__name__}, not an object"))
     if "command" not in tool_input:
         sys.exit(0)  # not a command-bearing tool call — nothing for this guard
-    global _PAYLOAD_CWD
+    global _PAYLOAD_CWD, _SESSION_ID
     if isinstance(data.get("cwd"), str):
         _PAYLOAD_CWD = data["cwd"]
+    if isinstance(data.get("session_id"), str):
+        _SESSION_ID = data["session_id"]
     cmd = tool_input["command"]
     if not isinstance(cmd, str):
         deny(_PARSE_FAIL.format(why=f"command was {type(cmd).__name__}, not a string"))

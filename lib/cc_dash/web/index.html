@@ -9,6 +9,10 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='1' width='14' height='14' rx='3.5' fill='%23171715'/%3E%3Crect x='4' y='9' width='2' height='3' rx='.6' fill='%23fcfcfb'/%3E%3Crect x='7' y='6' width='2' height='6' rx='.6' fill='%23fcfcfb'/%3E%3Crect x='10' y='4' width='2' height='8' rx='.6' fill='%23fcfcfb'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
 <link rel="stylesheet" href="/alerts.css"><!-- alerts: toasts, drawer, title badge -->
+<link rel="stylesheet" href="/control.css"><!-- control mode: action cards, composer -->
+<link rel="stylesheet" href="/docs.css"><!-- Docs view: tree, reader, Markdown -->
+<link rel="stylesheet" href="/plans.css"><!-- plans: progress bars, plan cards, plan page -->
+<link rel="stylesheet" href="/routing.css"><!-- Overview: the Routing panel -->
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
@@ -21,11 +25,12 @@
     <nav class="tabs" aria-label="Views">
       <a href="#/live" data-view="live">Live <span class="count" id="live-count" hidden></span></a>
       <a href="#/sessions" data-view="sessions">Sessions</a>
-      <a href="#/overview" data-view="overview">Overview</a>
+      <a href="#/overview" data-view="projects">Projects</a>
     </nav>
     <div class="top-right">
       <span class="scope" id="scope"></span>
-      <span class="sync" id="sync" role="status" aria-live="polite"></span>
+      <span class="sync" id="sync"><span class="sync-txt"><span class="g s-failed" aria-hidden="true"></span><span class="sync-msg"></span></span><span class="sync-bar" aria-hidden="true"><span class="sync-fill"></span></span></span>
+      <span class="vh" id="sync-live" role="status" aria-live="polite"></span>
       <button class="icon-btn" id="theme" type="button" aria-label="Theme: follow system" title="Theme (t)"></button>
       <button class="icon-btn" id="help-btn" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
     </div>
@@ -36,9 +41,10 @@
 <dialog class="help" id="help">
   <h2>Keyboard</h2>
   <dl>
-    <dt><kbd>l</kbd> <kbd>s</kbd> <kbd>o</kbd></dt><dd>Live, Sessions, Overview</dd>
+    <dt><kbd>l</kbd> <kbd>s</kbd></dt><dd>Live, Sessions</dd>
+    <dt><kbd>o</kbd> <kbd>p</kbd> <kbd>d</kbd></dt><dd>Projects: Overview, Plans, Docs (for the project you picked)</dd>
     <dt><kbd>v</kbd></dt><dd>Live: switch between agents and sessions</dd>
-    <dt><kbd>/</kbd></dt><dd>Search sessions</dd>
+    <dt><kbd>/</kbd></dt><dd>Search sessions, or the project's docs</dd>
     <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Move down and up a list</dd>
     <dt><kbd>Enter</kbd></dt><dd>Open the selected row</dd>
     <dt><kbd>Esc</kbd></dt><dd>Back, or clear the search</dd>
@@ -46,12 +52,21 @@
     <dt><kbd>e</kbd></dt><dd>Expand or collapse every tool group</dd>
     <dt><kbd>t</kbd></dt><dd>Cycle theme: system, light, dark</dd>
     <dt><kbd>a</kbd></dt><dd>Alerts: what your agents are waiting on</dd>
+    <dt class="ctl-only"><kbd>y</kbd> <kbd>n</kbd></dt><dd class="ctl-only">Control mode: approve or deny the focused decision (press twice)</dd>
+    <dt class="ctl-only"><kbd>m</kbd></dt><dd class="ctl-only">Control mode: write a message to this session or agent</dd>
   </dl>
   <div class="help-foot"><button class="btn" id="help-close" type="button">Close</button></div>
 </dialog>
+<script src="/auth.js"></script><!-- pairing and the per-launch token -->
 <script src="/dom.js"></script>
 <script src="/timeline.js"></script>
+<script src="/control.js"></script><!-- control mode (cc-dash --control) -->
+<script src="/plans.js"></script><!-- plans: list, plan page, chips (app.js calls ccPlans.init) -->
+<script src="/agents.js"></script><!-- session Agents tab and the effort chip (app.js calls ccAgents.init) -->
+<script src="/routing.js"></script><!-- Overview: the Routing panel (app.js calls ccRouting.init) -->
 <script src="/app.js"></script>
+<script src="/markdown.js"></script><!-- Docs: the Markdown renderer (pure, no DOM) -->
+<script src="/docs.js"></script><!-- Docs view: per-project Markdown and HTML -->
 <script src="/alerts.js"></script><!-- alerts: polls /api/alerts -->
 </body>
 </html>

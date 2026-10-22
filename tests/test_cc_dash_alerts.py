@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import attention  # noqa: E402
 from cc_dash.attention import Attention  # noqa: E402
 from cc_dash.server import make_server  # noqa: E402
+from dash_pairing import auto_cookie  # noqa: E402  (tests/dash_pairing.py: every request carries the pairing cookie)
 from cc_dash.store import Store  # noqa: E402
 
 RESULTS = []
@@ -423,6 +424,7 @@ def test_endpoint():
         th = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
         th.start()
         port = srv.port
+        auto_cookie(srv)
         try:
             st, hd, body = get(port, "/api/alerts")
             d = json.loads(body)

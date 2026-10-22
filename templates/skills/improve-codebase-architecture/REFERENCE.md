@@ -6,7 +6,7 @@ When assessing a candidate for deepening, classify its dependencies:
 
 ### 1. In-process
 
-Pure computation, in-memory state, no I/O. Always deepenable — just merge the modules and test directly.
+Pure computation, in-memory state, no I/O. Always deepenable: just merge the modules and test directly.
 
 ### 2. Local-substitutable
 
@@ -26,10 +26,10 @@ Third-party services (Stripe, Twilio, etc.) you don't control. Mock at the bound
 
 The core principle: **replace, don't layer.**
 
-- Old unit tests on shallow modules are waste once boundary tests exist — delete them
+- Old unit tests on shallow modules are waste once boundary tests exist, so delete them
 - Write new tests at the deepened module's interface boundary
 - Tests assert on observable outcomes through the public interface, not internal state
-- Tests should survive internal refactors — they describe behavior, not implementation
+- Tests should survive internal refactors; they describe behavior, not implementation
 
 ## Issue Template
 

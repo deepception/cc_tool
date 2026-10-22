@@ -9,6 +9,32 @@ already valid JSON. Malformed lines are counted and skipped.
 One Claude Code API message is spread over several `assistant` records (one
 per content block) that repeat the same `message.id` and `usage`, so usage is
 counted once per message id.
+
+"Tokens" everywhere means NEW tokens: input + cache writes + output. Cache
+reads are re-read context, priced at a fraction of input; they are kept and
+shown apart, never added into the headline.
+
+Subagent transcripts mostly save only the usage from the start of a reply's
+stream (no record with a stop_reason), so their output_tokens stay near 10
+while the reply holds thousands. For a message with no final record the
+output counted (and priced) is the larger of the recorded value and its
+visible content at ~4 characters a token (text, tool input JSON, thinking
+text). Hidden thinking cannot be seen, so this is a floor; msg_est keeps the
+messages and tokens that are estimates. A final record, when one arrives,
+replaces the estimate.
+
+Effort and thinking (see tree.py for how they roll up):
+  - `api-request` records (Claude Code 2.1.29x+) carry the request params:
+    params.model, params.output_config.effort and params.thinking.
+  - From 2.1.30x every assistant record also carries its own `effort` field,
+    subagents included. A reply is credited with that field when present,
+    else with the effort of the latest api-request record before it.
+  - usage.output_tokens_details.thinking_tokens counts thinking inside the
+    output tokens, on records written after the reply finished. Subagent
+    transcripts mostly save usage at the start of the stream, without it.
+  - thinking / redacted_thinking content blocks: usually a signature only
+    (thinking display "updates" or "omitted"), sometimes with text.
+  - usage.speed == "fast" marks fast mode.
 """
 import json
 import os
@@ -33,7 +59,15 @@ _SKIP_PREFIXES = tuple(b'{"type":"%s"' % t for t in (
     b"mode", b"permission-mode", b"last-prompt",
 ))
 
+_REQUEST_PREFIX = b'{"type":"api-request",'   # small; the -blob and -shape kinds stay skipped
 _SPAWN_TOOLS = {"Agent", "Task"}
+_EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+MAX_EDITED = 200           # distinct edited paths kept per transcript (routing.py needs "any" and a rough count)
+# What a Bash command says about the work (routing.py's work-type heuristic): a check run, or a change made.
+_TEST_RE = re.compile(r"\b(pytest|vitest|jest|npm (run )?test|pnpm (run )?test|yarn test|go test|cargo test|"
+                      r"make test|playwright|unittest|tox|npx tsc|tsc --noEmit|ruff|eslint|mypy|flutter test|gradlew|maestro|bats|shellcheck|run_tests|test\.sh|tests?/)")
+_MUTATE_RE = re.compile(r"(\bgit (commit|add|apply|checkout -b|merge|rebase|push|worktree add)|\bsed -i|\bmv |\brm |\bcp |"
+                        r"> ?[\w./~-]+\.(py|ts|tsx|js|md|json|sh|yaml|yml)\b|\btee )")
 _TAG_STRIP = re.compile(r"<(ide_opened_file|ide_selection|system-reminder|ide_diagnostics)>.*?</\1>", re.S)
 _CMD_NAME = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
 _CMD_ARGS = re.compile(r"<command-args>\s*(.*?)\s*</command-args>", re.S)
@@ -102,6 +136,42 @@ def workflow_name(ti):
     if isinstance(sp, str) and sp:
         return os.path.basename(sp).split(".")[0]
     return "workflow"
+
+
+def _request_params(line):
+    """(timestamp, model, effort, thinking) from one `api-request` record line, or None."""
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return None
+    p = rec.get("params") if isinstance(rec, dict) else None
+    if not isinstance(p, dict):
+        return None
+    oc = p.get("output_config") if isinstance(p.get("output_config"), dict) else {}
+    th = p.get("thinking") if isinstance(p.get("thinking"), dict) else {}
+    eff = oc.get("effort") if isinstance(oc.get("effort"), str) else ""
+    think = "/".join(x for x in (th.get("type"), th.get("display")) if isinstance(x, str) and x)
+    model = p.get("model") if isinstance(p.get("model"), str) else ""
+    return parse_ts(rec.get("timestamp")), model, clip(eff, 20), clip(think, 40)
+
+
+def _visible_chars(content):
+    """Characters of output a model wrote into these content blocks (text, tool input, thinking text)."""
+    n = 0
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if bt == "text" and isinstance(b.get("text"), str):
+            n += len(b["text"])
+        elif bt == "tool_use":
+            try:
+                n += len(json.dumps(b.get("input"), ensure_ascii=False, separators=(",", ":"))) + len(b.get("name") or "")
+            except (TypeError, ValueError):
+                pass
+        elif bt == "thinking" and isinstance(b.get("thinking"), str):
+            n += len(b["thinking"])
+    return n
 
 
 def _content_text(content):
@@ -224,6 +294,31 @@ class Acc:
         self.events = []
         self.dropped_events = 0
         self._last_text_mid = None
+        self.plan_sigs = []                   # plans.py hook: tool calls that can tie this transcript to a plan
+        # effort and thinking (module docstring)
+        self.effort = ""                      # effort on the latest api-request record ("" before any)
+        self.effort_msgs = {}                 # effort -> assistant messages sent with it
+        self.effort_log = []                  # [{"t", "effort", "model"}] at the first request and each change
+        self.thinking_mode = ""               # params.thinking of the latest request, e.g. "adaptive/updates"
+        self.think_blocks = 0                 # thinking + redacted_thinking content blocks
+        self.think_redacted = 0
+        self.think_text_blocks = 0            # blocks that carry thinking text (not just a signature)
+        self.think_chars = 0
+        self.think_model = {}                 # model -> [messages with a thinking count, their output tokens, thinking tokens]
+        self.msg_think = {}                   # message id -> (model, output tokens, thinking tokens)
+        self.fast_msgs = 0                    # messages billed at fast-mode speed
+        self.model_log = []                   # [{"t", "from", "to"}] each time the model changes mid-transcript
+        # Output estimates (module docstring): messages with no final usage record
+        self.msg_chars = {}                   # message id -> characters of its visible content (text, tool input, thinking text)
+        self.msg_final = set()                # message ids that have a record with stop_reason (final usage)
+        self.msg_est = {}                     # message id -> (model, output tokens added by the estimate)
+        self.context = 0                      # the latest call's prompt: input + cache read + cache write
+        # What the transcript did, for routing.py (work type, effort by cost)
+        self.msg_eff = {}                     # message id -> effort it was sent with (when a request record named one)
+        self.edited = set()                   # file paths touched by Edit/Write/MultiEdit/NotebookEdit (capped)
+        self.bash_tests = 0                   # Bash calls that ran a test, lint or type check
+        self.bash_mutate = 0                  # Bash calls that changed files or repo state
+        self._ctx_mid = None
 
     # ── helpers ────────────────────────────────────────────────────────────
     def _hour(self, t):
@@ -247,6 +342,7 @@ class Acc:
         return max(self.models.items(), key=lambda kv: kv[1])[0]
 
     def totals(self):
+        """Usage sums. "tokens" is NEW tokens (input + cache writes + output); cache reads stay separate."""
         inp = out = cr = cw = msgs = 0
         cost = 0.0
         unpriced = 0
@@ -259,9 +355,20 @@ class Acc:
             if pricing.has_price(m):
                 cost += u[6]
             else:
-                unpriced += u[1] + u[2] + u[3] + u[4] + u[5]
+                unpriced += u[1] + u[2] + u[4] + u[5]
         return {"input": inp, "output": out, "cache_read": cr, "cache_write": cw,
-                "tokens": inp + out + cr + cw, "cost": cost, "unpriced_tokens": unpriced, "msgs": msgs}
+                "tokens": inp + out + cw, "cost": cost, "unpriced_tokens": unpriced, "msgs": msgs,
+                "output_estimated": sum(e[1] for e in self.msg_est.values()), "est_msgs": len(self.msg_est),
+                "context": self.context}
+
+    def est_by_model(self):
+        """model -> [messages with estimated output, output tokens the estimate added]."""
+        out = {}
+        for m, extra in self.msg_est.values():
+            r = out.setdefault(m, [0, 0])
+            r[0] += 1
+            r[1] += extra
+        return out
 
     # ── the record handler ─────────────────────────────────────────────────
     def feed(self, rec):
@@ -311,6 +418,27 @@ class Acc:
             if rec.get("entrypoint") and not self.entrypoint:
                 self.entrypoint = rec["entrypoint"]
 
+    def request(self, line):
+        """One `api-request` record: the effort and thinking mode the next messages are sent with."""
+        got = _request_params(line)
+        if got is None:
+            return
+        ts, model, eff, think = got
+        if think:
+            self.thinking_mode = think
+        self._set_effort(ts, model, eff)
+
+    def _set_effort(self, ts, model, eff):
+        if not eff or eff == self.effort:
+            return
+        first = not self.effort
+        self.effort = eff
+        self.effort_log.append({"t": ts, "effort": eff, "model": model})
+        if len(self.effort_log) > 200:
+            del self.effort_log[1:-199]
+        self._event({"k": "effort", "t": ts, "text": ("Effort " if first else "Effort changed to ") + eff,
+                     "effort": eff, "first": first})
+
     def _assistant(self, rec):
         msg = rec.get("message")
         if not isinstance(msg, dict):
@@ -320,8 +448,22 @@ class Acc:
         mid = msg.get("id") or rec.get("requestId") or rec.get("uuid") or ""
         synthetic = model.startswith("<")
         if model and not synthetic:
+            if self.last_model and model != self.last_model and mid not in self.msg_usage:
+                self.model_log.append({"t": ts, "from": self.last_model, "to": model})
+                if len(self.model_log) > 200:
+                    del self.model_log[1:-199]
+                if not (self.events and self.events[-1].get("k") == "fallback"):   # a refusal fallback already says so
+                    self._event({"k": "model", "t": ts, "text": "Model changed from " + pricing.display_name(self.last_model)
+                                 + " to " + pricing.display_name(model)})
+                    self._last_text_mid = None
             self.last_model = model
         u = msg.get("usage")
+        if mid and not synthetic:
+            content0 = msg.get("content")
+            if isinstance(content0, list):
+                self.msg_chars[mid] = self.msg_chars.get(mid, 0) + _visible_chars(content0)
+            if msg.get("stop_reason"):
+                self.msg_final.add(mid)
         if not synthetic and isinstance(u, dict) and mid:
             cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else None
             cw_total = int(u.get("cache_creation_input_tokens") or 0)
@@ -332,8 +474,24 @@ class Acc:
                     cw5 += cw_total - cw1h - cw5
             else:
                 cw5, cw1h = cw_total, 0
-            tup = (int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0),
+            out_rec = int(u.get("output_tokens") or 0)
+            out_eff = out_rec
+            if mid not in self.msg_final:
+                # Usage saved at the start of the stream: the reply's real output is at least
+                # what its visible content holds, about 4 characters a token.
+                est = (self.msg_chars.get(mid, 0) + 3) // 4
+                if est > out_rec:
+                    out_eff = est
+                    self.msg_est[mid] = (model, est - out_rec)
+                else:
+                    self.msg_est.pop(mid, None)
+            else:
+                self.msg_est.pop(mid, None)
+            tup = (int(u.get("input_tokens") or 0), out_eff,
                    int(u.get("cache_read_input_tokens") or 0), cw5, cw1h)
+            if self._ctx_mid is None or mid == self._ctx_mid or mid not in self.msg_usage:
+                self._ctx_mid = mid
+                self.context = tup[0] + tup[2] + tup[3] + tup[4]
             prev = self.msg_usage.get(mid)
             if prev is None or prev[1] != tup:
                 cost = pricing.message_cost(model, *tup, speed=u.get("speed") or "")
@@ -346,8 +504,25 @@ class Acc:
                     if ts:
                         self.msg_order.append(mid)
                         self.msg_ts[mid] = ts
+                    if u.get("speed") == "fast":
+                        self.fast_msgs += 1
+                    # routing.py's effort: the assistant record's own `effort` field (written by 2.1.30x for
+                    # every reply, subagents included), else the latest api-request record's.
+                    reff = rec.get("effort")
+                    if isinstance(reff, str) and reff:
+                        self._set_effort(ts, model, clip(reff, 20))
+                    eff = self.effort
+                    if eff:
+                        self.msg_eff[mid] = eff
+                        self.effort_msgs[eff] = self.effort_msgs.get(eff, 0) + 1
+                        if hour:
+                            em = self._hour(ts).setdefault("e", {}).setdefault(model, {})
+                            em[eff] = em.get(eff, 0) + 1
                 self.msg_usage[mid] = (model, tup, cost, hour)
                 self._apply_usage(model, tup, cost, hour, 1)
+            det = u.get("output_tokens_details")
+            if isinstance(det, dict) and isinstance(det.get("thinking_tokens"), int):
+                self._think_usage(mid, model, tup[1], det["thinking_tokens"])
         content = msg.get("content")
         if msg.get("stop_reason"):
             self.last_stop = msg["stop_reason"]
@@ -374,6 +549,30 @@ class Acc:
                     self._last_text_mid = mid
             elif bt == "tool_use":
                 self._tool_use(b, ts)
+            elif bt in ("thinking", "redacted_thinking"):
+                self.think_blocks += 1
+                if bt == "redacted_thinking":
+                    self.think_redacted += 1
+                txt = b.get("thinking")
+                if isinstance(txt, str) and txt:
+                    self.think_text_blocks += 1
+                    self.think_chars += len(txt)
+
+    def _think_usage(self, mid, model, out, think):
+        """A message's thinking count; a later record of the same message replaces the earlier one."""
+        prev = self.msg_think.get(mid)
+        if prev == (model, out, think):
+            return
+        for m, o, t, sign in ((prev[0], prev[1], prev[2], -1) if prev else (None, 0, 0, 0), (model, out, think, 1)):
+            if not sign:
+                continue
+            r = self.think_model.get(m)
+            if r is None:
+                r = self.think_model[m] = [0, 0, 0]
+            r[0] += sign
+            r[1] += sign * o
+            r[2] += sign * t
+        self.msg_think[mid] = (model, out, think)
 
     def _apply_usage(self, model, tup, cost, hour, sign):
         """Add (sign=1) or remove (sign=-1) one message's usage."""
@@ -390,12 +589,14 @@ class Acc:
         b = self.hours.get(hour)
         if b is None:
             b = self.hours[hour] = {"c": {}, "m": {}, "tok": 0, "tools": 0, "err": 0, "msgs": 0}
-        b["tok"] += sign * sum(tup)
+        new = tup[0] + tup[1] + tup[3] + tup[4]       # new tokens; cache reads counted apart
+        b["tok"] += sign * new
+        b["cr"] = b.get("cr", 0) + sign * tup[2]
         b["msgs"] += sign
         mu = b["m"].get(model)
         if mu is None:
             mu = b["m"][model] = [0, 0.0]
-        mu[0] += sign * sum(tup)
+        mu[0] += sign * new
         if cost is not None:
             mu[1] += sign * cost
             fam = pricing.family(model)
@@ -406,6 +607,19 @@ class Acc:
         ti = b.get("input") if isinstance(b.get("input"), dict) else {}
         tid = b.get("id") or ""
         self.tool_calls += 1
+        sig = _plans.tool_signal(name, ti, ts)   # plans.py hook: plan reads, checkbox ticks, todos, Skill args
+        if sig is not None:
+            self.plan_sigs.append(sig)
+        if name in _EDIT_TOOLS:
+            if len(self.edited) < MAX_EDITED:
+                self.edited.add(str(ti.get("file_path") or ti.get("notebook_path") or "?"))
+        elif name == "Bash":
+            cmd = ti.get("command")
+            if isinstance(cmd, str):
+                if _TEST_RE.search(cmd):
+                    self.bash_tests += 1
+                if _MUTATE_RE.search(cmd):
+                    self.bash_mutate += 1
         st = self.tools.get(name)
         if st is None:
             st = self.tools[name] = [0, 0, 0.0, 0]
@@ -421,6 +635,7 @@ class Acc:
                   "description": clip(ti.get("description") if name != "Workflow" else workflow_name(ti), 200),
                   "subagent_type": ti.get("subagent_type") or ("workflow" if name == "Workflow" else "general-purpose"),
                   "model_requested": ti.get("model") or "",
+                  "effort_requested": clip(ti.get("effort"), 20) if isinstance(ti.get("effort"), str) else "",
                   "background": bool(ti.get("run_in_background")),
                   "status": "pending", "agent_id": "", "run_id": "", "resolved_model": "",
                   "total_tokens": None, "duration_ms": None, "tool_uses": None, "error": ""}
@@ -613,6 +828,11 @@ class FileCache:
     @staticmethod
     def _lines(acc, data):
         for line in data.split(b"\n"):
+            if line.startswith(_REQUEST_PREFIX):
+                req = getattr(acc, "request", None)
+                if req is not None:
+                    req(line)
+                continue
             if not line or line.startswith(_SKIP_PREFIXES):
                 continue
             if b'"attachment":{' in line[:160] and line.startswith(b'{"parentUuid"'):
@@ -649,3 +869,6 @@ class LineLog:
                             "tool": rec.get("tool") or "",
                             "target": clip(tilde(rec.get("command") or rec.get("path") or ""), TEXT_TARGET),
                             "message": clip(rec.get("message"), TEXT_ERROR)})
+
+
+from . import plans as _plans   # noqa: E402  plans.py hook; imported last because plans.py imports this module

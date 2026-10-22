@@ -15,7 +15,7 @@ A **deep module** (John Ousterhout, "A Philosophy of Software Design") has a sma
 
 ### 1. Explore the codebase
 
-Use the Agent tool with subagent_type=Explore to navigate the codebase naturally. Do NOT follow rigid heuristics — explore organically and note where you experience friction:
+Use the Agent tool with subagent_type=Explore to navigate the codebase naturally. Do NOT follow rigid heuristics. Explore organically and note where you experience friction:
 
 - Where does understanding one concept require bouncing between many small files?
 - Where are modules so shallow that the interface is nearly as complex as the implementation?
@@ -44,21 +44,21 @@ Before spawning sub-agents, write a user-facing explanation of the problem space
 
 - The constraints any new interface would need to satisfy
 - The dependencies it would need to rely on
-- A rough illustrative code sketch to make the constraints concrete — this is not a proposal, just a way to ground the constraints
+- A rough illustrative code sketch to make the constraints concrete; this is not a proposal, just a way to ground the constraints
 
 Show this to the user, then immediately proceed to Step 5. The user reads and thinks about the problem while the sub-agents work in parallel.
 
 ### 5. Design multiple interfaces
 
-Spawn a small number of sub-agents in parallel using the Agent tool — as many as there are genuinely distinct approaches worth seeing, not a fixed count. Each must produce a **radically different** interface for the deepened module.
+Spawn a small number of sub-agents in parallel using the Agent tool, as many as there are genuinely distinct approaches worth seeing, not a fixed count. Each must produce a **radically different** interface for the deepened module.
 
 This is a deliberate exception to the delegation guidance in CLAUDE.md: the value here comes from genuinely independent designs produced without sight of each other, which one agent cannot reproduce sequentially. It is not a licence to fan out on ordinary work.
 
 Prompt each sub-agent with a separate technical brief (file paths, coupling details, dependency category, what's being hidden). This brief is independent of the user-facing explanation in Step 4. Give each agent a different design constraint:
 
-- Agent 1: "Minimize the interface — aim for 1-3 entry points max"
-- Agent 2: "Maximize flexibility — support many use cases and extension"
-- Agent 3: "Optimize for the most common caller — make the default case trivial"
+- Agent 1: "Minimize the interface: aim for 1-3 entry points max"
+- Agent 2: "Maximize flexibility, supporting many use cases and extension"
+- Agent 3: "Optimize for the most common caller, making the default case trivial"
 - Agent 4 (if applicable): "Design around the ports & adapters pattern for cross-boundary dependencies"
 
 Each sub-agent outputs:
@@ -66,15 +66,15 @@ Each sub-agent outputs:
 1. Interface signature (types, methods, params)
 2. Usage example showing how callers use it
 3. What complexity it hides internally
-4. Dependency strategy (how deps are handled — see [REFERENCE.md](REFERENCE.md))
+4. Dependency strategy (how deps are handled; see [REFERENCE.md](REFERENCE.md))
 5. Trade-offs
 
 Present designs sequentially, then compare them in prose.
 
-After comparing, give your own recommendation: which design you think is strongest and why. If elements from different designs would combine well, propose a hybrid. Be opinionated — the user wants a strong read, not just a menu.
+After comparing, give your own recommendation: which design you think is strongest and why. If elements from different designs would combine well, propose a hybrid. Be opinionated. The user wants a strong read, not just a menu.
 
 ### 6. User picks an interface (or accepts recommendation)
 
 ### 7. Create GitHub issue
 
-Draft the refactor RFC using the template in [REFERENCE.md](REFERENCE.md). Show the user the drafted body, then create it with `gh issue create` once they confirm — a GitHub issue is public and outward-facing, so it gets a confirmation even though they invoked this skill deliberately. Share the URL afterwards.
+Draft the refactor RFC using the template in [REFERENCE.md](REFERENCE.md). Show the user the drafted body, then create it with `gh issue create` once they confirm. A GitHub issue is public and outward-facing, so it gets a confirmation even though they invoked this skill deliberately. Share the URL afterwards.

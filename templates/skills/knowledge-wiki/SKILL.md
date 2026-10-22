@@ -1,15 +1,15 @@
 ---
 name: knowledge-wiki
-description: Compile a large external source corpus (papers, docs, scraped pages, a big codebase) once into a project-local, cross-linked markdown wiki, then answer queries from the pre-synthesized wiki instead of re-reading raw files. Use when you will repeatedly query the same large corpus and want to cut token cost. Operations: ingest a source, query the wiki, lint for rot.
+description: "Compile a large external source corpus (papers, docs, scraped pages, a big codebase) once into a project-local, cross-linked markdown wiki, then answer queries from the pre-synthesized wiki instead of re-reading raw files. Use when you will repeatedly query the same large corpus and want to cut token cost. Operations: ingest a source, query the wiki, lint for rot."
 user-invocable: true
-argument-hint: [ingest|query|lint] [path-or-question]
+argument-hint: "[ingest|query|lint] [path-or-question]"
 ---
 
 # Knowledge Wiki
 
 Implements Andrej Karpathy's "LLM Wiki" / compile-once pattern. When you will repeatedly query a large external **source corpus**, re-reading the raw files on every query (RAG-style) is ruinously token-expensive, and the cost multiplies under sub-agent fan-out and loops. Instead, compile the corpus **once** into a structured, queryable markdown wiki. Subsequent queries read the pre-synthesized wiki, not the raw sources. The llm-wiki-compiler reference implementation (see Notes) reports ~84-90% token reduction.
 
-Act as a **research librarian**: do the interlinking, deduplication, and index upkeep that makes human-maintained wikis rot. This skill is pure markdown plus the filesystem tools you already have — no new MCP server, no external dependency.
+Act as a **research librarian**: do the interlinking, deduplication, and index upkeep that makes human-maintained wikis rot. This skill is pure markdown plus the filesystem tools you already have, with no new MCP server and no external dependency.
 
 ## When to Use
 
@@ -19,15 +19,15 @@ Act as a **research librarian**: do the interlinking, deduplication, and index u
 
 ## When NOT to Use
 
-- A handful of files, or a one-off read — the compile cost only pays back across many queries.
+- A handful of files, or a one-off read: the compile cost only pays back across many queries.
 - A corpus that changes faster than you can re-ingest it.
-- Emitting your own decisions / preferences / cross-project architecture notes — that belongs in Claude Code's native memory (see below).
+- Emitting your own decisions / preferences / cross-project architecture notes. That belongs in Claude Code's native memory (see below).
 
 ## Relationship to native memory
 
 Complementary, not a replacement.
 
-- **Claude Code's memory** stores **emitted** knowledge: decisions, preferences, architecture — carried across sessions by the harness itself.
+- **Claude Code's memory** stores **emitted** knowledge: decisions, preferences, architecture, carried across sessions by the harness itself.
 - **knowledge-wiki** **digests** an external **source** corpus into a project-local wiki, tracked in the repo.
 
 Different inputs (your output vs. an external corpus), different scope (cross-session notes vs. one project's source digest). Use both; do not conflate them.
@@ -38,9 +38,9 @@ Project-local and git-trackable, default under `.wiki/`:
 
 ```
 .wiki/
-  raw/        # ground truth — immutable snapshots of external/ephemeral sources; read and cite, NEVER edit; in-repo sources are cited by path instead
+  raw/        # ground truth: immutable snapshots of external/ephemeral sources; read and cite, NEVER edit; in-repo sources are cited by path instead
   wiki/       # LLM-owned synthesized markdown (source summaries, entity/concept pages), cross-linked with [[Page Name]] wikilinks
-  index.md    # routing table: every wiki page + one-line summary — read FIRST so a query loads only candidate pages
+  index.md    # routing table: every wiki page + one-line summary. Read FIRST so a query loads only candidate pages
   log.md      # append-only, dated, grep-friendly record of each operation
 ```
 
@@ -48,8 +48,8 @@ Project-local and git-trackable, default under `.wiki/`:
 
 ### Ingest (one new source -> wiki)
 
-1. **Read** the source. Copy it into `raw/` first only if it is external or ephemeral (scraped page, downloaded paper, fetched doc) — then never edit the copy. If the source already lives in the repo (e.g., codebase files) or is too large to duplicate, read it in place and cite it by repo path; do not copy it into `raw/`.
-2. **Summarize** the source into a source page under `wiki/` (key claims, entities, terms), in your own words, with citations back to the `raw/` path. Mark any passage you reproduce as a quotation — an unmarked copy reads as a wiki claim, and later lints can't tell it from one.
+1. **Read** the source. Copy it into `raw/` first only if it is external or ephemeral (scraped page, downloaded paper, fetched doc). Never edit the copy after that. If the source already lives in the repo (e.g., codebase files) or is too large to duplicate, read it in place and cite it by repo path; do not copy it into `raw/`.
+2. **Summarize** the source into a source page under `wiki/` (key claims, entities, terms), in your own words, with citations back to the `raw/` path. Mark any passage you reproduce as a quotation. An unmarked copy reads as a wiki claim, and later lints can't tell it from one.
 3. **Surgically edit affected pages**: update existing entity/concept pages this source touches; create new ones only when genuinely new. Add `[[wikilinks]]` between related pages. Deduplicate overlapping claims.
 4. **Refresh `index.md`**: add or update the one-line summary for every page changed or created.
 5. **Append to `log.md`**: a dated line naming the source ingested and the pages touched.
@@ -61,8 +61,8 @@ Ingest one source at a time so edits stay surgical and reviewable. For a long so
 1. **Read `index.md` first.** Pick only the candidate pages whose summaries match the question.
 2. **Load only those pages.** Follow `[[wikilinks]]` only when a page points at something needed.
 3. **Answer with citations** to the wiki page(s), and through them to the underlying `raw/` source.
-4. If the wiki cannot answer, say so — and either ingest the missing source or flag the gap. Do not silently fall back to re-reading the whole corpus.
-5. **Optionally file the answer back** as a synthesis page under `wiki/`, add it to `index.md`, and log it — so the next identical query is even cheaper.
+4. If the wiki cannot answer, say so, and either ingest the missing source or flag the gap. Do not silently fall back to re-reading the whole corpus.
+5. **Optionally file the answer back** as a synthesis page under `wiki/`, add it to `index.md`, and log it, so the next identical query is even cheaper.
 
 ### Lint (find rot)
 
@@ -78,7 +78,7 @@ Present findings as a prioritized list; ask before applying fixes. Append a date
 
 ## Notes
 
-- Keep wiki pages focused — one entity or concept per page — so queries load less.
+- Keep wiki pages focused, with one entity or concept per page, so queries load less.
 - Prefer Edit over rewrite on existing pages to keep diffs small and reviewable.
 - Commit `.wiki/` with the project so the compiled knowledge is shared and versioned.
 - For reference, see the open implementations `praneybehl/llm-wiki-plugin` and `ussumant/llm-wiki-compiler`; this skill is self-contained and needs neither.

@@ -28,6 +28,22 @@ else
     echo "✓ Added to PATH in $PROFILE"
 fi
 
+# One command to open the dashboard from any terminal: starts cc-dash in the
+# background (the browser opens and pairs itself) and returns the prompt.
+# A dashboard already running is stopped first, so it always comes up on its
+# usual port in the mode asked for.
+# Arguments pass through, e.g. `ccdash --control`. The log holds the one-time
+# pairing link, so it is written owner-only.
+CCDASH_LINE='ccdash() { local b d="${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool"; b="$(command -v cc-dash)" || { echo "cc-dash not on PATH" >&2; return 1; }; pkill -u "$USER" -f "$b" 2>/dev/null && sleep 1; mkdir -p "$d" && (umask 077; nohup "$b" "$@" >>"$d/cc-dash.log" 2>&1 </dev/null &) && echo "cc-dash is opening in your browser (log: $d/cc-dash.log)"; }'
+
+if grep -qF 'ccdash() {' "$PROFILE" 2>/dev/null; then
+    echo "✓ ccdash already defined ($PROFILE)"
+else
+    echo "# cc_tool: ccdash opens the dashboard (cc-dash) in the background" >> "$PROFILE"
+    echo "$CCDASH_LINE" >> "$PROFILE"
+    echo "✓ Added ccdash to $PROFILE (run: ccdash, or ccdash --control)"
+fi
+
 # ── 2. Global plugins (bin/ not in PATH yet, call via full path) ──────────────
 echo ""
 "$BIN_DIR/cc-install-superpowers"

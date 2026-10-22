@@ -4,7 +4,7 @@ What `docs/E2E-TEST-PLAN.md` looks like mid-engagement for a fictional app ("tas
 
 ---
 
-# taskboard — End-to-End Test Plan
+# taskboard: End-to-End Test Plan
 
 Covers typical user interactions against the local dev stack
 (`docker compose up` → backend `:8000` with `GET /health`, frontend `:5173`;
@@ -43,7 +43,7 @@ Walkthrough of 2026-07-08 (paired mode, scope P0): executed scenarios marked
 | # | Scenario | Steps | Expected |
 |---|----------|-------|----------|
 | 3.1 | Drag card across columns | Drag a card from "Todo" to "Done" | Card moves; persists across reload (one 2xx persistence request) |
-| 3.2 | Concurrent delete (known quirk) | Tab A: open a card's modal. Tab B: delete that card. Tab A: save | Graceful 404/409 + modal closes and board refetches — never a 500 |
+| 3.2 | Concurrent delete (known quirk) | Tab A: open a card's modal. Tab B: delete that card. Tab A: save | Graceful 404/409 + modal closes and board refetches, never a 500 |
 
 ## §4 Cross-cutting
 
@@ -55,7 +55,7 @@ Walkthrough of 2026-07-08 (paired mode, scope P0): executed scenarios marked
 
 ## Priorities
 
-**P0** — 1.1, 1.2, 1.4, 2.1, 2.2, 3.1. **P1** — 1.3, 3.2, §4.1–4.2. **P2** — 4.3.
+**P0**: 1.1, 1.2, 1.4, 2.1, 2.2, 3.1. **P1**: 1.3, 3.2, §4.1–4.2. **P2**: 4.3.
 
 ## Suggested automation structure
 
@@ -70,5 +70,5 @@ This is a sketch for a future suite; generating it is a separate follow-up.
 
 ## Suggested fix order
 
-1. 2.2 — server-side RBAC on workspace mutations (data-integrity bug, all P0 flows depend on it).
-2. 3.2 — turn the known concurrent-delete 500 into a 404/409 with UI recovery.
+1. 2.2: server-side RBAC on workspace mutations (data-integrity bug, all P0 flows depend on it).
+2. 3.2: turn the known concurrent-delete 500 into a 404/409 with UI recovery.

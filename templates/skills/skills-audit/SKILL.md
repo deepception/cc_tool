@@ -19,7 +19,7 @@ Your task is to audit all Claude Code skills installed at both project and globa
    - Show the first line of the `description` field from the frontmatter
 4. **Present a summary table** with columns: Name, Scope, Lines, Description.
 5. **Ask the user** which skill(s) they want to review for improvement opportunities.
-6. **Coverage pass — for selected skills**, surface every potential improvement you can find; do not pre-filter by category or severity. Useful lenses (and anything else you observe):
+6. **Coverage pass (for selected skills)**, surface every potential improvement you can find; do not pre-filter by category or severity. Useful lenses (and anything else you observe):
    - Conciseness: Can instructions be shortened without losing meaning?
    - Clarity: Are instructions unambiguous and actionable?
    - Overlapping scopes: Does this skill duplicate another skill or CLAUDE.md content?

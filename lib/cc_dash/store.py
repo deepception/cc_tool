@@ -23,6 +23,8 @@ import threading
 import time
 
 from . import pricing
+from . import routing
+from . import tree as agent_tree
 from .parser import Acc, FileCache, LineLog, clip, tilde
 
 LIVE_SECS = 600          # a transcript written in the last 10 minutes is live
@@ -37,6 +39,9 @@ STALL_LONG_SECS = 1800   # ...for tools that are allowed to wait (Monitor, TaskO
 STALL_GEN_SECS = 420     # a model turn in flight this long with no write is "stalled?"
 SHOW_STALLED_SECS = 1800 # a stalled or blocked-on-you agent leaves the board this long after its last write
 SPARK_MINS = 15          # tool calls per minute over the last 15 minutes
+SPARK_TOP = 3            # tools named per spark minute; the rest only count
+SPARK_NAME = 40          # a named tool is clipped to this many characters
+RATE_SECS = 60           # "calls/min": tool calls started in the trailing 60 seconds
 BURN_SECS = 300          # burn rate over the last 5 minutes
 FEED_MAX = 50            # entries in the live activity feed
 _USER_WAIT = {"AskUserQuestion": ("question", "Answer a question"), "ExitPlanMode": ("plan", "Review the plan")}
@@ -262,6 +267,9 @@ class Store:
         self.cache = FileCache()
         self.side_cache = FileCache()     # journals and activity logs
         self._json_cache = {}             # path -> (mtime_ns, data) for meta and workflow json
+        self._tree_cache = {}             # session id -> (key, tree.build() result)
+        self._route_prof = {}             # (transcript path, role) -> (signature, routing.profile())
+        self._route_cache = {}            # project -> (key, payload)
         self.sessions = {}
         self.lock = threading.RLock()
         self._last = 0.0
@@ -500,7 +508,10 @@ class Store:
 
     @staticmethod
     def _usage_rows(accs):
+        """Usage per model. "tokens" is new tokens (input + cache writes + output); cache_read stays apart,
+        and output_estimated is the part of output that comes from the content estimate (parser.py)."""
         merged = {}
+        est = {}
         for a in accs:
             for m, u in a.usage.items():
                 r = merged.get(m)
@@ -508,13 +519,19 @@ class Store:
                     r = merged[m] = [0, 0, 0, 0, 0, 0, 0.0]
                 for i in range(7):
                     r[i] += u[i]
+            for m, (n, extra) in a.est_by_model().items():
+                e = est.setdefault(m, [0, 0])
+                e[0] += n
+                e[1] += extra
         rows = []
         for m, u in merged.items():
             priced = pricing.has_price(m)
+            e = est.get(m, [0, 0])
             rows.append({"model": m, "name": pricing.display_name(m), "family": pricing.family(m),
                          "msgs": u[0], "input": u[1], "output": u[2], "cache_read": u[3],
                          "cache_write_5m": u[4], "cache_write_1h": u[5],
-                         "tokens": sum(u[1:6]), "cost": round(u[6], 6) if priced else None})
+                         "tokens": u[1] + u[2] + u[4] + u[5], "output_estimated": e[1], "est_msgs": e[0],
+                         "cost": round(u[6], 6) if priced else None})
         rows.sort(key=lambda r: -r["tokens"])
         return rows
 
@@ -525,7 +542,8 @@ class Store:
                 "unpriced_tokens": sum(r["tokens"] for r in rows if r["cost"] is None),
                 "input": sum(r["input"] for r in rows), "output": sum(r["output"] for r in rows),
                 "cache_read": sum(r["cache_read"] for r in rows),
-                "cache_write": sum(r["cache_write_5m"] + r["cache_write_1h"] for r in rows)}
+                "cache_write": sum(r["cache_write_5m"] + r["cache_write_1h"] for r in rows),
+                "output_estimated": sum(r["output_estimated"] for r in rows), "est_msgs": sum(r["est_msgs"] for r in rows)}
 
     def _title(self, a):
         return a.custom_title or a.agent_name or a.ai_title or a.summary or a.first_prompt or "(no prompt)"
@@ -556,6 +574,8 @@ class Store:
             "blocked": sum(x.blocked for x in accs),
             "subagents": len(s.subs), "workflows": workflows,
             "tokens": tot["tokens"], "cost": tot["cost"], "unpriced_tokens": tot["unpriced_tokens"],
+            "cache_read": tot["cache_read"], "input": tot["input"], "output": tot["output"], "cache_write": tot["cache_write"],
+            "output_estimated": tot["output_estimated"], "est_msgs": tot["est_msgs"], "context": a.context,
             "guard": len(s.guard), "guard_kinds": guard_kinds,
             "state": self._state(s, now), "entrypoint": a.entrypoint, "version": a.version,
             "interrupts": a.interrupts, "compactions": a.compactions,
@@ -579,6 +599,8 @@ class Store:
             "duration": (a.last_ts - a.first_ts) if a.first_ts and a.last_ts else 0,
             "active": round(a.active_secs, 1),
             "tokens": tot["tokens"], "cost": tot["cost"], "unpriced_tokens": tot["unpriced_tokens"],
+            "cache_read": tot["cache_read"], "input": tot["input"], "output": tot["output"], "cache_write": tot["cache_write"],
+            "output_estimated": tot["output_estimated"], "est_msgs": tot["est_msgs"], "context": a.context,
             "tool_calls": a.tool_calls, "tool_errors": a.tool_errors, "blocked": a.blocked,
             "status": x.status, "last_tool": a.last_tool, "last_text": a.last_text,
             "age": now - x.mtime, "worktree": x.meta.get("worktreeBranch") or "",
@@ -703,35 +725,74 @@ class Store:
 
     @staticmethod
     def _spark(a, now):
-        """Tool calls per minute, oldest first; the last bucket is the current minute."""
+        """Per-minute tool-call buckets, oldest first, plus the current rate and the peak.
+
+        Each bucket is {n, err, tools}: calls started in that clock minute, how
+        many of them failed (an error result or a guard block), and the top
+        SPARK_TOP tools by count (ties by name). The last bucket is the current,
+        still-filling minute. rate counts the calls started in the last
+        RATE_SECS, a trailing window, so it is current at every poll and never
+        reads a partial minute as a drop; peak is the busiest bucket. Walks the
+        timeline from the end and stops at the first event older than the
+        window, so the cost follows the last 15 minutes, not the transcript."""
         end = (int(now // 60) + 1) * 60
         start = end - SPARK_MINS * 60
-        out = [0] * SPARK_MINS
-        for t in reversed(a.tool_ts):   # record order, so near-sorted: stop at the first older call
+        n, err, tools = [0] * SPARK_MINS, [0] * SPARK_MINS, [{} for _ in range(SPARK_MINS)]
+        rate = 0
+        for e in reversed(a.events):   # record order, so near-sorted: stop at the first older event
+            t = e.get("t")
+            if not t:
+                continue
             if t < start:
                 break
+            if e.get("k") != "tool":
+                continue
             i = int((t - start) // 60)
-            if 0 <= i < SPARK_MINS:
-                out[i] += 1
-        return out, end
+            if not 0 <= i < SPARK_MINS:
+                continue
+            n[i] += 1
+            if e.get("status") in ("error", "blocked"):
+                err[i] += 1
+            name = (e.get("name") or "?")[:SPARK_NAME]
+            tools[i][name] = tools[i].get(name, 0) + 1
+            if t >= now - RATE_SECS:
+                rate += 1
+        buckets = [{"n": n[i], "err": err[i],
+                    "tools": dict(sorted(tools[i].items(), key=lambda kv: (-kv[1], kv[0]))[:SPARK_TOP])}
+                   for i in range(SPARK_MINS)]
+        return {"spark": buckets, "spark_end": end, "rate": rate, "peak": max(n)}
 
     @staticmethod
     def _burn(a, now):
-        """Tokens (all, and output only) and estimated cost per minute over the last BURN_SECS."""
+        """Per-minute rates over the last BURN_SECS.
+
+        cost_min is the estimated dollars per minute and is what the board
+        shows: it prices cache reads at their own (low) rate. new_min counts
+        new tokens only (input, cache writes and output), the fallback for an
+        unpriced model. tok_min also counts cache reads, which re-count the
+        whole context on every call, so it runs about 100x new_min; it is
+        kept for the breakdown and never shown as the rate. unpriced_min is
+        the part of new_min from messages with no price."""
         cut = now - BURN_SECS
-        tok = out = 0
+        tok = new = out = unpriced = 0
         cost = 0.0
         for mid in reversed(a.msg_order):
             if a.msg_ts.get(mid, 0) < cut:
                 break
             u = a.msg_usage.get(mid)
             if u:
+                inp, o, _cread, cw5, cw1h = u[1]
+                fresh = inp + o + cw5 + cw1h
                 tok += sum(u[1])
-                out += u[1][1]
-                cost += u[2] or 0.0
+                new += fresh
+                out += o
+                if u[2] is None:
+                    unpriced += fresh
+                else:
+                    cost += u[2]
         span = max(60.0, min(float(BURN_SECS), now - (a.first_ts or now)))
-        return {"tok_min": round(tok * 60 / span), "out_min": round(out * 60 / span),
-                "cost_min": round(cost * 60 / span, 4)}
+        return {"tok_min": round(tok * 60 / span), "new_min": round(new * 60 / span), "out_min": round(out * 60 / span),
+                "unpriced_min": round(unpriced * 60 / span), "cost_min": round(cost * 60 / span, 4)}
 
     def _session_agents(self, s, now):
         """(visible agent nodes in tree order, workflow headers); ([], []) when nothing is on the board."""
@@ -843,7 +904,6 @@ class Store:
         a, x = n["acc"], n["x"]
         m = a.last_model or a.model_main()
         tot = a.totals()
-        spark, spark_end = self._spark(a, now)
         if x is None:
             label, typ, kind, phase, bg = self._title(a), "main", "main", "", False
         else:
@@ -853,17 +913,23 @@ class Store:
             kind = "workflow" if x.run_id else "sub"
             phase = x.meta.get("workflowPhase") or (j.phase.get(x.agent_id) if j else "") or ""
             bg = x.meta.get("requestShape") == "background" or bool(x.spawn and x.spawn.get("background"))
+        # Effort on the board only when recorded or asked for: an inferred one would be noise on every row.
+        effort, effort_src = a.effort or "", "recorded" if a.effort else ""
+        if not effort and x is not None:
+            req = (x.spawn or {}).get("effort_requested") or x.meta.get("effort")
+            effort, effort_src = (req, "requested") if isinstance(req, str) and req else ("", "")
         return {
             "key": n["key"], "session": s.sid, "agent_id": x.agent_id if x is not None else None,
             "parent": n["parent"], "kind": kind, "depth": n["depth"], "run_id": x.run_id if x is not None else "",
             "phase": phase, "label": clip(label, 200), "type": typ, "background": bg, "project": s.label,
             "model": pricing.display_name(m) if m else "", "family": pricing.family(m) if m else "other",
-            "state": n["state"], "since": n["since"], "tool": n["tool"], "needs": n["needs"],
+            "effort": clip(effort, 20), "effort_source": effort_src, "state": n["state"], "since": n["since"], "tool": n["tool"], "needs": n["needs"],
             "waiting_on": n["waiting_on"], "stalled_for": n["stalled_for"],
             "start": n["start"], "last_write": n["mtime"], "age": now - n["mtime"],
-            "tokens": tot["tokens"], "cost": round(tot["cost"], 4), "burn": self._burn(a, now),
+            "tokens": tot["tokens"], "cache_read": tot["cache_read"], "output_estimated": tot["output_estimated"],
+            "cost": round(tot["cost"], 4), "burn": self._burn(a, now),
             "tool_calls": a.tool_calls, "errors": a.tool_errors + a.api_errors,
-            "spark": spark, "spark_end": spark_end, "last_tool": a.last_tool, "last_text": a.last_text,
+            **self._spark(a, now), "last_tool": a.last_tool, "last_text": a.last_text,
         }
 
     @staticmethod
@@ -980,7 +1046,8 @@ class Store:
         out.sort(key=lambda r: r["age"])
         return {"now": now, "live_secs": LIVE_SECS, "sessions": out, **board,
                 "limits": {"linger": LINGER_SECS, "stall_tool": STALL_TOOL_SECS, "stall_gen": STALL_GEN_SECS,
-                           "spark_mins": SPARK_MINS, "feed_max": FEED_MAX}}
+                           "spark_mins": SPARK_MINS, "spark_top": SPARK_TOP, "rate_secs": RATE_SECS,
+                           "feed_max": FEED_MAX}}
 
     def scope_sessions(self, project):
         """Sessions in one project (exact label match), or all of them for ''.
@@ -1028,11 +1095,13 @@ class Store:
         hc = int(cutoff // 3600)
         hours = {}
         models = {}
+        effort_msgs = {}                 # model -> {effort: messages sent with it}, from api-request records
         sub_mix = {}
         sub_types = {}
         groups = {}
         tot = {"sessions": 0, "live": 0, "cost": 0.0, "tokens": 0, "tool_calls": 0, "tool_errors": 0,
-               "api_errors": 0, "subagents": 0, "prompts": 0, "unpriced_tokens": 0, "blocked": 0, "active": 0.0}
+               "api_errors": 0, "subagents": 0, "prompts": 0, "unpriced_tokens": 0, "blocked": 0, "active": 0.0,
+               "cache_read": 0}
         guard = {"deny": 0, "ask": 0, "warn": 0}
         tools_main, tools_sub = [], []
         with self.lock:
@@ -1080,6 +1149,11 @@ class Store:
                             g["cost"] += c
                             g["cost_hours"][h] = g["cost_hours"].get(h, 0.0) + c
                         g["tokens"] += b["tok"]
+                        tot["cache_read"] += b.get("cr", 0)
+                        for m, per in b.get("e", {}).items():   # messages with a recorded effort
+                            em = effort_msgs.setdefault(m, {})
+                            for eff, cnt in per.items():
+                                em[eff] = em.get(eff, 0) + cnt
                         for m, (tok, cost) in b.get("m", {}).items():
                             r = models.setdefault(m, {"model": m, "name": pricing.display_name(m),
                                                       "family": pricing.family(m), "main_tokens": 0, "sub_tokens": 0,
@@ -1133,6 +1207,7 @@ class Store:
                 p["worktrees"] = []          # only the main checkout: nothing to fold
             self._shape_group(p)
         for r in models.values():
+            r["effort"] = effort_msgs.get(r["model"], {})
             r["cost"] = round(r["cost"], 4) if r["priced"] else None
             if not r["priced"]:
                 tot["unpriced_tokens"] += r["main_tokens"] + r["sub_tokens"]
@@ -1150,6 +1225,48 @@ class Store:
             "tools": tools[:14], "projects": sorted(projects.values(), key=lambda r: -r["cost"]),
         }
 
+    def agent_tree(self, s, now):
+        """tree.build() for one session, rebuilt only when a transcript, journal or run file changed
+        (or every 10 s, since running/stopped depends on the clock)."""
+        key = (s.last_write, len(s.subs), sum(len(j.outcome) for j in s.journals.values()),
+               sum(1 for j in s.journals.values() for o in j.outcome.values() if o != "running"),
+               len(s.workflows), int(now // 10))
+        hit = self._tree_cache.get(s.sid)
+        if hit and hit[0] == key:
+            return hit[1]
+        t = agent_tree.build(self, s, now)
+        if len(self._tree_cache) > 64:
+            self._tree_cache.clear()
+        self._tree_cache[s.sid] = (key, t)
+        return t
+
+    def routing_payload(self, project=""):
+        """routing.build() for one scope, rebuilt when a transcript grew or every 15 s."""
+        project = (project or "")[:200]
+        self.refresh()
+        now = self.clock()
+        with self.lock:
+            key = (sum(s.acc.api_msgs + sum(x.acc.api_msgs for x in s.subs) for s in self.sessions.values()),
+                   len(self.sessions), int(now // 15))
+            hit = self._route_cache.get(project)
+            if hit and hit[0] == key:
+                return hit[1]
+            out = routing.build(self, project, now, self._route_prof)
+            if len(self._route_cache) > 32:
+                self._route_cache.clear()
+            self._route_cache[project] = (key, out)
+            return out
+
+    def tree_payload(self, sid):
+        self.refresh()
+        now = self.clock()
+        with self.lock:
+            s = self.sessions.get(sid)
+            if s is None:
+                return None
+            t = self.agent_tree(s, now)
+            return {**t, "now": now, "effort": agent_tree.session_effort(s, t["nodes"][0] if t["nodes"] else None)}
+
     def session_payload(self, sid):
         self.refresh()
         now = self.clock()
@@ -1161,9 +1278,12 @@ class Store:
             tree, orphans = self._tree(s, now)
             usage_main = self._usage_rows([s.acc])
             usage_sub = self._usage_rows([x.acc for x in s.subs])
+            at = self.agent_tree(s, now)
             return {
                 "now": now, "session": row, "events": s.acc.events, "dropped_events": s.acc.dropped_events,
                 "tree": tree, "orphans": orphans,
+                "agents": {k: v for k, v in at["summary"].items() if k not in ("matrix", "thinking", "levels", "efforts")},
+                "effort": agent_tree.session_effort(s, at["nodes"][0] if at["nodes"] else None),
                 "tools": self._tools([s.acc], [x.acc for x in s.subs]),
                 "usage": {"main": usage_main, "sub": usage_sub,
                           "all": self._usage_rows([s.acc] + [x.acc for x in s.subs])},
@@ -1182,8 +1302,10 @@ class Store:
             x = next((x for x in s.subs if x.agent_id == agent_id), None)
             if x is None:
                 return None
+            node = next((n for n in self.agent_tree(s, now)["nodes"] if n["id"] == "a:" + agent_id), None) or {}
             return {"now": now, "session_id": sid, "session_title": clip(self._title(s.acc), 200),
                     "agent": self._sub_row(s, x, now), "events": x.acc.events,
+                    "node": {k: node.get(k) for k in ("effort", "thinking", "sub", "level", "link", "fast_msgs", "models", "effort_log")},
                     "dropped_events": x.acc.dropped_events, "tools": self._tools([x.acc], []),
                     "usage": self._usage_rows([x.acc]), "bad_lines": x.acc.bad_lines,
                     "children": [self._sub_row(s, y, now) for y in s.subs

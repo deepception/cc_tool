@@ -2,7 +2,7 @@
 name: skill-engineer
 description: Creates new Claude Code skills or updates existing ones. Use when you need to create a skill, improve a skill, or convert a repeated workflow into a reusable skill. Handles SKILL.md generation, frontmatter configuration, supporting files, and validation.
 user-invocable: true
-argument-hint: [create|update] [skill-name]
+argument-hint: "[create|update] [skill-name]"
 ---
 
 # Skill Engineer
@@ -46,8 +46,8 @@ Determine which pattern fits (this drives structure decisions):
 
 ### 4. Determine Scope
 
-- **Global** (`~/.claude/skills/`) — useful across all projects (meta-skills, general workflows)
-- **Project** (`.claude/skills/`) — tied to this codebase (domain knowledge, project-specific workflows)
+- **Global** (`~/.claude/skills/`): useful across all projects (meta-skills, general workflows)
+- **Project** (`.claude/skills/`): tied to this codebase (domain knowledge, project-specific workflows)
 
 Default to project scope unless the skill is clearly universal.
 
@@ -101,18 +101,18 @@ user-invocable: true           # false only for pure reference/knowledge skills
 
 **Writing style:**
 - Use imperative sentences: "Scan all files" not "You should scan all files"
-- Use plain imperatives ("Use this tool when X"), not intensifiers ("CRITICAL: You MUST", "always default to", "if in doubt, use X") — strong guardrail phrasing over-triggers. State scope explicitly when a rule spans multiple items.
+- Use plain imperatives ("Use this tool when X"), not intensifiers ("CRITICAL: You MUST", "always default to", "if in doubt, use X"). Strong guardrail phrasing over-triggers. State scope explicitly when a rule spans multiple items.
 - **De-scaffold**: prefer the shortest instruction that works; add step-by-step scaffolding only where it measurably beats the model's default behavior. Current models respond badly to long enumerated instruction lists.
-- **State goals and constraints, not step lists**, unless the order genuinely matters. A skill that says "spawn N sub-agents" or "always add a verification step" fights the delegation guidance and the Verification protocol in the managed CLAUDE.md block — check yours against those before shipping it.
+- **State goals and constraints, not step lists**, unless the order genuinely matters. A skill that says "spawn N sub-agents" or "always add a verification step" fights the delegation guidance and the Verification protocol in the managed CLAUDE.md block. Check yours against those before shipping it.
 - Be specific: "List files matching `.claude/skills/*/SKILL.md`" not "Find skill files"
-- Prose for behavior, with the reason beside each constraint — a rule without its reason gets applied where it doesn't fit. Bullets and tables for reference data (commands, paths, lookup tables).
+- Prose for behavior, with the reason beside each constraint, since a rule without its reason gets applied where it doesn't fit. Bullets and tables for reference data (commands, paths, lookup tables).
 - Code blocks for commands and paths
 
 #### Description Writing
 
-The description is critical — it determines when Claude loads the skill.
+The description is critical because it determines when Claude loads the skill.
 
-Descriptions must stay under 1,536 characters (Claude Code's hard cap for the skill listing). Lead with the primary trigger phrase or key use case in the first sentence — Claude Code drops full descriptions for the least-invoked skills first when the always-visible listing exceeds its context budget.
+Descriptions must stay under 1,536 characters (Claude Code's hard cap for the skill listing). Lead with the primary trigger phrase or key use case in the first sentence, because Claude Code drops full descriptions for the least-invoked skills first when the always-visible listing exceeds its context budget.
 
 **Good descriptions include:**
 - What the skill does (action verb)
@@ -129,16 +129,16 @@ Descriptions must stay under 1,536 characters (Claude Code's hard cap for the sk
 
 ### 6. Create Supporting Files (if needed)
 
-**reference.md** — for stable domain knowledge:
+**reference.md**, for stable domain knowledge:
 - Color theory, API specifications, protocol details
 - Load on-demand, not every invocation
 - Reference from SKILL.md: "For details, see [reference.md](reference.md)"
 
-**templates/** — for boilerplate:
+**templates/**, for boilerplate:
 - File templates, config scaffolds
 - Loaded when Claude needs to fill them in
 
-**scripts/** — for executable helpers:
+**scripts/**, for executable helpers:
 - Validation scripts, generators
 - Called via Bash, not loaded as text
 
@@ -177,14 +177,14 @@ When updating an existing skill:
 
 ## Anti-Patterns to Avoid
 
-- **Bloated skills**: Over 200 lines in SKILL.md — split into SKILL.md + reference.md
-- **Vague descriptions**: "Helps with X" — be specific about when and why
-- **Unnecessary frontmatter**: Adding fields with default values — omit them
-- **Duplicate coverage**: Skill that restates CLAUDE.md content — reference it instead
+- **Bloated skills**: Over 200 lines in SKILL.md. Split into SKILL.md + reference.md
+- **Vague descriptions**: "Helps with X" instead of being specific about when and why
+- **Unnecessary frontmatter**: Adding fields with default values. Omit them
+- **Duplicate coverage**: Skill that restates CLAUDE.md content. Reference it instead
 - **Over-restricting tools**: Adding `allowed-tools` without a clear security reason
 - **Missing trigger phrases**: Description that doesn't match how users actually ask for it
-- **Over-forceful phrasing**: `CRITICAL` / `MUST` / `ALWAYS` / anti-laziness language — see Writing style; plain imperatives read more reliably
-- **Cargo-cult prescription**: porting every enumerated step from a prior-model skill unchanged — review whether the current model's default behavior already exceeds the scaffold. Today's models are more capable unscaffolded than the ones most existing skills were written for
-- **Hardcoded fan-out floors**: "spawn 3+ agents", "always delegate X" — say *when* delegation pays instead of fixing a count; whether the current model over- or under-delegates changes per release
-- **Thinking instructions**: "think carefully", "think step by step", "ultrathink" — current models think before every reply and decide how much; effort is the control, and the line only delays the answer
-- **Asking for reasoning in the reply**: "show your reasoning", "explain your thinking step by step" — Opus 5.5 and Sonnet 5.5 can decline it as `reasoning_extraction`, with no fallback retry; ask for what you actually need ("why this approach, in three sentences")
+- **Over-forceful phrasing**: `CRITICAL` / `MUST` / `ALWAYS` / anti-laziness language. See Writing style; plain imperatives read more reliably
+- **Cargo-cult prescription**: porting every enumerated step from a prior-model skill unchanged. Review whether the current model's default behavior already exceeds the scaffold. Today's models are more capable unscaffolded than the ones most existing skills were written for
+- **Hardcoded fan-out floors**: "spawn 3+ agents", "always delegate X". Say *when* delegation pays instead of fixing a count; whether the current model over- or under-delegates changes per release
+- **Thinking instructions**: "think carefully", "think step by step", "ultrathink". Current models think before every reply and decide how much; effort is the control, and the line only delays the answer
+- **Asking for reasoning in the reply**: "show your reasoning", "explain your thinking step by step". Opus 5.5 and Sonnet 5.5 can decline it as `reasoning_extraction`, with no fallback retry; ask for what you actually need ("why this approach, in three sentences")

@@ -497,6 +497,19 @@ if [[ ! "$inject_confirm" =~ ^[Nn]$ ]]; then
     inject_snippet
 fi
 
+# ── 4b. .gitignore: taste-skill's working folder ─────────────────────────────
+# design-taste-frontend v2 writes its dealt direction, inspector screenshots and
+# critique into .taste-skill/ at the project root; regenerable, never source.
+# (Its credited pictures go to assets/, which stays tracked.)
+GITIGNORE="$PROJECT_DIR/.gitignore"
+if [[ -f "$GITIGNORE" ]] && grep -qxE '/?\.taste-skill/?' "$GITIGNORE"; then
+    echo "  ✓ .taste-skill/ already in .gitignore"
+else
+    [[ -s "$GITIGNORE" && -n "$(tail -c1 "$GITIGNORE")" ]] && echo >> "$GITIGNORE"
+    printf '# taste-skill working files (cc_tool)\n.taste-skill/\n' >> "$GITIGNORE"
+    echo "  ✓ .taste-skill/ added to .gitignore"
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "Done! What's active in this project:"

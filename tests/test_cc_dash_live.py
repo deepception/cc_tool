@@ -33,6 +33,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import store as store_mod  # noqa: E402
 from cc_dash.server import Handler, make_server  # noqa: E402
+from cc_dash.auth import Auth  # noqa: E402
+from dash_pairing import auto_cookie  # noqa: E402  (tests/dash_pairing.py: every request carries the pairing cookie)
 from cc_dash.store import Store  # noqa: E402
 
 RESULTS = []
@@ -287,8 +289,8 @@ def test_spark_feed(st):
     p, A = board(st)
     c1 = A[S1.sid + "/c1"]
     check("spark: 15 one-minute buckets ending after the current minute", len(c1["spark"]) == 15 and c1["spark_end"] == T + 30, c1["spark_end"] - T)
-    check("spark: calls land in their minutes", c1["spark"] == [0] * 11 + [1, 1, 2, 0], c1["spark"])
-    s9 = A[S9.sid]["spark"]
+    check("spark: calls land in their minutes", [b["n"] for b in c1["spark"]] == [0] * 11 + [1, 1, 2, 0], c1["spark"])
+    s9 = [b["n"] for b in A[S9.sid]["spark"]]
     check("spark: older calls fall off the 15-minute window", sum(s9) == sum(1 for i in range(70) if T - 600 + i * 5 >= T + 30 - 900), s9)
     feed = p["feed"]
     check("feed: capped at 50", len(feed) == store_mod.FEED_MAX == 50, len(feed))
@@ -342,6 +344,7 @@ def test_endpoint():
     st = Store(days=1, clock=lambda: NOW[0])
     srv = make_server(0, st, fallback=False)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    auto_cookie(srv)
     try:
         code, body = _get(srv.port, "/api/live")
         d = json.loads(body)
@@ -349,7 +352,7 @@ def test_endpoint():
         check("endpoint: board keys present", all(k in d for k in ("sessions", "agents", "groups", "workflows", "feed", "counts", "limits")), list(d))
         need = {"key", "session", "agent_id", "parent", "kind", "depth", "run_id", "phase", "label", "type", "background", "project",
                 "model", "family", "state", "since", "tool", "needs", "waiting_on", "stalled_for", "start", "last_write", "age",
-                "tokens", "cost", "burn", "tool_calls", "errors", "spark", "spark_end", "last_tool", "last_text"}
+                "tokens", "cost", "burn", "tool_calls", "errors", "spark", "spark_end", "rate", "peak", "last_tool", "last_text"}
         check("endpoint: every agent row has the full shape", all(need <= set(a) for a in d["agents"]), need - set(d["agents"][0]))
         check("endpoint: groups carry project and title", all({"session", "project", "title", "cost", "agents", "running", "needs"} <= set(g) for g in d["groups"]))
         check("endpoint: sessions list unchanged for the Sessions mode", isinstance(d["sessions"], list) and all("running_subs" in s for s in d["sessions"]))
@@ -411,6 +414,8 @@ class StubHandler(Handler):
         if self.path.startswith("/api/alerts"):
             if not self._host_ok():
                 return self._deny(421, "no")
+            if self.server.auth.session(self.headers) is None:
+                return self._json(401, {"error": "Not paired."})
             return self._json(200, self.server.alerts) if self.server.alerts is not None else self._deny(404, "Not found.")
         return super().do_GET()
 
@@ -421,6 +426,7 @@ def _stub_server(st, alerts):
     srv.store, srv.verbose, srv.alerts = st, False, alerts
     srv.port = srv.server_address[1]
     srv.allowed_hosts = {f"127.0.0.1:{srv.port}", f"localhost:{srv.port}"}
+    srv.auth, srv.control = Auth(srv.port), None
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
@@ -434,7 +440,7 @@ const { chromium } = require(process.env.PW);
     const page = await (await browser.newContext({ viewport: { width: 1440, height: 1000 }, colorScheme: 'light' })).newPage();
     const errs = [];
     page.on('pageerror', (e) => errs.push(String(e)));
-    await page.goto(`http://127.0.0.1:${port}/#/live`, { waitUntil: 'load' });
+    await page.goto(`http://127.0.0.1:${port}/pair#code=${process.env['PAIR_' + port]}`, { waitUntil: 'load' });   // auth.js trades the code for the token
     await page.waitForSelector('.arow[data-key]', { timeout: 15000 });
     await page.waitForTimeout(name === 'alerts' ? 3000 : 1500);
     const r = await page.evaluate(async () => {
@@ -443,7 +449,7 @@ const { chromium } = require(process.env.PW);
       let api, rows;
       for (let i = 0; i < 3; i++) {
         await new Promise((ok) => setTimeout(ok, 3500));   // let the page render a poll
-        api = await (await fetch('/api/live')).json();
+        api = await (await window.ccAuth.fetch('/api/live')).json();
         rows = [...document.querySelectorAll('.agroup:not(.loose) .arow[data-key]')];
         if (rows.length === api.agents.length) break;
       }
@@ -480,7 +486,7 @@ const { chromium } = require(process.env.PW);
     page.on('pageerror', (e) => errs.push(String(e)));
     let polls = 0;
     page.on('request', (rq) => { if (rq.url().includes('/api/live')) polls += 1; });
-    await page.goto(`http://127.0.0.1:${process.env.PORT_C}/#/live`, { waitUntil: 'load' });
+    await page.goto(`http://127.0.0.1:${process.env.PORT_C}/pair#code=${process.env['PAIR_' + process.env.PORT_C]}`, { waitUntil: 'load' });
     await page.waitForSelector('.arow[data-key]', { timeout: 15000 });
     await page.waitForTimeout(4000);          // first render and its one follow-up poll settle
     await page.evaluate(() => window.scrollTo(0, 260));
@@ -495,7 +501,11 @@ const { chromium } = require(process.env.PW);
       const root = document.querySelector('#main');
       window.__muts = { childList: [], attributes: {}, characterData: 0 };
       window.__anims = [];
-      document.addEventListener('animationstart', (e) => window.__anims.push(e.animationName + ' on ' + (e.target.className.baseVal != null ? e.target.className.baseVal : e.target.className)), true);
+      // The header sync bar's late pulse (sync-wait) is a state animation, not poll
+      // churn: it runs only when a poll answer is 700 ms past due, which a loaded
+      // machine can cause. Its fill is a Web Animation (no animationstart, no DOM
+      // writes) and the header is outside #main, so nothing else of it is counted.
+      document.addEventListener('animationstart', (e) => e.animationName !== 'sync-wait' && window.__anims.push(e.animationName + ' on ' + (e.target.className.baseVal != null ? e.target.className.baseVal : e.target.className)), true);
       const desc = (n) => n.nodeType === 1 ? n.tagName.toLowerCase() + '.' + String(n.className.baseVal != null ? n.className.baseVal : n.className).split(' ').join('.') : '#' + n.nodeType + ':' + (n.nodeValue || '').slice(0, 20);
       new MutationObserver((ms) => { for (const m of ms) {
         if (m.type === 'childList') window.__muts.childList.push({ target: desc(m.target), added: [...m.addedNodes].map(desc), removed: [...m.removedNodes].map(desc) });
@@ -503,6 +513,17 @@ const { chromium } = require(process.env.PW);
         else window.__muts.characterData += 1;
       } }).observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
       window.__hovered = document.querySelector('.arow[data-key]:nth-child(2)');
+      // Sync bar: count fill restarts (one per applied poll), frame by frame.
+      const fill = document.querySelector('#sync .sync-fill');
+      window.__sync = { resets: 0, late: 0 };
+      let prevAnim = null;
+      const watch = () => {
+        const a = fill.getAnimations()[0];
+        if (a && a !== prevAnim) { if (prevAnim) window.__sync.resets += 1; prevAnim = a; }
+        if (document.querySelector('#sync').classList.contains('late')) window.__sync.late += 1;
+        requestAnimationFrame(watch);
+      };
+      requestAnimationFrame(watch);
       return { scrollY: window.scrollY, rows: document.querySelectorAll('.arow[data-key]').length };
     });
     const p0 = polls;
@@ -510,7 +531,12 @@ const { chromium } = require(process.env.PW);
     const after = await page.evaluate(() => ({ muts: window.__muts, anims: window.__anims, scrollY: window.scrollY,
       sel: getSelection().toString() === window.__selText && window.__selText.length > 0,
       hoverKept: window.__hovered.isConnected && window.__hovered.matches(':hover'),
-      rows: document.querySelectorAll('.arow[data-key]').length }));
+      rows: document.querySelectorAll('.arow[data-key]').length,
+      sync: Object.assign({}, window.__sync, {
+        barHidden: document.querySelector('#sync .sync-bar').getAttribute('aria-hidden'),
+        role: document.querySelector('#sync').getAttribute('role'),
+        liveText: document.querySelector('#sync-live').textContent,
+        text: document.querySelector('#sync').textContent }) }));
     after.polls = polls - p0;
     after.before = before;
     // Feed while hovered: a new call arrives, the list must not move.
@@ -554,6 +580,9 @@ def test_browser():
     with open(js, "w") as fh:
         fh.write(BROWSER_JS)
     env = dict(os.environ, PW=PLAYWRIGHT, CHROME=CHROME, PORT_A=str(a.port), PORT_B=str(b.port), PORT_C=str(c.port), SHOTS=SHOTS)
+    for x in (a, b, c):
+        env["PAIR_%d" % x.port] = x.auth.new_code()
+        auto_cookie(x)
     try:
         r = subprocess.run(["node", js], capture_output=True, text=True, timeout=180, env=env)
     finally:
@@ -568,11 +597,11 @@ def test_browser():
     check("browser: no page errors", not al["errors"] and not na["errors"], al["errors"] + na["errors"])
     check("browser: one row per agent on the board", al["rows"] == al["apiAgents"] >= 12, (al["rows"], al["apiAgents"]))
     c1 = [n for n in al["needs"] if n["key"] == S1.sid + "/c1"]
-    check("browser: alert marks the matching subagent 'Needs you: approve Bash'", c1 and "Needs you: approve Bash" in c1[0]["text"], al["needs"])
+    check("browser: alert marks the matching subagent 'Needs a decision: approve Bash'", c1 and "Needs a decision: approve Bash" in c1[0]["text"], al["needs"])
     check("browser: transcript AskUserQuestion also shows as needs you", any(n["key"] == S6.sid for n in al["needs"]), al["needs"])
     check("browser: an alert for a session not on the board gets its own group first", al["firstGroup"].startswith("Needs you"), al["firstGroup"])
     check("browser: the session with the alerted agent sorts right after", al["secondGroupKeys"][:1] in ([S1.sid], [S6.sid]), al["secondGroupKeys"][:2])
-    check("browser: summary counts the agents that need you", "3 need you" in al["sub"], al["sub"])
+    check("browser: summary counts the agents that need a decision (an idle session is 'Your turn', not counted)", "2 need you" in al["sub"], al["sub"])
     check("browser: workflow header row rendered", any("review-sweep" in w and "2 of 3 finished" in w for w in al["wf"]), al["wf"])
     check("browser: feed shows at most 50 entries", 0 < al["feed"] <= 50, al["feed"])
     check("browser: a sparkline per agent", al["sparks"] == al["rows"], (al["sparks"], al["rows"]))
@@ -585,6 +614,11 @@ def test_browser():
     check("flicker: no node added, removed or replaced across polls with unchanged data", not fl["muts"]["childList"], fl["muts"]["childList"][:5])
     check("flicker: only text ticks (characterData) changed", fl["muts"]["characterData"] > 0 and not fl["muts"]["attributes"], fl["muts"])
     check("flicker: no entrance or exit animation ran during routine polls", not fl["anims"], fl["anims"])
+    sy = fl["sync"]
+    print(f"sync bar: {sy['resets']} fill restarts over {fl['polls']} polls, late frames={sy['late']}")
+    check("sync bar: the fill restarts once per applied poll", fl["polls"] - 1 <= sy["resets"] <= fl["polls"] + 1, (sy, fl["polls"]))
+    check("sync bar: visual only (aria-hidden, no role on the indicator)", sy["barHidden"] == "true" and sy["role"] is None, sy)
+    check("sync bar: routine polls announce nothing and show no 'Updated' text", sy["liveText"] == "" and sy["text"] == "", sy)
     check("flicker: scroll position kept", fl["scrollY"] == fl["before"]["scrollY"] and fl["scrollY"] > 0, (fl["before"]["scrollY"], fl["scrollY"]))
     check("flicker: text selection kept", fl["sel"])
     check("flicker: hovered row is the same node and still hovered", fl["hoverKept"])

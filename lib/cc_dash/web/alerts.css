@@ -1,70 +1,57 @@
-/* cc-dash alerts: bell, toast stack, drawer. Uses app.css tokens only, so
-   light and dark (system or forced) follow the rest of the page. Amber marks
-   "waiting on you", red an error, gray an idle session. Motion follows
-   product-ui-motion: toasts 200ms in and 150ms out, the drawer 260ms on the
-   drawer curve; reduced motion keeps the fade and drops the travel. */
-
-:root {
-  --al-wait: var(--warn-dot);
-  --al-err: var(--bad);
-  --al-idle: var(--ink-4);
-  --al-w: 380px;
-}
+/* cc-dash alerts: bell, toast stack, drawer. app.css tokens and components
+   only. A toast and a drawer entry are the decision card (control.css
+   .ctl-card, .al-card share one anatomy); its status pill is the app.css
+   status language: amber "Needs a decision", neutral "Your turn", red
+   "Failed". Motion follows product-ui-motion: toasts 200ms in and 150ms out,
+   the drawer 260ms on the drawer curve; reduced motion keeps the fade and
+   drops the travel. */
 
 /* ── Bell ────────────────────────────────────────────────────────────── */
 .al-bell { position: relative; }
-.al-bell.on { color: var(--ink); border-color: color-mix(in srgb, var(--al-wait) 55%, var(--line)); background: color-mix(in srgb, var(--al-wait) 8%, var(--surface)); }
+.al-bell.on { color: var(--ink); border-color: color-mix(in srgb, var(--warn-dot) 55%, var(--line)); background: color-mix(in srgb, var(--warn-dot) 8%, var(--surface)); }
 .al-bell-count {
-  position: absolute; top: -6px; right: -7px; min-width: 16px; height: 16px; padding: 0 4px;
-  border-radius: var(--r-pill); background: var(--al-wait); color: var(--on-warn); border: 2px solid var(--bg);
-  font: 600 10px/12px var(--font); font-variant-numeric: tabular-nums; text-align: center; box-sizing: border-box;
+  position: absolute; top: -6px; right: -7px; min-width: 16px; height: 16px; padding: 0 var(--sp-1);
+  border-radius: var(--r-pill); background: var(--warn-dot); color: var(--on-warn); border: 2px solid var(--bg);
+  font: 600 var(--fs-11)/12px var(--font); font-variant-numeric: tabular-nums; text-align: center; box-sizing: border-box;
 }
 
-/* ── Card (shared by toasts and the drawer) ──────────────────────────── */
-.al-card {
-  --k: var(--al-wait);
-  position: relative; display: block; background: var(--raised); color: var(--ink);
-  border: 1px solid var(--line-2); border-radius: var(--r-l); box-shadow: var(--shadow-pop);
-  overflow: hidden;
-}
-.al-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--k); }
-.al-card.k-error { --k: var(--al-err); }
-.al-card.k-idle { --k: var(--al-idle); }
-.al-open { display: block; padding: var(--sp-3) var(--sp-4) 14px; color: inherit; text-decoration: none; cursor: pointer; transition: background-color var(--t-fast) ease; }
+/* ── The alert card (the decision card's frame) ──────────────────────── */
+.al-card { display: block; padding: 0; overflow: hidden; }
+.al-card.k-idle { --edge: var(--ink-4); border-color: var(--line-2); }
+.al-card.k-error { --edge: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, var(--line-2)); }
+.al-open { display: flex; flex-direction: column; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4) var(--sp-3) calc(var(--sp-4) + 3px); color: inherit; text-decoration: none; cursor: pointer; transition: background-color var(--t-fast) ease; }
 .al-open:hover { background: var(--hover); }
 .al-open:focus-visible { outline-offset: -2px; border-radius: var(--r-l); }
-.al-row1 { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-12); color: var(--ink-3); min-width: 0; }
 .al-toast .al-row1 { padding-right: 26px; }
-.al-kind {
-  flex: none; font: 600 var(--fs-11)/1 var(--font);
-  padding: 4px 7px; border-radius: var(--r-pill); color: var(--k);
-  background: color-mix(in srgb, var(--k) 14%, transparent);
-}
-.al-card.k-permission .al-kind, .al-card.k-question .al-kind, .al-card.k-plan .al-kind, .al-card.k-other .al-kind { color: var(--warn); }
-.al-card.k-idle .al-kind { color: var(--ink-3); }
-.al-who { flex: 1 1 auto; color: var(--ink-2); font-weight: 500; }
-.al-age { flex: none; margin-left: auto; color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.al-title { margin-top: var(--sp-2); font-size: var(--fs-14); font-weight: 600; line-height: 1.35; color: var(--ink); }
 .al-msg {
-  margin-top: var(--sp-1); font-size: var(--fs-12); color: var(--ink-2); line-height: 1.45;
+  font-size: var(--fs-12); color: var(--ink-2); line-height: 1.45;
   display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
   overflow-wrap: anywhere; white-space: pre-wrap;
 }
-.al-msg.mono { background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-m); padding: 6px var(--sp-2); margin-top: var(--sp-2); font-size: var(--fs-12); }
-.al-src { margin-top: var(--sp-2); font-size: var(--fs-11); }
+.al-msg.mono { background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-m); padding: var(--sp-1h) var(--sp-2); }
+.al-src { font-size: var(--fs-11); }
 .al-x {
-  position: absolute; top: 9px; right: 9px; width: 24px; height: 24px; display: grid; place-items: center;
+  position: absolute; top: var(--sp-2); right: var(--sp-2); width: 24px; height: 24px; display: grid; place-items: center;
   border: 0; border-radius: var(--r-m); background: transparent; color: var(--ink-3); cursor: pointer;
   transition: background-color var(--t-fast) ease, color var(--t-fast) ease;
 }
 .al-x:hover { background: var(--select); color: var(--ink); }
+/* In an alert the decision card is the lower half, not a second box: the
+   alert's row 1 and title stand for the card's, and the card's exact command
+   replaces the one-line summary (you approve exactly what the box shows). */
+.al-card .ctl-slot:not(:empty) { padding: 0 var(--sp-4) var(--sp-3) calc(var(--sp-4) + 3px); margin-top: calc(-1 * var(--sp-1)); }
+.al-card .ctl-card { background: transparent; border: 0; padding: 0; gap: var(--sp-1h); }
+.al-card .ctl-card::before, .al-card .ctl-card .ctl-row1, .al-card .ctl-card .ctl-what { display: none; }
+.al-card:has(.ctl-card) .al-msg { display: none; }
+.al-card.al-linger { opacity: .92; }
 
 /* ── Toast stack ─────────────────────────────────────────────────────── */
 .al-stack {
-  position: fixed; right: var(--sp-5); bottom: var(--sp-5); z-index: 35; width: min(var(--al-w), calc(100vw - 32px));
-  display: flex; flex-direction: column; gap: 10px; pointer-events: none;
+  position: fixed; right: var(--sp-5); bottom: var(--sp-5); z-index: 35; width: min(380px, calc(100vw - 32px));
+  display: flex; flex-direction: column; gap: var(--sp-2h); pointer-events: none;
 }
 .al-stack > * { pointer-events: auto; }
+.al-toast { box-shadow: var(--shadow-pop); }
 html.al-drawer-open .al-stack { visibility: hidden; }
 @media (prefers-reduced-motion: no-preference) {
   .al-toast { animation: al-in var(--t-toast) var(--ease) both; }
@@ -92,19 +79,18 @@ html.al-drawer-open .al-stack { visibility: hidden; }
 @keyframes al-slide { from { transform: translateX(32px); opacity: 0; } to { transform: none; opacity: 1; } }
 .al-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); height: var(--h-top); padding: 0 var(--sp-3) 0 var(--sp-5); border-bottom: 1px solid var(--line); flex: none; }
 .al-h { margin: 0; font-size: var(--fs-14); font-weight: 600; display: flex; align-items: center; gap: var(--sp-2); }
-.al-head-count:not(:empty) { font: 500 var(--fs-11)/1 var(--font); min-width: 18px; text-align: center; padding: 3px 6px; border-radius: var(--r-pill); background: color-mix(in srgb, var(--al-wait) 18%, transparent); color: var(--warn); }
-.al-list { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; padding: var(--sp-4); display: flex; flex-direction: column; gap: 10px; }
-.al-list .al-card { box-shadow: none; border-color: var(--line); }
+.al-head-count:empty { display: none; }
+.al-list { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; padding: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-2h); }
 .al-list .al-card:hover { border-color: var(--line-2); }
 .al-empty { margin: 48px var(--sp-2); text-align: center; color: var(--ink-3); }
-.al-empty-t { color: var(--ink); font-weight: 600; font-size: var(--fs-14); margin: 0 0 6px; }
+.al-empty-t { color: var(--ink); font-weight: 600; font-size: var(--fs-14); margin: 0 0 var(--sp-1h); }
 .al-empty .faint { margin: 0 auto; max-width: 300px; font-size: var(--fs-12); }
-.al-foot { flex: none; border-top: 1px solid var(--line); padding: var(--sp-3) var(--sp-4) 14px; }
+.al-foot { flex: none; border-top: 1px solid var(--line); padding: var(--sp-3) var(--sp-4) var(--sp-3h); }
 .al-opts { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
 .al-opt { height: var(--h-ctl-s); font-size: var(--fs-12); }
-.al-opt[aria-pressed="true"] { border-color: color-mix(in srgb, var(--al-wait) 60%, var(--line-2)); background: color-mix(in srgb, var(--al-wait) 10%, var(--surface)); }
+.al-opt[aria-pressed="true"] { border-color: var(--ink-3); background: var(--raised); }
 .al-opt:disabled { cursor: default; color: var(--ink-4); }
-.al-status:not(:empty) { margin: 10px 0 0; font-size: var(--fs-12); color: var(--bad); }
+.al-status:not(:empty) { margin: var(--sp-2h) 0 0; font-size: var(--fs-12); color: var(--bad); }
 .al-status:empty { display: none; }
 
 @media (max-width: 560px) {

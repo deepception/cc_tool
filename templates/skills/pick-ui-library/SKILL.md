@@ -1,7 +1,7 @@
 ---
 name: pick-ui-library
 description: >-
-  Task-to-library lookup for common UI/product needs — toasts, command palettes, drag
+  Task-to-library lookup for common UI/product needs, including toasts, command palettes, drag
   and drop, virtualization, global state, class-name/variant composition, theming,
   forms, charts, date pickers, OTP inputs, animated numbers, syntax highlighting,
   icons, and which design system (Fluent/Material/Carbon/Radix/shadcn) fits a new
@@ -34,7 +34,7 @@ Most "should I build this myself" questions for common UI mechanics already have
 | Code syntax highlighting | `shiki` | VS Code-quality grammars, no runtime highlighting jank |
 | Icons | `@phosphor-icons/react` (then `hugeicons-react`, `@radix-ui/react-icons`, `@tabler/icons-react`) | Consistent stroke and grid; never hand-draw SVG icon paths. One family per project, so an existing icon dependency wins |
 
-Not covered here — use these instead:
+Not covered here, so use these instead:
 - **Accessible primitives** (dropdown, dialog, popover, tabs, tooltip) → the project's design system (below); Radix primitives when it has none.
 - **Visual direction, type, colour** → `design-director`.
 - **Motion, gesture physics, spring configs** → `product-ui-motion`.
@@ -59,4 +59,4 @@ Signals that a hand-rolled implementation should be replaced with a library from
 2. Check the lookup table, then the "not covered here" cross-references, before assuming nothing fits.
 3. Check the project's manifest for an existing dependency that already does the job (including one not in this table) before adding a new one.
 4. Recommend **one** library with the install command, not a menu of alternatives. If the project already uses a competing library for the same job, follow the existing one instead of introducing a second.
-5. If nothing here fits and no existing dependency covers it, say so rather than forcing a match — some things are genuinely fine to hand-roll (a copy-to-clipboard button, a simple modal wrapper around a native primitive).
+5. If nothing here fits and no existing dependency covers it, say so rather than forcing a match. Some things are genuinely fine to hand-roll (a copy-to-clipboard button, a simple modal wrapper around a native primitive).

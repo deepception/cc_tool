@@ -1,6 +1,6 @@
 # Design token scaffold
 
-Define these before writing any layout or component code — filling in values after the fact tends to produce one-off inline styles that drift from the design read. This is a starting shape, not a fixed schema: drop categories the build doesn't need, add ones it does (a data-viz palette, an elevation scale for a dashboard).
+Define these before writing any layout or component code. Filling in values after the fact tends to produce one-off inline styles that drift from the design read. This is a starting shape, not a fixed schema: drop categories the build doesn't need, add ones it does (a data-viz palette, an elevation scale for a dashboard).
 
 ```css
 :root {
@@ -40,4 +40,4 @@ Define these before writing any layout or component code — filling in values a
 }
 ```
 
-Fill values from the design read, not from habit — `design-taste-frontend` §4 (typography/color) and `product-ui-motion` (durations, easing curves) own the actual value decisions; this scaffold just fixes the token *names* so a build doesn't accumulate inline one-offs. One dark-mode swap strategy per project (Tailwind `dark:` variant or a second value set under `[data-theme="dark"]`/`prefers-color-scheme`) — see `design-taste-frontend` §8.
+Fill values from the design read, not from habit: `design-taste-frontend` §4 (typography/color) and `product-ui-motion` (durations, easing curves) own the actual value decisions; this scaffold just fixes the token *names* so a build doesn't accumulate inline one-offs. One dark-mode swap strategy per project (Tailwind `dark:` variant or a second value set under `[data-theme="dark"]`/`prefers-color-scheme`). See `design-taste-frontend` §8.

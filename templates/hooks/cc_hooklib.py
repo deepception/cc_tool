@@ -253,3 +253,56 @@ def match_rules(rules: list, tool: str, fields: dict) -> list:
             continue
         hits.append((r, m.group(0)))
     return hits
+
+
+# ── cc-dash control mode: why a command asked ─────────────────────────────────
+def guard_ask_key(session: str, command: str) -> str:
+    """Marker name; dash-control.py's guard_key() computes the same."""
+    return hashlib.sha256(("%s\0Bash\0%s" % (session, command)).encode("utf-8", "replace")).hexdigest()[:40]
+
+
+def _control_dir() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "cc_tool", "control")
+
+
+def _private(path: str, want_dir: bool) -> bool:
+    import stat
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    kind = stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)
+    return kind and st.st_uid == os.getuid() and not (st.st_mode & 0o077)
+
+
+def guard_ask_mark(session: str, command: str, reason: str) -> None:
+    """When `cc-dash --control` holds a fresh lease, leave a 0600 marker saying
+    bash-guard asked about this command and why, so the dashboard's approval
+    card shows the reason and asks for a typed confirm. Otherwise do nothing."""
+    try:
+        ctl = _control_dir()
+        lease = os.path.join(ctl, "lease")
+        asked = os.path.join(ctl, "asked")
+        if not session or not (_private(ctl, True) and _private(asked, True) and _private(lease, False)):
+            return
+        with open(lease, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if not isinstance(d, dict) or not isinstance(d.get("expires"), (int, float)) or d["expires"] < time.time():
+            return
+        try:
+            os.kill(int(d.get("pid") or 0), 0)
+        except (OSError, ValueError, TypeError):
+            return
+        path = os.path.join(asked, guard_ask_key(session, command) + ".json")
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, json.dumps({"session": session, "reason": reason[:2000], "ts": round(time.time(), 3)}).encode())
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 - never affect the guard's decision
+        pass

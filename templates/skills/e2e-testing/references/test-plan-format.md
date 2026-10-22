@@ -1,4 +1,4 @@
-# E2E Test Plan — Document Format
+# E2E Test Plan: Document Format
 
 Template for `docs/E2E-TEST-PLAN.md`. Sections in order; name scenario sections after the app's own feature areas. A complete worked example (mid-walkthrough state, one inline bug entry): [example-e2e-test-plan.md](example-e2e-test-plan.md).
 
@@ -6,7 +6,7 @@ Template for `docs/E2E-TEST-PLAN.md`. Sections in order; name scenario sections 
 
 State what the plan runs against, the marker legend, and the walkthrough date:
 
-    # <App> — End-to-End Test Plan
+    # <App>: End-to-End Test Plan
 
     Covers typical user interactions against <stack description>
     (<launch commands>, <seeded users/fixtures source>).
@@ -22,7 +22,7 @@ Credentials per role, seeded entities with names and counts, the reset mechanism
 
 ## Scenario sections
 
-One numbered section per feature area — auth first, role-based access second, then each major screen/command group, cross-cutting last. Each section is a table with hierarchical ids:
+One numbered section per feature area: auth first, role-based access second, then each major screen/command group, cross-cutting last. Each section is a table with hierarchical ids:
 
     | # | Scenario | Steps | Expected |
     |---|----------|-------|----------|
@@ -44,11 +44,11 @@ Pick what applies:
 
 ## Priorities
 
-Close the plan with tiers: **P0** — the flows that make the app worth shipping (login, the core object's happy path, regressions for data-destroying bugs); **P1** — the rest of the main features; **P2** — live-event edge cases and cross-cutting sweeps.
+Close the plan with tiers: **P0**: the flows that make the app worth shipping (login, the core object's happy path, regressions for data-destroying bugs); **P1**: the rest of the main features; **P2**: live-event edge cases and cross-cutting sweeps.
 
 ## Suggested automation structure
 
-Sketch the suite the plan maps to — a file per section plus a fixtures module:
+Sketch the suite the plan maps to (a file per section plus a fixtures module):
 
     e2e/
     ├── fixtures.ts          # login per role, seed helpers, health probe
@@ -59,4 +59,4 @@ This is a sketch for a future suite; generating it is a separate follow-up.
 
 ## Suggested fix order
 
-Appended at wrap-up, not authored with the plan: a short numbered list ordering the walkthrough's ❌ findings — user-blocking bugs first, then cheap-and-visible fixes.
+Appended at wrap-up, not authored with the plan: a short numbered list ordering the walkthrough's ❌ findings: user-blocking bugs first, then cheap-and-visible fixes.

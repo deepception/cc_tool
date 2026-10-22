@@ -117,6 +117,15 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -e \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/lease\" ] && python3 $CLAUDE_PROJECT_DIR/.claude/hooks/dash-control.py || true",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "Stop": [
@@ -140,6 +149,15 @@
             "async": true
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -e \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/pending\" ] && python3 $CLAUDE_PROJECT_DIR/.claude/hooks/dash-control.py || true",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -153,6 +171,15 @@
             "async": true
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -e \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/pending\" ] && python3 $CLAUDE_PROJECT_DIR/.claude/hooks/dash-control.py || true",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PermissionRequest": [
@@ -164,6 +191,15 @@
             "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
             "timeout": 2,
             "async": true
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -e \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/lease\" ] && python3 $CLAUDE_PROJECT_DIR/.claude/hooks/dash-control.py || true",
+            "timeout": 600
           }
         ]
       }
@@ -216,6 +252,15 @@
             "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
             "timeout": 2,
             "async": true
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -e \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/pending\" ] && python3 $CLAUDE_PROJECT_DIR/.claude/hooks/dash-control.py || true",
+            "timeout": 10
           }
         ]
       }
@@ -275,6 +320,25 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/route-nudge.py",
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -e \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/pending\" ] && python3 $CLAUDE_PROJECT_DIR/.claude/hooks/dash-control.py || true",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -308,6 +372,15 @@
             "async": true
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -e \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/pending\" ] && python3 $CLAUDE_PROJECT_DIR/.claude/hooks/dash-control.py || true",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -319,6 +392,15 @@
             "command": "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/attention.py",
             "timeout": 2,
             "async": true
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -e \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/pending\" ] && python3 $CLAUDE_PROJECT_DIR/.claude/hooks/dash-control.py || true",
+            "timeout": 10
           }
         ]
       }

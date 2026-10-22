@@ -1,7 +1,7 @@
 """The movie in one file: tempo, scene lengths, cue beats, on-screen copy and scored events.
 
 Brief (fill in before anything else; every claim on screen must trace to a source):
-  product:   <name> — <one-line value proposition, in your own words>
+  product:   <name>, <one-line value proposition, in your own words>
   audience:  <who>
   promise:   <the tagline the end card carries>
   sources:   <docs / code paths / URLs each claim was checked against>
@@ -19,7 +19,7 @@ Knobs, from coarse to fine:
 
 BPM = 128
 WIDTH, HEIGHT = 1920, 1080  # 1080×1920 for Shorts/Reels/TikTok, 1080×1080 for feeds
-TITLE = "Product — Launch"
+TITLE = "Product: Launch"
 
 # Brand tokens: injected into every scene as CSS custom properties (--c-<name>) and @font-face rules.
 COLORS = {

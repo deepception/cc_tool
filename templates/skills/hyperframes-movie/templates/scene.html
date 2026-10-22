@@ -75,7 +75,7 @@
             { opacity: 1, scale: 1, filter: "blur(0px)", textShadow: CHROMA_OFF, duration: 0.32, ease: "expo.out" },
             at,
           );
-        // Impact shake on the stage (three sequential .to — never a repeated fromTo).
+        // Impact shake on the stage (three sequential .to calls, never a repeated fromTo).
         const shake = (at, amp = 14) => {
           tl.to("#__ID__-stage", { x: -amp, y: amp * 0.5, duration: 0.035, ease: "none" }, at);
           tl.to("#__ID__-stage", { x: amp * 0.7, y: -amp * 0.4, duration: 0.045, ease: "none" }, at + 0.035);

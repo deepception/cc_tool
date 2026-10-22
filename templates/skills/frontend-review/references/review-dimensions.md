@@ -1,9 +1,9 @@
 # Frontend Review Dimensions
 
-What to look for, per dimension. Severity: 🔴 must fix, 🟡 should fix, 🔵 polish — user impact, not effort. A clean dimension is itself a finding worth one sentence. Defect findings follow the [finding format](#finding-format) at the end.
+What to look for, per dimension. Severity goes by user impact, not effort: 🔴 must fix, 🟡 should fix, 🔵 polish. A clean dimension is itself a finding worth one sentence. Defect findings follow the [finding format](#finding-format) at the end.
 
 ## 1. API client & auth plumbing
-- Endpoints bypassing the shared request wrapper — duplicated auth logic missing the shared 401/error handling.
+- Endpoints bypassing the shared request wrapper, so auth logic is duplicated and the shared 401/error handling is missed.
 - Missing timeouts/AbortController: a hung call spins a loading state forever.
 - Independent requests awaited one after another: a waterfall that multiplies load time, where `Promise.all` would run them together.
 - Error bodies not parsed (raw JSON shown to users).
@@ -11,7 +11,7 @@ What to look for, per dimension. Severity: 🔴 must fix, 🟡 should fix, 🔵 
 - Redirect handling that drops auth headers (e.g. a trailing-slash 307 whose re-request goes cross-origin or changes scheme).
 
 ## 2. State management
-- Token/session validation on app load — or does a stale token render the full shell before the first 401?
+- Is the token or session validated on app load, or does a stale token render the full shell before the first 401?
 - Events for unknown ids silently dropped; swallowed catch blocks with no diagnostic trail.
 - Persistence inventory: everything landing in localStorage/config files, one pattern or several, any secrets or PII.
 - Unbounded growth: arrays fed by streams/events without caps.
@@ -22,13 +22,13 @@ What to look for, per dimension. Severity: 🔴 must fix, 🟡 should fix, 🔵 
 - Destructive actions without confirmation.
 - Inverted threshold/comparison logic (a higher-is-better metric flagged as bad for exceeding a threshold).
 - Rules-of-hooks violations, including suppressed ones (`eslint-disable` on early returns before hooks).
-- Effects that subscribe (listeners, intervals, sockets, observers) with no cleanup; dependency arrays missing a value the effect reads, so it acts on stale data — suppressed `exhaustive-deps` included.
+- Effects that subscribe (listeners, intervals, sockets, observers) with no cleanup; dependency arrays missing a value the effect reads, so it acts on stale data, including suppressed `exhaustive-deps`.
 - Side effects in the render path (fetches, DOM writes, state setters). Components defined inside another component's body: each parent render creates a new type, so the child remounts and loses its state and focus.
 - Dead interactive chrome (buttons without onClick); dead code (components with no importers).
 - Silent failure paths: catch blocks that only log, no user feedback.
 
 ## 4. i18n architecture
-- Key-set symmetry across locales — diff programmatically, report as fact.
+- Key-set symmetry across locales: diff programmatically, report as fact.
 - Placeholder symmetry per key, in the same pass: `{count}` in one locale and `{n}` in another renders a raw token or a blank.
 - Plurals: a count-bearing string given one form in a locale whose rules need more (Polish and Russian distinguish one/few/many; Arabic has six categories). Numbers or units in a translation that disagree with the source string.
 - Files with zero i18n usage hardcoding user-visible strings (grep for absence of the translation hook).
@@ -38,11 +38,11 @@ What to look for, per dimension. Severity: 🔴 must fix, 🟡 should fix, 🔵 
 ## 5. Type safety
 - `any` in production code, `@ts-ignore`/`@ts-expect-error`, non-null `!` assertions, unjustified casts.
 - Runtime shape validation at API boundaries, or noted as mirroring a genuinely dynamic backend schema.
-- Contract drift: when the backend source or an OpenAPI/GraphQL schema is in the repo, compare the client's types with what the server actually sends — field names, optionality, nullability — rather than trusting the client's declaration.
+- Contract drift: when the backend source or an OpenAPI/GraphQL schema is in the repo, compare the client's types with what the server actually sends (field names, optionality, nullability) rather than trusting the client's declaration.
 
 ## 6. Accessibility basics
 - Clickable non-interactive elements: div/Box with onClick but no role, tabIndex, or keyboard handler.
-- Icon-only buttons without labels — spot-check and report the sample size.
+- Icon-only buttons without labels. Spot-check and report the sample size.
 - Color-only meaning without a text pairing.
 - Fixed `id`s inside components rendered more than once (list rows, reusable fields): every `htmlFor`/`aria-labelledby`/`aria-describedby` then resolves to the first instance. Form inputs with no associated label.
 - Contrast, focus traps, tab order → route to "Needs live confirmation".
@@ -63,9 +63,9 @@ Name the highest-complexity uncovered components; tie gaps to bugs from other di
 
 ## 9. Motion & interaction feel
 
-Applies to any app with transitions, animations, or drag/swipe interactions; skip it for CLIs and APIs and say so. The rule catalog and exact values live in [`product-ui-motion`](../../product-ui-motion/SKILL.md) and its `references/` — read them before writing findings, and pull curves, durations and spring configs from there rather than approximating. If that skill isn't installed alongside, review this dimension from the code's own motion tokens and flag the missing standard.
+Applies to any app with transitions, animations, or drag/swipe interactions; skip it for CLIs and APIs and say so. The rule catalog and exact values live in [`product-ui-motion`](../../product-ui-motion/SKILL.md) and its `references/`. Read them before writing findings, and pull curves, durations and spring configs from there rather than approximating. If that skill isn't installed alongside, review this dimension from the code's own motion tokens and flag the missing standard.
 
-- Animation on something the user hits 100+ times a day — a command palette, core navigation, a frequent toggle. The fix is usually deletion, not tuning.
+- Animation on something the user hits 100+ times a day (a command palette, core navigation, a frequent toggle). The fix is usually deletion, not tuning.
 - `transition: all`, `ease-in` on anything the user waits on, UI durations over 300ms outside modals/drawers/sheets.
 - Entrances from `scale(0)`; `transform-origin: center` on a trigger-anchored popover, dropdown or tooltip (modals are exempt).
 - `@keyframes` on rapidly-triggered elements (toasts, toggles) where transitions or springs would retarget instead of restarting.
@@ -73,7 +73,7 @@ Applies to any app with transitions, animations, or drag/swipe interactions; ski
 - Missing `prefers-reduced-motion` handling on movement; `:hover` motion not gated behind `@media (hover: hover) and (pointer: fine)`.
 - Symmetric timing on a press-and-release or hold interaction; a group entrance with no stagger where 30–80ms belongs.
 
-Report these as the `Before | After | Why` table from `motion-standards.md` rather than prose bullets, and close with a short **considered and rejected** list — places that could animate and deliberately should not, each with the reason. A motion section that only adds motion is a wishlist. Feel judgements that code can't settle (does a crossfade read as one object, is a spring's bounce right) go to "Needs live confirmation" with the feel-check that would settle them.
+Report these as the `Before | After | Why` table from `motion-standards.md` rather than prose bullets, and close with a short **considered and rejected** list of places that could animate and deliberately should not, each with the reason. A motion section that only adds motion is a wishlist. Feel judgements that code can't settle (does a crossfade read as one object, is a spring's bounce right) go to "Needs live confirmation" with the feel-check that would settle them.
 
 ## 10. Untrusted content & client-side security
 
@@ -82,7 +82,7 @@ The interface layer's share of security: places where data the repo didn't autho
 - Raw-HTML escape hatches: `dangerouslySetInnerHTML`, `v-html`, `innerHTML`/`insertAdjacentHTML`, Astro's `set:html`, a template engine's unescaped output (`{{{ }}}`, `!{}`, `|safe`). Trace where the string comes from and whether a sanitizer runs after the last concatenation. Plain JSX or `{{ }}` text is escaped by the framework already; don't flag it.
 - User- or API-supplied URLs in `href`, `src`, `action`, `window.location`, or a post-login redirect (`?next=`, `returnUrl`) with no scheme or destination allowlist: `javascript:` links, open redirects. Frameworks differ by version on blocking `javascript:` URLs, so check the installed version before rating severity.
 - `eval`, `new Function`, string arguments to `setTimeout`/`setInterval`, `document.write`.
-- Server data crossing to the client whole: SSR props, hydrated-island props or serialized page state (`__NEXT_DATA__`, `window.__INITIAL_STATE__`) carrying fields the UI never shows — tokens, internal ids, other users' records. State serialized into an inline `<script>` without escaping `</script>`.
+- Server data crossing to the client whole: SSR props, hydrated-island props or serialized page state (`__NEXT_DATA__`, `window.__INITIAL_STATE__`) carrying fields the UI never shows: tokens, internal ids, other users' records. State serialized into an inline `<script>` without escaping `</script>`.
 
 ## Finding format
 
@@ -92,13 +92,13 @@ One root cause at many sites is one finding: give the count and representative c
 
 ## Doc skeleton
 
-    # <App> — Frontend Code Review (<date>)
+    # <App>: Frontend Code Review (<date>)
 
-    Static source review of `<scope>`. Complements <sibling docs> — findings here
+    Static source review of `<scope>`. Complements <sibling docs>. Findings here
     are visible only by reading the code, and duplicate none of those reports'
     line items except where a new, distinct root cause was found.
 
-    Coverage: <N> files in scope — <n> read in full, <n> sampled (<how>),
+    Coverage: <N> files in scope, of which <n> read in full, <n> sampled (<how>),
     <n> skipped (<why>). Excluded as generated/vendored: <paths>.
     Severity: 🔴 must fix · 🟡 should fix · 🔵 polish.
 

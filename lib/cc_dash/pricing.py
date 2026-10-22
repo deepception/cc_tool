@@ -37,6 +37,15 @@ LONG_CONTEXT = {
     "claude-haiku-5-5": (100_000, (0.50, 2.50, 0.05)),
 }
 
+# Claude Code's default effort per model when nothing sets one (README.md
+# "Choosing a model"). Used only to label an unrecorded effort as a default.
+DEFAULT_EFFORT = {
+    "claude-opus-5-5": "medium",
+    "claude-sonnet-5-5": "medium",
+    "claude-haiku-5-5": "medium",
+}
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
 # Fast mode (usage.speed == "fast") doubles the price ($8/$40 for Opus 5.5).
 FAST_MULTIPLIER = 2.0
 
@@ -77,6 +86,11 @@ def display_name(model: str) -> str:
     return fam.capitalize() + (" " + ".".join(nums) if nums else "")
 
 
+def default_effort(model: str) -> str:
+    """The effort Claude Code uses for this model when none is set, or '' when we do not know it."""
+    return DEFAULT_EFFORT.get(normalize(model), "")
+
+
 def has_price(model: str) -> bool:
     return normalize(model) in PRICES
 
@@ -96,6 +110,20 @@ def message_cost(model: str, inp: int, out: int, cread: int, cw5: int, cw1h: int
     if speed == "fast":
         cost *= FAST_MULTIPLIER
     return cost
+
+
+def cache_write_cost(model: str, inp: int, cread: int, cw5: int, cw1h: int, speed: str = ""):
+    """The cache-write share of one message's cost (routing.py's cache-expiry rewrites), or None when unpriced."""
+    m = normalize(model)
+    p = PRICES.get(m)
+    if p is None:
+        return None
+    pin = p[0]
+    lc = LONG_CONTEXT.get(m)
+    if lc and (inp + cread + cw5 + cw1h) > lc[0]:
+        pin = lc[1][0]
+    cost = (cw5 * pin * 1.25 + cw1h * pin * 2.0) / 1e6
+    return cost * FAST_MULTIPLIER if speed == "fast" else cost
 
 
 def table():

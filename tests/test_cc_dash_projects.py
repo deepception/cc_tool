@@ -37,6 +37,7 @@ from urllib.parse import quote
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash.server import make_server  # noqa: E402
+from dash_pairing import auto_cookie  # noqa: E402  (tests/dash_pairing.py: every request carries the pairing cookie)
 from cc_dash.store import Store, resolve_projects  # noqa: E402
 
 RESULTS = []
@@ -249,6 +250,7 @@ def run(base):
     srv = make_server(0, Store(root=cfg, days=7), fallback=False)
     port = srv.port
     threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+    auto_cookie(srv)
     try:
         code, body = get(port, "/api/overview?project=beta")
         d = json.loads(body)

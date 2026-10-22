@@ -20,7 +20,7 @@ to the pointer breaks the illusion immediately.
 el.addEventListener('pointerdown', (e) => {
   el.setPointerCapture(e.pointerId);          // tracking survives leaving the bounds
   const grabOffset = e.clientY - el.getBoundingClientRect().top;
-  // keep a short history of (position, timestamp) — you need velocity at release
+  // keep a short history of (position, timestamp) to get velocity at release
 });
 ```
 
@@ -34,12 +34,12 @@ switching fingers mid-drag makes the element jump.
 ## Interruption
 
 Every animation a user can touch must be grabbable mid-flight and reversible without
-waiting for it to finish. Animate from the **presentation value** — the element's live
-on-screen transform — never from the logical target, or the interrupt visibly jumps.
+waiting for it to finish. Animate from the **presentation value** (the element's live
+on-screen transform), never from the logical target, or the interrupt visibly jumps.
 
 When a gesture reverses, blend velocity rather than hard-cutting it; a discontinuity at
-the reversal reads as a brick wall. Decompose 2D motion into independent X and Y springs
-— one spring over a 2D distance desyncs when the axes have different velocities.
+the reversal reads as a brick wall. Decompose 2D motion into independent X and Y springs.
+One spring over a 2D distance desyncs when the axes have different velocities.
 
 ## Velocity handoff
 
@@ -52,12 +52,12 @@ relativeVelocity = gestureVelocity / (targetValue − currentValue)
 ```
 
 Element at `y=50`, target `y=150`, finger at 50px/s → `50 / 100 = 0.5`. Undefined when
-already at the target — guard it.
+already at the target, so guard it.
 
 ## Momentum projection
 
 Don't snap to the boundary nearest the *release point*. Project where the gesture was
-going — the same deceleration model scrolling uses — and snap to the target nearest
+going, using the same deceleration model scrolling uses, and snap to the target nearest
 *that*. This is what makes a flick feel like a throw.
 
 ```js
@@ -70,7 +70,7 @@ const projected = currentPosition + project(releaseVelocity);
 animateSpringTo(nearestSnapPoint(projected), { velocity: releaseVelocity });
 ```
 
-The textbook `v²/(2·decel)` is not what ships here — the exponential-decay form above is.
+The textbook `v²/(2·decel)` is not what ships here; the exponential-decay form above is.
 
 For dismissal, don't gate on distance alone: compute `Math.abs(distance) / elapsedMs`
 and dismiss above ~0.11 regardless of how far it travelled. A flick should be enough.
@@ -95,13 +95,13 @@ What slides in from the right dismisses to the right. Enter and exit share a pat
 reversible transitions mirror their easing (inverse control points for the two
 directions). A surface that arrives one way and leaves another disorients.
 
-Intermediate motion should point at the outcome — people predict the final state from
+Intermediate motion should point at the outcome. People predict the final state from
 the trajectory, so make the in-between frames telegraph it rather than interpolate
 blindly.
 
 ## Reduced motion
 
-Gestures are the case where "reduced" cannot mean "removed" — the interaction is the
+Gestures are the case where "reduced" cannot mean "removed", because the interaction is the
 motion. Replace projected/spring settling with a short cross-fade to the committed
 state, drop overshoot entirely, and keep the 1:1 tracking during the gesture itself.
 Also honour `prefers-reduced-transparency` (raise background opacity, drop blur) and
