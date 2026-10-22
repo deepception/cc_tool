@@ -90,7 +90,7 @@ GUARD_MARK_TTL = 120.0
 CLIP = 400
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 QUESTION_TOOLS = {"AskUserQuestion": "question", "ExitPlanMode": "plan"}
-SHOWN_KEYS = ("session", "agent_id", "cwd", "tool", "kind", "input", "guard", "ask_rule")   # = lib/cc_dash/control.py
+SHOWN_KEYS = ("session", "agent_id", "agent_type", "cwd", "tool", "kind", "sig", "input", "input_truncated", "mode", "guard", "ask_rule")   # = lib/cc_dash/control.py
 VERIFY_TIMEOUT = 2.0
 TARGET_KEYS = ("file_path", "notebook_path", "path", "url", "pattern", "query", "skill",
                "description", "prompt", "command", "message")

@@ -881,6 +881,12 @@ CASES = [
     ("CD60", "ccdash", FEATURE, "ls ~/.local/state//cc_tool/././control/dec", D),
     ("CD61", "ccdash", FEATURE, "curl -s http://127.0.0.1:7878//api/control/decide", D),
     ("CD62", "ccdash", FEATURE, "cat ~/.local/state/cc_tool//attention.jsonl", A),
+    ("CD63", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/con\\trol/lease", D),          # backslash escape
+    ("CD64", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/x/../control/lease", D),     # .. segment
+    ("CD65", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/contr?l/req/a.json", K),      # glob under cc_tool
+    ("CD66", "ccdash", FEATURE, "ls ~/.local/state/cc_t*/control/dec", K),               # glob in place of cc_tool
+    ("CD67", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/{control,x}/lease", K),      # brace expansion
+    ("CD68", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/attention.jsonl | tail", A),
     ("CD39", "ccdash", FEATURE, "cc-dash --control-wait 30", A),                        # not --control (cc-dash itself needs --control for it)
     ("CD40", "ccdash", FEATURE, "git log --oneline -- bin/cc-dash", A),
 

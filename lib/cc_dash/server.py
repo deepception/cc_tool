@@ -525,7 +525,11 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
     # A typical double-fork escape: re-parented to init or a user-manager subreaper
     # and no controlling terminal left.
     parent = _proc_stat(st["ppid"], proc) if st["ppid"] > 1 else None
-    if st["tty"] == 0 and (st["ppid"] <= 1 or (parent or {}).get("comm") in ("systemd", "init")):
+    reparented = st["ppid"] <= 1 or (parent or {}).get("comm") in ("systemd", "init")
+    if st["sid"] == me and reparented:          # setsid'd itself, then lost its parent: a fresh detached session
+        return ("cc-dash --control must be started from your own terminal: this process leads a fresh session "
+                "and was re-parented to pid %d." % st["ppid"])
+    if st["tty"] == 0 and reparented:
         return ("cc-dash --control must be started from your own terminal: this process was detached (re-parented "
                 "to pid %d) and has no controlling terminal." % st["ppid"])
     return ""

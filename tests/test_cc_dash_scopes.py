@@ -441,10 +441,16 @@ def test_launch_refusals():
     check("fake /proc: a process-group leader that descends from claude: refused", "process-group leader descends" in why, why)
     build(sid_leader_parent=110, me_tty=0, me_sid=400, me_pgrp=400)
     why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
-    check("fake /proc: re-parented to the user manager with no controlling terminal: refused", "was detached" in why, why)
+    check("fake /proc: re-parented to the user manager with no controlling terminal: refused",
+          "must be started from your own terminal" in why, why)
+    # What `ccdash` really does (measured): own process group, the shell's session,
+    # re-parented to the user manager, the terminal still open.
+    build(sid_leader_parent=110, me_sid=200, me_pgrp=400)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    check("fake /proc: detached into its own process group, shell's session, terminal open (what `ccdash` does): allowed", why == "", why)
     build(sid_leader_parent=110, me_sid=400, me_pgrp=400)
     why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
-    check("fake /proc: detached but with its own terminal (what `ccdash` does): allowed", why == "", why)
+    check("fake /proc: leads a fresh session (setsid) and was re-parented: refused", "leads a fresh session" in why, why)
     build(sid_leader_parent=110, me_ppid=300)
     why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
     check("fake /proc: started from a terminal shell, leaders clean: allowed", why == "", why)
@@ -485,6 +491,15 @@ def test_card_binding_with_real_hook():
         st, out = s.req("POST", "/api/control/decide", {"id": req["id"], "action": "allow", "hash": req["hash"]}, token=ctok)
         time.sleep(1.0)
         check("binding: the approval of the forged card is not applied to the real call", st == 200 and p.poll() is None, (st, p.poll()))
+        # Only the one-line summary the card and Live row show is rewritten, the input is untouched.
+        os.unlink(path)
+        plant(path, dict(req, sig="ls"))
+        s.ctl.scan()
+        shown = next(x for x in s.req("GET", "/api/control/state", token=tok)[1]["requests"] if x["id"] == req["id"])
+        check("binding: the dashboard shows the forged summary", shown.get("sig") == "ls", shown.get("sig"))
+        st, out = s.req("POST", "/api/control/decide", {"id": req["id"], "action": "allow", "hash": req["hash"]}, token=ctok)
+        time.sleep(1.0)
+        check("binding: a forged summary alone cannot borrow an approval either", p.poll() is None, (st, p.poll()))
         p.terminate()
         p.communicate(timeout=5)
     finally:
@@ -515,7 +530,16 @@ fd = os.open(tty if tty != "-" else os.devnull, os.O_RDWR)
 os.dup2(fd, 0)
 lf = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 os.dup2(lf, 1); os.dup2(lf, 2)
-os.write(pidw, str(os.getpid()).encode()); os.close(pidw)
+# Like a terminal: a "shell" leads the session and owns the pty, cc-dash runs as its child.
+child = os.fork()
+if child:
+    os.write(pidw, str(child).encode()); os.close(pidw)
+    os.closerange(3, 1024)             # the "shell" holds no extra fds (e.g. the --ready-fd pipe)
+    try:
+        os.waitpid(child, 0)
+    finally:
+        os._exit(0)
+os.close(pidw)
 os.execvpe(cmd[0], cmd, os.environ)
 """
 

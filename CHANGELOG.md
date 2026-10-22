@@ -2,6 +2,17 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.2.2
+
+Security follow-up to v0.2.1's control mode, from another review round.
+
+**Upgrading:** run `cc-update-project` in each project (dash-control.py and bash-guard.py changed).
+
+- **A decision is bound to everything its card shows:** the command, its one-line summary, the agent, its type and the permission mode. Before, a pending request rewritten after the card was drawn could keep the real command and change only the summary, so the card looked harmless while the approval applied to the real call.
+- **bash-guard path matching** now also drops backslashes and `x/..` segments before matching cc-dash's control directory and log, and a glob or brace pattern that could expand into them (`contr?l`, `cc_t*/control`, `{control,x}`) asks instead of passing.
+- **`cc-dash --control` also refuses** a process that leads a fresh session after losing its parent (the `setsid` form of a detached launch). A real `ccdash` launch keeps the shell's session and is unaffected.
+- **Tests:** bash-guard 739, scopes 108 (the real-process tests now launch cc-dash as a terminal does: a shell leads the session and cc-dash runs as its child).
+
 ## v0.2.1
 
 Security hotfix for `cc-dash --control`. A review of v0.2.0 found that the user's own agents, which run as the same user, could pair the dashboard and approve their own permission prompts, or plant a decision file the control hook would apply. Read-only `cc-dash` was not affected.

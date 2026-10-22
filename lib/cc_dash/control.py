@@ -85,7 +85,7 @@ AUDIT_MAX_BYTES = 5_000_000
 SUBDIRS = ("req", "dec", "res", "msg", "dlv", "asked", "sock", "stop", "stopped")
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-SHOWN_KEYS = ("session", "agent_id", "cwd", "tool", "kind", "input", "guard", "ask_rule")
+SHOWN_KEYS = ("session", "agent_id", "agent_type", "cwd", "tool", "kind", "sig", "input", "input_truncated", "mode", "guard", "ask_rule")
 DECIDE_ACTIONS = {"permission": ("allow", "allow_session", "deny", "release"), "plan": ("allow", "deny", "release"),
                   "question": ("answer", "deny", "release")}
 APPROVALS = ("allow", "allow_session", "answer")

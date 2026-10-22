@@ -2352,12 +2352,19 @@ def _dash_norm(cmd: str) -> str:
     """The command with quotes dropped, repeated '/' collapsed and './' segments
     removed, so `/cc_tool//control`, `/cc_tool/./control` or `/cc_"tool"/control`
     can't slip past the path and URL patterns."""
-    s = cmd.replace('"', "").replace("'", "")
+    s = cmd.replace('"', "").replace("'", "").replace("\\", "")
     s = re.sub(r"/{2,}", "/", s)
     prev = None
     while prev != s:
-        prev, s = s, re.sub(r"/\.(?=/)", "", s)
+        prev = s
+        s = re.sub(r"/\.(?=/|$)", "", s)                       # ./ segments
+        s = re.sub(r"/(?!\.\.(?:/|$))[^/\s]+/\.\.(?=/|$)", "", s)  # x/.. segments
     return s
+
+
+# A glob or brace segment where a path could expand into the control dir or the log:
+# directly under cc_tool/, or in place of cc_tool before control/ or cc-dash.log.
+_CTL_GLOB_RE = re.compile(r"/cc_tool/[^/\s]*[*?\[{]|/[^/\s]*[*?\[{][^/\s]*/(?:control(?![\w.-])|cc-dash\.log(?![\w-]))")
 
 
 def check_cc_dash_raw(cmd: str) -> None:
@@ -2367,6 +2374,11 @@ def check_cc_dash_raw(cmd: str) -> None:
         what = "the cc-dash log" if "cc-dash.log" in m.group(0) else "cc-dash's control directory (…/cc_tool/control/)"
         deny(f"this command touches {what}: it carries dashboard approvals, messages and stops (and the pairing "
              "link), and only cc-dash and its hook may read or write it", _DASH_SUGGESTION)
+    m = _CTL_GLOB_RE.search(cmd)
+    if m:
+        ask(f"this command uses a pattern ('{m.group(0)}') that can expand into cc-dash's control directory or log, "
+            "which carry dashboard approvals and only cc-dash and its hook may touch",
+            "write the path out in full; if it isn't cc-dash's control directory or log, this will pass")
     m = _DASH_API_RE.search(cmd)
     if m:
         deny(f"this command calls cc-dash's pairing or control endpoint ('{m.group(0)}'): only the user's own "
