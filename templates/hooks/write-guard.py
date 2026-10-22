@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Pre-flight guard for file writes (PreToolUse hook on Edit|Write|MultiEdit).
+"""Pre-flight guard for file writes (PreToolUse hook on Edit|Write|MultiEdit|NotebookEdit).
+
+Every path-like field in the tool input (file_path, path, notebook_path) is
+checked against the location rules below, not just the first one present: a
+decoy field must not stand in for the path the tool really writes.
 
 Blocks (deny):
   - writes to system paths (/etc, /usr, /bin, /boot, /dev, /proc, /sys, …)
@@ -7,10 +11,20 @@ Blocks (deny):
     ~/.zshrc, ~/.profile, ~/.gitconfig, ~/.aws/*, ~/.npmrc, ~/.config/gh/*)
   - writes inside the repo's .git/ directory (or another worktree's)
   - writes into cc-dash's control directory
-    (${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/) or its log: decision,
-    message and stop files there are how the dashboard talks to the
-    dash-control hook, and an agent must not forge them (cc-dash also verifies
-    every one; this is defence in depth)
+    (${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/) or its log, by
+    Write, Edit, MultiEdit or NotebookEdit, judged on the real path of the
+    exact path (symlinks resolved): the lease, decision, message and stop
+    files there are how the dashboard talks to the dash-control hook, and an
+    agent must not forge them (the hook also checks the dashboard process and
+    cc-dash verifies every file; this is defence in depth).
+  - writes anywhere in the cc_tool checkout this project was set up from (the
+    path in cc_tool_root beside this hook): it holds the code cc-dash and the
+    hooks run, so an agent must not change it from another project. Unless the
+    project IS that checkout or one of its worktrees: developing cc_tool
+    itself is outside control mode's protection.
+  - writes to cc-dash's project registry (.../cc_tool/projects.json).
+  NotebookEdit gets the location checks (these denials, .git/, system paths,
+  dotfiles, outside the project), not the content ones.
   - secrets in the proposed content: private-key blocks, AWS/GitHub/Slack/
     Anthropic/OpenAI/Google/Stripe keys, JWTs, and `api_key = "<long literal>"`
     style assignments. Placeholder-looking values (EXAMPLE, your_, xxx, <…>,
@@ -159,10 +173,45 @@ def check_cc_dash(root: str, path: str) -> None:
     real = os.path.realpath(path)
     sd = _cc_state_dir()
     for spot in {sd, os.path.realpath(sd)}:
-        if _under(real, os.path.join(spot, "control")) or real == os.path.join(spot, "cc-dash.log"):
+        if _under(real, os.path.join(spot, "control")) or real in (os.path.join(spot, "cc-dash.log"),
+                                                                    os.path.join(spot, "projects.json")):
             deny(root, path, f"writing '{real}' forges cc-dash's control channel (approvals, messages and stops "
                              "between the dashboard and its hook)",
                  "ask the user to approve or answer in their terminal or in the dashboard")
+
+
+def _pinned_root() -> str:
+    """The real path in cc_tool_root beside this hook (written by cc-setup), or ''."""
+    import stat
+    p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc_tool_root")
+    try:
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022 or st.st_size > 4096:
+            return ""
+        raw = os.read(fd, 4096).decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+    return os.path.realpath(raw) if os.path.isabs(raw) and "\n" not in raw else ""
+
+
+def check_checkout(root: str, path: str) -> None:
+    pin = _pinned_root()
+    if not pin or os.path.realpath(root) == pin:
+        return              # no pin, or this project is the cc_tool checkout itself
+    real = os.path.realpath(path)
+    if not _under(real, pin):
+        return
+    if any(os.path.realpath(wt) == pin for wt in repo_worktrees(root)):
+        return              # a worktree of the cc_tool repository: developing cc_tool itself
+    deny(root, path, f"writing '{real}' changes the cc_tool checkout whose code cc-dash and this "
+                     "project's hooks run",
+         "make cc_tool changes in a session opened in the cc_tool repository itself")
 
 
 def check_location(root: str, path: str, settings: dict) -> None:
@@ -278,9 +327,11 @@ def main() -> None:
     ti = data.get("tool_input") or {}
     if not isinstance(ti, dict):
         sys.exit(0)
-    path = ti.get("file_path") or ti.get("path") or ""
-    if not isinstance(path, str) or not path:
+    # Every path-like field present, not the first: a decoy file_path must not hide a notebook_path.
+    paths = [ti[k] for k in ("file_path", "path", "notebook_path") if isinstance(ti.get(k), str) and ti[k]]
+    if not paths:
         sys.exit(0)
+    path = paths[0]
     root = lib.repo_root() if lib else (os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     settings: dict = {}
     if lib:
@@ -291,11 +342,14 @@ def main() -> None:
             contents.append(e.get("new_string"))
     contents = [c for c in contents if isinstance(c, str)]
 
-    check_cc_dash(root, path)
-    check_location(root, path, settings)
-    check_secrets(root, path, contents)
-    check_project_rules(root, path, contents)
-    check_trajectory(root, data.get("session_id") or "", path)
+    for each in paths:
+        check_cc_dash(root, each)
+        check_checkout(root, each)
+        check_location(root, each, settings)
+    if TOOL != "NotebookEdit":             # notebooks: the location checks only
+        check_secrets(root, path, contents)
+        check_project_rules(root, path, contents)
+        check_trajectory(root, data.get("session_id") or "", path)
     if WARNINGS:
         _log(root, "warn", path, " | ".join(WARNINGS))
         print(json.dumps({"hookSpecificOutput": {

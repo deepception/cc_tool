@@ -12,8 +12,19 @@ file alone: it asks this process (GET /api/control/verify, answered from
 checks that the answer came from the process the lease names (the socket's
 owner in /proc). A planted file without a matching record does nothing, and
 files this launch did not issue are not shown either. A decision is also bound
-to what the card showed (a digest of tool, input, cwd and flags), so a request
-file rewritten under the dashboard's eyes cannot borrow an approval.
+to what the card showed (a digest of every field the card renders: tool,
+input, cwd, flags, session rules, MCP server), so a request file rewritten
+under the dashboard's eyes cannot borrow an approval.
+
+Requests. A req/ file is shown only while the process it names (`pid`) is a
+dash-control.py hook installed from this checkout: /proc/<pid>/exe a Python
+interpreter running exactly <project>/.claude/hooks/dash-control.py (the
+project from that process's own CLAUDE_PROJECT_DIR), whose cc_tool_root names
+this checkout, holding that very file open, from a project cc-setup registered
+in projects.json (procs.hook_problem). Anything else is a
+planted card (one could ask for the control code): it is not shown, and the
+audit log records it. Text sent from the dashboard (deny reasons, answers,
+messages) that contains the control code is refused by the server.
 
 The lease. A 0700 directory ${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/
 holds a 0600 `lease` (pid, launch id, expiry ~6 s ahead, the hook's wait)
@@ -25,9 +36,11 @@ Permission prompts (also questions and plans). The hook writes req/<id>.json,
 with a sha256 of tool + canonical input, and polls dec/<id>.json; decide()
 writes the decision there by atomic rename, carrying that hash, and the hook's
 outcome comes back in res/<id>.json (applied, terminal, released, lease,
-timeout). A request that bash-guard asked about (its marker in asked/) or that
-matches a permissions.ask rule needs a typed "approve", never just a click, and
-never gets "allow for this session". Approvals are rate-limited per client.
+timeout). A request that bash-guard asked about (the hook runs bash-guard's
+own classify() on the command) or that matches a permissions.ask rule needs a
+typed "approve", never just a click, and never gets "allow for this session".
+A request whose input the hook had to shorten (input_truncated) can only be
+denied or released to the terminal. Approvals are rate-limited per client.
 
 Messages. To a session's main thread they go over the session's inbox socket
 (cross-session messaging, the documented way for a script to post into a
@@ -65,7 +78,12 @@ import subprocess
 import threading
 import time
 
+from . import procs
 from .attention import state_dir
+
+# This checkout (lib/cc_dash/control.py -> the repo): a request is shown only when
+# a dash-control.py installed from here (its cc_tool_root names it) wrote it.
+CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 REQ_ID = re.compile(r"^[0-9a-f]{6,16}-[0-9a-f]{12}$")
@@ -82,10 +100,18 @@ MAX_REASON = 4000
 RATE_N, RATE_SECS = 6, 10.0    # at most this many approvals per client in this window
 AUDIT_KEEP = 2000              # audit lines kept in memory (the file keeps everything)
 AUDIT_MAX_BYTES = 5_000_000
-SUBDIRS = ("req", "dec", "res", "msg", "dlv", "asked", "sock", "stop", "stopped")
+SUBDIRS = ("req", "dec", "res", "msg", "dlv", "sock", "stop", "stopped")
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 CLOEXEC = getattr(os, "O_CLOEXEC", 0)
-SHOWN_KEYS = ("session", "agent_id", "agent_type", "cwd", "tool", "kind", "sig", "input", "input_truncated", "mode", "guard", "ask_rule")
+# Every request field the dashboard card (web/control.js buildCard) renders, and only those
+# (besides id, hash, ts and status); templates/hooks/dash-control.py has the same tuple.
+# `sig`, the one-line summary, is not among them: the card shows the input itself, and an
+# alert row's text is derived from the input too (_summary).
+SHOWN_KEYS = ("session", "agent_id", "agent_type", "cwd", "tool", "kind", "input", "input_truncated", "mode", "guard",
+              "ask_rule", "session_rules", "server")
+# The fields attention.py's target() takes a call's one-line summary from, in order.
+TARGET_KEYS = ("file_path", "notebook_path", "path", "url", "pattern", "query", "skill",
+               "description", "prompt", "command", "message")
 DECIDE_ACTIONS = {"permission": ("allow", "allow_session", "deny", "release"), "plan": ("allow", "deny", "release"),
                   "question": ("answer", "deny", "release")}
 APPROVALS = ("allow", "allow_session", "answer")
@@ -117,14 +143,19 @@ def private_dir(d):
 
 
 def read_json(path, limit=1024 * 1024):
+    return read_json_ident(path, limit)[0]
+
+
+def read_json_ident(path, limit=1024 * 1024):
+    """(dict, (st_dev, st_ino) of the very file read), or (None, None)."""
     try:
         fd = os.open(path, os.O_RDONLY | NOFOLLOW | CLOEXEC | getattr(os, "O_NONBLOCK", 0))
     except OSError:
-        return None
+        return None, None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077 or st.st_size > limit:
-            return None
+            return None, None
         raw = b""
         while len(raw) <= limit:
             b = os.read(fd, 65536)
@@ -132,14 +163,14 @@ def read_json(path, limit=1024 * 1024):
                 break
             raw += b
     except OSError:
-        return None
+        return None, None
     finally:
         os.close(fd)
     try:
         d = json.loads(raw)
     except ValueError:
-        return None
-    return d if isinstance(d, dict) else None
+        return None, None
+    return (d, (st.st_dev, st.st_ino)) if isinstance(d, dict) else (None, None)
 
 
 def write_json(path, obj):
@@ -260,7 +291,8 @@ def _socket_ok(path):
 
 # ── the controller ──────────────────────────────────────────────────────────
 class Control:
-    def __init__(self, store, port, ctl_dir=None, wait=300.0, clock=time.time, agents_cmd="auto", sockets=True):
+    def __init__(self, store, port, ctl_dir=None, wait=300.0, clock=time.time, agents_cmd="auto", sockets=True,
+                 hook_check=True, root=None):
         self.store = store
         self.port = port
         self.dir = ctl_dir or os.path.join(state_dir(), "control")
@@ -289,9 +321,16 @@ class Control:
         self.agents = {}           # session id -> {"status", "waiting_for", "pid"}
         self._agents_at = 0.0
         self._lease_at = 0.0
+        self._lease_seen = False       # the first write replaces whatever a previous launch left
+        self._lease_foreign = set()    # pids of other lease writers already audited
         self._stop = threading.Event()
         self._thread = None
         self.audit_path = os.path.join(self.dir, "audit.jsonl")
+        # Requests are shown only from a real hook process (procs.hook_problem). Off
+        # only for tests that write request files by hand.
+        self.hook_check = hook_check and os.path.isdir("/proc/self")
+        self.root = root or CC_TOOL_DIR
+        self.planted = {}          # request id -> why it was not shown (audited once)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def start(self, thread=True):
@@ -327,6 +366,15 @@ class Control:
     def write_lease(self):
         now = self.clock()
         self._lease_at = now
+        # Someone else wrote the lease since our last write (a second dashboard, or something running
+        # as you): ours goes back, and the audit log says so once per writer. The hook trusts a lease
+        # only when its pid is this checkout's cc-dash, so a planted one can block, never approve.
+        old = read_json(os.path.join(self.dir, "lease"), 4096) if self._lease_seen else None
+        self._lease_seen = True
+        if old is not None and old.get("launch") != self.launch and old.get("pid") not in self._lease_foreign:
+            self._lease_foreign.add(old.get("pid"))
+            self.log(None, "refused", kind="lease", item=str(old.get("pid")),
+                     result="another process overwrote the control lease (pid %s); cc-dash wrote its own back" % old.get("pid"))
         write_json(os.path.join(self.dir, "lease"),
                    {"v": 1, "pid": os.getpid(), "launch": self.launch, "port": self.port, "key": self.key,
                     "expires": round(now + LEASE_TTL, 3), "wait": self.wait, "written": round(now, 3)})
@@ -396,13 +444,12 @@ class Control:
             self._scan_stops(now)
             self._prune_issued(now)
             self.set_pending(bool(_names(os.path.join(self.dir, "msg")) or _names(os.path.join(self.dir, "stop"))))
-            for n in _names(os.path.join(self.dir, "asked")):
-                p = os.path.join(self.dir, "asked", n)
-                try:
-                    if now - os.lstat(p).st_mtime > 300:
-                        unlink(p)
-                except OSError:
-                    pass
+
+    def projects(self):
+        """The projects cc-setup registered (real paths), from projects.json beside
+        the control directory: only their hooks' requests are shown."""
+        d = read_json(os.path.join(os.path.dirname(self.dir), "projects.json"), 1 << 20) or {}
+        return {os.path.realpath(p) for p in d.get("projects") or [] if isinstance(p, str) and os.path.isabs(p)}
 
     def _scan_requests(self, now):
         req_dir, res_dir = os.path.join(self.dir, "req"), os.path.join(self.dir, "res")
@@ -411,15 +458,31 @@ class Control:
             rid = n[:-5]
             if not REQ_ID.match(rid):
                 continue
+            if rid in self.planted:
+                continue
             present.add(rid)
             if rid in self.requests:
+                r = self.requests[rid]
+                if r["status"] == "open" and self.hook_check and not procs.proc_stat(r.get("pid") or 0):
+                    present.discard(rid)   # its hook is gone: closed below after the grace period
                 continue
-            d = read_json(os.path.join(req_dir, n))
+            d, ident = read_json_ident(os.path.join(req_dir, n))
             if d is None or d.get("id") != rid or not isinstance(d.get("session"), str) or not isinstance(d.get("hash"), str):
+                continue
+            # The hook keeps the file it wrote open while it waits: the very inode read here.
+            why = procs.hook_problem(d.get("pid"), self.root, ident=ident, projects=self.projects()) if self.hook_check else ""
+            if why:
+                present.discard(rid)
+                self.planted[rid] = now
+                self.log(None, "refused", kind="req", item=rid, session=d.get("session")[:100] or None,
+                         tool=_str(d.get("tool"), 100) or None,
+                         result="a request file no dash-control hook wrote was not shown (%s)" % why)
                 continue
             d["status"] = "open"
             d["seen_at"] = now
             self.requests[rid] = d
+        for rid in [k for k, t in self.planted.items() if now - t > KEEP_RESOLVED]:
+            del self.planted[rid]
         results = {}
         for n in _names(res_dir):
             rid = n[:-5]
@@ -620,6 +683,9 @@ class Control:
             if body.get("hash") is not None and body.get("hash") != r["hash"]:
                 return 409, {"error": "The request changed; reload it."}
             flagged = r.get("guard") or r.get("ask_rule")
+            if action in APPROVALS and r.get("input_truncated"):
+                return 400, {"error": "The dashboard holds a shortened copy of this request, so it cannot be approved "
+                                      "here. Deny it, or answer in the terminal, which shows all of it."}
             if action == "allow_session" and (flagged or not r.get("session_rules")):
                 return 400, {"error": "Allow for this session is not offered for this request."}
             if action in ("allow", "allow_session") and flagged and body.get("confirm") != "approve":
@@ -839,6 +905,9 @@ class Control:
 
     # ── alerts: which open request an alert row is ─────────────────────────
     def annotate(self, rows):
+        """Link each alert to its open request. A linked row's text then comes
+        from the request (the hook's own record of the call), never from
+        attention.jsonl, which anything running as you can append to."""
         with self.lock:
             live = [r for r in self.requests.values() if r["status"] in ("open", "sent")]
         for row in rows:
@@ -848,13 +917,28 @@ class Control:
             for r in live:
                 if (r.get("session"), r.get("agent_id") or None, r.get("tool") or None, r.get("sig") or "") == m:
                     row["request"] = r["id"]
+                    row["message"] = _summary(r, 400)
                     break
 
 
-def _target_text(r):
+def _summary(r, n=300):
+    """A request's one-line summary, from its input (never its `sig`, which the
+    card does not show): the command, the plan, the first question, or the
+    first of attention.py's target fields."""
     ti = r.get("input") if isinstance(r.get("input"), dict) else {}
-    if r.get("tool") == "Bash":
-        return _str(ti.get("command"), 2000)
-    if r.get("kind") == "plan":
-        return _str(ti.get("plan"), 300)
-    return _str(r.get("sig"), 300)
+    tool = r.get("tool")
+    if tool == "Bash":
+        v = ti.get("command")
+    elif r.get("kind") == "plan":
+        v = ti.get("plan")
+    elif r.get("kind") == "question":
+        qs = ti.get("questions")
+        v = qs[0].get("question") if isinstance(qs, list) and qs and isinstance(qs[0], dict) else ""
+    else:
+        v = next((ti[k] for k in TARGET_KEYS if isinstance(ti.get(k), str) and ti[k]), "")
+    v = " ".join(v.split()) if isinstance(v, str) else ""
+    return v if len(v) <= n else v[: n - 1] + "…"
+
+
+def _target_text(r):
+    return _summary(r, 2000)

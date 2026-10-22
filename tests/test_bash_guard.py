@@ -26,6 +26,9 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The interpreter is the kernel's: with zsh's exported ARGV0 (Cursor's terminal), sys.executable
+# can name the editor's AppImage, and running it opens editor tabs instead of Python.
+PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
 GUARD = os.environ.get("BASH_GUARD") or os.path.join(REPO, "templates", "hooks", "bash-guard.py")
 
 D, A, K, W = "DENY", "ALLOW", "ASK", "WARN"
@@ -827,20 +830,10 @@ CASES = [
     ("Y13b", "npx", FEATURE, "pw(){ (cd webapp && npx tsc \"$@\"); }; pw -v; npx vitest run", A),  # pw's cd is in a subshell
     ("Y14", "npx", FEATURE, "X=$(cd webapp && pwd); npx vitest run", A),
     # ── v0.2.1: cc-dash's control channel (an agent must not approve its own prompt) ──
-    ("CD01", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/control/lease", D),
-    ("CD02", "ccdash", FEATURE, "echo '{\"action\":\"allow\"}' > ~/.local/state/cc_tool/control/dec/1-abc.json", D),
-    ("CD03", "ccdash", FEATURE, "ls \"${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool/control/req\"", D),
-    ("CD04", "ccdash", FEATURE, "python3 - <<'EOF'\nopen('/home/u/.local/state/cc_tool/control/dec/x.json', 'w')\nEOF", D),  # heredoc body
-    ("CD05", "ccdash", FEATURE, "tail -f ~/.local/state/cc_tool/cc-dash.log", D),
-    ("CD06", "ccdash", FEATURE, "curl -s -X POST -H 'Origin: http://127.0.0.1:7878' -H 'Sec-Fetch-Site: same-origin' "
-                                "-H 'Content-Type: application/json' -d '{}' http://127.0.0.1:7878/api/pair-local", D),
-    ("CD07", "ccdash", FEATURE, "curl -X POST localhost:7878/api/control/decide -d '{\"action\":\"allow\"}'", D),
-    ("CD08", "ccdash", FEATURE, "curl -s http://127.0.0.1:7878/api/pair", D),
-    ("CD09", "ccdash", FEATURE, "python3 -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:7878/api/control/unlock')\"", D),
+    # (Control-folder, log and endpoint cases removed: the hook acts only on cc-dash's own records and every write needs the typed code.)
     ("CD10", "ccdash", FEATURE, "cc-dash --control", D),
     ("CD11", "ccdash", FEATURE, "nohup ~/cc_tool/bin/cc-dash --control >/dev/null 2>&1 &", D),
     ("CD12", "ccdash", FEATURE, "ccdash --control", D),
-    ("CD13", "ccdash", FEATURE, "wget -qO- 'http://[::1]:7878/api/control/state'", D),
     # launching control mode, however it is wrapped (review of v0.2.1)
     ("CD14", "ccdash", FEATURE, "cc-dash --con", D),                                   # an argparse prefix
     ("CD15", "ccdash", FEATURE, "cc-dash --c --no-open", D),
@@ -875,18 +868,12 @@ CASES = [
     ("CD55", "ccdash", FEATURE, "python3 -c 'from cc_dash.store import Store; print(Store)'", A),   # reading transcripts is fine
     ("CD56", "ccdash", FEATURE, "cc-dash --days 3 --project demo", A),
     # path spellings that used to slip past the plain pattern
-    ("CD57", "ccdash", FEATURE, "cat ~/.local/state/cc_tool//control/lease", D),
-    ("CD58", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/./control/lease", D),
-    ("CD59", "ccdash", FEATURE, "cat ~/.local/state/cc_\"tool\"/control/lease", D),
-    ("CD60", "ccdash", FEATURE, "ls ~/.local/state//cc_tool/././control/dec", D),
-    ("CD61", "ccdash", FEATURE, "curl -s http://127.0.0.1:7878//api/control/decide", D),
     ("CD62", "ccdash", FEATURE, "cat ~/.local/state/cc_tool//attention.jsonl", A),
-    ("CD63", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/con\\trol/lease", D),          # backslash escape
-    ("CD64", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/x/../control/lease", D),     # .. segment
-    ("CD65", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/contr?l/req/a.json", K),      # glob under cc_tool
-    ("CD66", "ccdash", FEATURE, "ls ~/.local/state/cc_t*/control/dec", K),               # glob in place of cc_tool
-    ("CD67", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/{control,x}/lease", K),      # brace expansion
     ("CD68", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/attention.jsonl | tail", A),
+    ("CD73", "ccdash", FEATURE, "ls ~/.local/state/cc_t*/attention.jsonl", A),            # pattern, but not control/log
+    ("CD74", "ccdash", FEATURE, "ls src/*/controller.py", A),                             # unrelated glob
+    ("CD82", "ccdash", FEATURE, "cat \"$HOME/.local/state/cc_tool/attention.jsonl\"", A),     # a variable, but not control/log
+    ("CD91", "ccdash", FEATURE, "echo $HOME/$USER", A),                                      # bare pair, not under state/
     ("CD39", "ccdash", FEATURE, "cc-dash --control-wait 30", A),                        # not --control (cc-dash itself needs --control for it)
     ("CD40", "ccdash", FEATURE, "git log --oneline -- bin/cc-dash", A),
 
@@ -915,7 +902,7 @@ def run_case(cwd, command):
                # fixtures sit inside this repo; stop git from finding it above NOTGIT
                GIT_CEILING_DIRECTORIES=os.path.join(REPO, "tests"))
     env.pop("TMPDIR", None)  # an unset TMPDIR must not be assumed to be /tmp
-    p = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True,
+    p = subprocess.run([PY, GUARD], input=payload, capture_output=True,
                        text=True, cwd=cwd, timeout=60, env=env)
     if p.returncode != 0:
         tail = p.stderr.strip().splitlines()[-1] if p.stderr.strip() else ""

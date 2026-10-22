@@ -19,6 +19,9 @@ import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The interpreter is the kernel's: with zsh's exported ARGV0 (Cursor's terminal), sys.executable
+# can name the editor's AppImage, and running it opens editor tabs instead of Python.
+PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
 HOOKS = os.path.join(REPO, "templates", "hooks")
 GUARD = os.path.join(HOOKS, "write-guard.py")
 sys.path.insert(0, HOOKS)
@@ -85,6 +88,9 @@ lib.save_session(ROOT, RED, _red)
 _XDG = os.environ.get("XDG_STATE_HOME") or ""
 CC_STATE = os.path.join(_XDG if os.path.isabs(_XDG) else os.path.join(HOME, ".local", "state"), "cc_tool")
 
+CTL_LINK = os.path.join(ROOT, "src", "ctl-link")      # a symlink to cc-dash's control directory
+os.symlink(os.path.join(CC_STATE, "control"), CTL_LINK)
+
 FAKE_GH = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 FAKE_ANT = "sk-ant-api03-" + "qwertyuiopasdfghjklzxcvbnm1234"
 
@@ -144,19 +150,65 @@ CASES = [
     ("C02", "ccdash", ROOT, "Edit", {"file_path": os.path.join(CC_STATE, "control", "lease"), "old_string": "a", "new_string": "b"}, "s", D),
     ("C03", "ccdash", ROOT, "MultiEdit", {"file_path": os.path.join(CC_STATE, "control", "msg", "s.main.1.json"), "edits": []}, "s", D),
     ("C04", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "cc-dash.log"), "content": "x"}, "s", D),
+    ("C07", "ccdash", ROOT, "NotebookEdit", {"notebook_path": os.path.join(CC_STATE, "control", "req", "1-abc.json"), "new_source": "x"}, "s", D),
+    ("C08", "ccdash", ROOT, "Write", {"file_path": os.path.join(CTL_LINK, "dec", "1-abc.json"), "content": "{}"}, "s", D),  # a symlink into it
+    ("C09", "ccdash", ROOT, "NotebookEdit", {"notebook_path": os.path.join(ROOT, "nb.ipynb"), "new_source": "x"}, "s", A),  # notebooks: location checks only
+    # every path-like field is checked, not the first one present (a decoy must not stand in)
+    ("C15", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "projects.json"), "content": "{}"}, "s", D),  # cc-dash's project registry
+    ("C10", "ccdash", ROOT, "NotebookEdit", {"file_path": A_TS, "notebook_path": os.path.join(CC_STATE, "control", "lease"), "new_source": "x"}, "s", D),
+    ("C11", "ccdash", ROOT, "NotebookEdit", {"file_path": os.path.join(CC_STATE, "control", "lease"), "notebook_path": os.path.join(ROOT, "nb.ipynb"), "new_source": "x"}, "s", D),
+    ("C12", "ccdash", ROOT, "Write", {"file_path": A_TS, "path": os.path.join(CC_STATE, "control", "dec", "1-a.json"), "content": "x"}, "s", D),
+    ("C13", "ccdash", ROOT, "NotebookEdit", {"file_path": A_TS, "notebook_path": os.path.join(ROOT, ".git", "config"), "new_source": "x"}, "s", D),
+    ("C14", "ccdash", ROOT, "NotebookEdit", {"notebook_path": "/etc/x.ipynb", "new_source": "x"}, "s", D),
     ("C05", "ccdash", ROOT, "Write", {"file_path": os.path.join(ROOT, "src", "control", "x.ts"), "content": "x"}, "s", A),
     ("C06", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "notes.txt"), "content": "x"}, "s", W),  # outside the repo: a note, not a block
 ]
 
 
-def run_case(root, tool, tool_input, session):
+# The cc_tool checkout a project was set up from (cc_tool_root beside the hook): its code is off limits
+# from other projects. A copy of the guard beside a pin naming a fake checkout.
+FAKE_ROOT = os.path.join(BASE, "fake_cc_tool")
+for _d in ("bin", "lib/cc_dash", "templates/hooks", "docs"):
+    os.makedirs(os.path.join(FAKE_ROOT, _d), exist_ok=True)
+_git(FAKE_ROOT, "init", "-q", "-b", "feature/x")
+open(os.path.join(FAKE_ROOT, "CHANGELOG.md"), "w").write("a\n")
+_git(FAKE_ROOT, "add", "-A")
+_git(FAKE_ROOT, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-qm", "init")
+FAKE_WT = os.path.join(BASE, "fake_cc_tool_wt")
+_git(FAKE_ROOT, "worktree", "add", "-q", "-b", "wt/x", FAKE_WT)
+PIN_HOOKS = os.path.join(BASE, "pinned-hooks")
+os.makedirs(PIN_HOOKS)
+for _f in ("write-guard.py", "cc_hooklib.py"):
+    shutil.copy(os.path.join(HOOKS, _f), os.path.join(PIN_HOOKS, _f))
+with open(os.path.join(PIN_HOOKS, "cc_tool_root"), "w") as _fh:
+    _fh.write(FAKE_ROOT + "\n")
+os.chmod(os.path.join(PIN_HOOKS, "cc_tool_root"), 0o600)
+PIN_GUARD = os.path.join(PIN_HOOKS, "write-guard.py")
+PIN_CASES = [
+    ("K01", "checkout", ROOT, "Write", {"file_path": os.path.join(FAKE_ROOT, "lib", "cc_dash", "procs.py"), "content": "x"}, "s", D),
+    ("K02", "checkout", ROOT, "Edit", {"file_path": os.path.join(FAKE_ROOT, "bin", "cc-dash"), "old_string": "a", "new_string": "b"}, "s", D),
+    ("K03", "checkout", ROOT, "MultiEdit", {"file_path": os.path.join(FAKE_ROOT, "templates", "hooks", "dash-control.py"), "edits": []}, "s", D),
+    ("K04", "checkout", ROOT, "NotebookEdit", {"notebook_path": os.path.join(FAKE_ROOT, "lib", "x.ipynb"), "new_source": "x"}, "s", D),
+    ("K05", "checkout", ROOT, "NotebookEdit", {"file_path": A_TS, "notebook_path": os.path.join(FAKE_ROOT, "bin", "x.ipynb"), "new_source": "x"}, "s", D),
+    ("K06", "checkout", ROOT, "Write", {"file_path": os.path.join(FAKE_ROOT, "docs", "notes.md"), "content": "x"}, "s", D),   # anywhere in the checkout
+    ("K09", "checkout", ROOT, "Write", {"file_path": os.path.join(FAKE_ROOT, "templates", "skills", "x", "SKILL.md"), "content": "x"}, "s", D),
+    ("K10", "checkout", ROOT, "Edit", {"file_path": os.path.join(FAKE_ROOT, "CHANGELOG.md"), "old_string": "a", "new_string": "b"}, "s", D),
+    ("K11", "checkout", ROOT, "Write", {"file_path": os.path.join(FAKE_ROOT, "new-root-file.py"), "content": "x"}, "s", D),
+    ("K12", "checkout", FAKE_WT, "Write", {"file_path": os.path.join(FAKE_ROOT, "lib", "cc_dash", "x.py"), "content": "x"}, "s", A),  # a worktree of cc_tool: developing it
+    ("K13", "checkout", ROOT, "Write", {"file_path": os.path.join(BASE, "fake_cc_tool_sibling", "x.py"), "content": "x"}, "s", A),  # a sibling, not the checkout
+    ("K07", "checkout", FAKE_ROOT, "Write", {"file_path": os.path.join(FAKE_ROOT, "lib", "cc_dash", "procs.py"), "content": "x"}, "s", A),  # developing cc_tool itself
+    ("K08", "checkout", ROOT, "Write", {"file_path": A_TS, "content": "hi"}, "s", A),
+]
+
+
+def run_case(root, tool, tool_input, session, guard=None):
     if isinstance(tool_input, str) and tool_input.startswith("@@RAW@@"):
         payload = tool_input[len("@@RAW@@"):]
     else:
         payload = json.dumps({"session_id": session, "hook_event_name": "PreToolUse",
                               "tool_name": tool, "tool_input": tool_input})
     env = dict(os.environ, CLAUDE_PROJECT_DIR=root)
-    p = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True,
+    p = subprocess.run([PY, guard or GUARD], input=payload, capture_output=True,
                        text=True, cwd=root, timeout=60, env=env)
     if p.returncode != 0:
         tail = p.stderr.strip().splitlines()[-1] if p.stderr.strip() else ""
@@ -173,13 +225,13 @@ def run_case(root, tool, tool_input, session):
 
 def main():
     fails = []
-    for cid, section, root, tool, ti, session, expected in CASES:
-        got, detail = run_case(root, tool, ti, session)
+    for cid, section, root, tool, ti, session, expected, guard in [c + (None,) for c in CASES] + [c + (PIN_GUARD,) for c in PIN_CASES]:
+        got, detail = run_case(root, tool, ti, session, guard)
         if got != expected:
             fails.append((cid, section, expected, got, detail[:160]))
         elif got == D and "BLOCKED:" not in detail:
             fails.append((cid, section, "BLOCKED: prefix", got, detail[:160]))
-    print("total=%d  pass=%d  fail=%d" % (len(CASES), len(CASES) - len(fails), len(fails)))
+    print("total=%d  pass=%d  fail=%d" % (len(CASES) + len(PIN_CASES), len(CASES) + len(PIN_CASES) - len(fails), len(fails)))
     for cid, section, exp, got, detail in fails:
         print("  %-5s %-10s expected %-6s got %-8s  %s" % (cid, section, exp, got, detail))
     return 1 if fails else 0

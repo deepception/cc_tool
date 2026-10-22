@@ -185,6 +185,16 @@ class Auth:
             self.control_code = code.replace("-", "")
         return code
 
+    def mentions_code(self, text):
+        """True when text carries this launch's control code: its letters and
+        digits, case-folded, contain the code's (separators and spacing do not
+        hide it). The code only ever goes into the unlock field; a card or a
+        message that gets you to type it elsewhere is phishing for it."""
+        code = self.control_code
+        if not code or not isinstance(text, str):
+            return False
+        return code in "".join(ch for ch in text.upper() if ch.isalnum())
+
     def control_state(self, headers):
         """This token's standing with the control code: {"locked", "tries_left"}."""
         s = self.session(headers) or {}

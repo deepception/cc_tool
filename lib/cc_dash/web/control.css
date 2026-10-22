@@ -23,6 +23,9 @@
 
 /* ── The decision card: control's parts (the frame is in app.css) ──── */
 .ctl-where { font-size: var(--fs-11); color: var(--ink-3); margin-top: calc(-1 * var(--sp-1)); }
+.ctl-meta { font-size: var(--fs-11); color: var(--ink-3); margin-top: calc(-1 * var(--sp-1h)); }
+.ctl-more { font-size: var(--fs-11); }   /* "Show all" and the session rules: kept in a toast too */
+.ctl-more code { font-size: var(--fs-11); background: var(--sunk); padding: 1px var(--sp-1); border-radius: var(--r-xs); overflow-wrap: anywhere; }
 .ctl-box {
   margin: 0; padding: var(--sp-2) var(--sp-3); max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
   background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-m); font-size: var(--fs-12); line-height: 1.5; color: var(--ink);

@@ -36,6 +36,9 @@ import time
 from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The interpreter is the kernel's: with zsh's exported ARGV0 (Cursor's terminal), sys.executable
+# can name the editor's AppImage, and running it opens editor tabs instead of Python.
+PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import auth as auth_mod  # noqa: E402
 from cc_dash.control import Control, shown_digest  # noqa: E402
@@ -86,7 +89,8 @@ class Srv:
         self.store.refresh(force=True)
         self.srv = make_server(0, self.store)
         self.port = self.srv.port
-        self.ctl = Control(self.store, self.port, ctl_dir=os.path.join(self.state, "cc_tool", "control"), agents_cmd=None)
+        self.ctl = Control(self.store, self.port, ctl_dir=os.path.join(self.state, "cc_tool", "control"), agents_cmd=None,
+                           hook_check=False)   # requests written by hand; test_planted_request checks the real rule
         self.ctl.start(thread=False)
         self.srv.control = self.ctl
         self.code = self.srv.auth.enable_control()
@@ -384,18 +388,52 @@ def test_launch_refusals():
     check("no lease, not under Claude Code: allowed", server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=[]) == "")
     shell = [(50, "zsh", "/usr/bin/zsh", ["zsh"]), (40, "gnome-terminal-", "/usr/libexec/gnome-terminal-server", ["gnome-terminal-server"])]
     check("a plain terminal parent chain: allowed", server_mod.control_refusal(d, proc=NOPROC, env={"HOME": "/h"}, ancestors=shell) == "")
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    try:
-        fd = os.open(os.path.join(d, "lease"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.write(fd, json.dumps({"pid": sleeper.pid, "expires": time.time() + 6, "port": 7878}).encode())
+    def plant_lease(pid):
+        p = os.path.join(d, "lease")
+        if os.path.lexists(p):
+            os.unlink(p)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, json.dumps({"pid": pid, "expires": time.time() + 10 ** 9, "port": 7878}).encode())
         os.close(fd)
-        why = server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=[])
-        check("a live control lease held by another process: takeover refused", "holds the control lease" in why, why)
+
+    # F5 (final review): a planted lease naming any live pid (pid 1 is always alive)
+    # used to block the human's `cc-dash --control` for good.
+    notes = []
+    plant_lease(1)
+    why = server_mod.control_refusal(d, env={}, ancestors=[], note=notes.append)
+    check("a planted lease naming a live process that is not cc-dash (pid 1): not counted", "holds the control lease" not in why, why)
+    check("a planted lease: removed, with a note for the terminal",
+          not os.path.exists(os.path.join(d, "lease")) and notes and "not a cc-dash dashboard" in notes[0], notes)
+    sleeper = subprocess.Popen([PY, "-c", "import time; time.sleep(30)"])
+    try:
+        plant_lease(sleeper.pid)
+        why = server_mod.control_refusal(d, env={}, ancestors=[], note=notes.append)
+        check("a lease naming a live Python that is not cc-dash: removed, not counted",
+              "holds the control lease" not in why and not os.path.exists(os.path.join(d, "lease")), why)
+        # The same program check as the hook: a pid that IS cc-dash from this checkout
+        # (fake /proc: python -I <repo>/bin/cc-dash, clean environment, a terminal shell parent).
+        lp = os.path.join(BASE, "leaseproc")
+        for pid, comm, ppid, argv, exe in ((sleeper.pid, "python3", 70, ["python3", "-I", os.path.join(REPO, "bin", "cc-dash"), "--control"], PY),
+                                           (70, "zsh", 60, ["zsh"], "/usr/bin/zsh"),
+                                           (60, "gnome-terminal-", 1, ["gnome-terminal-server"], "/usr/libexec/gnome-terminal-server")):
+            os.makedirs(os.path.join(lp, str(pid)), exist_ok=True)
+            with open(os.path.join(lp, str(pid), "stat"), "w") as fh:
+                fh.write("%d (%s) S %d %d %d 34816 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n" % (pid, comm, ppid, 70 if pid != 60 else 60, 70 if pid != 60 else 60))
+            with open(os.path.join(lp, str(pid), "cmdline"), "wb") as fh:
+                fh.write(b"\0".join(a.encode() for a in argv) + b"\0")
+            with open(os.path.join(lp, str(pid), "environ"), "wb") as fh:
+                fh.write(b"HOME=/h\0PATH=/usr/bin\0")
+            os.symlink(exe, os.path.join(lp, str(pid), "exe"))
+            os.symlink(REPO, os.path.join(lp, str(pid), "cwd"))
+        plant_lease(sleeper.pid)
+        why = server_mod.control_refusal(d, proc=lp, env={}, ancestors=[])
+        check("a live lease held by a real cc-dash of this checkout: takeover refused", "holds the control lease" in why, why)
     finally:
         sleeper.kill()
         sleeper.wait()
     check("the holder gone: allowed again", server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=[]) == "")
-    os.unlink(os.path.join(d, "lease"))
+    if os.path.exists(os.path.join(d, "lease")):
+        os.unlink(os.path.join(d, "lease"))
     for var in server_mod.CLAUDE_ENV_SIGNALS:
         why = server_mod.control_refusal(d, proc=NOPROC, env={var: "x"}, ancestors=[])
         check("Claude Code's Bash environment (%s set): refused with the plain message" % var,
@@ -468,7 +506,7 @@ def test_card_binding_with_real_hook():
                    CC_DASH_LEASE_ANY_PROGRAM="1")   # the dashboard here runs inside this test process
         payload = {"session_id": SID, "transcript_path": "/x", "cwd": s.cwd, "hook_event_name": "PermissionRequest",
                    "permission_mode": "default", "tool_name": "Bash", "tool_input": {"command": "git push --force origin main"}}
-        p = subprocess.Popen([sys.executable, HOOK], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+        p = subprocess.Popen([PY, HOOK], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
         p.stdin.write(json.dumps(payload).encode())
         p.stdin.close()
         p.stdin = None
@@ -488,18 +526,23 @@ def test_card_binding_with_real_hook():
         s.ctl.scan()
         shown = next(x for x in s.req("GET", "/api/control/state", token=tok)[1]["requests"] if x["id"] == req["id"])
         check("binding: the dashboard shows the forged text", shown["input"] == {"command": "ls"}, shown["input"])
-        st, out = s.req("POST", "/api/control/decide", {"id": req["id"], "action": "allow", "hash": req["hash"]}, token=ctok)
+        st, out = s.req("POST", "/api/control/decide", {"id": req["id"], "action": "allow", "hash": req["hash"], "confirm": "approve"},
+                        token=ctok)   # bash-guard refuses this command, so the card asks for the typed approve
         time.sleep(1.0)
         check("binding: the approval of the forged card is not applied to the real call", st == 200 and p.poll() is None, (st, p.poll()))
-        # Only the one-line summary the card and Live row show is rewritten, the input is untouched.
-        os.unlink(path)
-        plant(path, dict(req, sig="ls"))
-        s.ctl.scan()
-        shown = next(x for x in s.req("GET", "/api/control/state", token=tok)[1]["requests"] if x["id"] == req["id"])
-        check("binding: the dashboard shows the forged summary", shown.get("sig") == "ls", shown.get("sig"))
-        st, out = s.req("POST", "/api/control/decide", {"id": req["id"], "action": "allow", "hash": req["hash"]}, token=ctok)
-        time.sleep(1.0)
-        check("binding: a forged summary alone cannot borrow an approval either", p.poll() is None, (st, p.poll()))
+        # Only `sig`, the one-line summary, rewritten: the card does not show it (it shows the input,
+        # and an alert row's text comes from the input too), so it is not in the digest, and the
+        # card a human approves still shows the real call.
+        forged_sig = dict(req, sig="npm test", id="0" * 12 + "-" + "a" * 12, status="open")
+        check("binding: a forged summary leaves every field the card shows unchanged", shown_digest(forged_sig) == shown_digest(req))
+        with s.ctl.lock:
+            s.ctl.requests[forged_sig["id"]] = forged_sig
+        rows = [{"_match": (SID, None, "Bash", "npm test"), "message": "npm test"}]
+        s.ctl.annotate(rows)
+        with s.ctl.lock:
+            del s.ctl.requests[forged_sig["id"]]
+        check("binding: an alert row linked through the forged summary shows the real command, not the summary",
+              rows[0].get("message") == req["input"]["command"], rows[0])
         p.terminate()
         p.communicate(timeout=5)
     finally:
@@ -546,7 +589,7 @@ os.execvpe(cmd[0], cmd, os.environ)
 
 def _launch_detached(cmd, env, log, tty="-", keep=()):
     pr, pw = os.pipe()
-    subprocess.run([sys.executable, "-c", LAUNCHER, tty, log, str(pw)] + cmd, env=env, pass_fds=(pw,) + tuple(keep),
+    subprocess.run([PY, "-c", LAUNCHER, tty, log, str(pw)] + cmd, env=env, pass_fds=(pw,) + tuple(keep),
                    timeout=30, check=True)
     os.close(pw)
     pid = int(os.read(pr, 32) or b"0")
@@ -614,7 +657,7 @@ def test_real_process_code_never_on_disk():
     log = os.path.join(root, "cc-dash.log")
     master, slave = os.openpty()
     rfd, wfd = os.pipe()
-    pid = _launch_detached([sys.executable, CC_DASH, "--control", "--no-open", "--port", "0", "--ready-fd", str(wfd)],
+    pid = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0", "--ready-fd", str(wfd)],
                            env, log, tty=os.ttyname(slave), keep=(wfd,))
     os.close(slave)
     os.close(wfd)
@@ -663,7 +706,7 @@ def test_real_process_code_never_on_disk():
         # A second control-mode cc-dash (an agent's, say) cannot take the lease over.
         log2 = os.path.join(root, "second.log")
         m2, s2 = os.openpty()
-        pid2 = _launch_detached([sys.executable, CC_DASH, "--control", "--no-open", "--port", "0"], env, log2, tty=os.ttyname(s2))
+        pid2 = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0"], env, log2, tty=os.ttyname(s2))
         os.close(s2)
         term2 = _read_pty(m2, 15)
         end = time.time() + 20
@@ -685,7 +728,7 @@ def test_real_process_code_never_on_disk():
     env3 = dict(_env(root3), CLAUDECODE="1")
     log3 = os.path.join(root3, "cc-dash.log")
     m3, s3 = os.openpty()
-    pid3 = _launch_detached([sys.executable, CC_DASH, "--control", "--no-open", "--port", "0"], env3, log3, tty=os.ttyname(s3))
+    pid3 = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0"], env3, log3, tty=os.ttyname(s3))
     os.close(s3)
     term3 = _read_pty(m3, 10)
     end = time.time() + 20
@@ -699,7 +742,7 @@ def test_real_process_code_never_on_disk():
     root2 = os.path.join(BASE, "notty")
     env2 = _env(root2)
     log2 = os.path.join(root2, "cc-dash.log")
-    pid2 = _launch_detached([sys.executable, CC_DASH, "--control", "--no-open", "--port", "0"], env2, log2)
+    pid2 = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0"], env2, log2)
     end = time.time() + 30
     while time.time() < end and _alive(pid2):
         time.sleep(0.1)

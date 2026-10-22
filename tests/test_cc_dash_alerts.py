@@ -22,6 +22,9 @@ import time
 from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The interpreter is the kernel's: with zsh's exported ARGV0 (Cursor's terminal), sys.executable
+# can name the editor's AppImage, and running it opens editor tabs instead of Python.
+PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import attention  # noqa: E402
 from cc_dash.attention import Attention  # noqa: E402
@@ -454,7 +457,7 @@ def test_endpoint():
                        "agent_type": "general-purpose"}
             env = dict(os.environ, XDG_STATE_HOME=state)
             t0 = time.time()
-            subprocess.run([sys.executable, HOOK], input=json.dumps(payload).encode(), env=env, check=True)
+            subprocess.run([PY, HOOK], input=json.dumps(payload).encode(), env=env, check=True)
             seen = None
             while time.time() - t0 < 5:
                 d = json.loads(get(port, "/api/alerts")[2])

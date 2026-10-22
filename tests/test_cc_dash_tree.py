@@ -612,7 +612,7 @@ def test_browser():
     st = Store(root=CFG, days=1, clock=lambda: NOW)   # frozen: polls bring nothing new
     srv = make_server(0, st)
     from cc_dash.control import Control
-    ctl = Control(st, srv.port, ctl_dir=os.path.join(BASE, "ctl"), agents_cmd=None, sockets=False)
+    ctl = Control(st, srv.port, ctl_dir=os.path.join(BASE, "ctl"), agents_cmd=None, sockets=False, hook_check=False)
     ctl.start(thread=False)
     srv.control = ctl
     th = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)

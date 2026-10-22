@@ -15,20 +15,26 @@ one shell test per event, not an interpreter start.
 
 PermissionRequest (synchronous; also the dialog behind AskUserQuestion and
 ExitPlanMode). The terminal dialog opens at once and stays answerable; the first
-answer wins. This hook writes req/<id>.json (session, agent, cwd, tool, input,
-kind, a sha256 of tool + canonical input, why it asked: bash-guard's marker or
-a matching permissions.ask rule) and polls dec/<id>.json every 200 ms. A
-decision applies only when it names this request's hash.
+answer wins. This hook writes req/<id>.json and keeps it open while it waits
+(cc-dash shows a request only from a hook process that holds that very file:
+cc_procs.py hook_problem). The request carries session, agent, cwd,
+tool, input, kind, a sha256 of tool + canonical input, and why it asked (what
+bash-guard decides for the command, from its own classify() loaded from this
+directory, or a matching permissions.ask rule). The hook polls dec/<id>.json
+every 200 ms. A decision applies only when it names this request's hash.
   allow          {"behavior": "allow"}; AskUserQuestion: updatedInput = the
                  input plus "answers"; ExitPlanMode: updatedInput = the input
                  echoed (a bare allow leaves the plan dialog up). A Bash command
                  is never edited.
   allow_session  allow plus updatedPermissions: Claude Code's own addRules
-                 suggestion with destination "session" only. Refused for a
-                 guard-asked or ask-rule request.
+                 suggestion with destination "session" only, and only when
+                 those rules are exactly the ones the card showed. Refused for
+                 a guard-asked or ask-rule request.
   deny           {"behavior": "deny", "message": ...}; Claude reads it (a plan
                  is revised and resubmitted).
   release        exit silently.
+An approval (allow, allow_session, answer) is refused when the request carries
+a shortened copy of the input (input_truncated): the card could not show it all.
 It exits silently, without printing, once the prompt is answered in the terminal
 (a late answer is ignored but the hook is not killed on "Yes"): attention.py's
 log shows the call ran (PostToolUse/PostToolUseFailure, same tool and target),
@@ -64,10 +70,31 @@ what was sent from a control-unlocked page in this launch. The answer counts
 only when the socket that sent it belongs to the lease's pid (/proc/net/tcp
 inode -> /proc/<pid>/fd; lsof where there is no /proc), so a server an agent
 starts on another port cannot vouch for a planted file. A decision also names a
-digest of what the dashboard card showed (tool, input, cwd, flags), so an
-approval cannot be moved onto a request file rewritten after it was shown.
-Limit: a program that rewrites the lease AND serves the answer itself runs as
-you with your full rights; see docs/guides/commands.md (Control mode, Security).
+digest of every field the dashboard card shows (tool, the whole input, cwd,
+session, agent, mode, flags, the session rules, the MCP server), so an approval
+cannot be moved onto a request file rewritten after it was shown.
+
+Which dashboard. The lease is a file anything running as you can write, so its
+pid is trusted only when that process is cc-dash from the checkout cc-setup
+pinned for this project (.claude/hooks/cc_tool_root, beside this hook; .claude/
+is a protected path in Claude Code), launched the way bin/cc-dash launches
+itself (`python -I <root>/bin/cc-dash`, judged by /proc/<pid>/exe and its
+argv), and from outside Claude Code: no Claude Code or PYTHON* variable in its
+/proc/<pid>/environ, no claude process among its parents or its session and
+process-group leaders' parents, not a fresh session after a re-parent; no
+LD_* variable either. And its code must be what cc-setup recorded: the sha256 of
+bin/cc-dash, cc_procs.py and every entry under lib/ (nothing unlisted, no
+symlink), in cc_dash_manifest.json beside this hook ("cc-dash's code changed
+since cc-setup ran; run cc-update-project to re-record it if you changed it
+yourself"), and that code and the record must have last changed (ctime) before
+the dashboard process started ("... changed after the dashboard started;
+restart it"). The checks are
+cc_procs.py beside this hook (cc-setup copies it here; never code from the
+checkout, which an agent could edit), the same code cc-dash runs on itself,
+run when the lease is read and again before every verify.
+Limit: a process running as you that rewrites its own memory (argv,
+environment) can still pass; see docs/guides/commands.md (Control mode,
+Security).
 
 Files: directory 0700 and ours, files 0600, opened with O_NOFOLLOW, written to a
 temp name with O_EXCL and renamed; anything that is not a plain file we own that
@@ -86,11 +113,11 @@ DEFAULT_WAIT = 300.0
 MAX_WAIT = 590.0            # under the 600 s registered timeout
 MAX_INPUT = 256 * 1024      # bytes of tool input copied into a request for display
 MAX_MSG_FILE = 64 * 1024
-GUARD_MARK_TTL = 120.0
 CLIP = 400
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 QUESTION_TOOLS = {"AskUserQuestion": "question", "ExitPlanMode": "plan"}
-SHOWN_KEYS = ("session", "agent_id", "agent_type", "cwd", "tool", "kind", "sig", "input", "input_truncated", "mode", "guard", "ask_rule")   # = lib/cc_dash/control.py
+SHOWN_KEYS = ("session", "agent_id", "agent_type", "cwd", "tool", "kind", "input", "input_truncated", "mode", "guard",
+              "ask_rule", "session_rules", "server")   # = lib/cc_dash/control.py: every field the card renders
 VERIFY_TIMEOUT = 2.0
 TARGET_KEYS = ("file_path", "notebook_path", "path", "url", "pattern", "query", "skill",
                "description", "prompt", "command", "message")
@@ -159,16 +186,28 @@ def read_json(path, limit=MAX_INPUT * 2):
     return d if isinstance(d, dict) else None
 
 
-def write_private(path, obj):
-    """Write obj as JSON to path atomically: temp file (O_EXCL, 0600), then rename."""
+def write_private(path, obj, keep=False):
+    """Write obj as JSON to path atomically: temp file (O_EXCL, 0600), then rename.
+    keep=True returns the file still open: the request file stays open in this
+    process for as long as it waits, which is how cc-dash tells a request this
+    hook wrote from one planted beside it (it must be this very inode)."""
     tmp = "%s.%d.%s.tmp" % (path, os.getpid(), os.urandom(4).hex())
     data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC, 0o600)
     try:
         os.write(fd, data)
-    finally:
+    except BaseException:
         os.close(fd)
-    os.replace(tmp, path)
+        raise
+    if not keep:
+        os.close(fd)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        if keep:
+            os.close(fd)
+        raise
+    return fd if keep else None
 
 
 def unlink(path):
@@ -206,37 +245,104 @@ def lease(ctl, now=None):
     return d if pid_alive(d.get("pid")) and is_cc_dash(d.get("pid")) else None
 
 
+def pinned_root():
+    """The cc_tool checkout cc-setup pinned for this project: the path in
+    cc_tool_root beside this hook, or ''. Only a plain file we own that nobody
+    else can write counts (cc_procs.py read_pin() applies the same rules)."""
+    p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc_tool_root")
+    try:
+        fd = os.open(p, os.O_RDONLY | NOFOLLOW | CLOEXEC)
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022 or st.st_size > 4096:
+            return ""
+        root = os.read(fd, 4096).decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+    return root if os.path.isabs(root) and "\n" not in root else ""
+
+
+_PROCS = []
+
+
+def _procs():
+    """cc_procs.py from beside this hook (cached; None when missing). Never code
+    from the cc_tool checkout: that lies outside the project, where an agent
+    can edit it; .claude/hooks/ is a protected path in Claude Code."""
+    if not _PROCS:
+        mod = None
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "cc_procs", os.path.join(os.path.dirname(os.path.realpath(__file__)), "cc_procs.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception:  # noqa: BLE001
+            mod = None
+        _PROCS.append(mod)
+    return _PROCS[0]
+
+
+def dashboard_problem(pid):
+    """'' when the lease's pid is the cc-dash this hook trusts (the module
+    docstring, "Which dashboard"), else why not."""
+    if os.environ.get("CC_DASH_LEASE_ANY_PROGRAM") == "1":
+        return ""                          # the hook's tests: their fake dashboard is the test process
+    if not os.path.isdir("/proc/self"):
+        return ""                          # no /proc: the dashboard's keyed, socket-checked answer carries the trust
+    root = pinned_root()
+    if not root:
+        return "no cc_tool_root beside this hook (run cc-update-project)"
+    mod = _procs()
+    if mod is None:
+        return "cc_procs.py is not next to this hook (run cc-update-project)"
+    try:
+        manifest = os.path.join(os.path.dirname(os.path.realpath(__file__)), mod.MANIFEST_NAME)
+        # the recorded code, a real cc-dash process, and that process started after the code last changed
+        return code_problem(root, mod) or mod.dashboard_problem(pid, root) or mod.code_after_start(pid, root, manifest)
+    except Exception as e:  # noqa: BLE001
+        return "the process check failed (%s)" % type(e).__name__
+
+
+def code_problem(root, mod=None):
+    """'' when cc-dash's code under the pinned root is what cc-setup recorded in
+    cc_dash_manifest.json beside this hook (sha256 of bin/cc-dash, cc_procs.py,
+    every entry under lib/, nothing unlisted, no symlink), else why not. Anything
+    running as you can rewrite the checkout through Bash; the record cannot be,
+    without your approval (.claude/ is protected)."""
+    mod = mod or _procs()
+    if mod is None:
+        return "cc_procs.py is not next to this hook (run cc-update-project)"
+    raw = None
+    p = os.path.join(os.path.dirname(os.path.realpath(__file__)), getattr(mod, "MANIFEST_NAME", "cc_dash_manifest.json"))
+    try:
+        fd = os.open(p, os.O_RDONLY | NOFOLLOW | CLOEXEC)
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022 and st.st_size < (1 << 20):
+                raw = os.read(fd, 1 << 20)
+        finally:
+            os.close(fd)
+    except OSError:
+        raw = None
+    try:
+        manifest = json.loads(raw) if raw else None
+    except ValueError:
+        manifest = None
+    if not isinstance(manifest, dict):
+        return "no cc_dash_manifest.json beside this hook (run cc-update-project)"
+    return mod.manifest_problem(root, manifest)
+
+
 def is_cc_dash(pid):
-    """True when the lease's process is cc-dash: a Python interpreter running a
-    `bin/cc-dash` that sits in a cc_tool checkout (lib/cc_dash/server.py beside
-    it), or `python -m cc_dash.server`. A lease pointing at any other process is
-    not trusted; an argument merely mentioning cc-dash does not count.
-    Where /proc is missing the check can't run and the dashboard's own answer
-    (verify, keyed and socket-owner checked) carries the trust.
+    """True when the lease's process is the cc-dash this hook trusts.
     CC_DASH_LEASE_ANY_PROGRAM=1 is for the hook's tests, whose fake dashboard is
     the test process; hooks inherit Claude Code's environment, not an agent's."""
-    if os.environ.get("CC_DASH_LEASE_ANY_PROGRAM") == "1":
-        return True
-    try:
-        with open("/proc/%d/cmdline" % pid, "rb") as f:
-            argv = [a.decode("utf-8", "replace") for a in f.read(8192).split(b"\0") if a]
-    except FileNotFoundError:
-        return not os.path.isdir("/proc/self")
-    except (OSError, TypeError):
-        return False
-    if len(argv) >= 3 and argv[1] == "-m" and argv[2] == "cc_dash.server":
-        return os.path.basename(argv[0]).startswith("python")
-    if len(argv) < 2 or not os.path.basename(argv[0]).startswith("python"):
-        return False
-    script = argv[1]
-    if os.path.basename(script) != "cc-dash":
-        return False
-    try:                                   # relative to the dashboard's own working directory
-        script = os.path.realpath(os.path.join(os.readlink("/proc/%d/cwd" % pid), script))
-    except OSError:
-        return False
-    # a real cc_tool checkout: bin/cc-dash with lib/cc_dash/server.py beside it
-    return os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(script)), "lib", "cc_dash", "server.py"))
+    return dashboard_problem(pid) == ""
 
 
 # ── asking the dashboard before acting on a file ─────────────────────────────
@@ -303,6 +409,8 @@ def verify(ls, **query):
     port, pid, key = ls.get("port"), ls.get("pid"), ls.get("key")
     if not isinstance(port, int) or not 0 < port < 65536 or not isinstance(pid, int) or not isinstance(key, str) or not key:
         return None
+    if not is_cc_dash(pid):                # checked again now, not only when the lease was read
+        return None
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=VERIFY_TIMEOUT)
     try:
         c.request("GET", "/api/control/verify?" + urlencode({k: v for k, v in query.items() if v is not None}),
@@ -353,11 +461,6 @@ def call_hash(tool, ti):
     return hashlib.sha256((str(tool) + "\0" + canon).encode("utf-8", "replace")).hexdigest()
 
 
-def guard_key(session, command):
-    """Name of bash-guard's "asked" marker (cc_hooklib.guard_ask_key computes the same)."""
-    return hashlib.sha256(("%s\0Bash\0%s" % (session, command)).encode("utf-8", "replace")).hexdigest()[:40]
-
-
 def display_input(ti):
     """The tool input for the dashboard card, capped at MAX_INPUT bytes."""
     try:
@@ -372,22 +475,27 @@ def display_input(ti):
     return out, True
 
 
-# ── why it asked: bash-guard's marker, or a permissions.ask rule ───────────
-def guard_reason(ctl, d):
+# ── why it asked: bash-guard's own verdict, or a permissions.ask rule ──────
+def guard_reason(d):
+    """Why bash-guard asked about this Bash command, or ''. Decided here, by
+    bash-guard's own classify() on the same command and working directory (no
+    marker file to trust or delete). A command it would deny counts too, and so
+    does one it could not judge (fail closed: the card then asks for a typed
+    confirm). The reason goes into the request, covered by the card's digest."""
     ti = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
     cmd = ti.get("command")
-    if d.get("tool_name") != "Bash" or not isinstance(cmd, str):
+    if d.get("tool_name") != "Bash" or not isinstance(cmd, str) or not cmd.strip():
         return ""
-    # Not deleted on read: a parallel identical call must be flagged too. Markers
-    # expire by age (GUARD_MARK_TTL here; cc-dash prunes them after 5 minutes).
-    p = os.path.join(ctl, "asked", guard_key(d.get("session_id") or "", cmd) + ".json")
-    m = read_json(p, 16384)
-    if m is None:
+    bg = _bash_guard()
+    if bg is None or not callable(getattr(bg, "classify", None)):
+        return "(not checked: bash-guard.py is not next to this hook, so cc-dash cannot tell whether it asked about this command)"
+    try:
+        decision, reason = bg.classify(cmd, d.get("cwd") or "")
+    except Exception as e:  # noqa: BLE001
+        return "(not checked: bash-guard failed on this command, %s)" % type(e).__name__
+    if decision == "allow":
         return ""
-    ts = m.get("ts")
-    if not isinstance(ts, (int, float)) or time.time() - ts > GUARD_MARK_TTL:
-        return ""
-    return clip(m.get("reason") or "bash-guard asked about this command", 1200)
+    return clip(reason or "bash-guard asked about this command", 1200)
 
 
 def _settings_files(cwd):
@@ -971,6 +1079,8 @@ def decision_output(d, dec, req):
     ti = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
     kind = req["kind"]
     out = lambda decision: {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}  # noqa: E731
+    if action in ("allow", "allow_session", "answer") and req.get("input_truncated") is not False:
+        return None                        # the card held a shortened copy: deny, or answer in the terminal
     if action == "deny":
         msg = dec.get("message") if isinstance(dec.get("message"), str) else ""
         msg = msg.strip()[:4000]
@@ -987,7 +1097,10 @@ def decision_output(d, dec, req):
         return out({"behavior": "allow", "updatedInput": ti})      # a bare allow leaves the plan dialog up
     if action == "allow_session" and kind == "permission" and not req["guard"] and not req["ask_rule"]:
         rules = session_rules(d)
-        return out({"behavior": "allow", "updatedPermissions": rules}) if rules else None
+        # Exactly what the card listed (the request's session_rules, covered by the digest), or nothing.
+        if not rules or rule_text(rules) != req.get("session_rules"):
+            return None
+        return out({"behavior": "allow", "updatedPermissions": rules})
     if action == "answer" and kind == "question":
         answers = dec.get("answers")
         qs = ti.get("questions") if isinstance(ti.get("questions"), list) else []
@@ -1018,7 +1131,7 @@ def permission_request(d, ctl, ls):
     wait = max(5.0, min(float(wait), MAX_WAIT))
     rid = "%x-%s" % (int(started * 1000), os.urandom(6).hex())
     shown, truncated = display_input(ti)
-    guard = guard_reason(ctl, d) if private_dir(os.path.join(ctl, "asked")) else ""
+    guard = guard_reason(d) if kind == "permission" else ""
     rule = ask_rule(d) if kind == "permission" else ""
     req = {
         "v": 1, "id": rid, "ts": round(started, 3), "pid": os.getpid(), "session": sid[:100],
@@ -1036,7 +1149,7 @@ def permission_request(d, ctl, ls):
     import signal
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda *_: sys.exit(0))   # killed (terminal "No", or the timeout): still clean up
-    write_private(req_path, req)
+    held = write_private(req_path, req, keep=True)     # open until we exit: cc-dash checks we hold this inode
     res = {"v": 1, "id": rid, "session": req["session"], "agent_id": req["agent_id"], "outcome": "terminal"}
     watch = Resolution(d, started)
     try:
@@ -1073,6 +1186,7 @@ def permission_request(d, ctl, ls):
             time.sleep(POLL)
     finally:
         unlink(req_path)
+        os.close(held)
         unlink(dec_path)
         res["ts"] = round(time.time(), 3)
         res["waited"] = round(res["ts"] - started, 3)

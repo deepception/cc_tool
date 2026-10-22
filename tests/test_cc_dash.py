@@ -25,6 +25,9 @@ import time
 from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The interpreter is the kernel's: with zsh's exported ARGV0 (Cursor's terminal), sys.executable
+# can name the editor's AppImage, and running it opens editor tabs instead of Python.
+PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import pricing  # noqa: E402
 from cc_dash.parser import Acc, FileCache  # noqa: E402
@@ -342,9 +345,9 @@ def test_server():
 
 
 def test_cli():
-    p = subprocess.run([sys.executable, os.path.join(REPO, "bin", "cc-dash"), "--help"], capture_output=True, text=True, timeout=30)
+    p = subprocess.run([PY, os.path.join(REPO, "bin", "cc-dash"), "--help"], capture_output=True, text=True, timeout=30)
     check("cli: --help exits 0 and names the flags", p.returncode == 0 and all(f in p.stdout for f in ("--port", "--no-open", "--days", "--project")), p.stderr[-200:])
-    p = subprocess.run([sys.executable, os.path.join(REPO, "bin", "cc-dash"), "--days", "0"], capture_output=True, text=True, timeout=30)
+    p = subprocess.run([PY, os.path.join(REPO, "bin", "cc-dash"), "--days", "0"], capture_output=True, text=True, timeout=30)
     check("cli: --days 0 rejected", p.returncode != 0)
 
 

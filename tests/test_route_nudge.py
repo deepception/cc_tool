@@ -28,6 +28,9 @@ import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The interpreter is the kernel's: with zsh's exported ARGV0 (Cursor's terminal), sys.executable
+# can name the editor's AppImage, and running it opens editor tabs instead of Python.
+PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
 HOOK = os.path.join(REPO, "templates", "hooks", "route-nudge.py")
 SETTINGS = os.path.join(REPO, "templates", "settings.json")
 RESULTS = []
@@ -48,7 +51,7 @@ def run(payload, env_extra=None, raw=None, cwd=None):
     env.update(env_extra or {})
     data = raw if raw is not None else json.dumps(payload).encode()
     t0 = time.perf_counter()
-    p = subprocess.run([sys.executable, HOOK], input=data, env=env, capture_output=True, timeout=10, cwd=cwd)
+    p = subprocess.run([PY, HOOK], input=data, env=env, capture_output=True, timeout=10, cwd=cwd)
     return p, (time.perf_counter() - t0) * 1000
 
 
@@ -161,7 +164,7 @@ def test_latency():
     base = []
     for _ in range(25):
         t0 = time.perf_counter()
-        subprocess.run([sys.executable, "-c", "pass"], capture_output=True)
+        subprocess.run([PY, "-c", "pass"], capture_output=True)
         base.append((time.perf_counter() - t0) * 1000)
     own = statistics.median(xs) - statistics.median(base)
     print("latency: median %.1f ms per call, bare interpreter %.1f ms, own work about %.1f ms" % (statistics.median(xs), statistics.median(base), own))
@@ -217,7 +220,7 @@ def test_rollout():
     regs = [(e.get("matcher"), h["command"]) for e in s["hooks"]["PreToolUse"] for h in e["hooks"] if "route-nudge.py" in h["command"]]
     check("rollout: cc-setup registers it once with the Agent|Task matcher", regs == [("Agent|Task", "python3 $CLAUDE_PROJECT_DIR/.claude/hooks/route-nudge.py")], regs)
     # The deployed copy runs from the project the way Claude Code runs it.
-    p = subprocess.run([sys.executable, hook], input=json.dumps(call(description="d")).encode(), capture_output=True, env=dict(env, CLAUDE_PROJECT_DIR=proj))
+    p = subprocess.run([PY, hook], input=json.dumps(call(description="d")).encode(), capture_output=True, env=dict(env, CLAUDE_PROJECT_DIR=proj))
     check("rollout: the deployed hook answers", ctx_of(p) is not None, p.stdout)
     # An older project: no registration, no script, and a project hook of its own beside it.
     s["hooks"]["PreToolUse"] = [e for e in s["hooks"]["PreToolUse"] if not any("route-nudge.py" in h["command"] for h in e["hooks"])]
@@ -238,7 +241,7 @@ def test_rollout():
     regs2 = [h["command"] for e in s2["hooks"]["PreToolUse"] for h in e["hooks"] if "route-nudge.py" in h["command"]]
     check("rollout: re-running is idempotent (still one registration)", r.returncode == 0 and len(regs2) == 1, regs2)
     m = re.search(r"\((\d+) hooks\)", r.stdout)
-    n_templates = len([f for f in os.listdir(os.path.dirname(HOOK)) if f.endswith((".py", ".sh")) and f != "cc_hooklib.py"])
+    n_templates = len([f for f in os.listdir(os.path.dirname(HOOK)) if f.endswith((".py", ".sh")) and f not in ("cc_hooklib.py", "cc_procs.py")])
     check("rollout: the installed-hooks count matches the template scripts", m and int(m.group(1)) >= n_templates, (m and m.group(1), n_templates))
 
 

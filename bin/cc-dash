@@ -13,11 +13,35 @@ Usage: cc-dash [--port 7878] [--no-open] [--days 7] [--project <text>] [--contro
 import os
 import sys
 
+# Run isolated: re-execute once as `python -I <this script> ...` without PYTHON*
+# or LD_* variables, so no PYTHONPATH, PYTHONSTARTUP, user site directory
+# (usercustomize, .pth files), current directory or preloaded library can put
+# other code into the dashboard. The control hook trusts a dashboard only in
+# exactly this form (templates/hooks/cc_procs.py).
+# The interpreter is the kernel's (/proc/self/exe): with zsh's exported ARGV0,
+# sys.executable can name the terminal's AppImage instead of Python.
+if not sys.flags.isolated:
+    exe = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "LD_"))}
+    os.execve(exe, [exe, "-I", sys.argv[0]] + sys.argv[1:], env)
+
 sys.dont_write_bytecode = True  # "writes nothing" includes __pycache__ next to lib/
+# ... and reads none either: a .pyc planted in lib/cc_dash/__pycache__ (an unchecked-hash
+# one runs without looking at the source) would bypass the code manifest the control
+# hook checks. A cache directory that cannot exist means sources only.
+sys.pycache_prefix = os.path.join(os.devnull, "cc-dash-no-pycache")
 # Same convention as cc-setup's CC_TOOL_DIR: the repo is this script's parent's
 # parent. realpath so a symlinked cc-dash still finds lib/.
 CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-sys.path.insert(0, os.path.join(CC_TOOL_DIR, "lib"))
+# The package is loaded by its path, and lib/ never goes on sys.path: a stray
+# lib/json.py could otherwise stand in for the standard library.
+import importlib.util  # noqa: E402
+
+_pkg = os.path.join(CC_TOOL_DIR, "lib", "cc_dash")
+_spec = importlib.util.spec_from_file_location("cc_dash", os.path.join(_pkg, "__init__.py"), submodule_search_locations=[_pkg])
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules["cc_dash"] = _mod
+_spec.loader.exec_module(_mod)
 
 from cc_dash.server import main  # noqa: E402
 

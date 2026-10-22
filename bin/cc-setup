@@ -92,6 +92,66 @@ if kept:
 EOF
 find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -name "*.sh" -exec chmod +x {} \;
 
+# Pin this cc_tool checkout for the dash-control hook: it trusts a control-mode
+# dashboard only when that process runs <this root>/bin/cc-dash, so a copy of
+# cc_tool (or a fake one) an agent starts cannot answer for the dashboard.
+# .claude/ is a protected path in Claude Code: an agent cannot rewrite this
+# file, or the hooks beside it, without your approval. cc-update-project
+# refreshes it (it runs this script).
+# Beside it, cc_dash_manifest.json: the sha256 of cc-dash's code in this checkout
+# (bin/cc-dash, cc_procs.py, lib/cc_dash/). The hook trusts a dashboard only while
+# that code is unchanged, so a Bash edit of the checkout cannot vouch for itself.
+# After a `git pull` of cc_tool, cc-update-project re-records it.
+# And the project goes into ${XDG_STATE_HOME:-~/.local/state}/cc_tool/projects.json
+# (0600): cc-dash shows a permission request only from a registered project's hook.
+python3 - "$CC_TOOL_DIR" "$PROJECT_DIR" <<'EOF'
+import importlib.util, json, os, sys
+root, project = os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])
+hooks = os.path.join(project, ".claude", "hooks")
+
+
+def write(path, data):
+    # Unchanged content is left alone: the hook requires the record to predate the running
+    # dashboard (its ctime), so a no-op re-run must not force a dashboard restart.
+    try:
+        st = os.lstat(path)
+        if os.path.isfile(path) and not os.path.islink(path) and (st.st_mode & 0o777) == 0o600:
+            with open(path, encoding="utf-8") as fh:
+                if fh.read() == data:
+                    return
+    except OSError:
+        pass
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.write(fd, data.encode())
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+write(os.path.join(hooks, "cc_tool_root"), root + "\n")
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("cc_procs", os.path.join(root, "templates", "hooks", "cc_procs.py"))
+procs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(procs)
+write(os.path.join(hooks, procs.MANIFEST_NAME), json.dumps(procs.build_manifest(root), indent=1, sort_keys=True) + "\n")
+base = os.environ.get("XDG_STATE_HOME") or ""
+if not os.path.isabs(base):
+    base = os.path.join(os.path.expanduser("~"), ".local", "state")
+state = os.path.join(base, "cc_tool")
+os.makedirs(state, mode=0o700, exist_ok=True)
+reg = os.path.join(state, "projects.json")
+try:
+    with open(reg, encoding="utf-8") as fh:
+        known = json.load(fh).get("projects") or []
+except (OSError, ValueError, AttributeError):
+    known = []
+known = sorted({p for p in known if isinstance(p, str)} | {project})
+write(reg, json.dumps({"v": 1, "projects": known}, indent=1) + "\n")
+EOF
+
 # Prune hooks cc_tool used to ship and no longer does. Copying alone left them
 # behind forever: cc_tool's entries in the settings.json hooks block are rebuilt
 # from the template, so an orphan stops being registered but the file lingers as dead weight — and a
@@ -147,7 +207,7 @@ if kept:
           % ", ".join(sorted(kept)))
 EOF
 
-hook_count=$(find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) ! -name cc_hooklib.py | wc -l | tr -d ' ')
+hook_count=$(find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -type f \( -name "*.sh" -o -name "*.py" \) ! -name cc_hooklib.py ! -name cc_procs.py | wc -l | tr -d ' ')
 echo "  ✓ .claude/hooks/ installed ($hook_count hooks)"
 
 # ── 2. settings.json (merge hooks, preserve permissions) ────────────────────

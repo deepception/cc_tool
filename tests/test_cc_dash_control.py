@@ -31,6 +31,9 @@ import time
 from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The interpreter is the kernel's: with zsh's exported ARGV0 (Cursor's terminal), sys.executable
+# can name the editor's AppImage, and running it opens editor tabs instead of Python.
+PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import auth as auth_mod  # noqa: E402
 from cc_dash.control import Control  # noqa: E402
@@ -73,7 +76,7 @@ class Srv:
     """A cc-dash server (optionally in control mode) with its own state dir."""
     n = 0
 
-    def __init__(self, control=True, agents_cmd=None, sockets=True, port=0):
+    def __init__(self, control=True, agents_cmd=None, sockets=True, port=0, hook_check=False):
         Srv.n += 1
         self.root = os.path.join(BASE, "s%d" % Srv.n)
         self.cfg = os.path.join(self.root, "claude")
@@ -92,7 +95,7 @@ class Srv:
         self.ctl = None
         if control:
             self.ctl = Control(self.store, self.port, ctl_dir=os.path.join(self.state, "cc_tool", "control"),
-                               agents_cmd=agents_cmd, sockets=sockets)
+                               agents_cmd=agents_cmd, sockets=sockets, hook_check=hook_check)
             self.ctl.start(thread=False)
             self.srv.control = self.ctl
         threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
@@ -250,7 +253,7 @@ def test_pairing():
         a3.cleanup()
         check("pair file: deleted once the code expires", not os.path.exists(p3))
         if True:
-            out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r)\n"
+            out = subprocess.run([PY, "-c", "import sys; sys.path.insert(0, %r)\n"
                                   "import webbrowser, threading, cc_dash.server as m\n"
                                   "opened=[]\nwebbrowser.open=lambda u,*a,**k: opened.append(u)\n"
                                   "class T:\n def __init__(s,t,f): s.f=f\n def start(s): s.f()\n"
@@ -278,7 +281,7 @@ def test_write_checks():
     try:
         d = s.ctl.dir
         check("control dir 0700, subdirs 0700", stat.S_IMODE(os.stat(d).st_mode) == 0o700
-              and all(stat.S_IMODE(os.stat(os.path.join(d, x)).st_mode) == 0o700 for x in ("req", "dec", "res", "msg", "dlv", "asked", "sock", "stop", "stopped")))
+              and all(stat.S_IMODE(os.stat(os.path.join(d, x)).st_mode) == 0o700 for x in ("req", "dec", "res", "msg", "dlv", "sock", "stop", "stopped")))
         lease = json.load(open(s.path("lease")))
         check("lease 0600 with pid, launch, expiry and wait", stat.S_IMODE(os.stat(s.path("lease")).st_mode) == 0o600
               and lease["pid"] == os.getpid() and lease["launch"] == s.ctl.launch and lease["expires"] > time.time() and lease["wait"] == 300, lease)
@@ -512,7 +515,7 @@ def test_socket_transport():
 
 def test_agents_release_and_annotate():
     script = os.path.join(BASE, "agents.json")
-    cmd = [sys.executable, "-c", "import sys;print(open(sys.argv[1]).read())", script]
+    cmd = [PY, "-c", "import sys;print(open(sys.argv[1]).read())", script]
 
     def status(st):
         with open(script, "w") as fh:
@@ -546,7 +549,7 @@ def test_round_trip_with_hook():
                    CC_DASH_LEASE_ANY_PROGRAM="1")   # the dashboard here runs inside this test process
         payload = {"session_id": SID, "transcript_path": "/x", "cwd": s.cwd, "hook_event_name": "PermissionRequest",
                    "permission_mode": "default", "tool_name": "Bash", "tool_input": {"command": "make deploy"}}
-        p = subprocess.Popen([sys.executable, HOOK], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+        p = subprocess.Popen([PY, HOOK], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
         p.stdin.write(json.dumps(payload).encode())
         p.stdin.close()
         p.stdin = None

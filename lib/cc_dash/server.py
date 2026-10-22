@@ -23,7 +23,6 @@ import argparse
 import errno
 import json
 import os
-import re
 import sys
 import threading
 import time
@@ -32,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import attention
+from . import procs
 from . import plans   # plan progress (/api/plans)
 from .auth import Auth, local_pairing_supported, same_user
 from .control import MAX_BODY, Control
@@ -337,6 +337,13 @@ class Handler(BaseHTTPRequestHandler):
         body, err = self._read_body()
         if err:
             return self._json(*err)
+        if any(auth.mentions_code(t) for t in _typed_texts(body)):
+            # Never echoed, logged with the text or written to a file: the code stays on the terminal.
+            ctl.log(client, "refused", kind=path.rsplit("/", 1)[-1], session=body.get("session") if isinstance(body.get("session"), str) else None,
+                    result="text containing the control code was not sent")
+            return self._json(400, {"error": "That text contains your control code. The code only goes into the unlock "
+                                             "field; nothing else on this page or from an agent should ever ask for it. "
+                                             "Nothing was sent.", "code_in_text": True})
         try:
             if path == "/api/control/decide":
                 code, out = ctl.decide(client, body)
@@ -351,6 +358,16 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(code, out)
 
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _no_body
+
+
+def _typed_texts(body):
+    """Every piece of text a control POST carries that a person typed: a deny
+    reason, a message, each answer (and the question it answers)."""
+    out = [body.get(k) for k in ("message", "text") if isinstance(body.get(k), str)]
+    ans = body.get("answers")
+    if isinstance(ans, dict):
+        out += [x for kv in ans.items() for x in kv if isinstance(x, str)]
+    return out
 
 
 class DashServer(ThreadingHTTPServer):
@@ -422,72 +439,35 @@ def _ready(a):
         a.ready_fd = None
 
 
-# What Claude Code puts in the environment of its Bash tool's processes
-# (checked against `env` from a headless `claude -p` Bash call, CLI 2.1.30x).
-CLAUDE_ENV_SIGNALS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID",
-                      "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_CHILD_SESSION")
+# Process checks live in templates/hooks/cc_procs.py (procs.py loads it), the same file
+# cc-setup copies beside the control hook, so both judge a launch the same way.
+CLAUDE_ENV_SIGNALS = procs.CLAUDE_ENV_SIGNALS
 INSIDE_CLAUDE = "cc-dash --control must be started from your own terminal, not from inside a Claude Code session"
+_proc_stat = procs.proc_stat
+_ancestors = procs.ancestors
+_is_claude = procs.is_claude
+# This checkout: lib/cc_dash/server.py -> the repo (bin/cc-dash finds lib/ the same way).
+CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 
-def _proc_stat(pid, proc="/proc"):
-    """{comm, ppid, pgrp, sid, tty} from /proc/<pid>/stat, or None."""
-    try:
-        with open("%s/%d/stat" % (proc, pid), encoding="utf-8", errors="replace") as fh:
-            st = fh.read()
-        comm = st[st.index("(") + 1:st.rindex(")")]
-        f = st[st.rindex(")") + 2:].split()
-        return {"comm": comm, "ppid": int(f[1]), "pgrp": int(f[2]), "sid": int(f[3]), "tty": int(f[4])}
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def _ancestors(pid=None, n=64, proc="/proc"):
-    """(pid, comm, exe, argv) of pid (default: this process's parent) and each of
-    its ancestors up to init, from /proc; [] elsewhere."""
-    out, pid = [], os.getppid() if pid is None else pid
-    for _ in range(n):
-        if pid <= 1:
-            break
-        st = _proc_stat(pid, proc)
-        if st is None:
-            break
-        try:
-            with open("%s/%d/cmdline" % (proc, pid), "rb") as fh:
-                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
-        except OSError:
-            argv = []
-        try:
-            exe = os.readlink("%s/%d/exe" % (proc, pid))
-        except OSError:
-            exe = ""
-        out.append((pid, st["comm"], exe, argv))
-        pid = st["ppid"]
-    return out
-
-
-def _is_claude(comm, exe, argv):
-    """The claude CLI itself, or node running it."""
-    names = {comm, os.path.basename(exe or "")} | ({os.path.basename(argv[0])} if argv else set())
-    if "claude" in names:
-        return True
-    if names & {"node", "nodejs", "bun"}:
-        return any(re.search(r"(?:^|/)(?:claude(?:\.js|\.mjs)?|@anthropic-ai/claude-code(?:/|$))", a) for a in argv[1:3])
-    return False
-
-
-def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=None):
+def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=None, root=None, note=None):
     """Why control mode must not start here, or ''.
 
     Control mode is how the human approves agents, so it refuses (1) to take
     over from a dashboard that already holds a live lease (the human stops that
     one first; `ccdash` does), and (2) to start from inside Claude Code: its
-    shells carry CLAUDECODE=1 and descend from the `claude` process. Both are
-    raised bars, not walls: a program running as you can unset the variable and
+    shells carry CLAUDECODE=1 and descend from the `claude` process. A lease
+    counts as live only when its pid passes the same program check the hook
+    applies (procs.dashboard_problem: cc-dash from this checkout, launched as
+    cc-dash launches itself, from outside Claude Code); any other lease is
+    removed, with a note (`note`, a callable, gets the text). Both are raised
+    bars, not walls: a program running as you can unset the variable and
     detach. See docs/guides/commands.md (Control mode, Security)."""
-    from .control import read_json
+    from .control import read_json, unlink
     env = os.environ if env is None else env
     d = ctl_dir or os.path.join(attention.state_dir(), "control")
-    lease = read_json(os.path.join(d, "lease"), 4096)
+    lease_path = os.path.join(d, "lease")
+    lease = read_json(lease_path, 4096)
     if lease is not None and isinstance(lease.get("expires"), (int, float)) and lease["expires"] > time.time():
         pid = lease.get("pid")
         alive = False
@@ -500,8 +480,15 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
             except OSError:
                 alive = False
         if alive:
-            return ("another cc-dash --control (pid %d) is running and holds the control lease. Stop it first "
-                    "(Ctrl-C in its terminal; `ccdash --control` does this for you)." % pid)
+            why = procs.dashboard_problem(pid, root or CC_TOOL_DIR, proc) \
+                if (proc != "/proc" or os.path.isdir("/proc/self")) else ""
+            if not why:
+                return ("another cc-dash --control (pid %d) is running and holds the control lease. Stop it first "
+                        "(Ctrl-C in its terminal; `ccdash --control` does this for you)." % pid)
+            unlink(lease_path)
+            if note is not None:
+                note("cc-dash: removed a control lease that named pid %d, which is not a cc-dash dashboard (%s). "
+                     "Something running as you wrote it; see the audit log once control mode is on." % (pid, why))
     seen = [k for k in CLAUDE_ENV_SIGNALS if env.get(k)]
     if seen:
         return INSIDE_CLAUDE + " (its environment carries %s)." % ", ".join(seen)
@@ -516,20 +503,15 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
         return ""
     # The session leader and the process-group leader outlive a double fork: if
     # either is, or descends from, the claude CLI, this was started inside it.
-    for label, leader in (("session", st["sid"]), ("process-group", st["pgrp"])):
-        if leader in (0, me):
-            continue
-        for pid, comm, exe, argv in _ancestors(leader, proc=proc):
-            if _is_claude(comm, exe, argv):
-                return INSIDE_CLAUDE + " (its %s leader descends from process %d, %s)." % (label, pid, comm)
+    why = procs.claude_lineage(me, proc, parents=[])
+    if why:
+        return INSIDE_CLAUDE + " (%s)." % why
     # A typical double-fork escape: re-parented to init or a user-manager subreaper
     # and no controlling terminal left.
-    parent = _proc_stat(st["ppid"], proc) if st["ppid"] > 1 else None
-    reparented = st["ppid"] <= 1 or (parent or {}).get("comm") in ("systemd", "init")
-    if st["sid"] == me and reparented:          # setsid'd itself, then lost its parent: a fresh detached session
+    if procs.fresh_session(me, proc):          # setsid'd itself, then lost its parent: a fresh detached session
         return ("cc-dash --control must be started from your own terminal: this process leads a fresh session "
                 "and was re-parented to pid %d." % st["ppid"])
-    if st["tty"] == 0 and reparented:
+    if st["tty"] == 0 and procs.reparented(st, proc):
         return ("cc-dash --control must be started from your own terminal: this process was detached (re-parented "
                 "to pid %d) and has no controlling terminal." % st["ppid"])
     return ""
@@ -583,7 +565,7 @@ def main(argv=None):
     if srv.port != a.port and a.port:
         print(f"cc-dash: port {a.port} is busy, using {srv.port}.")
     if a.control:
-        why = control_refusal()
+        why = control_refusal(note=lambda text: print(text, file=sys.stderr))
         if why:
             print("cc-dash: " + why, file=sys.stderr)
             srv.server_close()

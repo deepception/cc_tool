@@ -17,17 +17,18 @@ Blocks:
     `--force-with-lease`), `curl … | sh`, `env | curl`, registry redirection
     (`npm config set registry`, writes to `.npmrc`/`pip.conf`), `mkfs`/`dd
     of=/dev/…`, `chmod 777`, shutdown.
-  - cc-dash's control channel, so an agent cannot approve its own prompt: any
-    reference to `…/cc_tool/control` (the hook handoff directory, read or
-    write) or `…/cc_tool/cc-dash.log`, a call to the dashboard's pairing or
-    control endpoints on the loopback (`/api/pair`, `/api/pair-local`,
-    `/api/control/…` on 127.0.0.1 / localhost), and starting `cc-dash
-    --control` / `ccdash --control`. Heredoc bodies and inline code are
-    scanned too. GET /api/live and the other read endpoints, and reading
-    transcripts, stay allowed. Defence in depth only: a script that builds the
-    path or URL at run time is invisible here; the control code and cc-dash's
-    verification of every decision (lib/cc_dash/auth.py, control.py) are the
-    real protection.
+  - starting cc-dash's control mode (`cc-dash --control` / `ccdash --control`,
+    however wrapped; heredoc bodies and inline code are scanned too), so an
+    agent cannot run its own approval dashboard. Defence in depth only: the
+    control code, the control hook's checks on the dashboard process and
+    cc-dash's verification of every decision (lib/cc_dash/auth.py, procs.py,
+    control.py) are the real protection. The control directory, log and
+    endpoints are not matched in command text (that can never be complete).
+
+Pure entry point: classify(command, cwd) -> ("deny" | "ask" | "allow", reason)
+runs the same checks without printing, exiting or logging; cc-dash's control
+hook uses it to learn whether a permission prompt is one this guard asked
+about.
 
 Asks (hands the decision to the user; in an unattended run that is a refusal).
 The rule is: ask before an install or a deletion, nowhere else.
@@ -121,7 +122,7 @@ MAX_COMMAND_CHARS = 400_000
 
 _CMD_FOR_LOG = ""      # set by main() so deny/ask can log what they refused
 _PAYLOAD_CWD = ""      # the Bash tool's working directory, from the hook payload
-_SESSION_ID = ""       # the payload's session_id (cc-dash's "asked" marker is keyed by it)
+_CAPTURE = False       # classify(): deny()/ask() raise _Verdict instead of printing and exiting
 _WARNINGS: list = []   # non-blocking notes, emitted together at the end
 
 
@@ -140,12 +141,22 @@ def _log(kind: str, message: str) -> None:
             pass
 
 
+class _Verdict(Exception):
+    """classify()'s capture mode: the decision deny()/ask() would have printed."""
+
+    def __init__(self, decision: str, reason: str):
+        super().__init__(reason)
+        self.decision, self.reason = decision, reason
+
+
 def deny(reason: str, suggestion: str = "") -> None:
     """Refuse the command. The message follows one shape for every cc_tool guard:
     `BLOCKED: <what and why>. Suggestion: <the safe form>.` The managed CLAUDE.md
     block teaches the model to take the suggestion rather than rephrase around
     the guard."""
     msg = _fmt(reason, suggestion)
+    if _CAPTURE:
+        raise _Verdict("deny", msg)
     _log("deny", msg)
     print(json.dumps({
         "hookSpecificOutput": {
@@ -161,14 +172,9 @@ def ask(reason: str, suggestion: str = "") -> None:
     """Hand the decision to the user (destructive-but-sometimes-legitimate ops,
     or a command the guard cannot analyse)."""
     msg = _fmt(reason, suggestion).replace("BLOCKED:", "NEEDS APPROVAL:", 1)
+    if _CAPTURE:
+        raise _Verdict("ask", msg)
     _log("ask", msg)
-    if lib:
-        # cc-dash control mode: tell the dashboard's approval card why this asked
-        # (a no-op unless `cc-dash --control` holds a fresh lease).
-        try:
-            lib.guard_ask_mark(_SESSION_ID, _CMD_FOR_LOG, msg)
-        except Exception:  # noqa: BLE001
-            pass
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -185,7 +191,7 @@ def warn(note: str) -> None:
 
 
 def flush_warnings() -> None:
-    if not _WARNINGS:
+    if not _WARNINGS or _CAPTURE:
         return
     _log("warn", " | ".join(_WARNINGS))
     print(json.dumps({
@@ -2333,58 +2339,13 @@ def check_write_bypass(tokens) -> None:
             return
 
 
-# ── cc-dash's control channel ─────────────────────────────────────────────────
-# Your agents run as you. cc-dash --control hands approvals to the hook through
-# files in ${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/ and takes them from
-# a page unlocked with a code shown on the user's terminal. An agent has no
-# business in either: refuse the plain forms (a path written out, a URL written
-# out, launching control mode). Scanned on the raw command, so heredoc bodies
-# and `python3 -c` code count. Narrow on purpose: `curl …/api/live`, reading
-# ~/.claude/projects transcripts and ~/.local/state/cc_tool/attention.jsonl pass.
-_CTL_PATH_RE = re.compile(r"/cc_tool/(?:control(?![\w.-])|cc-dash\.log(?![\w-]))")
-_DASH_API_RE = re.compile(r"(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(?::\d+)?/api/(?:pair(?:-local)?(?![\w-])|control/)",
-                          re.I)
-_DASH_SUGGESTION = ("ask the user to approve, answer or message in their terminal or in the dashboard; to read what "
-                    "agents are doing, read the transcripts or GET /api/live")
-
-
-def _dash_norm(cmd: str) -> str:
-    """The command with quotes dropped, repeated '/' collapsed and './' segments
-    removed, so `/cc_tool//control`, `/cc_tool/./control` or `/cc_"tool"/control`
-    can't slip past the path and URL patterns."""
-    s = cmd.replace('"', "").replace("'", "").replace("\\", "")
-    s = re.sub(r"/{2,}", "/", s)
-    prev = None
-    while prev != s:
-        prev = s
-        s = re.sub(r"/\.(?=/|$)", "", s)                       # ./ segments
-        s = re.sub(r"/(?!\.\.(?:/|$))[^/\s]+/\.\.(?=/|$)", "", s)  # x/.. segments
-    return s
-
-
-# A glob or brace segment where a path could expand into the control dir or the log:
-# directly under cc_tool/, or in place of cc_tool before control/ or cc-dash.log.
-_CTL_GLOB_RE = re.compile(r"/cc_tool/[^/\s]*[*?\[{]|/[^/\s]*[*?\[{][^/\s]*/(?:control(?![\w.-])|cc-dash\.log(?![\w-]))")
-
-
-def check_cc_dash_raw(cmd: str) -> None:
-    cmd = _dash_norm(cmd)
-    m = _CTL_PATH_RE.search(cmd)
-    if m:
-        what = "the cc-dash log" if "cc-dash.log" in m.group(0) else "cc-dash's control directory (…/cc_tool/control/)"
-        deny(f"this command touches {what}: it carries dashboard approvals, messages and stops (and the pairing "
-             "link), and only cc-dash and its hook may read or write it", _DASH_SUGGESTION)
-    m = _CTL_GLOB_RE.search(cmd)
-    if m:
-        ask(f"this command uses a pattern ('{m.group(0)}') that can expand into cc-dash's control directory or log, "
-            "which carry dashboard approvals and only cc-dash and its hook may touch",
-            "write the path out in full; if it isn't cc-dash's control directory or log, this will pass")
-    m = _DASH_API_RE.search(cmd)
-    if m:
-        deny(f"this command calls cc-dash's pairing or control endpoint ('{m.group(0)}'): only the user's own "
-             "browser pairs with the dashboard or acts through it", _DASH_SUGGESTION)
-
-
+# ── cc-dash control mode: no launches from an agent ──────────────────────────
+# Your agents run as you. cc-dash --control shows its per-launch code on the
+# terminal that started it, so an agent must not start one: refuse launching
+# control mode (scanned on the raw command too, so heredoc bodies and
+# `python3 -c` code count). cc-dash itself also refuses to start inside a
+# Claude Code session. The control files and endpoints need no guard here: the
+# hook acts only on the dashboard's own records and every write needs the code.
 # `--control`, any prefix argparse might once have accepted (`--c`, `--con`, ...;
 # cc-dash now sets allow_abbrev=False), and `--control=...`.
 _CONTROL_FLAG_RE = re.compile(r"^--(?:c|co|con|cont|contr|contro|control)(?:=.*)?$", re.S)
@@ -2561,22 +2522,19 @@ def read_command() -> str:
             why=f"tool_input was {type(tool_input).__name__}, not an object"))
     if "command" not in tool_input:
         sys.exit(0)  # not a command-bearing tool call — nothing for this guard
-    global _PAYLOAD_CWD, _SESSION_ID
+    global _PAYLOAD_CWD
     if isinstance(data.get("cwd"), str):
         _PAYLOAD_CWD = data["cwd"]
-    if isinstance(data.get("session_id"), str):
-        _SESSION_ID = data["session_id"]
     cmd = tool_input["command"]
     if not isinstance(cmd, str):
         deny(_PARSE_FAIL.format(why=f"command was {type(cmd).__name__}, not a string"))
     return cmd
 
 
-def main() -> None:
+def check_command(cmd: str) -> None:
+    """Every check, in order, on one non-empty command. deny() and ask() end it
+    (they exit, or raise _Verdict under classify()); returning means no objection."""
     global _CMD_FOR_LOG
-    cmd = read_command()
-    if not cmd.strip():
-        sys.exit(0)
     _CMD_FOR_LOG = cmd
     if len(cmd) > MAX_COMMAND_CHARS:
         # Never silently allow what we did not analyse.
@@ -2586,7 +2544,6 @@ def main() -> None:
             f"you are sure it does not commit/push to a protected branch or read secrets."
         )
 
-    check_cc_dash_raw(cmd)
     prepped = shell_prepass(cmd)
     global _SINGLE_QUOTED_DOLLAR, _PREPPED
     _SINGLE_QUOTED_DOLLAR = _has_single_quoted_dollar(prepped)
@@ -2606,8 +2563,7 @@ def main() -> None:
         if _DELETE_UNPARSEABLE_RE.search(prepped):
             ask("bash-guard could not parse this command (unbalanced quotes), so it cannot tell what the "
                 "'rm' in it deletes", _DELETE_SUGGESTION)
-        flush_warnings()
-        sys.exit(0)
+        return
 
     check_secret_read(tokens)
     check_cc_dash_launch(tokens, cmd)
@@ -2620,6 +2576,35 @@ def main() -> None:
     check_built_deleters(prepped)
     check_command_words(tokens)
     check_write_bypass(tokens)
+
+
+def classify(command: str, cwd: str = ""):
+    """("deny" | "ask" | "allow", reason): what this hook decides for `command`
+    run in `cwd`, without printing, exiting or logging. For cc-dash's control
+    hook, which must know whether a permission prompt is one bash-guard asked
+    about (that needs a typed confirm on the dashboard). A crash is a deny, as
+    when the hook runs."""
+    global _CAPTURE, _PAYLOAD_CWD, _WARNINGS, _BRANCH_LOOKUPS
+    if not isinstance(command, str) or not command.strip():
+        return "allow", ""
+    _CAPTURE, _PAYLOAD_CWD, _WARNINGS, _BRANCH_LOOKUPS = True, cwd if isinstance(cwd, str) else "", [], 0
+    _BRANCH_CACHE.clear()
+    try:
+        check_command(command)
+    except _Verdict as v:
+        return v.decision, v.reason
+    except Exception as exc:  # noqa: BLE001 - the hook denies on a crash; so does this
+        return "deny", _fmt(f"bash-guard failed while checking this command ({type(exc).__name__}: {exc})", "")
+    finally:
+        _CAPTURE = False
+    return "allow", ""
+
+
+def main() -> None:
+    cmd = read_command()
+    if not cmd.strip():
+        sys.exit(0)
+    check_command(cmd)
     flush_warnings()
     sys.exit(0)
 

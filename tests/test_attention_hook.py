@@ -21,6 +21,9 @@ import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The interpreter is the kernel's: with zsh's exported ARGV0 (Cursor's terminal), sys.executable
+# can name the editor's AppImage, and running it opens editor tabs instead of Python.
+PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
 HOOK = os.path.join(REPO, "templates", "hooks", "attention.py")
 SETTINGS = os.path.join(REPO, "templates", "settings.json")
 RESULTS = []
@@ -40,7 +43,7 @@ def run(payload, env_extra=None, raw=None, home=None):
     env.update(env_extra or {})
     data = raw if raw is not None else json.dumps(payload).encode()
     t0 = time.perf_counter()
-    p = subprocess.run([sys.executable, HOOK], input=data, env=env, capture_output=True, timeout=10)
+    p = subprocess.run([PY, HOOK], input=data, env=env, capture_output=True, timeout=10)
     return p, (time.perf_counter() - t0) * 1000
 
 
@@ -235,7 +238,7 @@ def test_speed():
     bare = []
     for _ in range(25):
         t0 = time.perf_counter()
-        subprocess.run([sys.executable, "-c", "pass"], capture_output=True)
+        subprocess.run([PY, "-c", "pass"], capture_output=True)
         bare.append((time.perf_counter() - t0) * 1000)
     med, bmed = statistics.median(times), statistics.median(bare)
     print(f"  hook latency: median {med:.1f} ms (bare interpreter {bmed:.1f} ms, so the hook's own work is {med - bmed:.1f} ms)")
