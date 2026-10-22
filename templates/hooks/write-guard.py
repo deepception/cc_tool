@@ -6,6 +6,11 @@ Blocks (deny):
   - writes to the user's shell/credential dotfiles (~/.ssh/*, ~/.bashrc,
     ~/.zshrc, ~/.profile, ~/.gitconfig, ~/.aws/*, ~/.npmrc, ~/.config/gh/*)
   - writes inside the repo's .git/ directory (or another worktree's)
+  - writes into cc-dash's control directory
+    (${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/) or its log: decision,
+    message and stop files there are how the dashboard talks to the
+    dash-control hook, and an agent must not forge them (cc-dash also verifies
+    every one; this is defence in depth)
   - secrets in the proposed content: private-key blocks, AWS/GitHub/Slack/
     Anthropic/OpenAI/Google/Stripe keys, JWTs, and `api_key = "<long literal>"`
     style assignments. Placeholder-looking values (EXAMPLE, your_, xxx, <…>,
@@ -142,6 +147,24 @@ def repo_worktrees(root: str) -> list:
             for line in out.stdout.splitlines() if line.startswith("worktree ")]
 
 
+def _cc_state_dir() -> str:
+    """${XDG_STATE_HOME:-~/.local/state}/cc_tool, the rule cc-dash and its hooks use."""
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):
+        base = os.path.join(_home(), ".local", "state")
+    return os.path.join(base, "cc_tool")
+
+
+def check_cc_dash(root: str, path: str) -> None:
+    real = os.path.realpath(path)
+    sd = _cc_state_dir()
+    for spot in {sd, os.path.realpath(sd)}:
+        if _under(real, os.path.join(spot, "control")) or real == os.path.join(spot, "cc-dash.log"):
+            deny(root, path, f"writing '{real}' forges cc-dash's control channel (approvals, messages and stops "
+                             "between the dashboard and its hook)",
+                 "ask the user to approve or answer in their terminal or in the dashboard")
+
+
 def check_location(root: str, path: str, settings: dict) -> None:
     real = os.path.realpath(path)
     home = _home()
@@ -268,6 +291,7 @@ def main() -> None:
             contents.append(e.get("new_string"))
     contents = [c for c in contents if isinstance(c, str)]
 
+    check_cc_dash(root, path)
     check_location(root, path, settings)
     check_secrets(root, path, contents)
     check_project_rules(root, path, contents)

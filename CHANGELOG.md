@@ -2,6 +2,20 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.2.1
+
+Security hotfix for `cc-dash --control`. A review of v0.2.0 found that the user's own agents, which run as the same user, could pair the dashboard and approve their own permission prompts, or plant a decision file the control hook would apply. Read-only `cc-dash` was not affected.
+
+**Upgrading:** run `cc-update-project` in each project (dash-control.py, bash-guard.py and write-guard.py changed) and re-run `./install.sh` (the `ccdash` line is replaced in place).
+
+- **Pairing gives read-only access.** A browser paired by the one-time link or automatically as the same user can read everything; approving, answering, messaging and stopping need the per-launch **control code**, which `cc-dash --control` writes only to its own terminal (never to a file, the log, argv or the environment). `ccdash --control` prints it above your prompt. The dashboard asks for it once per tab and keeps the control token in the tab's memory only. Wrong codes lock only the tab that typed them (5 tries) and nothing shared stands before the comparison. Same-user pairing is not rate-limited, so an agent minting tokens cannot lock your browser out; the code's ~59 bits keep guessing hopeless, and the token table is bounded.
+- **The control hook verifies every decision.** Decision, message and stop files are only a doorbell: `dash-control.py` asks the running dashboard (with the lease's per-launch key, from a socket owned by this user) and applies the dashboard's own record, after checking the answer came from the process named in the lease. Planted files are ignored and logged; records are never consumed by a query; a lease is trusted only when its process is a Python interpreter running a cc_tool `bin/cc-dash` (or `-m cc_dash.server`).
+- **`cc-dash --control` refuses to start** without a terminal, while another control-mode dashboard is running, or from inside a Claude Code session (environment, ancestors, session and process-group leaders, and a detached process with no terminal are all checked). Abbreviated flags such as `--con` are no longer accepted.
+- **Guards:** bash-guard refuses references to cc-dash's control directory and log, calls to its pairing and control endpoints, and launching control mode (paths are matched after dropping quotes, repeated `/` and `./`), including through nested shells, wrappers, `python3 -m cc_dash` and inline imports; it asks when cc-dash's arguments are expanded at run time. write-guard refuses writes into the control directory and the log.
+- **Non-Bash `permissions.ask` rules** follow the documented path (`//`, `~/`, `/`, `./`, gitignore globs), `domain:` and MCP (`mcp__server`, `mcp__server__*`) forms; a form cc-dash cannot check now requires the typed confirm instead of passing silently.
+- **Threat model, stated in docs/guides/commands.md:** an agent acting through the tool calls the hooks see cannot approve its own prompt; a deliberately evasive program running as the same user cannot be fully stopped by any same-user mechanism.
+- **Tests:** 19 suites (new `test_cc_dash_scopes`; bash-guard 727, write-guard 49, control hook 197), plus a live end-to-end run against real interactive Claude (26 of 26 checks).
+
 ## v0.2.0
 
 `cc-dash` becomes a place to act on your agents, not only watch them, and cc_tool's routing advice becomes something agents follow. Each track was led by its own agent, reviewed before merge, and finished with one cohesion pass over the whole dashboard.

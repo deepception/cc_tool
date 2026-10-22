@@ -1,8 +1,19 @@
 """Control mode (cc-dash --control): act on agents from the dashboard.
 
 Off unless cc-dash runs with --control; without it every /api/control/* path is
-a 404. Who may call these endpoints is auth.py's job (pairing cookie, plus the
-write token, Origin and Content-Type checks on every POST).
+a 404. Who may call these endpoints is auth.py's job: every POST needs a
+control-scoped token (bought with the control code shown only on cc-dash's
+terminal), plus the Origin and Content-Type checks.
+
+Files are a doorbell, not an authority. Anything running as you can write into
+the control directory, so the hook never acts on a decision, message or stop
+file alone: it asks this process (GET /api/control/verify, answered from
+`issued`, the memory of what control-scoped requests made in this launch) and
+checks that the answer came from the process the lease names (the socket's
+owner in /proc). A planted file without a matching record does nothing, and
+files this launch did not issue are not shown either. A decision is also bound
+to what the card showed (a digest of tool, input, cwd and flags), so a request
+file rewritten under the dashboard's eyes cannot borrow an approval.
 
 The lease. A 0700 directory ${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/
 holds a 0600 `lease` (pid, launch id, expiry ~6 s ahead, the hook's wait)
@@ -42,6 +53,7 @@ Audit. Every dashboard action and its result is appended to control/audit.jsonl
 (0600): when, the launch id, the client, what, the target session and agent,
 the decision or message text, and the result.
 """
+import hashlib
 import json
 import os
 import re
@@ -73,6 +85,7 @@ AUDIT_MAX_BYTES = 5_000_000
 SUBDIRS = ("req", "dec", "res", "msg", "dlv", "asked", "sock", "stop", "stopped")
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+SHOWN_KEYS = ("session", "agent_id", "cwd", "tool", "kind", "input", "guard", "ask_rule")
 DECIDE_ACTIONS = {"permission": ("allow", "allow_session", "deny", "release"), "plan": ("allow", "deny", "release"),
                   "question": ("answer", "deny", "release")}
 APPROVALS = ("allow", "allow_session", "answer")
@@ -168,6 +181,12 @@ def unlink(path):
         return False
 
 
+def shown_digest(r):
+    """sha256 of what a decision card shows; dash-control.py's shown_digest() computes the same."""
+    canon = json.dumps({k: r.get(k) for k in SHOWN_KEYS}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canon.encode("utf-8", "replace")).hexdigest()
+
+
 def _str(v, n):
     return v[:n] if isinstance(v, str) else ""
 
@@ -248,12 +267,19 @@ class Control:
         self.wait = float(wait)
         self.clock = clock
         self.launch = secrets.token_hex(8)
+        # Per-launch key, written only to the 0600 lease: the hook sends it with every
+        # verify request, so another local user (who cannot read the lease) cannot ask.
+        self.key = secrets.token_hex(16)
         self.lock = threading.RLock()
         self.requests = {}         # request id -> request dict (+ "status", "decision")
         self.messages = {}         # message id -> message dict (+ "state")
         self.stops = {}            # "<session>.<agent|main>" -> stop dict
         self.audit = []
         self.approvals = {}        # client -> [ts of recent approvals]
+        # What this launch issued through control-scoped requests (and its own
+        # releases), the only thing GET /api/control/verify confirms:
+        # ("dec", request id) / ("msg", message id) / ("stop", "<session>.<agent|main>").
+        self.issued = {}
         self.socket = SocketTransport(self) if sockets else None
         self.queue = HookQueue(self)
         if agents_cmd == "auto":
@@ -302,7 +328,7 @@ class Control:
         now = self.clock()
         self._lease_at = now
         write_json(os.path.join(self.dir, "lease"),
-                   {"v": 1, "pid": os.getpid(), "launch": self.launch, "port": self.port,
+                   {"v": 1, "pid": os.getpid(), "launch": self.launch, "port": self.port, "key": self.key,
                     "expires": round(now + LEASE_TTL, 3), "wait": self.wait, "written": round(now, 3)})
 
     def set_pending(self, on):
@@ -368,6 +394,7 @@ class Control:
             self._scan_requests(now)
             self._scan_messages(now)
             self._scan_stops(now)
+            self._prune_issued(now)
             self.set_pending(bool(_names(os.path.join(self.dir, "msg")) or _names(os.path.join(self.dir, "stop"))))
             for n in _names(os.path.join(self.dir, "asked")):
                 p = os.path.join(self.dir, "asked", n)
@@ -438,10 +465,7 @@ class Control:
             mid = mid_of(n)
             m = self.messages.get(mid)
             if m is None:
-                d = read_json(os.path.join(msg_dir, n), 65536)
-                if d is None or d.get("id") != mid:
-                    continue
-                m = self.messages[mid] = dict(d, state="queued", file=n, transport="hook")
+                continue          # not queued by this launch (planted, or a previous run's): never shown
             seen_q.add(mid)
             if now - (m.get("ts") or now) > MSG_TTL and unlink(os.path.join(msg_dir, n)):
                 m["state"] = "expired"
@@ -455,11 +479,14 @@ class Control:
                 if now - m["delivered_ts"] > MSG_TTL:
                     unlink(os.path.join(dlv_dir, n))
                 continue
+            if m is None:
+                continue
             d = read_json(os.path.join(dlv_dir, n), 65536)
             if d is None or d.get("id") != mid:
                 continue
-            first = m is None or m["state"] in ("queued", "delivering")
-            m = self.messages[mid] = dict(m or {"transport": "hook"}, **d)
+            first = m["state"] in ("queued", "delivering")
+            d = {k: v for k, v in d.items() if k in ("delivered_ts", "via", "tool")}
+            m = self.messages[mid] = dict(m, **d)
             m["file"] = n
             if d.get("delivered_ts"):
                 m["state"] = "delivered"
@@ -481,23 +508,23 @@ class Control:
             for n in _names(os.path.join(self.dir, sub)):
                 key = n[:-5]
                 s = self.stops.get(key)
+                if s is None:
+                    continue      # not queued by this launch: never shown
                 if sub == "stop":
-                    if s is None:
-                        d = read_json(os.path.join(self.dir, sub, n), 4096)
-                        if d is not None:
-                            self.stops[key] = dict(d, state="pending")
-                    elif now - (s.get("ts") or now) > STOP_TTL and unlink(os.path.join(self.dir, sub, n)):
+                    if now - (s.get("ts") or now) > STOP_TTL and unlink(os.path.join(self.dir, sub, n)):
                         s["state"] = "expired"
+                        self.issued.pop(("stop", key), None)
                     continue
-                if s is not None and s["state"] != "pending":
+                if s["state"] != "pending":
                     if now - (s.get("applied_ts") or now) > STOP_TTL:
                         unlink(os.path.join(self.dir, sub, n))
                     continue
                 d = read_json(os.path.join(self.dir, sub, n), 4096)
                 if d is None or not d.get("applied_ts"):
                     continue
-                self.stops[key] = dict(s or {}, **d, state=d.get("outcome") or "stopped")
-                self.log((s or {}).get("client"), "result", session=d.get("session"), agent_id=d.get("agent_id"),
+                d = {k: v for k, v in d.items() if k in ("applied_ts", "outcome", "tool")}
+                self.stops[key] = dict(s, **d, state=d.get("outcome") or "stopped")
+                self.log(s.get("client"), "result", session=s.get("session"), agent_id=s.get("agent_id"),
                          stop=key, result=self.stops[key]["state"], tool=d.get("tool"))
 
     # ── `claude agents --json`: the documented status source ───────────────
@@ -536,9 +563,10 @@ class Control:
                 if st["status"] == "waiting":
                     r["seen_waiting"] = True
                 elif r.get("seen_waiting") and st["status"] in ("busy", "idle") and r["status"] == "open":
+                    dec = {"id": r["id"], "hash": r["hash"], "action": "release", "why": "terminal", "ts": now}
+                    self.issued[("dec", r["id"])] = dict(dec, shown=None, issued_at=now)
                     try:
-                        write_json(os.path.join(self.dir, "dec", r["id"] + ".json"),
-                                   {"id": r["id"], "hash": r["hash"], "action": "release", "why": "terminal", "ts": now})
+                        write_json(os.path.join(self.dir, "dec", r["id"] + ".json"), dec)
                     except OSError:
                         pass
 
@@ -611,9 +639,11 @@ class Control:
                         for k, v in answers.items()):
                     return 400, {"error": "Answers must map each question's text to a non-empty answer."}
                 dec["answers"] = {k: v.strip() for k, v in answers.items()}
+            self.issued[("dec", rid)] = dict(dec, shown=shown_digest(r), issued_at=self.clock())
             try:
                 write_json(os.path.join(self.dir, "dec", rid + ".json"), dec)
             except OSError as e:
+                self.issued.pop(("dec", rid), None)
                 return 500, {"error": "Could not write the decision: %s" % e.strerror}
             r["status"] = "sent"
             r["decision"] = {"action": action, "ts": dec["ts"], "client": client, "message": dec.get("message"),
@@ -665,9 +695,11 @@ class Control:
                 note = "inbox socket failed (%s); queued for the hooks" % (e.strerror or type(e).__name__)
         with self.lock:
             if state is None:
+                self.issued[("msg", mid)] = {"id": mid, "session": sid, "agent_id": agent, "text": msg["text"], "issued_at": now}
                 try:
                     state, transport = self.queue.send(msg), self.queue.name
                 except OSError as e:
+                    self.issued.pop(("msg", mid), None)
                     return 500, {"error": "Could not queue the message: %s" % e.strerror}
             m = self.messages[mid] = dict(msg, state=state, transport=transport,
                                           file="%s.%s.%s.json" % (sid, agent or "main", mid))
@@ -687,6 +719,7 @@ class Control:
                 return 409, {"error": "Already delivered.", "state": m["state"]}
             m["state"] = "cancelled"
             m["cancelled"] = True
+            self.issued.pop(("msg", mid), None)
             self.log(client, "cancel", message=mid, session=m.get("session"), agent_id=m.get("agent_id"), result="cancelled")
             self.scan()
             return 200, {"ok": True, "message": self._msg_view(m)}
@@ -700,6 +733,7 @@ class Control:
         now = self.clock()
         with self.lock:
             s = {"v": 1, "session": sid, "agent_id": agent, "ts": round(now, 3), "launch": self.launch, "client": client}
+            self.issued[("stop", key)] = {"key": key, "session": sid, "agent_id": agent, "ts": s["ts"], "issued_at": now}
             try:
                 unlink(os.path.join(self.dir, "stopped", key + ".json"))
                 write_json(os.path.join(self.dir, "stop", key + ".json"), s)
@@ -709,6 +743,43 @@ class Control:
             self.set_pending(True)
             self.log(client, "stop", session=sid, agent_id=agent, stop=key, result="pending")
             return 200, {"ok": True, "stop": self._stop_view(key, self.stops[key])}
+
+    # ── the hook asks before it acts ───────────────────────────────────────
+    def _prune_issued(self, now):
+        """Records live until their TTL (never until a first query: a query by
+        anyone else must not burn the human's decision, message or stop)."""
+        ttl = {"dec": self.wait + KEEP_RESOLVED, "msg": MSG_TTL, "stop": STOP_TTL}
+        for k in [k for k, r in self.issued.items() if now - r.get("issued_at", now) > ttl.get(k[0], 0)]:
+            del self.issued[k]
+
+    def verify(self, q):
+        """(http status, body) for GET /api/control/verify: the record this launch
+        issued for a decision, message or stop file, or 404. The hook applies the
+        answer, never the file. A query never consumes a record (the server
+        checked the caller's lease key); a message or stop already seen applied
+        (its dlv/ or stopped/ file read back) is no longer confirmed, so a copy of
+        the genuine file planted afterwards does nothing."""
+        kind, vid = q.get("kind") or "", (q.get("id") or "")[:200]
+        with self.lock:
+            if kind == "dec":
+                rec = self.issued.get(("dec", vid))
+                if rec is not None and rec["hash"] == q.get("hash") and rec.get("shown") in (None, q.get("shown")):
+                    return 200, dict({k: rec.get(k) for k in ("id", "hash", "action", "message", "answers", "why")}, ok=True)
+            elif kind == "msg":
+                rec = self.issued.get(("msg", vid))
+                m = self.messages.get(vid) or {}
+                if rec is not None and rec["session"] == q.get("session") and (rec["agent_id"] or "") == (q.get("agent") or "") \
+                        and m.get("state") in ("queued", "delivering"):
+                    return 200, dict({k: v for k, v in rec.items() if k != "issued_at"}, ok=True)
+            elif kind == "stop":
+                rec = self.issued.get(("stop", vid))
+                if rec is not None and (self.stops.get(vid) or {}).get("state") == "pending":
+                    return 200, dict({k: v for k, v in rec.items() if k != "issued_at"}, ok=True)
+            else:
+                return 400, {"ok": False, "error": "Unknown kind."}
+        self.log(None, "refused", kind=kind, item=vid, session=q.get("session") or None,
+                 result="no matching dashboard action: a file nobody sent from the dashboard was ignored")
+        return 404, {"ok": False}
 
     # ── the state the UI polls ─────────────────────────────────────────────
     def state(self, session=""):

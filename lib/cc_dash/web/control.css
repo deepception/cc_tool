@@ -143,5 +143,29 @@ html.ctl-paired .al-stack { bottom: calc(var(--sp-5) + var(--ctl-comp-h, 0px)); 
   .ctl-keys { display: none; }
 }
 html:not(.ctl-on) .ctl-only { display: none; }
+
+/* ── Read-only until the control code is typed ───────────────────────────
+   A paired page is read-only. Every acting control (card buttons, the typed
+   confirm, the composer, Stop) hides under html.ctl-locked and one quiet field
+   asks for the code cc-dash showed in its terminal; unlocking anywhere unlocks
+   the page. The field is the card's own parts: .ctl-other input, .btn, .ctl-err. */
+.ctl-lock { display: none; }
+html.ctl-locked .ctl-lock { display: flex; flex-direction: column; gap: var(--sp-1h); padding: var(--sp-2) var(--sp-3); border-radius: var(--r-m); background: var(--sunk); border: 1px solid var(--line); }
+html.ctl-locked .ctl-card.resolved .ctl-lock { display: none; }
+html.ctl-locked .ctl-card .ctl-acts:not(.ctl-lock .ctl-acts), html.ctl-locked .ctl-card .ctl-sub,
+html.ctl-locked .ctl-composer .ctl-comp-row, html.ctl-locked .ctl-composer .ctl-comp-foot,
+html.ctl-locked .ctl-stop-row .btn { display: none; }
+.ctl-lock-t { margin: 0; font-size: var(--fs-12); color: var(--ink-2); font-weight: 500; }
+.ctl-lock .ctl-acts { flex-wrap: nowrap; }
+.ctl-lock .ctl-code { width: 100%; max-width: 188px; flex: 1 1 auto; min-width: 0; letter-spacing: .06em; text-transform: uppercase; font-family: var(--mono); font-size: var(--fs-13); }
+.ctl-lock .ctl-code::placeholder { letter-spacing: .06em; text-transform: none; }
+.ctl-lock .ctl-code:disabled { background: var(--sunk); color: var(--ink-4); }
+.ctl-lock .btn { height: var(--h-ctl-s); flex: none; }
+.ctl-lock.compact { padding: var(--sp-1h) var(--sp-2h); }
+.ctl-card.compact .ctl-lock .ctl-other { display: block; }
+/* In the docked composer the field stays one slim row (it wraps on a phone). */
+html.ctl-locked .ctl-composer .ctl-lock { flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--sp-2) var(--sp-3); }
+.ctl-composer .ctl-lock .ctl-acts { flex: 0 1 280px; min-width: 0; }
+.ctl-composer .ctl-lock .ctl-err { flex-basis: 100%; }
 .repair h2 { font-size: var(--fs-20); }
 html.unpaired .tabs, html.unpaired .al-bell, html.unpaired .al-stack { visibility: hidden; }

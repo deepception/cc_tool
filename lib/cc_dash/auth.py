@@ -24,6 +24,33 @@ for that: cookies are scoped by host, not port, so a browser sends a
     the browser sends it, Sec-Fetch-Site: same-origin; plus the Host check.
   - The static shell (index.html, scripts, styles) carries no data and loads
     without the token, so it can pair or say "Re-pair".
+
+Two scopes. Every token from pairing (the link, or same-user pairing on Linux)
+is READ-ONLY: every GET, nothing that changes state. "Same user" is not "the
+human": your agents run as you too, and anything that is written to a file
+(the log holds the pairing link) can be read by them. Control mode's writes
+(decide, message, cancel, stop) need a CONTROL token, which only the control
+code buys:
+
+  - With --control, cc-dash makes a per-launch control code (three groups of
+    four from an alphabet with no 0/O/1/I/L, about 59 bits) and writes it to
+    its controlling terminal (/dev/tty) only: never to stdout or the log, never
+    to a file, never into argv or the environment. No terminal, no control mode.
+  - The page POSTs it to /api/control/unlock with its read token and gets a
+    control token, which it keeps in memory only (localStorage is a file in the
+    browser profile that a same-user process can read). A reload asks for the
+    code again; the code is valid for this launch and never after it.
+  - Wrong codes: compared in constant time; each read token has its own small
+    budget (one try a second, 5 wrong tries, then that token can no longer try;
+    a reload pairs a fresh one). Nothing is shared between tokens, so another
+    principal (an agent with its own pair-local token) can neither lock the
+    human out nor use up the human's tries: the right code from a token that
+    has not spent its own budget is always accepted. Same-user pairing is not
+    rate-limited (a cap would let an agent lock the human's browser out); fresh
+    tokens buy an agent 5 tries each, and the code's ~59 bits put guessing far
+    beyond any launch's life even at thousands of tokens a second. The token
+    table is bounded: past MAX_READ_TOKENS the oldest read tokens are dropped
+    (a dropped page pairs itself again). The code is valid for this launch only.
 """
 import hashlib
 import hmac
@@ -36,6 +63,11 @@ import time
 
 PAIR_TTL = 60.0
 HEADER = "X-CC-Dash-Token"
+CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"   # no 0/O, 1/I/L: read off a terminal and typed
+CODE_GROUPS, CODE_GROUP_LEN = 3, 4
+CODE_MAX_TRIES = 5          # wrong control codes per read token, then that token cannot try again
+CODE_MIN_GAP = 1.0          # seconds between two tries from one token
+MAX_READ_TOKENS = 5000      # read tokens kept; the oldest go first (control tokens are never dropped)
 
 
 def _private_dir(d):
@@ -62,7 +94,9 @@ class Auth:
         self.pair_dir = pair_dir
         self.lock = threading.Lock()
         self.codes = {}            # pairing code -> [expiry, pairing file or None]
-        self.tokens = {}           # token -> {"client"}
+        self.tokens = {}           # token -> {"client", "scope": "read" | "control"}
+        self.control_code = None   # this launch's control code (memory only), None without --control
+        self.control_unlocks = 0
 
     # ── pairing codes ──────────────────────────────────────────────────────
     def new_code(self):
@@ -119,7 +153,7 @@ class Auth:
             self._cleanup()
             if entry is None or entry[0] < self.clock():
                 return None
-            return self._issue()
+            return self._issue("read")
 
     def exchange_local(self, client_addr):
         """Pair without a code when the connecting socket belongs to this user (Linux).
@@ -128,16 +162,67 @@ class Auth:
         connection; another local user is refused. Other websites cannot get here
         (Origin, Sec-Fetch-Site and Host are checked first, and the token is only
         readable by the dashboard's own origin). The new token, or None."""
-        uid = peer_uid(client_addr, self.port)
-        if uid is None or not hasattr(os, "getuid") or uid != os.getuid():
+        if not same_user(client_addr, self.port):
             return None
         with self.lock:
-            return self._issue()
+            return self._issue("read")      # same uid is not the human: never control
 
-    def _issue(self):
+    def _issue(self, scope):
         token = secrets.token_urlsafe(32)
-        self.tokens[token] = {"client": hashlib.sha256(token.encode()).hexdigest()[:8]}
+        self.tokens[token] = {"client": hashlib.sha256(token.encode()).hexdigest()[:8], "scope": scope}
+        if scope == "read":
+            reads = [t for t, s in self.tokens.items() if s.get("scope") == "read"]
+            for old in reads[:max(0, len(reads) - MAX_READ_TOKENS)]:     # dicts keep insertion order
+                del self.tokens[old]
         return token
+
+    # ── the control code ───────────────────────────────────────────────────
+    def enable_control(self):
+        """Make this launch's control code. The caller shows it on the terminal only."""
+        code = "-".join("".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_GROUP_LEN))
+                        for _ in range(CODE_GROUPS))
+        with self.lock:
+            self.control_code = code.replace("-", "")
+        return code
+
+    def control_state(self, headers):
+        """This token's standing with the control code: {"locked", "tries_left"}."""
+        s = self.session(headers) or {}
+        wrong = s.get("wrong", 0)
+        return {"locked": self.control_code is not None and wrong >= CODE_MAX_TRIES,
+                "tries_left": max(0, CODE_MAX_TRIES - wrong)}
+
+    def unlock(self, headers, code):
+        """(http status, body) for POST /api/control/unlock {"code"}: a control token
+        for the right code. Needs a paired (read) token; wrong tries lock the code."""
+        sess = self.session(headers)
+        if sess is None:
+            return 401, {"error": "Not paired.", "repair": True}
+        norm = "".join(ch for ch in code.upper() if ch.isalnum()) if isinstance(code, str) else ""
+        if not norm or len(norm) > 64:
+            return 400, {"error": "Type the control code shown in the terminal where cc-dash --control runs."}
+        locked = {"error": "Too many wrong codes from this tab. Reload the page to pair again, then type the code "
+                           "shown in the terminal.", "locked": True}
+        with self.lock:
+            if self.control_code is None:
+                return 404, {"error": "Control mode is off."}
+            if sess.get("wrong", 0) >= CODE_MAX_TRIES:
+                return 423, locked
+            # Only this token's own budget applies; nothing shared stands before the
+            # comparison, so a correct code is never refused because of someone else.
+            now = self.clock()
+            if now - sess.get("last", -1e18) < CODE_MIN_GAP:
+                return 429, {"error": "One try a second; try again."}
+            sess["last"] = now
+            if not hmac.compare_digest(norm.encode(), self.control_code.encode()):
+                sess["wrong"] = sess.get("wrong", 0) + 1
+                left = CODE_MAX_TRIES - sess["wrong"]
+                if left <= 0:
+                    return 423, locked
+                return 403, {"error": "That is not the control code (%d %s left)." % (left, "try" if left == 1 else "tries"),
+                             "tries_left": left}
+            self.control_unlocks += 1
+            return 200, {"token": self._issue("control"), "scope": "control"}
 
     # ── checking requests ──────────────────────────────────────────────────
     def session(self, headers):
@@ -155,6 +240,10 @@ class Auth:
         s = self.session(headers)
         return s["client"] if s else None
 
+    def scope(self, headers):
+        s = self.session(headers)
+        return s["scope"] if s else None
+
     @staticmethod
     def check_origin(headers, host_value):
         """'' when a POST comes from the dashboard's own page as JSON, else why not."""
@@ -170,9 +259,13 @@ class Auth:
         return ""
 
     def check_write(self, headers, host_value):
-        """'' when a POST may change state, else the reason it may not."""
-        if self.session(headers) is None:
+        """'' when a POST may change state, else the reason it may not: "token"
+        (not paired), "scope" (a read-only token), or a bad origin header."""
+        s = self.session(headers)
+        if s is None:
             return "token"
+        if s.get("scope") != "control":
+            return "scope"
         return self.check_origin(headers, host_value)
 
 
@@ -201,6 +294,12 @@ def _browser_pair_dir():
 
 def local_pairing_supported():
     return os.path.exists("/proc/net/tcp")
+
+
+def same_user(client_addr, server_port):
+    """True when the kernel says the connecting socket belongs to this user (Linux)."""
+    uid = peer_uid(client_addr, server_port)
+    return uid is not None and hasattr(os, "getuid") and uid == os.getuid()
 
 
 def _hex_ip4(ip):

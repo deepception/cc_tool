@@ -101,9 +101,18 @@ class Srv:
     def path(self, *p):
         return os.path.join(self.ctl.dir, *p)
 
-    def pair(self, code=None):
+    def pair(self, code=None, control=True):
+        """Pair (a read-only token); in control mode also type the control code, as
+        the human does, and keep the control token."""
         st, out = self.post("/api/pair", {"code": code or self.srv.auth.new_code()}, token=False)
         self.token = out.get("token") if isinstance(out, dict) else None
+        self.read_token = self.token
+        if control and self.ctl is not None and st == 200:
+            if self.srv.auth.control_code is None:
+                self.control_code = self.srv.auth.enable_control()
+            st2, out2 = self.post("/api/control/unlock", {"code": self.control_code})
+            if st2 == 200:
+                self.token = out2["token"]
         return st, out
 
     def req(self, method, path, body=None, token=True, headers=None, raw=None, host=None):
@@ -197,7 +206,7 @@ def test_pairing():
         st, _, body = s.req("GET", "/api/live")
         check("paired: /api/live 200 with X-CC-Dash-Token", st == 200)
         st, _, body = s.req("GET", "/api/meta")
-        check("paired: meta says control is off", st == 200 and json.loads(body)["control"] == {"enabled": False, "paired": True})
+        check("paired: meta says control is off", st == 200 and json.loads(body)["control"] == {"enabled": False, "paired": True, "scope": "read"})
         st, _, _ = s.req("GET", "/api/live", token=False, headers={"Cookie": "ccdash_%d=%s" % (s.port, tok)})
         check("a token sent as a cookie is ignored (cookies are not port-scoped)", st == 401, st)
         st, _, _ = s.req("GET", "/api/auth")
@@ -533,7 +542,8 @@ def test_round_trip_with_hook():
     try:
         s.pair()
         env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
-        env.update(XDG_STATE_HOME=s.state, CLAUDE_CONFIG_DIR=s.cfg, HOME=s.root)
+        env.update(XDG_STATE_HOME=s.state, CLAUDE_CONFIG_DIR=s.cfg, HOME=s.root,
+                   CC_DASH_LEASE_ANY_PROGRAM="1")   # the dashboard here runs inside this test process
         payload = {"session_id": SID, "transcript_path": "/x", "cwd": s.cwd, "hook_event_name": "PermissionRequest",
                    "permission_mode": "default", "tool_name": "Bash", "tool_input": {"command": "make deploy"}}
         p = subprocess.Popen([sys.executable, HOOK], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)

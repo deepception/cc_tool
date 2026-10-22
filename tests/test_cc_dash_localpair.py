@@ -83,6 +83,12 @@ def test_server():
         c.request("GET", "/api/live", headers={"Host": good["Host"], "X-CC-Dash-Token": token or ""})
         r = c.getresponse(); r.read(); c.close()
         check("server: the token unlocks the API", r.status == 200, r.status)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        c.request("GET", "/api/meta", headers={"Host": good["Host"], "X-CC-Dash-Token": token or ""})
+        r = c.getresponse(); meta = json.loads(r.read()); c.close()
+        check("server: a same-user token is read-only (same uid is not the human)", meta["control"]["scope"] == "read", meta["control"])
+        check("server: the issued token is recorded with scope read", any(v.get("scope") == "read" for v in srv.auth.tokens.values())
+              and not any(v.get("scope") == "control" for v in srv.auth.tokens.values()))
         for k, v, why in (("Origin", "https://evil.example", "foreign Origin"), ("Sec-Fetch-Site", "cross-site", "cross-site fetch"),
                           ("Content-Type", "text/plain", "simple form post")):
             h = dict(good, **{k: v})

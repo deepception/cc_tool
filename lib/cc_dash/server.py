@@ -10,15 +10,20 @@ prompts), so the server
   - sends no CORS headers and a CSP that allows only its own origin.
 
 Every /api/* request needs this launch's token (auth.py: paired through a
-one-time code, sent as X-CC-Dash-Token, never a cookie). With --control
-(control.py) it also serves /api/control/*, whose POSTs also need Content-Type
-application/json and an Origin equal to the dashboard's own. Without --control
-those paths are 404 and every POST but /api/pair is 405.
+one-time code, sent as X-CC-Dash-Token, never a cookie). Pairing gives a
+read-only token. With --control (control.py) it also serves /api/control/*,
+whose POSTs need a control-scoped token (POST /api/control/unlock with the
+control code cc-dash wrote to its terminal), Content-Type application/json and
+an Origin equal to the dashboard's own. GET /api/control/verify is the hook's
+question ("did the dashboard send this?"); it carries no token, answers only a
+socket owned by this user, and confirms only what this launch issued. Without
+--control those paths are 404 and every POST but /api/pair is 405.
 """
 import argparse
 import errno
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -28,7 +33,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import attention
 from . import plans   # plan progress (/api/plans)
-from .auth import Auth, local_pairing_supported
+from .auth import Auth, local_pairing_supported, same_user
 from .control import MAX_BODY, Control
 from .docs import Docs, DocsError
 from .store import Store, config_dir
@@ -131,6 +136,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, fh.read(), "text/html; charset=utf-8")
             if path.startswith("/docs-frame/"):     # a one-time ticket from /api/docs/frame, no token
                 return self._docs_frame(path[len("/docs-frame/"):])
+            if ctl is not None and path == "/api/control/verify":   # the hook's check, no token (see _verify)
+                return self._verify(ctl, q)
             # Every data endpoint needs this launch's token in X-CC-Dash-Token (auth.py).
             sess = auth.session(self.headers) if auth is not None else None
             if sess is None:
@@ -139,7 +146,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._deny(404, "Not found.")
             if path == "/api/meta":
                 meta = store.meta()
-                meta["control"] = {"enabled": ctl is not None, "paired": True}
+                meta["control"] = {"enabled": ctl is not None, "paired": True, "scope": sess.get("scope") or "read"}
+                if ctl is not None:
+                    meta["control"].update(auth.control_state(self.headers))
                 return self._json(200, meta)
             if path == "/api/alerts":  # open "needs you" alerts, see attention.py
                 return self._json(200, attention.alerts_payload(store, ctl.annotate if ctl else None))
@@ -262,6 +271,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "This browser does not run as the user who started cc-dash."})
         return self._json(200, {"token": token})
 
+    def _verify(self, ctl, q):
+        """GET /api/control/verify?kind=dec|msg|stop&id=...: dash-control.py asks before
+        it acts on a file. The caller must send the lease's per-launch key
+        (X-CC-Dash-Lease; the lease is 0600, so other users cannot read it) and,
+        where the kernel can say (Linux), own the connecting socket: an unknown
+        owner is refused. The hook in turn checks that this process owns the
+        socket that answered. A query never consumes a record."""
+        import hmac
+        key = self.headers.get("X-CC-Dash-Lease") or ""
+        if not key or not hmac.compare_digest(key, ctl.key):
+            return self._json(403, {"ok": False})
+        if local_pairing_supported() and not same_user(self.client_address, self.server.port):
+            return self._json(403, {"ok": False})
+        code, out = ctl.verify(q)
+        return self._json(code, out)
+
+    def _unlock(self, auth):
+        """POST /api/control/unlock {"code"}: the control code from cc-dash's terminal
+        buys a control-scoped token (auth.py)."""
+        why = auth.check_origin(self.headers, (self.headers.get("Host") or "").strip().lower())
+        if why:
+            return self._json(403, {"error": "Refused: bad " + why + "."})
+        body, err = self._read_body()
+        if err:
+            return self._json(*err)
+        code, out = auth.unlock(self.headers, body.get("code"))
+        ctl = getattr(self.server, "control", None)
+        if ctl is not None and code in (200, 403, 423):
+            ctl.log(auth.client(self.headers), "unlock", result="control unlocked" if code == 200 else
+                    ("wrong control code" if code == 403 else "this token is locked after wrong control codes"))
+        return self._json(code, out)
+
     def _no_body(self):
         if not self._host_ok():
             return self._deny(421, "Misdirected request.")
@@ -281,11 +322,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._pair(auth)
         if path == "/api/pair-local" and auth is not None and local_pairing_supported():
             return self._pair_local(auth)
+        if path == "/api/control/unlock" and ctl is not None and auth is not None:
+            return self._unlock(auth)
         if ctl is None or auth is None or path not in self.POSTS:
             return self._no_body()
         why = auth.check_write(self.headers, (self.headers.get("Host") or "").strip().lower())
         if why == "token":
             return self._json(401, {"error": "Not paired.", "repair": True})
+        if why == "scope":
+            return self._json(403, {"error": "Enter the control code from your terminal to act.", "unlock": True})
         if why:
             return self._json(403, {"error": "Refused: bad " + why + "."})
         client = auth.client(self.headers)
@@ -339,7 +384,8 @@ def parse_args(argv):
         prog="cc-dash",
         description="Local dashboard of your Claude Code sessions, subagents, tokens, cost and cc_tool guard "
                     "catches (read-only unless --control). Serves on 127.0.0.1 until Ctrl-C; open the printed "
-                    "pairing link to use it.")
+                    "pairing link to use it.",
+        allow_abbrev=False)     # --con / --c are not --control: an abbreviation must not slip past bash-guard
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
                    help=f"port to listen on (default {DEFAULT_PORT}; a free port is used if it is taken)")
     p.add_argument("--no-open", action="store_true", help="do not open the browser")
@@ -352,6 +398,7 @@ def parse_args(argv):
                         "printed link)")
     p.add_argument("--control-wait", type=float, default=300, metavar="SECS",
                    help="control mode: how long a waiting permission hook waits for the dashboard (default 300)")
+    p.add_argument("--ready-fd", type=int, default=None, metavar="FD", help=argparse.SUPPRESS)
     a = p.parse_args(argv)
     if not (5 <= a.control_wait <= 590):
         p.error("--control-wait must be 5-590 seconds")
@@ -359,7 +406,155 @@ def parse_args(argv):
         p.error("--days must be positive")
     if not (0 <= a.port <= 65535):
         p.error("--port must be 0-65535")
+    if a.ready_fd is not None and a.ready_fd < 3:
+        p.error("--ready-fd must be 3 or more")
     return a
+
+
+def _ready(a):
+    """Close --ready-fd: the shell function `ccdash` waits on it so the control
+    code is on the terminal before its prompt comes back. Nothing is written to it."""
+    if a.ready_fd is not None:
+        try:
+            os.close(a.ready_fd)
+        except OSError:
+            pass
+        a.ready_fd = None
+
+
+# What Claude Code puts in the environment of its Bash tool's processes
+# (checked against `env` from a headless `claude -p` Bash call, CLI 2.1.30x).
+CLAUDE_ENV_SIGNALS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID",
+                      "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_CHILD_SESSION")
+INSIDE_CLAUDE = "cc-dash --control must be started from your own terminal, not from inside a Claude Code session"
+
+
+def _proc_stat(pid, proc="/proc"):
+    """{comm, ppid, pgrp, sid, tty} from /proc/<pid>/stat, or None."""
+    try:
+        with open("%s/%d/stat" % (proc, pid), encoding="utf-8", errors="replace") as fh:
+            st = fh.read()
+        comm = st[st.index("(") + 1:st.rindex(")")]
+        f = st[st.rindex(")") + 2:].split()
+        return {"comm": comm, "ppid": int(f[1]), "pgrp": int(f[2]), "sid": int(f[3]), "tty": int(f[4])}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _ancestors(pid=None, n=64, proc="/proc"):
+    """(pid, comm, exe, argv) of pid (default: this process's parent) and each of
+    its ancestors up to init, from /proc; [] elsewhere."""
+    out, pid = [], os.getppid() if pid is None else pid
+    for _ in range(n):
+        if pid <= 1:
+            break
+        st = _proc_stat(pid, proc)
+        if st is None:
+            break
+        try:
+            with open("%s/%d/cmdline" % (proc, pid), "rb") as fh:
+                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+        except OSError:
+            argv = []
+        try:
+            exe = os.readlink("%s/%d/exe" % (proc, pid))
+        except OSError:
+            exe = ""
+        out.append((pid, st["comm"], exe, argv))
+        pid = st["ppid"]
+    return out
+
+
+def _is_claude(comm, exe, argv):
+    """The claude CLI itself, or node running it."""
+    names = {comm, os.path.basename(exe or "")} | ({os.path.basename(argv[0])} if argv else set())
+    if "claude" in names:
+        return True
+    if names & {"node", "nodejs", "bun"}:
+        return any(re.search(r"(?:^|/)(?:claude(?:\.js|\.mjs)?|@anthropic-ai/claude-code(?:/|$))", a) for a in argv[1:3])
+    return False
+
+
+def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=None):
+    """Why control mode must not start here, or ''.
+
+    Control mode is how the human approves agents, so it refuses (1) to take
+    over from a dashboard that already holds a live lease (the human stops that
+    one first; `ccdash` does), and (2) to start from inside Claude Code: its
+    shells carry CLAUDECODE=1 and descend from the `claude` process. Both are
+    raised bars, not walls: a program running as you can unset the variable and
+    detach. See docs/guides/commands.md (Control mode, Security)."""
+    from .control import read_json
+    env = os.environ if env is None else env
+    d = ctl_dir or os.path.join(attention.state_dir(), "control")
+    lease = read_json(os.path.join(d, "lease"), 4096)
+    if lease is not None and isinstance(lease.get("expires"), (int, float)) and lease["expires"] > time.time():
+        pid = lease.get("pid")
+        alive = False
+        if isinstance(pid, int) and pid > 0 and pid != os.getpid():
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except PermissionError:
+                alive = True
+            except OSError:
+                alive = False
+        if alive:
+            return ("another cc-dash --control (pid %d) is running and holds the control lease. Stop it first "
+                    "(Ctrl-C in its terminal; `ccdash --control` does this for you)." % pid)
+    seen = [k for k in CLAUDE_ENV_SIGNALS if env.get(k)]
+    if seen:
+        return INSIDE_CLAUDE + " (its environment carries %s)." % ", ".join(seen)
+    me = os.getpid() if me is None else me
+    st = _proc_stat(me, proc)
+    if ancestors is None:
+        ancestors = _ancestors(st["ppid"], proc=proc) if st else _ancestors(proc=proc)
+    for pid, comm, exe, argv in ancestors:
+        if _is_claude(comm, exe, argv):
+            return INSIDE_CLAUDE + " (process %d, %s, is among its parents)." % (pid, comm)
+    if st is None:
+        return ""
+    # The session leader and the process-group leader outlive a double fork: if
+    # either is, or descends from, the claude CLI, this was started inside it.
+    for label, leader in (("session", st["sid"]), ("process-group", st["pgrp"])):
+        if leader in (0, me):
+            continue
+        for pid, comm, exe, argv in _ancestors(leader, proc=proc):
+            if _is_claude(comm, exe, argv):
+                return INSIDE_CLAUDE + " (its %s leader descends from process %d, %s)." % (label, pid, comm)
+    # A typical double-fork escape: re-parented to init or a user-manager subreaper
+    # and no controlling terminal left.
+    parent = _proc_stat(st["ppid"], proc) if st["ppid"] > 1 else None
+    if st["tty"] == 0 and (st["ppid"] <= 1 or (parent or {}).get("comm") in ("systemd", "init")):
+        return ("cc-dash --control must be started from your own terminal: this process was detached (re-parented "
+                "to pid %d) and has no controlling terminal." % st["ppid"])
+    return ""
+
+
+def show_control_code(code, tty="/dev/tty"):
+    """Write the control code to the controlling terminal and nowhere else: not
+    stdout (often a log file, as with `ccdash`), not stderr, not a file. False
+    when this process has no terminal."""
+    import signal
+    try:
+        fd = os.open(tty, os.O_WRONLY | getattr(os, "O_NOCTTY", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return False
+    old = None
+    try:
+        if not os.isatty(fd):
+            return False
+        if hasattr(signal, "SIGTTOU"):        # a background write must not stop us (stty tostop)
+            old = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        os.write(fd, ("\r\n  cc-dash control code:  %s\r\n  Type it into the dashboard to approve, answer or message "
+                      "(shown only here; never written to a file or a log).\r\n\r\n" % code).encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        if old is not None:
+            signal.signal(signal.SIGTTOU, old)
+        os.close(fd)
 
 
 def main(argv=None):
@@ -368,18 +563,14 @@ def main(argv=None):
     except (AttributeError, ValueError):
         pass
     a = parse_args(sys.argv[1:] if argv is None else argv)
+    if not a.control:
+        _ready(a)                   # nothing to show on the terminal
     root = config_dir()
     projects = os.path.join(root, "projects")
     if not os.path.isdir(projects):
         print(f"cc-dash: no transcripts at {tilde(projects)} (set CLAUDE_CONFIG_DIR if Claude Code keeps them elsewhere).",
               file=sys.stderr)
     store = Store(root=root, days=a.days, project=a.project)
-    t0 = time.time()
-    store.refresh(force=True)
-    scan = store.last_scan
-    print(f"cc-dash: read {scan['files']} transcripts ({scan['bytes'] / 1e6:.0f} MB) from "
-          f"{tilde(projects)} in {time.time() - t0:.1f}s; {len(store.sessions)} sessions in the last "
-          f"{a.days:g} days" + (f" matching '{a.project}'" if a.project else "") + ".")
     try:
         srv = make_server(a.port, store, a.verbose)
     except OSError as e:
@@ -388,6 +579,18 @@ def main(argv=None):
     if srv.port != a.port and a.port:
         print(f"cc-dash: port {a.port} is busy, using {srv.port}.")
     if a.control:
+        why = control_refusal()
+        if why:
+            print("cc-dash: " + why, file=sys.stderr)
+            srv.server_close()
+            return 1
+        # The control code goes to the terminal only. Without one there is no way
+        # to hand it to the human, so there is no control mode.
+        if not show_control_code(srv.auth.enable_control()):
+            print("cc-dash: --control needs a terminal: the control code is shown there and never written to a file "
+                  "or a log. Run cc-dash --control (or ccdash --control) from a terminal.", file=sys.stderr)
+            srv.server_close()
+            return 1
         try:
             # CC_DASH_CONTROL_TRANSPORT=hook: messages only through the hooks (no inbox socket), for testing.
             srv.control = Control(store, srv.port, wait=a.control_wait,
@@ -397,11 +600,19 @@ def main(argv=None):
             print(f"cc-dash: cannot start control mode: {e}", file=sys.stderr)
             srv.server_close()
             return 1
-        print("cc-dash: control mode is on: approvals, answers, plans and messages from the dashboard.")
+        print("cc-dash: control mode is on: approvals, answers, plans and messages from the dashboard, after the "
+              "control code shown on the terminal is typed into it.")
         print(f"cc-dash: audit log {tilde(srv.control.audit_path)}")
+        _ready(a)
+    t0 = time.time()
+    store.refresh(force=True)
+    scan = store.last_scan
+    print(f"cc-dash: read {scan['files']} transcripts ({scan['bytes'] / 1e6:.0f} MB) from "
+          f"{tilde(projects)} in {time.time() - t0:.1f}s; {len(store.sessions)} sessions in the last "
+          f"{a.days:g} days" + (f" matching '{a.project}'" if a.project else "") + ".")
     code = srv.auth.new_code()
     print("cc-dash: serving http://127.0.0.1:%d/  (Ctrl-C to stop). Open this link to pair a browser "
-          "(it works once, for 60 s):\n  %s" % (srv.port, srv.auth.pair_url(code)))
+          "(read-only; it works once, for 60 s):\n  %s" % (srv.port, srv.auth.pair_url(code)))
     if sys.stdin is not None and sys.stdin.isatty():
         print("cc-dash: press Enter here for a new pairing link.")
         threading.Thread(target=_pair_on_enter, args=(srv,), daemon=True).start()

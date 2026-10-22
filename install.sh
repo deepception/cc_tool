@@ -33,11 +33,23 @@ fi
 # A dashboard already running is stopped first, so it always comes up on its
 # usual port in the mode asked for.
 # Arguments pass through, e.g. `ccdash --control`. The log holds the one-time
-# pairing link, so it is written owner-only.
-CCDASH_LINE='ccdash() { local b d="${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool"; b="$(command -v cc-dash)" || { echo "cc-dash not on PATH" >&2; return 1; }; pkill -u "$USER" -f "$b" 2>/dev/null && sleep 1; mkdir -p "$d" && (umask 077; nohup "$b" "$@" >>"$d/cc-dash.log" 2>&1 </dev/null &) && echo "cc-dash is opening in your browser (log: $d/cc-dash.log)"; }'
+# pairing link (read-only), so it is written owner-only.
+# The control code (--control) never touches the log or any file: cc-dash writes
+# it straight to this terminal (/dev/tty). fd 3 is a pipe that carries nothing:
+# cc-dash closes it once the code is shown, so `| cat` holds the prompt until
+# then and the code lands above it, not in the middle of your next command.
+CCDASH_LINE='ccdash() { local b d="${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool"; b="$(command -v cc-dash)" || { echo "cc-dash not on PATH" >&2; return 1; }; pkill -u "$USER" -f "$b" 2>/dev/null && sleep 1; mkdir -p "$d" && (umask 077; nohup "$b" --ready-fd 3 "$@" 3>&1 >>"$d/cc-dash.log" 2>&1 </dev/null &) | cat && echo "cc-dash is opening in your browser (log: $d/cc-dash.log)"; }'
 
-if grep -qF 'ccdash() {' "$PROFILE" 2>/dev/null; then
+if grep -qF -- '--ready-fd 3' "$PROFILE" 2>/dev/null; then
     echo "✓ ccdash already defined ($PROFILE)"
+elif grep -qF 'ccdash() {' "$PROFILE" 2>/dev/null; then
+    # An older ccdash: replace its one line in place (v0.2.1 waits for the control code).
+    tmp="$(mktemp)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "ccdash() {"* ]]; then printf '%s\n' "$CCDASH_LINE"; else printf '%s\n' "$line"; fi
+    done < "$PROFILE" > "$tmp"
+    cat "$tmp" > "$PROFILE" && rm -f "$tmp"
+    echo "✓ Updated ccdash in $PROFILE (the control code now prints before the prompt returns)"
 else
     echo "# cc_tool: ccdash opens the dashboard (cc-dash) in the background" >> "$PROFILE"
     echo "$CCDASH_LINE" >> "$PROFILE"

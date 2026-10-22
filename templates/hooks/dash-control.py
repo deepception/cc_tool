@@ -55,6 +55,20 @@ SessionStart (gated on the lease): records the session's inbox socket path
 (CLAUDE_CODE_MESSAGING_SOCKET) in sock/<session>.json, so cc-dash can message
 an idle session. Never the token.
 
+Files are a doorbell, never the authority. Your agents run as you and can
+write into the control directory, so a decision, message or stop file alone does
+nothing: before acting, the hook asks the dashboard (GET /api/control/verify on
+the lease's port, with the lease's per-launch key, so only someone who can read
+the 0600 lease may ask) and applies cc-dash's answer, which comes from its memory of
+what was sent from a control-unlocked page in this launch. The answer counts
+only when the socket that sent it belongs to the lease's pid (/proc/net/tcp
+inode -> /proc/<pid>/fd; lsof where there is no /proc), so a server an agent
+starts on another port cannot vouch for a planted file. A decision also names a
+digest of what the dashboard card showed (tool, input, cwd, flags), so an
+approval cannot be moved onto a request file rewritten after it was shown.
+Limit: a program that rewrites the lease AND serves the answer itself runs as
+you with your full rights; see docs/guides/commands.md (Control mode, Security).
+
 Files: directory 0700 and ours, files 0600, opened with O_NOFOLLOW, written to a
 temp name with O_EXCL and renamed; anything that is not a plain file we own that
 nobody else can read is ignored. Every error is swallowed and the hook exits 0.
@@ -76,6 +90,8 @@ GUARD_MARK_TTL = 120.0
 CLIP = 400
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 QUESTION_TOOLS = {"AskUserQuestion": "question", "ExitPlanMode": "plan"}
+SHOWN_KEYS = ("session", "agent_id", "cwd", "tool", "kind", "input", "guard", "ask_rule")   # = lib/cc_dash/control.py
+VERIFY_TIMEOUT = 2.0
 TARGET_KEYS = ("file_path", "notebook_path", "path", "url", "pattern", "query", "skill",
                "description", "prompt", "command", "message")
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -187,7 +203,121 @@ def lease(ctl, now=None):
     exp = d.get("expires")
     if not isinstance(exp, (int, float)) or exp < (now or time.time()):
         return None
-    return d if pid_alive(d.get("pid")) else None
+    return d if pid_alive(d.get("pid")) and is_cc_dash(d.get("pid")) else None
+
+
+def is_cc_dash(pid):
+    """True when the lease's process is cc-dash: a Python interpreter running a
+    `bin/cc-dash` that sits in a cc_tool checkout (lib/cc_dash/server.py beside
+    it), or `python -m cc_dash.server`. A lease pointing at any other process is
+    not trusted; an argument merely mentioning cc-dash does not count.
+    Where /proc is missing the check can't run and the dashboard's own answer
+    (verify, keyed and socket-owner checked) carries the trust.
+    CC_DASH_LEASE_ANY_PROGRAM=1 is for the hook's tests, whose fake dashboard is
+    the test process; hooks inherit Claude Code's environment, not an agent's."""
+    if os.environ.get("CC_DASH_LEASE_ANY_PROGRAM") == "1":
+        return True
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            argv = [a.decode("utf-8", "replace") for a in f.read(8192).split(b"\0") if a]
+    except FileNotFoundError:
+        return not os.path.isdir("/proc/self")
+    except (OSError, TypeError):
+        return False
+    if len(argv) >= 3 and argv[1] == "-m" and argv[2] == "cc_dash.server":
+        return os.path.basename(argv[0]).startswith("python")
+    if len(argv) < 2 or not os.path.basename(argv[0]).startswith("python"):
+        return False
+    script = argv[1]
+    if os.path.basename(script) != "cc-dash":
+        return False
+    try:                                   # relative to the dashboard's own working directory
+        script = os.path.realpath(os.path.join(os.readlink("/proc/%d/cwd" % pid), script))
+    except OSError:
+        return False
+    # a real cc_tool checkout: bin/cc-dash with lib/cc_dash/server.py beside it
+    return os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(script)), "lib", "cc_dash", "server.py"))
+
+
+# ── asking the dashboard before acting on a file ─────────────────────────────
+def shown_digest(req):
+    """sha256 of what the dashboard card shows (lib/cc_dash/control.py computes the same)."""
+    canon = json.dumps({k: req.get(k) for k in SHOWN_KEYS}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canon.encode("utf-8", "replace")).hexdigest()
+
+
+def _tcp_inode(local_port, remote_port, tables=("/proc/net/tcp",)):
+    """Inode of the 127.0.0.1:local_port <-> 127.0.0.1:remote_port socket, or None."""
+    want_l, want_r = "0100007F:%04X" % local_port, "0100007F:%04X" % remote_port
+    for table in tables:
+        try:
+            with open(table, encoding="ascii", errors="replace") as fh:
+                next(fh, None)
+                for line in fh:
+                    cols = line.split()
+                    if len(cols) >= 10 and cols[1].upper() == want_l and cols[2].upper() == want_r:
+                        return cols[9]
+        except OSError:
+            continue
+    return None
+
+
+def _pid_owns_socket(pid, inode):
+    target = "socket:[%s]" % inode
+    d = "/proc/%d/fd" % pid
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return False
+    for n in names:
+        try:
+            if os.readlink(os.path.join(d, n)) == target:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def answered_by(pid, port, my_port):
+    """True when the server end of our connection (127.0.0.1:port <-> our port)
+    belongs to pid. Linux: /proc. Elsewhere: lsof's listener on the port."""
+    if os.path.exists("/proc/net/tcp"):
+        inode = _tcp_inode(port, my_port)
+        return bool(inode) and inode != "0" and _pid_owns_socket(pid, inode)
+    import subprocess
+    try:
+        out = subprocess.run(["lsof", "-nP", "-a", "-iTCP:%d" % port, "-sTCP:LISTEN", "-t"], capture_output=True,
+                             text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return str(pid) in out.split()
+
+
+def verify(ls, **query):
+    """cc-dash's own record for a file we are about to act on, or None.
+
+    Asks GET /api/control/verify on the lease's port, and believes the answer
+    only when the socket that sent it belongs to the lease's pid."""
+    import http.client
+    from urllib.parse import urlencode
+    port, pid, key = ls.get("port"), ls.get("pid"), ls.get("key")
+    if not isinstance(port, int) or not 0 < port < 65536 or not isinstance(pid, int) or not isinstance(key, str) or not key:
+        return None
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=VERIFY_TIMEOUT)
+    try:
+        c.request("GET", "/api/control/verify?" + urlencode({k: v for k, v in query.items() if v is not None}),
+                  headers={"Host": "127.0.0.1:%d" % port, "X-CC-Dash-Lease": key})
+        r = c.getresponse()
+        body = r.read(65536)
+        # Checked while the connection is still open, so the server's end is in its fd table.
+        if r.status != 200 or not answered_by(pid, port, c.sock.getsockname()[1]):
+            return None
+        d = json.loads(body)
+    except (OSError, ValueError, http.client.HTTPException, AttributeError):
+        return None
+    finally:
+        c.close()
+    return d if isinstance(d, dict) and d.get("ok") is True else None
 
 
 # ── what a call is (kept in step with attention.py and lib/cc_dash/control.py) ─
@@ -261,29 +391,34 @@ def guard_reason(ctl, d):
 
 
 def _settings_files(cwd):
-    """Every settings file Claude Code reads permissions from: user, project, local, managed."""
+    """(file, anchor) for every settings file Claude Code reads permissions from:
+    user, project, local, managed. `anchor` is where that file's `/path` rules
+    point (None: not documented for that source, so such a rule is not checked)."""
     import glob
     cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
     proj = os.environ.get("CLAUDE_PROJECT_DIR") or cwd or ""
-    out = [os.path.join(cfg, "settings.json"), os.path.join(cfg, "settings.local.json"),
-           "/etc/claude-code/managed-settings.json", "/Library/Application Support/ClaudeCode/managed-settings.json"]
-    out += sorted(glob.glob("/etc/claude-code/managed-settings.d/*.json"))
+    out = [(os.path.join(cfg, "settings.json"), cfg), (os.path.join(cfg, "settings.local.json"), cfg),
+           ("/etc/claude-code/managed-settings.json", None),
+           ("/Library/Application Support/ClaudeCode/managed-settings.json", None)]
+    out += [(f, None) for f in sorted(glob.glob("/etc/claude-code/managed-settings.d/*.json"))]
     if proj:
-        out += [os.path.join(proj, ".claude", "settings.json"), os.path.join(proj, ".claude", "settings.local.json")]
+        out += [(os.path.join(proj, ".claude", "settings.json"), proj),
+                (os.path.join(proj, ".claude", "settings.local.json"), proj)]
     return out
 
 
 def ask_rules(cwd):
-    """(rules, problem): every permissions.ask entry, and why that list may be incomplete."""
+    """([(rule, anchor)], problem): every permissions.ask entry with its file's
+    `/path` anchor, and why that list may be incomplete."""
     rules, problem = [], ""
-    for f in _settings_files(cwd):
+    for f, anchor in _settings_files(cwd):
         if not os.path.exists(f):
             continue
         try:
             with open(f, encoding="utf-8") as fh:
                 s = json.load(fh)
             ask = (s.get("permissions") or {}).get("ask") if isinstance(s, dict) else None
-            rules += [r for r in ask or [] if isinstance(r, str)]
+            rules += [(r, anchor) for r in ask or [] if isinstance(r, str)]
         except (OSError, ValueError, AttributeError):
             problem = "could not read %s" % f
     return rules, problem
@@ -358,42 +493,296 @@ def _rule_matches(body, text):
     return bool(_glob_rx(body).match(text))
 
 
+# Which tools a rule's tool name covers (https://code.claude.com/docs/en/permissions.md):
+# Edit rules apply to every built-in tool that edits files, Read rules (best effort)
+# to the ones that read; Agent and Task are one tool.
+_RULE_TOOLS = {"Read": ("Read", "Grep", "Glob"), "Edit": ("Edit", "Write", "MultiEdit", "NotebookEdit"),
+               "Agent": ("Agent", "Task"), "Task": ("Agent", "Task")}
+# Path rules written for these are accepted by Claude Code but never consulted.
+_UNCONSULTED_PATH_TOOLS = {"Write", "NotebookEdit", "MultiEdit", "Glob"}
+# A tool's primary field cannot be matched as `Tool(param:value)` (Claude Code ignores such a rule).
+_PRIMARY = {"Bash": "command", "PowerShell": "command", "Read": "file_path", "Edit": "file_path", "Write": "file_path",
+            "MultiEdit": "file_path", "Grep": "path", "Glob": "path", "NotebookEdit": "notebook_path", "WebFetch": "url"}
+_BASH_PARAMS = {"run_in_background", "timeout", "description", "dangerouslyDisableSandbox"}
+_PARAM_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$", re.S)
+
+
+class NotChecked(Exception):
+    """A rule names this tool but its pattern form is not understood: fail closed."""
+
+
+def _rule_tool_matches(rule_tool, tool, has_body):
+    """True when a rule's tool name covers this tool."""
+    if rule_tool.startswith("mcp__"):
+        if has_body:
+            return False                   # Claude Code skips an mcp__ rule with parentheses
+        if "*" in rule_tool:
+            import fnmatch
+            return fnmatch.fnmatchcase(tool, rule_tool)
+        # `mcp__server` and `mcp__server__*` both cover the whole server; as an ask rule
+        # `mcp__reports` also covers a server named `reports__v2`.
+        return tool == rule_tool or tool.startswith(rule_tool + "__")
+    if "*" in rule_tool or "?" in rule_tool or "[" in rule_tool:
+        import fnmatch
+        return fnmatch.fnmatchcase(tool, rule_tool)     # tool-name globs: the full name must match
+    if rule_tool in _UNCONSULTED_PATH_TOOLS and has_body:
+        return False
+    return tool in _RULE_TOOLS.get(rule_tool, (rule_tool,))
+
+
+def _value_matches(pattern, value):
+    """`Tool(param:value)`: the literal input value, `*` matching any text."""
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        value = repr(value)
+    elif not isinstance(value, str):
+        return False                       # nested objects and arrays are not matchable
+    return bool(_glob_rx(pattern.strip()).match(value))
+
+
+def _gitignore_rx(pat):
+    """Regex for a gitignore pattern relative to its anchor: `*` within a segment,
+    `**` across, `?`, [classes], backslash escapes. Raises NotChecked on what it
+    cannot translate."""
+    out, i, n = [], 0, len(pat)
+    while i < n:
+        c = pat[i]
+        if pat.startswith("**/", i) and (i == 0 or pat[i - 1] == "/"):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pat.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = pat.find("]", i + 2)
+            if j < 0:
+                raise NotChecked("an unclosed [ in the path pattern")
+            body = pat[i + 1:j]
+            if body.startswith("!"):
+                body = "^" + body[1:]
+            out.append("[" + body.replace("\\", "\\\\") + "]")
+            i = j + 1
+        elif c == "\\" and i + 1 < n:
+            out.append(re.escape(pat[i + 1]))
+            i += 2
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return "".join(out)
+
+
+def _path_rule(body, anchor_src, cwd, home):
+    """(anchor directory, compiled regex for the path below it), per the four
+    documented forms: //abs, ~/home, /settings-source, path or ./path."""
+    p = body.strip()
+    if p.startswith("!"):
+        return None                        # a carve-out only narrows other rules: ignoring it fails closed
+    if p.startswith("//"):
+        anchor, pat, relative = "/", p[2:], False
+    elif p.startswith("~/"):
+        if not home:
+            raise NotChecked("no home directory to resolve ~/")
+        anchor, pat, relative = home, p[2:], False
+    elif p.startswith("~"):
+        raise NotChecked("the ~user form is not documented")
+    elif p.startswith("/"):
+        if not anchor_src:
+            raise NotChecked("a /path rule from a settings file whose anchor is not documented")
+        anchor, pat, relative = anchor_src, p[1:], False
+    else:
+        if not cwd:
+            raise NotChecked("no working directory to resolve a relative path rule")
+        anchor, pat, relative = cwd, p[2:] if p.startswith("./") else p, True
+    pat = pat.rstrip("/")
+    if not pat or pat in ("**", "*"):
+        return anchor, re.compile(r"^.*$", re.S)
+    core = _gitignore_rx(pat)
+    if "/" not in pat:
+        rx = "(?:.*/)?" + core             # a bare name matches at any depth
+    elif relative and re.match(r"^[^/*?\[\\]+/\*\*$", pat):
+        # `dir/**` (also written ./dir/**) in an ask rule: that directory name at any depth
+        rx = "(?:.*/)?" + core
+    else:
+        rx = core
+    return anchor, re.compile("^" + rx + "(?:/.*)?$", re.S)
+
+
+def _under(path, anchor):
+    anchor = anchor.rstrip("/") or "/"
+    if anchor == "/":
+        return path.lstrip("/")
+    if path == anchor:
+        return ""
+    if path.startswith(anchor + "/"):
+        return path[len(anchor) + 1:]
+    return None
+
+
+def _literal_prefix(rx_body):
+    """The leading path segments of a pattern that contain no glob."""
+    segs = []
+    for seg in rx_body.split("/"):
+        if any(ch in seg for ch in "*?[\\"):
+            break
+        segs.append(seg)
+    return "/".join(segs)
+
+
+def _path_matches(body, anchor_src, ti, tool, cwd):
+    """True / False for a Read or Edit path rule against this call's path(s)."""
+    home = os.path.expanduser("~")
+    home = home if os.path.isabs(home) else ""
+    parsed = _path_rule(body, anchor_src, cwd, home)
+    if parsed is None:
+        return False
+    anchor, rx = parsed
+    key = {"NotebookEdit": "notebook_path", "Grep": "path", "Glob": "path"}.get(tool, "file_path")
+    raw = ti.get(key)
+    if raw is None and tool in ("Grep", "Glob"):
+        raw = cwd                          # no path: the search runs in the working directory
+    if not isinstance(raw, str) or not raw:
+        raise NotChecked("the call names no %s" % key)
+    if raw.startswith("~/") and home:
+        raw = os.path.join(home, raw[2:])
+    full = os.path.normpath(raw if os.path.isabs(raw) else os.path.join(cwd or "/", raw))
+    spellings = {full, os.path.realpath(full)}
+    for anc in {anchor, os.path.realpath(anchor)}:
+        for path in spellings:
+            rel = _under(path, anc)
+            if rel is not None and rx.match(rel):
+                return True
+    if tool in ("Grep", "Glob"):
+        # A search over a directory reaches every file below it: if the rule could
+        # match anything down there, do not call the search clean.
+        p = body.strip()
+        relative = not p.startswith(("/", "~"))
+        pat = (p[2:] if p.startswith(("//", "~/", "./")) else p[1:] if p.startswith("/") else p).rstrip("/")
+        any_depth = "/" not in pat or (relative and re.match(r"^[^/*?\[\\]+/\*\*$", pat))
+        pre = _literal_prefix(pat)
+        for path in spellings:
+            if _under(anchor, path) is not None:
+                raise NotChecked("the search covers %s, where this path rule applies" % anchor)
+            rel = _under(path, anchor)
+            if rel is not None and (any_depth or not pre or pre.startswith(rel + "/") or rel.startswith(pre)):
+                raise NotChecked("the search may reach files this path rule covers")
+    return False
+
+
+def _domain_matches(spec, url):
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        host = ""
+    if not host:
+        raise NotChecked("the URL has no host to compare")
+    spec = spec.strip().lower().rstrip(".")
+    if spec == "*":
+        return True
+    if spec.startswith("*."):
+        return host.endswith(spec[1:]) and host != spec[2:]
+    want, have = spec.split("."), host.split(".")
+    if len(want) != len(have):
+        return False
+    return all(re.match("^" + "[^.]*".join(re.escape(x) for x in w.split("*")) + "$", h) for w, h in zip(want, have))
+
+
+def _body_matches(rule_tool, body, anchor_src, tool, ti, cwd):
+    """True / False for one rule body against this call; NotChecked when the form
+    is not understood. Bash is matched separately (bash-guard's parser)."""
+    m = _PARAM_RE.match(body)
+    if m and m.group(1) not in ti and m.group(2).startswith("//"):
+        m = None                           # a URL such as https://…, not `param:value`
+    if m and not (rule_tool == "WebFetch" and m.group(1) == "domain"):
+        name, want = m.group(1), m.group(2)
+        is_path_tool = rule_tool in ("Read", "Edit")
+        if name in ti or not is_path_tool:
+            if _PRIMARY.get(tool) == name or _PRIMARY.get(rule_tool) == name:
+                return False               # ignored by Claude Code (bypassable), never consulted
+            if name not in ti:
+                return False               # a parameter the call leaves out is never matched
+            return _value_matches(want, ti[name])
+    if rule_tool in ("Read", "Edit"):
+        return _path_matches(body, anchor_src, ti, tool, cwd)
+    if rule_tool == "WebFetch":
+        if not body.strip().lower().startswith("domain:"):
+            raise NotChecked("a WebFetch rule without domain:")
+        url = ti.get("url")
+        if not isinstance(url, str):
+            raise NotChecked("the call names no url")
+        return _domain_matches(body.strip()[7:], url)
+    if rule_tool in ("Agent", "Task"):
+        st = ti.get("subagent_type")
+        return isinstance(st, str) and bool(_glob_rx(body.strip()).match(st))
+    if rule_tool == "Skill":
+        sk = ti.get("skill")
+        b = body.strip()
+        if b.endswith(":*"):
+            return isinstance(sk, str) and (sk == b[:-2] or sk.startswith(b[:-2] + ":"))
+        return isinstance(sk, str) and bool(_glob_rx(b).match(sk))
+    raise NotChecked("the %s(…) pattern form is not one cc-dash can check" % rule_tool)
+
+
 def ask_rule(d):
     """The permissions.ask rule this call matches, or a reason the check failed
     (fail closed: the dashboard then asks for a typed confirm), or ''."""
     tool = d.get("tool_name") or ""
     ti = d.get("tool_input") if isinstance(d.get("tool_input"), dict) else {}
+    cwd = d.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or ""
     rules, problem = ask_rules(d.get("cwd") or "")
     if problem:
         return "(not checked: %s)" % problem
     mine = []
-    for r in rules:
-        m = re.match(r"^([A-Za-z0-9_:.-]+)(?:\((.*)\))?$", r.strip(), re.S)
-        if m and m.group(1) == tool:
-            mine.append((r, m.group(2)))
+    for r, anchor in rules:
+        m = re.match(r"^([^()\s]+)(?:\((.*)\))?$", r.strip(), re.S)
+        if not m:
+            mine_problem = "the rule %s could not be parsed" % r
+            if tool and tool in r:
+                return "(not checked: %s)" % mine_problem
+            continue
+        rule_tool, body = m.group(1), m.group(2)
+        has_body = body is not None and body.strip() not in ("", "*")
+        if _rule_tool_matches(rule_tool, tool, has_body):
+            mine.append((r, rule_tool, body, anchor))
     if not mine:
         return ""
-    for r, body in mine:
+    for r, _rt, body, _a in mine:
         if body is None or body.strip() in ("", "*"):
             return r
     if tool == "Bash":
         cmd = ti.get("command") if isinstance(ti.get("command"), str) else ""
         cmds, problem = bash_commands(cmd)
         texts = [" ".join(cmd.split())] + cmds
-        for r, body in mine:
+        for r, _rt, body, _a in mine:
+            pm = _PARAM_RE.match(body)
+            if pm and pm.group(1) in _BASH_PARAMS:
+                if pm.group(1) in ti and _value_matches(pm.group(2), ti[pm.group(1)]):
+                    return r
+                continue
+            if pm and pm.group(1) == "command":
+                continue                   # ignored by Claude Code
             if any(_rule_matches(body, t) for t in texts):
                 return r
         if problem:
             return "(not checked against your permissions.ask rules: %s)" % problem
         return ""
-    val = next((ti.get(k) for k in ("file_path", "notebook_path", "path", "url") if isinstance(ti.get(k), str)), "")
-    for r, body in mine:
-        if body.startswith("domain:"):
-            if re.match(r"^https?://([^/:]+\.)?" + re.escape(body[7:]) + r"(?:[:/]|$)", val):
+    unsure = ""
+    for r, rule_tool, body, anchor in mine:
+        try:
+            if _body_matches(rule_tool, body, anchor, tool, ti, cwd):
                 return r
-        elif val and _glob_rx(body.replace("**", "*")).match(val):
-            return r
-    return ""
+        except NotChecked as e:
+            unsure = unsure or "%s: %s" % (r, e)
+        except (re.error, ValueError, TypeError) as e:
+            unsure = unsure or "%s: %s" % (r, type(e).__name__)
+    return "(not checked: %s)" % unsure if unsure else ""
 
 
 def session_rules(d):
@@ -657,10 +1046,14 @@ def permission_request(d, ctl, ls):
             dec = read_json(dec_path, MAX_MSG_FILE)
             if dec is not None:
                 unlink(dec_path)
-                if dec.get("id") == rid and dec.get("hash") == req["hash"] and dec.get("action") == "release":
+                # The file only rings the bell: what applies is cc-dash's own record of
+                # a decision sent from a control-unlocked page, for this request as shown.
+                dec = verify(ls, kind="dec", id=rid, hash=req["hash"], shown=shown_digest(req)) \
+                    if dec.get("id") == rid and dec.get("hash") == req["hash"] else None
+                if dec is not None and dec.get("id") == rid and dec.get("hash") == req["hash"] and dec.get("action") == "release":
                     res["outcome"] = "terminal" if dec.get("why") == "terminal" else "released"
                     return
-                o = decision_output(d, dec, req)
+                o = decision_output(d, dec, req) if dec is not None else None
                 if o is not None:
                     emit(o)
                     res.update(outcome="applied", action=dec.get("action"))
@@ -712,7 +1105,7 @@ def claim(ctl, src, dst, name, sid, agent):
     return m, to
 
 
-def stop_turn(d, ctl, ev):
+def stop_turn(d, ctl, ev, ls):
     t = target_ok(d)
     if t is None or not (private_dir(os.path.join(ctl, "stop")) and private_dir(os.path.join(ctl, "stopped"))):
         return False
@@ -722,6 +1115,9 @@ def stop_turn(d, ctl, ev):
         return False
     m, to = claim(ctl, "stop", "stopped", "%s" % name, sid, agent)
     if m is None:
+        return False
+    if verify(ls, kind="stop", id=name[:-5], session=sid) is None:
+        unlink(to)                  # not sent from the dashboard: dropped, the turn goes on
         return False
     now = time.time()
     if ev == "PreToolUse":
@@ -739,8 +1135,9 @@ def stop_turn(d, ctl, ev):
 
 
 # ── message delivery ────────────────────────────────────────────────────────
-def take_messages(ctl, sid, agent):
-    """Claim every message queued for this session and agent; [(path, msg)]."""
+def take_messages(ctl, sid, agent, ls):
+    """Claim every message queued for this session and agent that cc-dash confirms
+    it sent; [(path, msg)] with cc-dash's text, never the file's."""
     msg_dir = os.path.join(ctl, "msg")
     if not (private_dir(msg_dir) and private_dir(os.path.join(ctl, "dlv"))):
         return []
@@ -752,20 +1149,26 @@ def take_messages(ctl, sid, agent):
     got = []
     for n in names:
         m, to = claim(ctl, "msg", "dlv", n, sid, agent)
-        if m is not None and isinstance(m.get("text"), str):
-            got.append((to, m))
+        if m is None:
+            continue
+        ok = verify(ls, kind="msg", id=m.get("id") if isinstance(m.get("id"), str) else "", session=sid, agent=agent or "")
+        if ok is None or not isinstance(ok.get("text"), str) or ok.get("session") != sid or (ok.get("agent_id") or None) != agent:
+            unlink(to)              # not sent from the dashboard: dropped unread
+            continue
+        m["text"] = ok["text"]
+        got.append((to, m))
     got.sort(key=lambda x: (x[1].get("ts") or 0, x[0]))     # oldest first
     return got
 
 
-def deliver(d, ctl, ev):
+def deliver(d, ctl, ev, ls):
     t = target_ok(d)
     if t is None:
         return
     sid, agent = t
     if (ev == "SubagentStop" and agent is None) or (ev == "Stop" and agent is not None):
         return
-    got = take_messages(ctl, sid, agent)
+    got = take_messages(ctl, sid, agent, ls)
     if not got:
         return
     now = time.time()
@@ -812,13 +1215,13 @@ def main():
     if ev == "PermissionRequest":
         permission_request(d, ctl, ls)
     elif ev == "PreToolUse":
-        stop_turn(d, ctl, ev)
+        stop_turn(d, ctl, ev, ls)
     elif ev == "SessionStart":
         record_socket(d, ctl)
     elif ev in ("PostToolUse", "PostToolUseFailure", "UserPromptSubmit", "Stop", "SubagentStop"):
         if ev in ("Stop", "SubagentStop"):
-            stop_turn(d, ctl, ev)
-        deliver(d, ctl, ev)
+            stop_turn(d, ctl, ev, ls)
+        deliver(d, ctl, ev, ls)
 
 
 if __name__ == "__main__":

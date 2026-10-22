@@ -17,6 +17,17 @@ Blocks:
     `--force-with-lease`), `curl … | sh`, `env | curl`, registry redirection
     (`npm config set registry`, writes to `.npmrc`/`pip.conf`), `mkfs`/`dd
     of=/dev/…`, `chmod 777`, shutdown.
+  - cc-dash's control channel, so an agent cannot approve its own prompt: any
+    reference to `…/cc_tool/control` (the hook handoff directory, read or
+    write) or `…/cc_tool/cc-dash.log`, a call to the dashboard's pairing or
+    control endpoints on the loopback (`/api/pair`, `/api/pair-local`,
+    `/api/control/…` on 127.0.0.1 / localhost), and starting `cc-dash
+    --control` / `ccdash --control`. Heredoc bodies and inline code are
+    scanned too. GET /api/live and the other read endpoints, and reading
+    transcripts, stay allowed. Defence in depth only: a script that builds the
+    path or URL at run time is invisible here; the control code and cc-dash's
+    verification of every decision (lib/cc_dash/auth.py, control.py) are the
+    real protection.
 
 Asks (hands the decision to the user; in an unattended run that is a refusal).
 The rule is: ask before an install or a deletion, nowhere else.
@@ -2322,6 +2333,167 @@ def check_write_bypass(tokens) -> None:
             return
 
 
+# ── cc-dash's control channel ─────────────────────────────────────────────────
+# Your agents run as you. cc-dash --control hands approvals to the hook through
+# files in ${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/ and takes them from
+# a page unlocked with a code shown on the user's terminal. An agent has no
+# business in either: refuse the plain forms (a path written out, a URL written
+# out, launching control mode). Scanned on the raw command, so heredoc bodies
+# and `python3 -c` code count. Narrow on purpose: `curl …/api/live`, reading
+# ~/.claude/projects transcripts and ~/.local/state/cc_tool/attention.jsonl pass.
+_CTL_PATH_RE = re.compile(r"/cc_tool/(?:control(?![\w.-])|cc-dash\.log(?![\w-]))")
+_DASH_API_RE = re.compile(r"(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(?::\d+)?/api/(?:pair(?:-local)?(?![\w-])|control/)",
+                          re.I)
+_DASH_SUGGESTION = ("ask the user to approve, answer or message in their terminal or in the dashboard; to read what "
+                    "agents are doing, read the transcripts or GET /api/live")
+
+
+def _dash_norm(cmd: str) -> str:
+    """The command with quotes dropped, repeated '/' collapsed and './' segments
+    removed, so `/cc_tool//control`, `/cc_tool/./control` or `/cc_"tool"/control`
+    can't slip past the path and URL patterns."""
+    s = cmd.replace('"', "").replace("'", "")
+    s = re.sub(r"/{2,}", "/", s)
+    prev = None
+    while prev != s:
+        prev, s = s, re.sub(r"/\.(?=/)", "", s)
+    return s
+
+
+def check_cc_dash_raw(cmd: str) -> None:
+    cmd = _dash_norm(cmd)
+    m = _CTL_PATH_RE.search(cmd)
+    if m:
+        what = "the cc-dash log" if "cc-dash.log" in m.group(0) else "cc-dash's control directory (…/cc_tool/control/)"
+        deny(f"this command touches {what}: it carries dashboard approvals, messages and stops (and the pairing "
+             "link), and only cc-dash and its hook may read or write it", _DASH_SUGGESTION)
+    m = _DASH_API_RE.search(cmd)
+    if m:
+        deny(f"this command calls cc-dash's pairing or control endpoint ('{m.group(0)}'): only the user's own "
+             "browser pairs with the dashboard or acts through it", _DASH_SUGGESTION)
+
+
+# `--control`, any prefix argparse might once have accepted (`--c`, `--con`, ...;
+# cc-dash now sets allow_abbrev=False), and `--control=...`.
+_CONTROL_FLAG_RE = re.compile(r"^--(?:c|co|con|cont|contr|contro|control)(?:=.*)?$", re.S)
+_DASH_NAMES = {"cc-dash", "ccdash"}
+# For text that is not shell (inline python/node code, heredoc bodies, an
+# unparseable command): the name, then such a flag within the same stretch.
+_RAW_LAUNCH_RE = re.compile(r"(?<![\w.-])(?:cc-dash|ccdash)(?![\w-])[^\n]{0,400}?(?<![\w-])"
+                            r"--(?:c|co|con|cont|contr|contro|control)(?![\w-])", re.S)
+_HEREDOC_ANY_RE = re.compile(r"<<-?[ \t]*['\"]?[A-Za-z_]")
+# Python that reaches the modules which start a server or mint codes (reading
+# transcripts with cc_dash.store / parser stays allowed), or runpy on cc-dash.
+_RAW_PY_DASH_RE = re.compile(r"\bcc_dash\.(?:server|auth|control)\b|\bfrom\s+cc_dash\s+import\s+[^\n]*\b(?:server|auth|control)\b"
+                             r"|\brunpy\b[\s\S]{0,300}?cc[-_]dash")
+_EXPANSION_RE = re.compile(r"[$`*?\[\]{}]")
+_LAUNCH_ASK: list = []      # cc-dash invocations whose arguments bash expands at run time
+
+
+def _raw_launch(text):
+    m = _RAW_LAUNCH_RE.search(text) or _RAW_PY_DASH_RE.search(text)
+    return m.group(0)[:80] if m else None
+
+
+def _launch_in_cmd(cmd, depth):
+    """The cc-dash control-mode launch in one simple command (or in what it hands
+    a shell, `script -c`, eval, a runner such as setsid/xargs, or an inline
+    interpreter), else None."""
+    if depth > 6 or not cmd:
+        return None
+    name = _cmd_name(cmd[0])
+    args = [_quoted(a) for a in cmd[1:]]
+    raw_args = list(cmd[1:])
+    if name in _INLINE_INTERP:
+        for k, a in enumerate(args):
+            if a in _EVAL_FLAGS and k + 1 < len(args) and _raw_launch(args[k + 1]):
+                return _raw_launch(args[k + 1])
+            if a == "-m" and k + 1 < len(args) and args[k + 1].split(".")[0] == "cc_dash":   # python3 -m cc_dash.server
+                name, args, raw_args = "cc-dash", args[k + 2:], raw_args[k + 2:]
+                break
+        else:
+            rest = [a for a in args if not a.startswith("-")]
+            if rest and _cmd_name(rest[0]) in _DASH_NAMES:      # python3 …/bin/cc-dash --control
+                k = args.index(rest[0])
+                name, args, raw_args = _cmd_name(rest[0]), args[k + 1:], raw_args[k + 1:]
+    if name in _DASH_NAMES:
+        if any(_CONTROL_FLAG_RE.match(a) for a in args):
+            return " ".join([name] + args)[:80]
+        if any(_EXPANSION_RE.search(a) for a in raw_args):
+            _LAUNCH_ASK.append(" ".join([name] + raw_args)[:80])
+    code = None
+    if name in _NESTED_SHELLS:
+        code = _shell_code(cmd)
+    elif name == "script":                                     # script -qc '<command>' /dev/null
+        for k, a in enumerate(args):
+            if a.startswith("--command="):
+                code = a.split("=", 1)[1]
+            elif (a == "--command" or (a.startswith("-") and not a.startswith("--") and "c" in a[1:])) and k + 1 < len(args):
+                code = args[k + 1]
+    elif name == "eval":
+        code = " ".join(args)
+    if code:
+        inner = tokenize(shell_prepass(code))
+        hit = _launch_problem(inner, depth + 1) if inner is not None else _raw_launch(code)
+        if hit:
+            return hit
+    for handed in _handed_commands(cmd):
+        inner = _strip_assignments(_strip_wrappers(_strip_assignments(handed))[0])
+        hit = _launch_in_cmd(inner, depth + 1)
+        if hit:
+            return hit
+    return None
+
+
+def _launch_problem(tokens, depth=0):
+    if depth > 6:
+        return None
+    for i, tok in enumerate(tokens):
+        if tok == "<<<" and i + 1 < len(tokens):               # bash <<< 'cc-dash --control'
+            body = _quoted(tokens[i + 1])
+            inner = tokenize(shell_prepass(body))
+            hit = _launch_problem(inner, depth + 1) if inner is not None else _raw_launch(body)
+            if hit:
+                return hit
+    for _span, cmd in _simple_commands_at(tokens):
+        hit = _launch_in_cmd(cmd, depth)
+        if hit:
+            return hit
+    return None
+
+
+def _deny_launch(what):
+    deny(f"starting cc-dash in control mode from an agent ('{what}'): control mode is the user's way to approve "
+         "agents, and its code belongs on the user's terminal", "ask the user to run `ccdash --control` in their own "
+         "terminal; `cc-dash` without --control (read-only) is fine")
+
+
+def check_cc_dash_launch(tokens, cmd: str) -> None:
+    hit = _launch_problem(tokens)
+    # Heredoc bodies are not in the tokens, and text piped into a shell or runner
+    # (`echo 'cc-dash --control' | sh`, `… | xargs sh -c '{}'`) becomes a command
+    # at run time: in either case scan the raw text.
+    feeds_code = any(_cmd_name(c[0]) in _NESTED_SHELLS | {"xargs", "parallel", "script", "eval", "source", "."}
+                     for _s, c in _simple_commands_at(tokens))
+    if not hit and (feeds_code or _HEREDOC_ANY_RE.search(cmd)):
+        hit = _raw_launch(cmd)
+    if hit:
+        _deny_launch(hit)
+    if _LAUNCH_ASK:
+        # Name and flag matching is not a boundary: arguments bash builds at run
+        # time could become --control. cc-dash itself also refuses to start control
+        # mode under Claude Code; this asks before relying on that.
+        ask(f"cc-dash is started with arguments the shell expands at run time ('{_LAUNCH_ASK[0]}'), so bash-guard "
+            "cannot tell whether they turn on control mode", "write cc-dash's arguments out literally")
+
+
+def check_cc_dash_launch_raw(cmd: str) -> None:
+    """The unparseable-command fallback: the raw text scan."""
+    hit = _raw_launch(cmd)
+    if hit:
+        _deny_launch(hit)
+
+
 # ── Project rules (.claude/guard-rules.json) ──────────────────────────────────
 def check_project_rules(cmd: str) -> None:
     if not lib:
@@ -2402,6 +2574,7 @@ def main() -> None:
             f"you are sure it does not commit/push to a protected branch or read secrets."
         )
 
+    check_cc_dash_raw(cmd)
     prepped = shell_prepass(cmd)
     global _SINGLE_QUOTED_DOLLAR, _PREPPED
     _SINGLE_QUOTED_DOLLAR = _has_single_quoted_dollar(prepped)
@@ -2412,6 +2585,7 @@ def main() -> None:
         # can't guess at it — that half stays fail-open, as before — but the git
         # half still gets its regex fallback.
         check_git_unparseable(prepped)
+        check_cc_dash_launch_raw(cmd)
         check_project_rules(cmd)
         if _NPX_UNPARSEABLE_RE.search(prepped):
             ask("bash-guard could not parse this command (unbalanced quotes), so it cannot confirm the "
@@ -2424,6 +2598,7 @@ def main() -> None:
         sys.exit(0)
 
     check_secret_read(tokens)
+    check_cc_dash_launch(tokens, cmd)
     if any(_cmd_name(t) == "git" for t in tokens):  # cheap gate before the invocation walk
         check_git(tokens)
     check_destructive(cmd, tokens)

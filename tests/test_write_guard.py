@@ -82,6 +82,9 @@ _red = lib.load_session(ROOT, RED)
 _red["failed"][os.path.realpath(A_TS)] = time.time()
 lib.save_session(ROOT, RED, _red)
 
+_XDG = os.environ.get("XDG_STATE_HOME") or ""
+CC_STATE = os.path.join(_XDG if os.path.isabs(_XDG) else os.path.join(HOME, ".local", "state"), "cc_tool")
+
 FAKE_GH = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 FAKE_ANT = "sk-ant-api03-" + "qwertyuiopasdfghjklzxcvbnm1234"
 
@@ -136,6 +139,13 @@ CASES = [
     ("M02", "malformed", ROOT, "Write", "@@RAW@@{\"tool_input\": null}", "s", A),
     ("M03", "malformed", ROOT, "Write", {"content": "no path"}, "s", A),
     ("L11", "location", ROOT, "Write", {"file_path": os.path.join(OUTSIDE, "tmp", "evil.py"), "content": "x"}, "s", W),
+    # ── v0.2.1: cc-dash's control channel cannot be forged with Write/Edit ─
+    ("C01", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "control", "dec", "1-abc.json"), "content": '{"action":"allow"}'}, "s", D),
+    ("C02", "ccdash", ROOT, "Edit", {"file_path": os.path.join(CC_STATE, "control", "lease"), "old_string": "a", "new_string": "b"}, "s", D),
+    ("C03", "ccdash", ROOT, "MultiEdit", {"file_path": os.path.join(CC_STATE, "control", "msg", "s.main.1.json"), "edits": []}, "s", D),
+    ("C04", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "cc-dash.log"), "content": "x"}, "s", D),
+    ("C05", "ccdash", ROOT, "Write", {"file_path": os.path.join(ROOT, "src", "control", "x.ts"), "content": "x"}, "s", A),
+    ("C06", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "notes.txt"), "content": "x"}, "s", W),  # outside the repo: a note, not a block
 ]
 
 
