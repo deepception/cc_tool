@@ -37,7 +37,8 @@ PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import auth as auth_mod  # noqa: E402
 from cc_dash.control import Control  # noqa: E402
-from cc_dash.server import make_server  # noqa: E402
+from cc_dash.server import make_server, start_hook_channel  # noqa: E402
+from hook_channel import hook_call  # noqa: E402  (tests/hook_channel.py: the hook side of the hook socket)
 from cc_dash.store import Store  # noqa: E402
 
 HOOK = os.path.join(REPO, "templates", "hooks", "dash-control.py")
@@ -96,6 +97,7 @@ class Srv:
         if control:
             self.ctl = Control(self.store, self.port, ctl_dir=os.path.join(self.state, "cc_tool", "control"),
                                agents_cmd=agents_cmd, sockets=sockets, hook_check=hook_check)
+            self.hook = start_hook_channel(self.ctl)          # the hook's channel, <control dir>/hook.sock
             self.ctl.start(thread=False)
             self.srv.control = self.ctl
         threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
@@ -152,15 +154,9 @@ class Srv:
         req = {"v": 1, "id": rid, "ts": time.time(), "pid": os.getpid(), "session": SID, "agent_id": agent, "cwd": self.cwd,
                "tool": tool, "kind": kind, "sig": ti.get("command", ""), "hash": os.urandom(32).hex(), "input": ti,
                "guard": guard, "ask_rule": ask_rule, "session_rules": rules or [], "deadline": time.time() + 300}
-        # As the hook does: handed over with the lease key (POST /api/control/request), then
-        # the doorbell req/<id>.json holding only the id.
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        c.request("POST", "/api/control/request", body=json.dumps(req).encode(),
-                  headers={"Host": "127.0.0.1:%d" % self.port, "X-CC-Dash-Lease": self.ctl.key, "Content-Type": "application/json"})
-        resp = c.getresponse()
-        resp.read()
-        st = resp.status
-        c.close()
+        # As the hook does: handed over over the hook socket with the lease key (POST
+        # /api/control/request), then the doorbell req/<id>.json holding only the id.
+        st, _out, _h = hook_call(self.ctl.dir, self.ctl.key, "POST", "/api/control/request", req)
         assert st == 200, st
         p = self.path("req", rid + ".json")
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -179,6 +175,8 @@ class Srv:
     def close(self):
         if self.ctl:
             self.ctl.stop()
+            self.hook.shutdown()
+            self.hook.server_close()
         self.srv.shutdown()
         self.srv.server_close()
 
@@ -581,16 +579,44 @@ def test_round_trip_with_hook():
         s.close()
 
 
+def test_refusal_on_terminal():
+    """A refused control launch shows its reason on the terminal (where the code would
+    have been), keeps it in the log (stderr), and tells `ccdash` through --ready-fd."""
+    import io
+    import types
+    from cc_dash import server as server_mod
+    master, slave = os.openpty()
+    r, w = os.pipe()
+    err, old = io.StringIO(), sys.stderr
+    sys.stderr = err
+    try:
+        a = types.SimpleNamespace(ready_fd=w)
+        server_mod.refuse_control(a, "cc-dash: cc-dash --control must be started from your own terminal: test reason.",
+                                  tty=os.ttyname(slave))
+    finally:
+        sys.stderr = old
+    shown = os.read(master, 4096).decode()
+    os.close(master)
+    os.close(slave)
+    told = os.read(r, 64)
+    os.close(r)
+    check("refusal: the reason is written to the terminal", "test reason" in shown, shown)
+    check("refusal: ... and to stderr (cc-dash.log with ccdash)", "test reason" in err.getvalue())
+    check("refusal: --ready-fd says `refused` and is closed (ccdash returns, without 'opening')",
+          told == b"refused" and a.ready_fd is None, told)
+
+
 def test_stop_cleans_lease():
     s = Srv()
     s.close()
     check("stop(): lease and pending removed on shutdown", not os.path.exists(os.path.join(s.state, "cc_tool", "control", "lease")))
+    check("stop(): the hook socket is removed on shutdown", not os.path.lexists(os.path.join(s.state, "cc_tool", "control", "hook.sock")))
 
 
 def main():
     try:
         for fn in (test_pairing, test_write_checks, test_decide, test_messages_and_stop, test_socket_transport,
-                   test_agents_release_and_annotate, test_round_trip_with_hook, test_stop_cleans_lease):
+                   test_agents_release_and_annotate, test_round_trip_with_hook, test_refusal_on_terminal, test_stop_cleans_lease):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001

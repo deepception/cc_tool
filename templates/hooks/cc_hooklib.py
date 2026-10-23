@@ -11,7 +11,9 @@ What it provides
   repo_root()            the project root (CLAUDE_PROJECT_DIR, else the nearest
                          ancestor with a .git, else cwd)
   state_dir(root)        <root>/.git/cc_tool/ — gitignored by construction, dies
-                         with the clone; a temp dir when .git is not a directory
+                         with the clone; for a worktree (.git is a file)
+                         ${XDG_STATE_HOME:-~/.local/state}/cc_tool/repos/<tag>/,
+                         0700 and checked; '' when no safe place exists
   log_event(...)         append one JSON line to the activity log
   load_session/save_session
                          per-session trajectory state (files seen with their
@@ -24,7 +26,7 @@ import hashlib
 import json
 import os
 import re
-import tempfile
+import stat
 import time
 
 ACTIVITY_LOG = "activity.jsonl"
@@ -46,21 +48,105 @@ def repo_root(start: str = "") -> str:
         d = parent
 
 
-def state_dir(root: str) -> str:
-    """Directory for hook state. Under .git/ when that is a real directory
-    (never committed, never in the worktree); otherwise a per-root temp dir
-    (git worktrees have a .git *file*)."""
-    git = os.path.join(root, ".git")
-    if os.path.isdir(git):
-        d = os.path.join(git, "cc_tool")
-    else:
-        tag = hashlib.sha1(root.encode("utf-8", "replace")).hexdigest()[:12]
-        d = os.path.join(tempfile.gettempdir(), "cc_tool", tag)
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+def _xdg_state() -> str:
+    """${XDG_STATE_HOME:-~/.local/state}/cc_tool (an absolute XDG_STATE_HOME only,
+    as the XDG spec says), or ''."""
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):
+        home = os.path.expanduser("~")
+        if not os.path.isabs(home):
+            return ""
+        base = os.path.join(home, ".local", "state")
+    return os.path.join(base, "cc_tool")
+
+
+def private_dir(d: str) -> bool:
+    """Create d (and missing parents) 0700; True only when d is then a real
+    directory (lstat: not a symlink) owned by us that group and others cannot
+    use at all."""
     try:
-        os.makedirs(d, exist_ok=True)
+        os.makedirs(os.path.dirname(d), mode=0o700, exist_ok=True)
     except OSError:
         pass
-    return d
+    try:
+        os.mkdir(d, 0o700)
+    except OSError:
+        pass
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return False
+    return (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not (st.st_mode & 0o077))
+
+
+def state_dir(root: str) -> str:
+    """Directory for hook state. Under .git/ when that is a real directory
+    (never committed, never in the worktree). Otherwise (git worktrees have a
+    .git *file*) ${XDG_STATE_HOME:-~/.local/state}/cc_tool/repos/<tag>/, made
+    0700 and used only when lstat shows it is ours, a real directory and
+    private: never a shared temp directory another local user could prepare.
+    '' when there is no such place (callers then keep no state)."""
+    git = os.path.join(root, ".git")
+    if os.path.isdir(git) and not os.path.islink(git):
+        d = os.path.join(git, "cc_tool")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        return d
+    base = _xdg_state()
+    if not base:
+        return ""
+    tag = hashlib.sha1(root.encode("utf-8", "replace")).hexdigest()[:12]
+    d = os.path.join(base, "repos", tag)
+    return d if private_dir(d) else ""
+
+
+def _append(path: str, line: str) -> None:
+    """Append a line to path: O_APPEND|O_CREAT|O_NOFOLLOW, 0600; a planted symlink
+    raises (ELOOP), and only a plain file of ours is written."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | NOFOLLOW | CLOEXEC, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return
+        os.write(fd, line.encode("utf-8", "replace"))
+    finally:
+        os.close(fd)
+
+
+def _read(path: str, limit: int = 4 * 1024 * 1024) -> str:
+    """The text of a plain file of ours (O_NOFOLLOW), else raises OSError."""
+    fd = os.open(path, os.O_RDONLY | NOFOLLOW | CLOEXEC | getattr(os, "O_NONBLOCK", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError("not a plain file of ours")
+        return os.read(fd, limit).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def _write_atomic(path: str, text: str) -> None:
+    """Write path through a fresh temp file (O_CREAT|O_EXCL|O_NOFOLLOW, 0600), renamed over it."""
+    tmp = "%s.%d.%s.tmp" % (path, os.getpid(), os.urandom(4).hex())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | CLOEXEC, 0o600)
+    try:
+        os.write(fd, text.encode("utf-8", "replace"))
+    finally:
+        os.close(fd)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ── Block message format ──────────────────────────────────────────────────────
@@ -83,32 +169,38 @@ def block_message(reason: str, suggestion: str = "") -> str:
 def log_event(root: str, kind: str, **fields) -> None:
     """Append one line: {"ts", "kind", ...fields}. Never raises."""
     try:
-        path = os.path.join(state_dir(root), ACTIVITY_LOG)
+        d = state_dir(root)
+        if not d:
+            return
+        path = os.path.join(d, ACTIVITY_LOG)
         try:
-            if os.path.getsize(path) > ACTIVITY_MAX_BYTES:
+            if os.lstat(path).st_size > ACTIVITY_MAX_BYTES:
                 os.replace(path, path + ".1")
         except OSError:
             pass
         rec = {"ts": round(time.time(), 3), "kind": kind}
         rec.update(fields)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        _append(path, json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     except Exception:  # noqa: BLE001 - logging must never affect the decision
         pass
 
 
 # ── Session trajectory state ──────────────────────────────────────────────────
 def _session_path(root: str, session_id: str) -> str:
+    """The session state file, or '' when there is no safe state dir."""
     sid = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "unknown")[:80]
-    return os.path.join(state_dir(root), f"session-{sid}.json")
+    d = state_dir(root)
+    return os.path.join(d, f"session-{sid}.json") if d else ""
 
 
 def load_session(root: str, session_id: str) -> dict:
     """{"seen": {path: mtime}, "failed": {path: ts}, "notes": {key: ts}}."""
     base = {"seen": {}, "failed": {}, "notes": {}}
     try:
-        with open(_session_path(root, session_id), encoding="utf-8") as fh:
-            data = json.load(fh)
+        path = _session_path(root, session_id)
+        if not path:
+            return base
+        data = json.loads(_read(path))
         if isinstance(data, dict):
             for k in base:
                 if isinstance(data.get(k), dict):
@@ -121,10 +213,9 @@ def load_session(root: str, session_id: str) -> dict:
 def save_session(root: str, session_id: str, data: dict) -> None:
     try:
         path = _session_path(root, session_id)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-        os.replace(tmp, path)
+        if not path:
+            return
+        _write_atomic(path, json.dumps(data))
         _prune_sessions(os.path.dirname(path))
     except Exception:  # noqa: BLE001
         pass
@@ -137,7 +228,7 @@ def _prune_sessions(d: str) -> None:
         for name in os.listdir(d):
             if name.startswith("session-") and name.endswith(".json"):
                 p = os.path.join(d, name)
-                if now - os.path.getmtime(p) > SESSION_TTL:
+                if now - os.lstat(p).st_mtime > SESSION_TTL:
                     os.remove(p)
     except OSError:
         pass

@@ -7,19 +7,19 @@ terminal), plus the Origin and Content-Type checks.
 
 Files are a doorbell, not an authority. Anything running as you can write into
 the control directory, so the hook never acts on a decision, message or stop
-file alone: it asks this process (GET /api/control/verify, answered from
-`issued`, the memory of what control-scoped requests made in this launch) and
-checks that the answer came from the process the lease names (the socket's
-owner in /proc). A planted file without a matching record does nothing, and
+file alone: it asks this process (GET /api/control/verify over the hook socket,
+<dir>/hook.sock, answered from `issued`, the memory of what control-scoped
+requests made in this launch) and checks that the answer came from the process
+the lease names (SO_PEERCRED on that socket) and carries the key's HMAC proof. A planted file without a matching record does nothing, and
 files this launch did not issue are not shown either. A decision is also bound
 to what the card showed (a digest of every field the card renders: tool,
 input, cwd, flags, session rules, MCP server), so an approval can only ever
 apply to the very request it was given for.
 
 Requests. The hook hands its request over directly: POST /api/control/request
-with the lease key (receive_request). It is taken only from a socket owned by
-the process the request names (`pid`; the server finds the socket's owner in
-/proc), and only while that process is a dash-control.py hook installed from
+over the hook socket, with the lease key (receive_request). It is taken only
+from the process the request names (`pid`), as the kernel reports the socket's
+peer (SO_PEERCRED; SO_PEERPIDFD rules out a reused pid), and only while that process is a dash-control.py hook installed from
 this checkout: /proc/<pid>/exe a Python interpreter running exactly
 <project>/.claude/hooks/dash-control.py (the project from that process's own
 CLAUDE_PROJECT_DIR), whose cc_tool_root names this checkout, from a project
@@ -32,7 +32,8 @@ sent from the dashboard (deny reasons, answers, messages) that contains the
 control code is refused by the server.
 
 The lease. A 0700 directory ${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/
-holds a 0600 `lease` (pid, launch id, expiry ~6 s ahead, the hook's wait)
+holds a 0600 `lease` (pid, launch id, the key, the hook socket's path, expiry
+~6 s ahead, the hook's wait)
 rewritten every 2 s. templates/hooks/dash-control.py does nothing unless the
 lease is fresh and its pid alive, so a stopped or crashed dashboard releases
 every waiting hook within seconds.
@@ -338,6 +339,7 @@ class Control:
         self.hook_check = hook_check and os.path.isdir("/proc/self")
         self.root = root or CC_TOOL_DIR
         self.planted = {}          # request id -> why it was not shown (audited once)
+        self.hook_sock = None      # <dir>/hook.sock once server.start_hook_channel made it; named in the lease
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def start(self, thread=True):
@@ -384,7 +386,8 @@ class Control:
                      result="another process overwrote the control lease (pid %s); cc-dash wrote its own back" % old.get("pid"))
         write_json(os.path.join(self.dir, "lease"),
                    {"v": 1, "pid": os.getpid(), "launch": self.launch, "port": self.port, "key": self.key,
-                    "expires": round(now + LEASE_TTL, 3), "wait": self.wait, "written": round(now, 3)})
+                    "sock": self.hook_sock, "expires": round(now + LEASE_TTL, 3), "wait": self.wait,
+                    "written": round(now, 3)})
 
     def set_pending(self, on):
         p = os.path.join(self.dir, "pending")
@@ -462,15 +465,18 @@ class Control:
     REQUEST_KEYS = ("v", "id", "ts", "pid", "session", "agent_id", "agent_type", "cwd", "transcript", "tool", "kind", "sig",
                     "hash", "input", "input_truncated", "mode", "deadline", "guard", "ask_rule", "session_rules", "server")
 
-    def receive_request(self, body, peer_pid=None):
+    def receive_request(self, body, peer_pid=None, peer_why="", still=None):
         """(http status, response) for POST /api/control/request: the hook hands over
         the request it waits on. The only way a request reaches a card: req/ files
         are doorbells, and their content is never read, so rewriting one changes
         nothing shown. With the hook check on (Linux), `peer_pid` (the process
-        that owns the connecting socket, found by the server) must be the pid the
-        request names, and that process a dash-control.py hook installed from this
+        that connected to the hook socket, from SO_PEERCRED; `peer_why` says why
+        there is none) must be the pid the request names, and that process a
+        dash-control.py hook installed from this
         checkout for a registered project (procs.hook_problem); anything else is
-        refused and audited. Each request id is taken once."""
+        refused and audited. `still` (from SO_PEERPIDFD, where the kernel has it)
+        says the process that connected is still the one with that pid, after
+        the check. Each request id is taken once."""
         rid = body.get("id")
         if not isinstance(rid, str) or not REQ_ID.match(rid) or not isinstance(body.get("session"), str) \
                 or not isinstance(body.get("hash"), str) or body.get("kind") not in DECIDE_ACTIONS:
@@ -478,8 +484,10 @@ class Control:
         now = self.clock()
         if self.hook_check:
             pid = body.get("pid")
-            why = "the connecting socket does not belong to process %s, which the request names" % pid \
+            why = (peer_why or "the connecting process is not process %s, which the request names" % pid) \
                 if peer_pid is None or peer_pid != pid else procs.hook_problem(pid, self.root, projects=self.projects())
+            if not why and still is not None and not still():
+                why = "process %s exited during the check, so its pid may now name another process" % pid
             if why:
                 with self.lock:
                     self.planted[rid] = now

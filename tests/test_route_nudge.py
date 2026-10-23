@@ -34,6 +34,9 @@ PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else
 HOOK = os.path.join(REPO, "templates", "hooks", "route-nudge.py")
 SETTINGS = os.path.join(REPO, "templates", "settings.json")
 RESULTS = []
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from state_guard import StateGuard  # noqa: E402  (tests/state_guard.py)
+STATE_GUARD = StateGuard()         # the real projects.json, before anything here runs cc-setup
 BASE = tempfile.mkdtemp(prefix="cc-route-nudge-")
 HOME = os.path.join(BASE, "home")
 os.makedirs(HOME)
@@ -210,6 +213,7 @@ def test_rollout():
     os.makedirs(proj)
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PROJECT_DIR",)}
     env["HOME"] = HOME
+    env["XDG_STATE_HOME"] = os.path.join(BASE, "state")      # cc-setup registers the project there, never in yours
     subprocess.run(["git", "init", "-q", proj], capture_output=True, env=env)
     r = subprocess.run([os.path.join(REPO, "bin", "cc-setup"), proj], capture_output=True, text=True, env=env, timeout=400, stdin=subprocess.DEVNULL)
     check("rollout: cc-setup exits 0", r.returncode == 0, r.stderr[-400:] + r.stdout[-400:])
@@ -256,6 +260,8 @@ def main():
                 check(fn.__name__ + " raised", False, "%s: %s" % (type(e).__name__, e))
     finally:
         shutil.rmtree(BASE, ignore_errors=True)
+    why = STATE_GUARD.problem()
+    check("the real state dir's projects.json is untouched by this run", not why, why)
     fails = [r for r in RESULTS if not r[1]]
     print("total=%d  pass=%d  fail=%d" % (len(RESULTS), len(RESULTS) - len(fails), len(fails)))
     return 1 if fails else 0

@@ -14,17 +14,21 @@ one-time code, sent as X-CC-Dash-Token, never a cookie). Pairing gives a
 read-only token. With --control (control.py) it also serves /api/control/*,
 whose POSTs need a control-scoped token (POST /api/control/unlock with the
 control code cc-dash wrote to its terminal), Content-Type application/json and
-an Origin equal to the dashboard's own. GET /api/control/verify is the hook's
-question ("did the dashboard send this?"); it carries no token, answers only a
-socket owned by this user, and confirms only what this launch issued. POST
-/api/control/request is the hook handing over the request it waits on: same
-gate, and the hook process the request names must own the connecting socket.
+an Origin equal to the dashboard's own. The hook does not use TCP: it talks to
+cc-dash over <control dir>/hook.sock (HookServer), a Unix socket this process
+makes in its 0700 control directory. There GET /api/control/verify is the hook's
+question ("did the dashboard send this?") and POST /api/control/request hands
+over the request it waits on; the kernel names the connecting process
+(SO_PEERCRED, and SO_PEERPIDFD against pid reuse), which must be your user and,
+for a request, the hook process the request names.
 Without --control those paths are 404 and every POST but /api/pair is 405.
 """
 import argparse
 import errno
 import json
 import os
+import re
+import socketserver
 import sys
 import threading
 import time
@@ -35,7 +39,7 @@ from urllib.parse import parse_qs, urlsplit
 from . import attention
 from . import procs
 from . import plans   # plan progress (/api/plans)
-from .auth import Auth, local_pairing_supported, peer_inode, same_user
+from .auth import Auth, local_pairing_supported
 from .control import MAX_BODY, MAX_REQUEST_BODY, Control
 from .docs import Docs, DocsError
 from .store import Store, config_dir
@@ -120,6 +124,8 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
+        if getattr(self.server, "hook_channel", False):
+            return self._hook("GET")
         if not self._host_ok():
             return self._deny(421, "Misdirected request: cc-dash only answers on 127.0.0.1 and localhost.")
         parts = urlsplit(self.path)
@@ -138,8 +144,6 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, fh.read(), "text/html; charset=utf-8")
             if path.startswith("/docs-frame/"):     # a one-time ticket from /api/docs/frame, no token
                 return self._docs_frame(path[len("/docs-frame/"):])
-            if ctl is not None and path == "/api/control/verify":   # the hook's check, no token (see _verify)
-                return self._verify(ctl, q)
             # Every data endpoint needs this launch's token in X-CC-Dash-Token (auth.py).
             sess = auth.session(self.headers) if auth is not None else None
             if sess is None:
@@ -273,45 +277,62 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "This browser does not run as the user who started cc-dash."})
         return self._json(200, {"token": token})
 
-    def _verify(self, ctl, q):
-        """GET /api/control/verify?kind=dec|msg|stop&id=...: dash-control.py asks before
-        it acts on a file. The caller must send the lease's per-launch key
-        (X-CC-Dash-Lease; the lease is 0600, so other users cannot read it) and,
-        where the kernel can say (Linux), own the connecting socket: an unknown
-        owner is refused. The hook in turn checks that this process owns the
-        socket that answered. A query never consumes a record."""
+    # ── the hook's channel: <control dir>/hook.sock (HookServer), never TCP ──
+    def _hook(self, method):
+        """GET /api/control/verify and POST /api/control/request from a
+        dash-control.py hook, over the Unix socket cc-dash made in its 0700
+        control directory (procs.bind_private_socket). The kernel says who
+        connected (SO_PEERCRED, fixed when the connection was made): it must be
+        your user, and send the lease's per-launch key (X-CC-Dash-Lease). Every
+        answer carries X-CC-Dash-Proof, an HMAC with that key over the hook's
+        nonce and the body, so the answer is bound to the key and to this very
+        exchange, on top of the hook's own SO_PEERCRED check that it reached the
+        lease's pid. A query never consumes a record."""
         import hmac
+        ctl = self.server.control
+        parts = urlsplit(self.path)
+        nonce = self.headers.get("X-CC-Dash-Nonce") or ""
         key = self.headers.get("X-CC-Dash-Lease") or ""
-        if not key or not hmac.compare_digest(key, ctl.key):
-            return self._json(403, {"ok": False})
-        if local_pairing_supported() and not same_user(self.client_address, self.server.port):
-            return self._json(403, {"ok": False})
-        code, out = ctl.verify(q)
-        return self._json(code, out)
 
-    def _request(self, ctl):
-        """POST /api/control/request: a dash-control.py hook hands over the permission
-        request it waits on. The only way a request reaches a card (a req/ file is
-        a doorbell). Same gate as _verify (the lease key, a socket of this user),
-        and the process the request names must own the connecting socket
-        (/proc/net/tcp inode -> /proc/<pid>/fd); control.receive_request then checks
-        that process is a hook installed from this checkout."""
-        import hmac
-        key = self.headers.get("X-CC-Dash-Lease") or ""
-        if not key or not hmac.compare_digest(key, ctl.key):
+        def answer(code, obj):
+            data = json.dumps(obj, separators=(",", ":"), default=str).encode()
+            proof = hmac.new(ctl.key.encode(), nonce.encode() + b"\n" + data, "sha256").hexdigest()
+            self._send(code, data, "application/json; charset=utf-8", extra={"X-CC-Dash-Proof": proof})
+
+        if not self._host_ok() or ctl is None:
+            return self._deny(421, "Misdirected request.")
+        if not key or not hmac.compare_digest(key, ctl.key) or not re.match(r"^[0-9a-f]{32,128}$", nonce):
             return self._json(403, {"ok": False})
-        if local_pairing_supported() and not same_user(self.client_address, self.server.port):
-            return self._json(403, {"ok": False})
-        body, err = self._read_body(MAX_REQUEST_BODY)
-        if err:
-            return self._json(*err)
-        peer = None
-        if local_pairing_supported():
-            inode = peer_inode(self.client_address, self.server.port)
-            pid = body.get("pid")
-            peer = pid if inode and isinstance(pid, int) and procs.holds_socket(pid, inode) else None
-        code, out = ctl.receive_request(body, peer_pid=peer)
-        return self._json(code, out)
+        pid, uid = procs.peer_cred(self.request)
+        if uid != os.getuid():
+            return answer(403, {"ok": False})
+        if method == "GET" and parts.path == "/api/control/verify":
+            code, out = ctl.verify({k: v[0] for k, v in parse_qs(parts.query).items()})
+            return answer(code, out)
+        if method == "POST" and parts.path == "/api/control/request":
+            body, err = self._read_body(MAX_REQUEST_BODY)
+            if err:
+                return answer(*err)
+            pidfd = procs.peer_pidfd(self.request)
+            try:
+                named = body.get("pid")
+                if not isinstance(named, int) or isinstance(named, bool) or pid is None or named != pid:
+                    peer, why = None, ("the process that connected (%s) is not process %s, which the request names"
+                                       % ("pid %d" % pid if pid else "unknown", named))
+                else:
+                    # And that process alone holds the client end (sock_diag peer inode, one /proc/*/fd
+                    # scan): a socket shared with another process does not say who wrote the request.
+                    why = procs.peer_holder_problem(self.request, pid)
+                    peer = None if why else pid
+                # With a pidfd (Linux >= 6.5): the process checked is the one that connected, still alive,
+                # so its pid was not reused by another process meanwhile.
+                still = (lambda: procs.pidfd_pid(pidfd) == pid) if pidfd is not None else None
+                code, out = ctl.receive_request(body, peer_pid=peer, peer_why=why, still=still)
+            finally:
+                if pidfd is not None:
+                    os.close(pidfd)
+            return answer(code, out)
+        return answer(404, {"ok": False})
 
     def _unlock(self, auth):
         """POST /api/control/unlock {"code"}: the control code from cc-dash's terminal
@@ -339,6 +360,8 @@ class Handler(BaseHTTPRequestHandler):
     POSTS = ("/api/control/decide", "/api/control/message", "/api/control/cancel", "/api/control/stop")
 
     def do_POST(self):
+        if getattr(self.server, "hook_channel", False):
+            return self._hook("POST")
         ctl = getattr(self.server, "control", None)
         auth = getattr(self.server, "auth", None)
         path = urlsplit(self.path).path
@@ -350,8 +373,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._pair_local(auth)
         if path == "/api/control/unlock" and ctl is not None and auth is not None:
             return self._unlock(auth)
-        if path == "/api/control/request" and ctl is not None:     # the hook's handover, no token (see _request)
-            return self._request(ctl)
         if ctl is None or auth is None or path not in self.POSTS:
             return self._no_body()
         why = auth.check_write(self.headers, (self.headers.get("Host") or "").strip().lower())
@@ -412,6 +433,46 @@ class DashServer(ThreadingHTTPServer):
         self.allowed_hosts = {f"127.0.0.1:{real}", f"localhost:{real}"}
         self.auth = Auth(real)
         self.docs = Docs(store)
+
+
+HOOK_HOST = "cc-dash-hook"
+
+
+class HookServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """The hook's channel: HTTP over <control dir>/hook.sock, serving only
+    Handler._hook (verify and request). Made by this process in its 0700
+    control directory (procs.bind_private_socket), 0600, removed on close."""
+    daemon_threads = True
+    hook_channel = True
+
+    def __init__(self, ctl):
+        path = os.path.join(ctl.dir, procs.HOOK_SOCK)
+        socketserver.UnixStreamServer.__init__(self, path, Handler, bind_and_activate=False)
+        self.socket.close()
+        self.socket, self.ident = procs.bind_private_socket(ctl.dir)
+        self.server_address = path
+        self.control, self.store, self.auth, self.verbose = ctl, ctl.store, None, False
+        self.allowed_hosts = {HOOK_HOST}
+
+    def server_close(self):
+        super().server_close()
+        try:                                   # ours only: the very file this process bound
+            st = os.lstat(self.server_address)
+            if (st.st_dev, st.st_ino) == self.ident:
+                os.unlink(self.server_address)
+        except OSError:
+            pass
+
+
+def start_hook_channel(ctl):
+    """Make <control dir>/hook.sock, serve it on a thread, and name it in the
+    lease (ctl.hook_sock); returns the HookServer."""
+    from .control import ensure_private_dir
+    ensure_private_dir(ctl.dir)
+    hs = HookServer(ctl)
+    ctl.hook_sock = hs.server_address
+    threading.Thread(target=hs.serve_forever, kwargs={"poll_interval": 0.2}, name="cc-dash-hook", daemon=True).start()
+    return hs
 
 
 def make_server(port, store, verbose=False, fallback=True):
@@ -579,49 +640,31 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
             if note is not None:
                 note("cc-dash: removed a control lease that named pid %d, which is not a cc-dash dashboard (%s). "
                      "Something running as you wrote it; see the audit log once control mode is on." % (pid, why))
-    seen = [k for k in CLAUDE_ENV_SIGNALS if env.get(k)]
-    if seen:
-        return INSIDE_CLAUDE + " (its environment carries %s)." % ", ".join(seen)
     me = os.getpid() if me is None else me
     st = _proc_stat(me, proc)
+    if st is None:                             # no /proc: only the environment (and given parents) can be checked
+        why = procs.claude_env(env) or next(("process %d, %s, is among its parents" % (p, comm)
+                                             for p, comm, exe, argv in ancestors or [] if _is_claude(comm, exe, argv)), "")
+        return (INSIDE_CLAUDE + " (%s)." % why) if why else ""
     if ancestors is None:
-        if st is None:                         # no /proc: only the environment can be checked
-            ancestors = []
-        else:
-            ancestors, complete = procs.chain(st["ppid"], proc=proc)
-            if not complete:
-                return ("cc-dash --control must be started from your own terminal: its parent chain cannot be read "
-                        "to the end (a process on the way is gone or hidden).")
-    for pid, comm, exe, argv in ancestors:
-        if _is_claude(comm, exe, argv):
-            return INSIDE_CLAUDE + " (process %d, %s, is among its parents)." % (pid, comm)
-    if st is None:
-        return ""
-    # The session leader and the process-group leader outlive a double fork: if
-    # either is, or descends from, the claude CLI, this was started inside it; if
-    # either cannot be inspected, nobody can tell, and that counts the same.
-    # The same checks as the hook's (procs.dashboard_problem), in the same order.
-    why = procs.claude_lineage(me, proc, parents=ancestors)
-    if why:
+        ancestors, complete = procs.chain(st["ppid"], proc=proc)
+        if not complete:
+            return ("cc-dash --control must be started from your own terminal: its parent chain cannot be read "
+                    "to the end (a process on the way is gone or hidden).")
+    # The rules the hook applies to the dashboard and cc-setup to a terminal it records
+    # (procs.origin_problem), in the same order: Claude Code's variables; the claude CLI
+    # among its parents or its session and process-group leaders' parents (they outlive
+    # a double fork; one that cannot be inspected counts); a terminal driver (script,
+    # expect ...) that was itself detached; then whoever holds the master side of this
+    # terminal, who reads the control code: one of your recorded terminals, and not
+    # Claude Code or something it started; a fresh session after a re-parent; detached
+    # with no controlling terminal left.
+    inside, why = procs.origin_problem(me, proc, env=env, parents=ancestors,
+                                       terminal=lambda: procs.terminal_problem(me, proc, terminals=terminals))
+    if inside:
         return INSIDE_CLAUDE + " (%s)." % why
-    # A terminal driver (script, expect ...) that was itself detached: something gave
-    # this process a terminal it reads, the control code included.
-    why = procs.driver_detached(me, proc, parents=ancestors)
     if why:
         return "cc-dash --control must be started from your own terminal: %s." % why
-    # Whoever holds the master side of this terminal reads the control code: it must be
-    # one of your recorded terminals, and not Claude Code or something it started.
-    why = procs.terminal_problem(me, proc, terminals=terminals)
-    if why:
-        return "cc-dash --control must be started from your own terminal: %s." % why
-    # A typical double-fork escape: re-parented to init or a user-manager subreaper
-    # and no controlling terminal left.
-    if procs.fresh_session(me, proc):          # setsid'd itself, then lost its parent: a fresh detached session
-        return ("cc-dash --control must be started from your own terminal: this process leads a fresh session "
-                "and was re-parented to pid %d." % st["ppid"])
-    if procs.detached(me, proc):
-        return ("cc-dash --control must be started from your own terminal: this process was detached (re-parented "
-                "to pid %d) and has no controlling terminal." % st["ppid"])
     return ""
 
 
@@ -657,10 +700,9 @@ def launch_note():
     return ""
 
 
-def show_control_code(code, tty="/dev/tty"):
-    """Write the control code to the controlling terminal and nowhere else: not
-    stdout (often a log file, as with `ccdash`), not stderr, not a file. False
-    when this process has no terminal."""
+def tty_write(text, tty="/dev/tty"):
+    """Write text to the controlling terminal and nowhere else (the control code's
+    channel). False when this process has no terminal."""
     import signal
     try:
         fd = os.open(tty, os.O_WRONLY | getattr(os, "O_NOCTTY", 0) | getattr(os, "O_CLOEXEC", 0))
@@ -672,8 +714,7 @@ def show_control_code(code, tty="/dev/tty"):
             return False
         if hasattr(signal, "SIGTTOU"):        # a background write must not stop us (stty tostop)
             old = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-        os.write(fd, ("\r\n  cc-dash control code:  %s\r\n  Type it into the dashboard to approve, answer or message "
-                      "(shown only here; never written to a file or a log).\r\n\r\n" % code).encode())
+        os.write(fd, text.encode())
         return True
     except OSError:
         return False
@@ -681,6 +722,30 @@ def show_control_code(code, tty="/dev/tty"):
         if old is not None:
             signal.signal(signal.SIGTTOU, old)
         os.close(fd)
+
+
+def show_control_code(code, tty="/dev/tty"):
+    """Write the control code to the controlling terminal and nowhere else: not
+    stdout (often a log file, as with `ccdash`), not stderr, not a file. False
+    when this process has no terminal."""
+    return tty_write("\r\n  cc-dash control code:  %s\r\n  Type it into the dashboard to approve, answer or message "
+                     "(shown only here; never written to a file or a log).\r\n\r\n" % code, tty)
+
+
+def refuse_control(a, text, tty="/dev/tty"):
+    """Control mode is refused: the reason goes to stderr (the log, with `ccdash`)
+    and to the terminal, where the control code would have been, so `ccdash
+    --control` does not look like it silently did nothing; then --ready-fd gets
+    `refused` and is closed, so the `ccdash` function returns after it is shown
+    without saying the dashboard is opening."""
+    print(text, file=sys.stderr)
+    tty_write("\r\n  %s\r\n\r\n" % text.replace("\n", "\r\n  "), tty)
+    if a.ready_fd is not None:
+        try:
+            os.write(a.ready_fd, b"refused")
+        except OSError:
+            pass
+    _ready(a)
 
 
 def main(argv=None):
@@ -697,6 +762,7 @@ def main(argv=None):
         print(f"cc-dash: no transcripts at {tilde(projects)} (set CLAUDE_CONFIG_DIR if Claude Code keeps them elsewhere).",
               file=sys.stderr)
     store = Store(root=root, days=a.days, project=a.project)
+    hook_srv = None
     try:
         srv = make_server(a.port, store, a.verbose)
     except OSError as e:
@@ -711,26 +777,27 @@ def main(argv=None):
         for path, reason in unsafe:
             print("cc-dash: ignored %s for the recorded terminals: it %s." % (tilde(path), reason), file=sys.stderr)
         if why:
-            print("cc-dash: " + why, file=sys.stderr)
+            refuse_control(a, "cc-dash: " + why)
             srv.server_close()
             return 1
         # The control code goes to the terminal only. Without one there is no way
         # to hand it to the human, so there is no control mode.
         if not show_control_code(srv.auth.enable_control()):
-            print("cc-dash: --control needs a terminal: the control code is shown there and never written to a file "
-                  "or a log. Run cc-dash --control (or ccdash --control) from a terminal.", file=sys.stderr)
+            refuse_control(a, "cc-dash: --control needs a terminal: the control code is shown there and never written to "
+                              "a file or a log. Run cc-dash --control (or ccdash --control) from a terminal.")
             srv.server_close()
             return 1
         try:
             # CC_DASH_CONTROL_TRANSPORT=hook: messages only through the hooks (no inbox socket), for testing.
             srv.control = Control(store, srv.port, wait=a.control_wait,
                                   sockets=os.environ.get("CC_DASH_CONTROL_TRANSPORT") != "hook")
+            hook_srv = start_hook_channel(srv.control)
             srv.control.start()
             for path, reason in unsafe:
                 srv.control.log(None, "refused", kind="manifest", item=path,
                                 result="a project manifest was ignored for the recorded terminals: it %s" % reason)
         except OSError as e:
-            print(f"cc-dash: cannot start control mode: {e}", file=sys.stderr)
+            refuse_control(a, f"cc-dash: cannot start control mode: {e}")
             srv.server_close()
             return 1
         print("cc-dash: control mode is on: approvals, answers, plans and messages from the dashboard, after the "
@@ -766,14 +833,28 @@ def main(argv=None):
         except OSError as e:
             print(f"cc-dash: could not open the browser ({e}); open the link above.", file=sys.stderr)
     try:
+        import signal
+        # SIGTERM (`ccdash` stops the previous dashboard with pkill) ends it like Ctrl-C, so the
+        # lease and the hook socket are removed rather than left behind.
+        signal.signal(signal.SIGTERM, _interrupt)
+    except (ValueError, OSError):
+        pass
+    try:
         srv.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("\ncc-dash: stopped.")
     finally:
         if srv.control is not None:
             srv.control.stop()
+        if hook_srv is not None:
+            hook_srv.shutdown()
+            hook_srv.server_close()
         srv.server_close()
     return 0
+
+
+def _interrupt(*_a):
+    raise KeyboardInterrupt
 
 
 def _pair_on_enter(srv):

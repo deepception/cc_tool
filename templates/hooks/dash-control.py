@@ -16,10 +16,11 @@ one shell test per event, not an interpreter start.
 PermissionRequest (synchronous; also the dialog behind AskUserQuestion and
 ExitPlanMode). The terminal dialog opens at once and stays answerable; the first
 answer wins. This hook sends the request to cc-dash directly (POST
-/api/control/request on the lease's port, with the lease's key, answered by a
-socket the lease's pid owns), and cc-dash shows only content that arrived that
-way from a socket this very hook process owns, from a dash-control.py installed
-by its checkout (cc_procs.py hook_problem). No file carries it, so rewriting
+/api/control/request over cc-dash's Unix socket <control dir>/hook.sock, with
+the lease's key, answered by the lease's pid as the kernel reports it), and
+cc-dash shows only content that arrived that way from this very hook process
+(SO_PEERCRED, and SO_PEERPIDFD against a reused pid), from a dash-control.py
+installed by its checkout (cc_procs.py hook_problem). No file carries it, so rewriting
 one changes nothing shown. cc-dash unreachable or refusing: the hook exits
 silently and the prompt stays in the terminal. Then it writes req/<id>.json, a
 doorbell holding only the id, and keeps it while it waits. The request carries
@@ -69,13 +70,14 @@ an idle session. Never the token.
 
 Files are a doorbell, never the authority. Your agents run as you and can
 write into the control directory, so a decision, message or stop file alone does
-nothing: before acting, the hook asks the dashboard (GET /api/control/verify on
-the lease's port, with the lease's per-launch key, so only someone who can read
+nothing: before acting, the hook asks the dashboard (GET /api/control/verify over
+the hook socket, with the lease's per-launch key, so only someone who can read
 the 0600 lease may ask) and applies cc-dash's answer, which comes from its memory of
 what was sent from a control-unlocked page in this launch. The answer counts
-only when the socket that sent it belongs to the lease's pid (/proc/net/tcp
-inode -> /proc/<pid>/fd; lsof where there is no /proc), so a server an agent
-starts on another port cannot vouch for a planted file. A decision also names a
+only when the socket is a 0600 socket of ours in the 0700 control directory,
+the process listening on it is the lease's pid (SO_PEERCRED), and the answer
+carries an HMAC under the lease key of a nonce this hook made, so a socket an
+agent puts at that path cannot vouch for a planted file. A decision also names a
 digest of every field the dashboard card shows (tool, the whole input, cwd,
 session, agent, mode, flags, the session rules, the MCP server), so an approval
 cannot be moved onto a request file rewritten after it was shown.
@@ -383,82 +385,61 @@ def shown_digest(req):
     return hashlib.sha256(canon.encode("utf-8", "replace")).hexdigest()
 
 
-def _tcp_inode(local_port, remote_port, tables=("/proc/net/tcp",)):
-    """Inode of the 127.0.0.1:local_port <-> 127.0.0.1:remote_port socket, or None."""
-    want_l, want_r = "0100007F:%04X" % local_port, "0100007F:%04X" % remote_port
-    for table in tables:
-        try:
-            with open(table, encoding="ascii", errors="replace") as fh:
-                next(fh, None)
-                for line in fh:
-                    cols = line.split()
-                    if len(cols) >= 10 and cols[1].upper() == want_l and cols[2].upper() == want_r:
-                        return cols[9]
-        except OSError:
-            continue
-    return None
-
-
-def _pid_owns_socket(pid, inode):
-    target = "socket:[%s]" % inode
-    d = "/proc/%d/fd" % pid
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return False
-    for n in names:
-        try:
-            if os.readlink(os.path.join(d, n)) == target:
-                return True
-        except OSError:
-            continue
-    return False
-
-
-def answered_by(pid, port, my_port):
-    """True when the server end of our connection (127.0.0.1:port <-> our port)
-    belongs to pid. Linux: /proc. Elsewhere: lsof's listener on the port."""
-    if os.path.exists("/proc/net/tcp"):
-        inode = _tcp_inode(port, my_port)
-        return bool(inode) and inode != "0" and _pid_owns_socket(pid, inode)
-    import subprocess
-    try:
-        out = subprocess.run(["lsof", "-nP", "-a", "-iTCP:%d" % port, "-sTCP:LISTEN", "-t"], capture_output=True,
-                             text=True, timeout=2).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return str(pid) in out.split()
+def hook_socket(ls):
+    """The path of cc-dash's hook socket: <control dir>/hook.sock, and only when
+    the lease names exactly that path; else ''."""
+    ctl = control_dir()
+    path = os.path.join(ctl, "hook.sock") if ctl else ""
+    return path if path and ls.get("sock") == path else ""
 
 
 def ask_dashboard(ls, method, path, body=None):
-    """cc-dash's JSON answer to `method path` on the lease's port, with the
-    lease's per-launch key, or None. Believed only when the socket that answered
-    belongs to the lease's pid, and that pid is (still) the cc-dash this hook
-    trusts; and only an {"ok": true} answer."""
+    """cc-dash's JSON answer to `method path` over its hook socket
+    (<control dir>/hook.sock: a socket of ours, 0600, in our 0700 control
+    directory), with the lease's per-launch key, or None. Believed only when
+    the kernel says the process that answered (SO_PEERCRED: the one listening)
+    is the lease's pid and our user, that pid is (still) the cc-dash this hook
+    trusts, the answer carries the HMAC of our fresh nonce and the body under
+    the lease key, and it is {"ok": true}."""
+    import hmac
     import http.client
-    port, pid, key = ls.get("port"), ls.get("pid"), ls.get("key")
-    if not isinstance(port, int) or not 0 < port < 65536 or not isinstance(pid, int) or not isinstance(key, str) or not key:
+    import socket
+    pid, key = ls.get("pid"), ls.get("key")
+    sock_path = hook_socket(ls)
+    mod = _procs()
+    if not sock_path or mod is None or not isinstance(pid, int) or not isinstance(key, str) or not key:
+        return None
+    if mod.socket_file_problem(sock_path):
         return None
     if not is_cc_dash(pid):                # checked again now, not only when the lease was read
         return None
-    headers = {"Host": "127.0.0.1:%d" % port, "X-CC-Dash-Lease": key}
+    nonce = os.urandom(16).hex()
+    headers = {"Host": "cc-dash-hook", "X-CC-Dash-Lease": key, "X-CC-Dash-Nonce": nonce}
     data = None
     if body is not None:
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
         headers["Content-Type"] = "application/json"
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=VERIFY_TIMEOUT)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(VERIFY_TIMEOUT)
+    c = http.client.HTTPConnection("cc-dash-hook", timeout=VERIFY_TIMEOUT)
     try:
+        mod.unix_path(sock_path, s.connect)
+        peer, uid = mod.peer_cred(s)
+        if peer != pid or uid != os.getuid():
+            return None
+        c.sock = s
         c.request(method, path, body=data, headers=headers)
         r = c.getresponse()
         raw = r.read(65536)
-        # Checked while the connection is still open, so the server's end is in its fd table.
-        if r.status != 200 or not answered_by(pid, port, c.sock.getsockname()[1]):
+        want = hmac.new(key.encode(), nonce.encode() + b"\n" + raw, "sha256").hexdigest()
+        if r.status != 200 or not hmac.compare_digest(r.getheader("X-CC-Dash-Proof") or "", want):
             return None
         d = json.loads(raw)
     except (OSError, ValueError, http.client.HTTPException, AttributeError):
         return None
     finally:
         c.close()
+        s.close()
     return d if isinstance(d, dict) and d.get("ok") is True else None
 
 
@@ -470,10 +451,10 @@ def verify(ls, **query):
 
 
 def send_request(ls, req):
-    """Hand the request to cc-dash directly: POST /api/control/request (ask_dashboard).
-    cc-dash shows only what arrives this way, from a socket this very process
-    owns, so rewriting a file cannot change what the card shows. True when
-    cc-dash took it."""
+    """Hand the request to cc-dash directly: POST /api/control/request over the
+    hook socket (ask_dashboard). cc-dash shows only what arrives this way, from
+    the very process the request names (the kernel's SO_PEERCRED), so rewriting
+    a file cannot change what the card shows. True when cc-dash took it."""
     return ask_dashboard(ls, "POST", "/api/control/request", req) is not None
 
 

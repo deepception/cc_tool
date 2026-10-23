@@ -17,6 +17,8 @@ cannot run; callers say what they do then.
                                 from outside Claude Code ('' when it is)
   hook_problem(pid, root)       why pid is not a dash-control.py hook installed
                                 by that checkout ('' when it is)
+  peer_cred(sock), peer_pidfd   who is at the other end of the hook's Unix
+                                socket (bind_private_socket, socket_file_problem)
   manifest_problem(root, m)     why cc-dash's code under root is not what the
                                 manifest m recorded ('' when it is); build_manifest
                                 makes one (cc-setup), with the interpreter
@@ -34,6 +36,10 @@ cannot run; callers say what they do then.
                                 detect_terminals records them (cc-setup)
   fresh_session(pid)            a process that leads a session it started after
                                 being re-parented (a typical double-fork escape)
+  origin_problem(pid, ...)      all of the above, the one set of rules for
+                                cc-dash --control, the hook's check of the
+                                dashboard and cc-setup's terminal recording
+                                (recording_problem)
   detached(pid)                 re-parented to init or a subreaper with no
                                 controlling terminal left
 """
@@ -248,34 +254,113 @@ def pts_index(tty_nr):
 
 
 def pty_master_holders(index, proc="/proc"):
-    """The pids holding the master side of /dev/pts/<index>: a /dev/ptmx fd whose
-    fdinfo says `tty-index: <index>`. Processes whose fds cannot be read (other
-    users', non-dumpable ones) are not seen."""
-    out = []
+    """The pids holding the master side of /dev/pts/<index> that can be seen
+    (pty_master_scan, which also says who could not be looked at)."""
+    return pty_master_scan(index, proc)[0]
+
+
+def uids(pid, proc="/proc"):
+    """The real, effective, saved and filesystem uids of pid (/proc/<pid>/status), or None."""
+    try:
+        with open("%s/%d/status" % (proc, pid), encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("Uid:"):
+                    return [int(x) for x in line.split()[1:5]]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def claude_descent(pid, proc="/proc"):
+    """'' unless pid, its parents, or its session or process-group leaders and
+    their parents include the claude CLI; then which one ("process N, claude").
+    Reads only /proc/<pid>/stat, cmdline and exe (as far as readable), which stay
+    readable for a process that hides its fd table. Unreadable links are not
+    counted (claude_lineage is the fail-closed check for the process judged)."""
+    st = proc_stat(pid, proc)
+    if st is None:
+        return ""
+    chains = [chain(pid, proc=proc)[0]]
+    chains += [chain(leader, proc=proc)[0] for _label, leader in _leaders(pid, st) if leader > 0]
+    for up in chains:
+        for p, comm, exe, argv in up:
+            if is_claude(comm, exe, argv):
+                return "process %d, %s" % (p, comm)
+    return ""
+
+
+def _hidden(pid, me, proc):
+    """True for a process of ours (any uid in /proc/<pid>/status) that descends
+    from Claude Code (claude_descent): one whose open files we cannot read then
+    could hold what we look for."""
+    return me in (uids(pid, proc) or []) and bool(claude_descent(pid, proc))
+
+
+def pty_master_scan(index, proc="/proc"):
+    """(holders, hidden) for /dev/pts/<index>: holders are the pids with a
+    /dev/ptmx fd whose fdinfo says `tty-index: <index>`; hidden are processes
+    running as you, descending from Claude Code (claude_descent), whose fd
+    table or a ptmx fdinfo cannot be read (any program can make itself
+    non-dumpable): such a process could hold that master, and the callers
+    refuse (fail closed). A hidden process of yours outside Claude Code's
+    lineage (an ssh-agent, an editor's sandbox helper) is not counted: hiding
+    from Claude Code needs that and a double fork away from it, the documented
+    same-user limit. Other users' processes cannot hold your terminal's master
+    without your help."""
+    out, hidden = [], []
+    me = os.getuid()
     try:
         names = os.listdir(proc)
     except OSError:
-        return out
+        return out, hidden
     for name in names:
         if not name.isdigit():
             continue
+        pid = int(name)
         d = "%s/%s/fd" % (proc, name)
         try:
             fds = os.listdir(d)
+        except FileNotFoundError:
+            continue                       # gone
         except OSError:
+            if os.path.isdir("%s/%s" % (proc, name)) and _hidden(pid, me, proc):
+                hidden.append(pid)
             continue
         for fd in fds:
             try:
                 if os.readlink(os.path.join(d, fd)) not in PTMX:
                     continue
+            except FileNotFoundError:
+                continue                   # closed meanwhile
+            except OSError:
+                if _hidden(pid, me, proc):
+                    hidden.append(pid)
+                    break
+                continue
+            try:
                 with open("%s/%s/fdinfo/%s" % (proc, name, fd), encoding="ascii", errors="replace") as fh:
                     m = re.search(r"^tty-index:\s*(\d+)\s*$", fh.read(4096), re.M)
+            except FileNotFoundError:
+                continue
             except OSError:
+                if _hidden(pid, me, proc):
+                    hidden.append(pid)
+                    break
                 continue
             if m and int(m.group(1)) == index:
-                out.append(int(name))
+                out.append(pid)
                 break
-    return sorted(out)
+    return sorted(out), sorted(set(hidden))
+
+
+def hidden_problem(hidden, what, proc="/proc"):
+    """The reason to refuse when a scan found hidden processes, or ''."""
+    if not hidden:
+        return ""
+    h = hidden[0]
+    st = proc_stat(h, proc)
+    return ("a hidden process descending from Claude Code could hold %s: process %d (%s, under %s) runs as you but its "
+            "open files cannot be read" % (what, h, (st or {}).get("comm", "?"), claude_descent(h, proc) or "Claude Code"))
 
 
 def _inherited_from(h, hosts, proc="/proc"):
@@ -297,8 +382,9 @@ def terminal_problem(pid, proc="/proc", terminals=None, mountinfo="/proc/self/mo
       and, as extra signals, no holder may be the claude CLI, descend from it, or
       carry a variable Claude Code sets for its tools.
 
-    Fails closed: nobody visible holding the master, or a holder whose program,
-    parents or environment cannot be read, counts. '' when the holders pass, and
+    Fails closed: nobody visible holding the master, a holder whose program,
+    parents or environment cannot be read, or a process of yours descending
+    from Claude Code whose open files cannot be read (pty_master_scan), counts. '' when the holders pass, and
     when pid has no controlling terminal or one that is not a pseudo-terminal
     (the detach rules judge the first; nothing as you can hold a console's
     master). terminals=None skips the recorded-host rule (only the signals)."""
@@ -308,7 +394,10 @@ def terminal_problem(pid, proc="/proc", terminals=None, mountinfo="/proc/self/mo
     index = pts_index(st["tty"])
     if index is None:
         return ""
-    holders = pty_master_holders(index, proc)
+    holders, hidden = pty_master_scan(index, proc)
+    why = hidden_problem(hidden, "this terminal (/dev/pts/%d)" % index, proc)
+    if why:
+        return why
     if not holders:
         return ("nobody visible holds the master side of its terminal (/dev/pts/%d), so who reads it cannot be "
                 "told" % index)
@@ -590,25 +679,68 @@ def interpreter_copy(open_path, cache=None):
 
 def recording_problem(pid=None, proc="/proc", env=None):
     """Why cc-setup running as pid (default: this process) must not record any
-    terminal: it runs under Claude Code (one of its tool variables in `env`,
-    default os.environ; a claude process among its parents) or its parent chain
-    cannot be read to the end. An agent could otherwise run cc-update-project
-    on a terminal of its own making and have that program recorded."""
+    terminal: exactly the rules `cc-dash --control` starts by (origin_problem:
+    Claude Code's variables in `env`, default os.environ; the claude CLI among
+    its parents or its session and process-group leaders' parents, failing
+    closed on anything unreadable; a detached terminal driver; a fresh session
+    after a re-parent; re-parented with no terminal), and it must run on a
+    pseudo-terminal of its own (pty_problem). An agent could otherwise run
+    cc-update-project on a terminal of its own making and have that program
+    recorded. '' when it may record."""
     env = os.environ if env is None else env
-    seen = [k for k in CLAUDE_ENV_SIGNALS if env.get(k)]
-    if seen:
-        return "it runs with %s set, so inside Claude Code" % ", ".join(seen)
     pid = os.getpid() if pid is None else pid
     st = proc_stat(pid, proc)
     if st is None:
         return "its own process cannot be inspected"
-    up, complete = chain(st["ppid"], proc=proc)
-    for p, comm, exe, argv in up:
-        if is_claude(comm, exe, argv):
-            return "process %d, %s, is among its parents (Claude Code)" % (p, comm)
-    if not complete:
-        return "its parent chain cannot be read to the end"
+    return origin_problem(pid, proc, env=env, terminal=lambda: pty_problem(st))[1]
+
+
+def pty_problem(st):
+    """Why a process (its proc_stat) has no controlling pseudo-terminal, or ''."""
+    if pts_index(st["tty"]) is None:
+        return "it is not running on a terminal (it has no controlling pseudo-terminal)"
     return ""
+
+
+def claude_env(env):
+    """Which of Claude Code's tool variables `env` carries, as a reason, or ''."""
+    seen = [k for k in CLAUDE_ENV_SIGNALS if (env or {}).get(k)]
+    return ("its environment carries %s (set by Claude Code)" % ", ".join(seen)) if seen else ""
+
+
+def origin_problem(pid, proc="/proc", env=None, parents=None, terminal=None):
+    """(inside, why): why pid was not started by the human from their own
+    terminal, the rules shared by `cc-dash --control` (server.control_refusal),
+    the control hook's check of the dashboard (dashboard_problem) and cc-setup's
+    terminal recording (recording_problem), in this order:
+
+      Claude Code's tool variables in `env` (None skips this rule)
+      claude_lineage    the claude CLI among its parents or its session and
+                        process-group leaders' parents; unreadable counts
+      driver_detached   a detached terminal driver (script, expect ...) on the way
+      terminal()        the caller's terminal rule (a callable returning a
+                        reason or ''; None skips it)
+      fresh_session     it, or its session leader, leads a session it started
+                        after being re-parented (a double fork)
+      detached          re-parented with no controlling terminal left
+
+    `inside` is True for the first two (started inside Claude Code, or cannot be
+    told apart from that). ('', False) when every rule passes."""
+    why = claude_env(env) if env is not None else ""
+    if why:
+        return True, why
+    why = claude_lineage(pid, proc, parents=parents)
+    if why:
+        return True, why
+    why = driver_detached(pid, proc, parents=parents) or (terminal() if terminal is not None else "")
+    if why:
+        return False, why
+    why = fresh_session(pid, proc)
+    st = proc_stat(pid, proc)
+    if not why and st is not None and 0 < st["sid"] != pid:
+        lead = fresh_session(st["sid"], proc)
+        why = ("its session leader (process %d) %s" % (st["sid"], lead.replace("it leads", "leads", 1))) if lead else ""
+    return False, why or detached(pid, proc)
 
 
 def detect_terminals(pid=None, proc="/proc", skipped=None):
@@ -620,7 +752,9 @@ def detect_terminals(pid=None, proc="/proc", skipped=None):
     parents (your shell, the user manager), and any holder that is, descends
     from or carries the variables of Claude Code, whose parent chain cannot be
     read, that runs with debug or eval switches (debug_problem), or whose
-    program is a generic interpreter or pty driver (NOT_RECORDABLE). `skipped`
+    program is a generic interpreter or pty driver (NOT_RECORDABLE). Nothing at
+    all when a hidden process of yours descending from Claude Code could hold
+    it (pty_master_scan). `skipped`
     (a list) receives (path, why) for each holder left out for those reasons.
     None when pid has no pseudo-terminal at all."""
     pid = os.getpid() if pid is None else pid
@@ -628,7 +762,11 @@ def detect_terminals(pid=None, proc="/proc", skipped=None):
     index = pts_index(st["tty"]) if st else None
     if index is None:
         return None
-    holders = pty_master_holders(index, proc)
+    holders, hidden = pty_master_scan(index, proc)
+    if hidden:
+        if skipped is not None:
+            skipped.append(("this terminal", hidden_problem(hidden, "this terminal (/dev/pts/%d)" % index, proc)))
+        return []
     roots = [h for h in holders if not _inherited_from(h, holders, proc)]
     out = set()
     for h in roots:
@@ -811,8 +949,8 @@ def dashboard_problem(pid, root, proc="/proc", python=None, terminals=None, cach
     env = environ(pid, proc)
     if env is None:
         return "cannot read the environment of process %d" % pid
-    why = (env_problem(env) or claude_lineage(pid, proc) or driver_detached(pid, proc)
-           or terminal_problem(pid, proc, terminals=terminals, cache=cache) or fresh_session(pid, proc) or detached(pid, proc))
+    why = env_problem(env) or origin_problem(
+        pid, proc, terminal=lambda: terminal_problem(pid, proc, terminals=terminals, cache=cache))[1]
     return ("process %d: %s" % (pid, why)) if why else ""
 
 
@@ -836,23 +974,209 @@ def read_pin(hooks_dir):
     return raw if os.path.isabs(raw) and "\n" not in raw else ""
 
 
-def holds_socket(pid, inode, proc="/proc"):
-    """True when pid has the socket with this inode (from /proc/net/tcp) open."""
-    if not isinstance(pid, int) or pid <= 1 or not inode or str(inode) == "0":
-        return False
-    target = "socket:[%s]" % inode
-    d = "%s/%d/fd" % (proc, pid)
+# ── the hook's channel to cc-dash: a Unix socket in the control directory ─────
+HOOK_SOCK = "hook.sock"
+SO_PEERPIDFD = 77           # Linux >= 6.5 (asm-generic/socket.h)
+
+
+def peer_cred(sock):
+    """(pid, uid) of the process at the other end of a connected Unix socket, as
+    the kernel recorded it when the connection was made (SO_PEERCRED on Linux;
+    LOCAL_PEERPID and LOCAL_PEERCRED on macOS), or (None, None)."""
+    import socket
+    import struct
     try:
-        names = os.listdir(d)
-    except (OSError, TypeError):
-        return False
-    for n in names:
-        try:
-            if os.readlink(os.path.join(d, n)) == target:
-                return True
-        except OSError:
+        if hasattr(socket, "SO_PEERCRED"):
+            pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            return (pid if pid > 0 else None), uid
+        import sys
+        if sys.platform == "darwin":
+            pid = sock.getsockopt(0, 0x002)                       # SOL_LOCAL, LOCAL_PEERPID
+            raw = sock.getsockopt(0, 0x001, 76)                   # LOCAL_PEERCRED: struct xucred
+            _ver, uid = struct.unpack("Ii", raw[:8])
+            return (pid if pid > 0 else None), uid
+    except (OSError, struct.error):
+        pass
+    return None, None
+
+
+def peer_pidfd(sock):
+    """A pidfd for the process at the other end of a connected Unix socket
+    (SO_PEERPIDFD, Linux >= 6.5), or None where the kernel has none. It names
+    that very process, so a pid reused after it exits does not match it."""
+    import socket
+    try:
+        fd = sock.getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD)
+    except OSError:
+        return None
+    return fd if isinstance(fd, int) and fd >= 0 else None
+
+
+def pidfd_pid(fd):
+    """The pid a pidfd names while that process lives; -1 once it has exited
+    (/proc/self/fdinfo/<fd> `Pid:`); None when it cannot be read."""
+    try:
+        with open("/proc/self/fdinfo/%d" % fd, encoding="ascii", errors="replace") as fh:
+            m = re.search(r"^Pid:\s*(-?\d+)\s*$", fh.read(4096), re.M)
+    except OSError:
+        return None
+    return int(m.group(1)) if m else None
+
+
+def unix_path(path, fn):
+    """fn(a name for the Unix socket path that fits sun_path): path itself, or,
+    when it is too long (108 bytes on Linux; a deep XDG_STATE_HOME), the same
+    file reached through an fd of its directory (/proc/self/fd/<n>/<name>)."""
+    if len(path.encode()) < 100 or not os.path.isdir("/proc/self/fd"):
+        return fn(path)
+    fd = os.open(os.path.dirname(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        return fn("/proc/self/fd/%d/%s" % (fd, os.path.basename(path)))
+    finally:
+        os.close(fd)
+
+
+def unix_peer_inode(sock):
+    """The inode of the other end of a connected Unix socket, from the kernel
+    (sock_diag: NETLINK_SOCK_DIAG, UDIAG_SHOW_PEER), or None where it cannot
+    say (no netlink, no unix_diag)."""
+    import socket
+    import struct
+    try:
+        ino = os.fstat(sock.fileno()).st_ino
+        nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4)        # NETLINK_SOCK_DIAG
+    except (OSError, AttributeError):
+        return None
+    try:
+        nl.settimeout(2)
+        # struct unix_diag_req: family, protocol, pad, states, ino, show (UDIAG_SHOW_PEER), cookie (none)
+        req = struct.pack("=BBHIIIII", socket.AF_UNIX, 0, 0, 0xffffffff, ino, 4, 0xffffffff, 0xffffffff)
+        nl.send(struct.pack("=IHHII", 16 + len(req), 20, 1, 1, 0) + req)   # SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST
+        data = nl.recv(65536)
+        length, kind = struct.unpack("=IH", data[:6])
+        if kind != 20:
+            return None
+        body = data[16:length]
+        if struct.unpack("=I", body[4:8])[0] != ino:
+            return None
+        off = 16                                                          # past struct unix_diag_msg
+        while off + 4 <= len(body):
+            alen, atype = struct.unpack("=HH", body[off:off + 4])
+            if alen < 4:
+                break
+            if atype == 2:                                                # UNIX_DIAG_PEER
+                peer = struct.unpack("=I", body[off + 4:off + 8])[0]
+                return peer or None
+            off += (alen + 3) & ~3
+    except (OSError, struct.error, ValueError):
+        return None
+    finally:
+        nl.close()
+    return None
+
+
+def socket_holders(inode, proc="/proc"):
+    """(holders, hidden) for the socket with this inode, from one scan of
+    /proc/*/fd: holders have it open; hidden are processes of yours descending
+    from Claude Code whose fd table cannot be read (they could hold it too)."""
+    target = "socket:[%s]" % inode
+    out, hidden = [], []
+    me = os.getuid()
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return out, hidden
+    for name in names:
+        if not name.isdigit():
             continue
-    return False
+        pid = int(name)
+        d = "%s/%s/fd" % (proc, name)
+        try:
+            fds = os.listdir(d)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            if os.path.isdir("%s/%s" % (proc, name)) and _hidden(pid, me, proc):
+                hidden.append(pid)
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(d, fd)) == target:
+                    out.append(pid)
+                    break
+            except FileNotFoundError:
+                continue
+            except OSError:
+                if _hidden(pid, me, proc):
+                    hidden.append(pid)
+                    break
+    return sorted(out), sorted(set(hidden))
+
+
+def peer_holder_problem(sock, pid, proc="/proc"):
+    """'' when the other end of the connected Unix socket `sock` is held by
+    process `pid` and nothing else (unix_peer_inode, socket_holders); else why
+    not. Fails closed: no answer from the kernel, or a hidden process of yours
+    descending from Claude Code, counts."""
+    inode = unix_peer_inode(sock)
+    if not inode:
+        return "the kernel cannot say which socket is at the other end (sock_diag)"
+    holders, hidden = socket_holders(inode, proc)
+    why = hidden_problem(hidden, "the connecting socket", proc)
+    if why:
+        return why
+    if holders != [pid]:
+        return ("the connecting socket is held by %s, not by process %d alone"
+                % (", ".join("process %d" % h for h in holders) or "no process that can be seen", pid))
+    return ""
+
+
+def bind_private_socket(directory, name=HOOK_SOCK):
+    """A listening Unix socket at <directory>/<name>, made by this process: bound
+    under a fresh random name (umask 077, then chmod 0600) in the private
+    directory and renamed over <name>, so whatever was planted there before is
+    replaced, never reused. Returns (socket, (st_dev, st_ino)) of the file."""
+    import socket
+    tmp = os.path.join(directory, ".hs.%s" % os.urandom(6).hex())
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o077)
+    try:
+        unix_path(tmp, s.bind)
+    except OSError:
+        s.close()
+        raise
+    finally:
+        os.umask(old)
+    try:
+        os.chmod(tmp, 0o600)
+        s.listen(16)
+        os.rename(tmp, os.path.join(directory, name))
+        st = os.lstat(os.path.join(directory, name))
+    except OSError:
+        s.close()
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return s, (st.st_dev, st.st_ino)
+
+
+def socket_file_problem(path):
+    """Why the hook must not talk to the Unix socket at path: it is not a socket,
+    not ours, open to others (mode beyond 0600), or its directory is not a
+    private directory of ours (0700). '' when it may connect; the answering
+    process is then checked with peer_cred."""
+    try:
+        st = os.lstat(path)
+        dst = os.lstat(os.path.dirname(path))
+    except OSError:
+        return "there is no socket at %s" % path
+    if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or dst.st_mode & 0o077:
+        return "%s is not a private directory of yours" % os.path.dirname(path)
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return "%s is not a socket of yours that only you can use" % path
+    return ""
 
 
 def holds(pid, ident, proc="/proc"):
@@ -1005,7 +1329,7 @@ def build_manifest(root, python=None, terminals=None):
     one running this, which for cc-setup is the python3 on PATH, the one
     bin/cc-dash's `#!/usr/bin/env python3` finds), and the terminal hosts
     (`terminals`, terminal_entry dicts; default: the terminal this runs in,
-    detect_terminals). Raises ValueError when the
+    detect_terminals, when recording_problem allows it, else none). Raises ValueError when the
     scope holds a symlink or a special file (the hook would refuse it anyway)."""
     root = os.path.realpath(root)
     files, dirs, bad = scan_code(root)
@@ -1014,7 +1338,8 @@ def build_manifest(root, python=None, terminals=None):
     return {"v": MANIFEST_V, "root": root,
             "files": {rel: file_hash(os.path.join(root, rel), st) for rel, st in sorted(files.items())},
             "dirs": sorted(dirs), "python": python or python_record(),
-            "terminal_hosts": merge_terminals([], detect_terminals() or []) if terminals is None else terminals}
+            "terminal_hosts": terminals if terminals is not None else
+            [] if recording_problem() else merge_terminals([], detect_terminals() or [])}
 
 
 def manifest_problem(root, manifest):

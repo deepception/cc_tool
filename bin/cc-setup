@@ -110,7 +110,7 @@ find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -name "*.sh" -exec chmod +x {} \;
 # cc-update-project re-records it. bin/cc-dash re-executes the interpreter its
 # shebang resolved, so run cc-setup with the python3 you run cc-dash with.
 # The manifest also lists your terminal programs (terminal_hosts): what holds the
-# terminal cc-setup runs in, plus CC_DASH_TERMINALS. The control code is shown
+# terminal cc-setup runs in, plus CC_DASH_TERMINALS (only beside a detected one). The control code is shown
 # only on a terminal one of them holds.
 # And the project goes into ${XDG_STATE_HOME:-~/.local/state}/cc_tool/projects.json
 # (0600): cc-dash shows a permission request only from a registered project's hook.
@@ -151,38 +151,44 @@ spec.loader.exec_module(procs)
 # bin/cc-dash's `#!/usr/bin/env python3` finds it), by the kernel's /proc/self/exe.
 python = procs.python_record()
 # The terminals the control code may be shown in: whatever holds the master side of the
-# terminal this runs in (its fdinfo tty-index), plus CC_DASH_TERMINALS=/path1:/path2, plus
-# what was recorded before (kept: they are yours). The hook refuses a dashboard whose
-# terminal is held by anything else.
+# terminal this runs in (its fdinfo tty-index), plus CC_DASH_TERMINALS=/path1:/path2 (only
+# beside a terminal detected in this run), plus what was recorded before (kept: they are
+# yours). The hook refuses a dashboard whose terminal is held by anything else.
 mpath = os.path.join(hooks, procs.MANIFEST_NAME)
 try:
     with open(mpath, encoding="utf-8") as fh:
         old = json.load(fh).get("terminal_hosts") or []
 except (OSError, ValueError, AttributeError):
     old = []
+# The same rules as `cc-dash --control` itself (procs.recording_problem): not under
+# Claude Code (its variables, the claude CLI among the parents or the session and
+# process-group leaders' parents, unreadable counts), no detached terminal driver, no
+# fresh session after a re-parent, and a controlling pseudo-terminal of its own.
 refusal = procs.recording_problem()
 skipped = []
+extra = [p for p in os.environ.get("CC_DASH_TERMINALS", "").split(":") if p]
 if refusal:
     # Run from inside Claude Code (an agent's Bash call, maybe on a terminal of its own
-    # making): record nothing, keep what was recorded, ignore CC_DASH_TERMINALS.
-    detected, extra, bad, terminals = [], [], [], old
+    # making) or not from a terminal of yours: record nothing, keep what was recorded,
+    # ignore CC_DASH_TERMINALS.
+    detected, bad, terminals = [], [], old
     print("  • control mode: no terminal recorded, because %s; the recorded list is kept." % refusal)
-    print("    Run cc-update-project from your own terminal to record it.")
+    print("    Run cc-update-project once from the terminal you will run `ccdash --control` in to record it.")
 else:
     detected = procs.detect_terminals(skipped=skipped)
-    extra = [p for p in os.environ.get("CC_DASH_TERMINALS", "").split(":") if p]
     bad = [p for p in extra if procs.terminal_entry(p) is None or procs._bare(os.path.realpath(p)) in procs.NOT_RECORDABLE
            or procs.interpreter_copy(os.path.realpath(p))]
-    terminals = procs.merge_terminals([] if reset_terminals else old, (detected or []) + [p for p in extra if p not in bad])
+    # CC_DASH_TERMINALS adds to a terminal detected here, never stands in for one: with no
+    # recordable terminal holding this one, whatever it names is not recorded either.
+    named = [p for p in extra if p not in bad] if detected else []
+    terminals = procs.merge_terminals([] if reset_terminals else old, (detected or []) + named)
 write(mpath, json.dumps(procs.build_manifest(root, python, terminals), indent=1, sort_keys=True) + "\n")
 for path, why in skipped:
     print("  • control mode: not recording %s as a terminal: %s" % (path, why))
-if not refusal and detected is None:
-    print("  • control mode: this is not running on a terminal, so no terminal was recorded for it. Run")
-    print("    cc-update-project once from the terminal you will run `ccdash --control` in.")
-elif not refusal and not detected:
-    print("  • control mode: could not see a program that may be recorded holding this terminal; nothing new recorded")
-    print("    (name it with CC_DASH_TERMINALS=/path/to/terminal cc-update-project).")
+if not refusal and not detected:
+    print("  • control mode: could not see a program that may be recorded holding this terminal; nothing new recorded.")
+    if extra:
+        print("    CC_DASH_TERMINALS is not recorded either: it only adds to a terminal recorded in the same run.")
 for p in bad:
     print("  • CC_DASH_TERMINALS: %s is not an executable file, or is a generic interpreter or terminal driver; "
           "not recorded" % p)

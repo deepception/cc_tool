@@ -271,8 +271,11 @@ def check_secrets(root: str, path: str, contents: list) -> None:
                 line = text[start:end if end != -1 else len(text)]
                 if _placeholder(m.group(0), line):
                     continue
-                deny(root, path, f"the proposed content contains what looks like a real secret ({label}); "
-                                 f"line: {line.strip()[:80]!r}",
+                # Never the matched text: this reason is shown to the model and written to the
+                # activity log. The label, the line number and the first 4 characters only.
+                lineno = text.count("\n", 0, m.start()) + 1
+                deny(root, path, f"the proposed content contains what looks like a real secret ({label}) "
+                                 f"on line {lineno} of the new text, starting {m.group(0)[:4]!r}\u2026",
                      "read it from an environment variable or a gitignored .env file; if this is a "
                      "fixture, make it obviously fake (EXAMPLE/xxx)")
 

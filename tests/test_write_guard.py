@@ -43,7 +43,14 @@ def _repo(path):
     return path
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from state_guard import StateGuard  # noqa: E402  (tests/state_guard.py)
+STATE_GUARD = StateGuard()
 BASE = tempfile.mkdtemp(prefix="writeguard-matrix-")
+# Every hook run here, and the paths the cases name, use a temp state dir, never the real one.
+# Not under /tmp (scratch paths are allowed by design); removed in the finally below.
+STATE = os.path.join(REPO, "tests", ".wg-state")
+os.environ["XDG_STATE_HOME"] = STATE
 ROOT = _repo(os.path.join(BASE, "repo"))
 # Must NOT live under /tmp (scratch paths are allowed by design), so it sits in
 # the tests dir and is removed in the finally below.
@@ -207,6 +214,7 @@ def run_case(root, tool, tool_input, session, guard=None):
     else:
         payload = json.dumps({"session_id": session, "hook_event_name": "PreToolUse",
                               "tool_name": tool, "tool_input": tool_input})
+    # A temp state dir: a worktree's hook state goes under XDG_STATE_HOME, never the real one.
     env = dict(os.environ, CLAUDE_PROJECT_DIR=root)
     p = subprocess.run([PY, guard or GUARD], input=payload, capture_output=True,
                        text=True, cwd=root, timeout=60, env=env)
@@ -231,7 +239,24 @@ def main():
             fails.append((cid, section, expected, got, detail[:160]))
         elif got == D and "BLOCKED:" not in detail:
             fails.append((cid, section, "BLOCKED: prefix", got, detail[:160]))
-    print("total=%d  pass=%d  fail=%d" % (len(CASES) + len(PIN_CASES), len(CASES) + len(PIN_CASES) - len(fails), len(fails)))
+    # A secret deny never repeats the secret: not in the reason shown to the model, not in activity.jsonl.
+    n_extra = 0
+    for cid, key, content in (("R01", FAKE_GH, f'token = "{FAKE_GH}"'), ("R02", FAKE_ANT, f'\n\nkey = "{FAKE_ANT}"')):
+        n_extra += 1
+        got, detail = run_case(ROOT, "Write", {"file_path": A_TS, "content": content}, "redact")
+        try:
+            log = open(os.path.join(lib.state_dir(ROOT), "activity.jsonl"), encoding="utf-8").read()
+        except OSError:
+            log = ""
+        leaked = [w for w in (key, key[4:20]) if w in detail or w in log]
+        if got != D or leaked or "line " not in detail or "secret" not in log:
+            fails.append((cid, "redact", "DENY without the secret", got, ("leaked %s; " % leaked) + detail[:160]))
+    why = STATE_GUARD.problem()
+    n_extra += 1
+    if why:
+        fails.append(("STATE", "guard", "untouched", "changed", why))
+    total = len(CASES) + len(PIN_CASES) + n_extra
+    print("total=%d  pass=%d  fail=%d" % (total, total - len(fails), len(fails)))
     for cid, section, exp, got, detail in fails:
         print("  %-5s %-10s expected %-6s got %-8s  %s" % (cid, section, exp, got, detail))
     return 1 if fails else 0
@@ -242,5 +267,6 @@ try:
 finally:
     shutil.rmtree(BASE, ignore_errors=True)
     shutil.rmtree(OUTSIDE, ignore_errors=True)
+    shutil.rmtree(STATE, ignore_errors=True)
     shutil.rmtree(WT_LINKED, ignore_errors=True)
     shutil.rmtree(WT_MAIN, ignore_errors=True)

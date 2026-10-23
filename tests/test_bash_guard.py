@@ -118,7 +118,12 @@ def make_fixtures(base):
 
 # Not under /tmp: the deletion guard treats /tmp as scratch, so fixtures there
 # would make every project-path deletion look disposable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from state_guard import StateGuard  # noqa: E402  (tests/state_guard.py)
+STATE_GUARD = StateGuard()
 BASE = tempfile.mkdtemp(prefix=".bashguard-matrix-", dir=os.path.join(REPO, "tests"))
+# The hooks' state for a fixture without a .git directory goes under XDG_STATE_HOME: a temp one.
+os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "state")
 NPM_CACHE = os.path.join(BASE, "npm-cache")
 TMP_LINK = "/tmp/.cc-bashguard-link-%d" % os.getpid()
 MASTER, FEATURE, OTHER, NOTGIT = make_fixtures(BASE)
@@ -938,7 +943,10 @@ def main():
     log = os.path.join(MASTER, ".git", "cc_tool", "activity.jsonl")
     if not os.path.exists(log) or "deny" not in open(log).read():
         fails.append(("LOG", "activity", log, "deny events logged", "missing"))
-    print("total=%d  pass=%d  fail=%d" % (len(CASES), len(CASES) - len(fails), len(fails)))
+    why = STATE_GUARD.problem()
+    if why:
+        fails.append(("STATE", "guard", "untouched", "changed", why))
+    print("total=%d  pass=%d  fail=%d" % (len(CASES) + 1, len(CASES) + 1 - len(fails), len(fails)))
     for cid, section, cmd, exp, got in fails:
         print("  %-5s %-10s expected %-6s got %-8s  %r" % (cid, section, exp, got, cmd))
     if "--json" in sys.argv:

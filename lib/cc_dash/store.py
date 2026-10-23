@@ -18,7 +18,6 @@ import bisect
 import hashlib
 import json
 import os
-import tempfile
 import threading
 import time
 
@@ -177,9 +176,10 @@ def activity_logs(root):
     if os.path.isdir(git):
         base, shared = os.path.join(git, "cc_tool"), False
     else:
+        # A worktree: ${XDG_STATE_HOME:-~/.local/state}/cc_tool/repos/<tag> (cc_hooklib.state_dir).
         tag = hashlib.sha1(root.encode("utf-8", "replace")).hexdigest()[:12]
-        base, shared = os.path.join(tempfile.gettempdir(), "cc_tool", tag), True
-    if shared and not _own_private(base):
+        base, shared = os.path.join(_state_base(), "repos", tag), True
+    if shared and not _own_private(base, 0o077):     # cc_hooklib makes it 0700 and uses nothing looser
         return []
     out = []
     for name in ("activity.jsonl.1", "activity.jsonl"):
@@ -189,18 +189,25 @@ def activity_logs(root):
     return out
 
 
-def _own_private(path):
-    """True for a non-symlink owned by us that group/others cannot write.
+def _state_base():
+    """${XDG_STATE_HOME:-~/.local/state}/cc_tool, as cc_hooklib computes it."""
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "cc_tool")
 
-    The temp-dir fallback is shared with every local user, so anyone could
-    plant a fake activity log there; read it only when it is provably ours."""
+
+def _own_private(path, bits=0o022):
+    """True for a non-symlink owned by us without any of the mode `bits`
+    (default: group/others cannot write). A worktree's log is read only when it
+    and its state directory are provably ours."""
     try:
         st = os.lstat(path)
     except OSError:
         return False
     if os.path.islink(path) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
         return False
-    return not (st.st_mode & 0o022)
+    return not (st.st_mode & bits)
 
 
 class Journal:

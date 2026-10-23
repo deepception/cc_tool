@@ -83,7 +83,8 @@ def _skip_marker(root: str, tool: str) -> str:
         return os.path.join(git_dir, f"cc-hook-skip-{tool}")
     if lib and os.path.isfile(git_dir):
         try:
-            return os.path.join(lib.state_dir(root), f"cc-hook-skip-{tool}")
+            d = lib.state_dir(root)
+            return os.path.join(d, f"cc-hook-skip-{tool}") if d else ""
         except Exception:  # noqa: BLE001 - no marker just means no skip
             return ""
     return ""
@@ -102,11 +103,12 @@ def _remember_timeout(marker: str) -> None:
     if not marker:
         return
     try:
-        with open(marker, "w", encoding="utf-8") as fh:
-            fh.write(
-                f"post-edit-typecheck.py: project check exceeded {TIMEOUT}s; "
-                f"skipped for {SKIP_TTL // 60}min. Safe to delete.\n"
-            )
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, (f"post-edit-typecheck.py: project check exceeded {TIMEOUT}s; "
+                          f"skipped for {SKIP_TTL // 60}min. Safe to delete.\n").encode())
+        finally:
+            os.close(fd)
     except OSError:
         pass  # fail-open: worst case is today's behavior (a silent stall per edit)
 

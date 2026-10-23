@@ -80,7 +80,7 @@ cc_tool/
       big-file-guard.py          PreToolUse Read: warn on files >200KB without offset/limit
       context-usage.py           Stop: warn when session context window passes 80% (suggest /compact)
       post-edit-typecheck.py     PostToolUse Edit|Write|MultiEdit: fast project check (tsc/cargo; ruff file-scoped for Python) after source edits, surface errors inline; tsc timeouts back off for 30 min via a marker in .git/ and report NOT CHECKED (once) instead of staying silent; missing tsc reported once per session; red/green recorded in session state
-      activity-log.py            PostToolUse (every tool): one JSON line per tool call in .git/cc_tool/activity.jsonl (guards append their deny/ask/warn there too; rotates at 5 MB); records file mtimes after Read/Edit/Write for the stale-read check
+      activity-log.py            PostToolUse (every tool): one JSON line per tool call in .git/cc_tool/activity.jsonl, or for a git worktree in ${XDG_STATE_HOME:-~/.local/state}/cc_tool/repos/<tag>/ (0700, used only when it is a private directory of yours; files opened with O_NOFOLLOW) (guards append their deny/ask/warn there too; rotates at 5 MB); records file mtimes after Read/Edit/Write for the stale-read check
       attention.py               PermissionRequest, Notification, PostToolUse/Failure/Batch, UserPromptSubmit, Stop, SubagentStop, StopFailure, Elicitation(Result), SessionEnd (async except SessionEnd): one JSON line per event in ${XDG_STATE_HOME:-~/.local/state}/cc_tool/attention.jsonl (0700/0600, no symlinks followed, rotates at 5 MB) for cc-dash alerts; silent, never blocks
   tests/
     test_bash_guard.py           allow/ask/warn/deny matrix for bash-guard.py (stdlib only, self-contained fixtures)

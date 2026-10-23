@@ -352,33 +352,44 @@ def test_cli():
 
 
 def test_activity_logs():
-    """The temp-dir fallback is shared with other users: only our own, private files count."""
+    """A worktree's activity log lives in ${XDG_STATE_HOME}/cc_tool/repos/<tag> (cc_hooklib.state_dir):
+    only our own private files count, and the old shared temp location is never read."""
     tmp = tempfile.mkdtemp(prefix="ccdash-act-")
-    saved = tempfile.tempdir
+    saved_tmp, saved_xdg = tempfile.tempdir, os.environ.get("XDG_STATE_HOME")
     try:
         tempfile.tempdir = tmp
+        os.environ["XDG_STATE_HOME"] = os.path.join(tmp, "xdg")
         root = os.path.join(tmp, "wt")  # a worktree: no .git directory
         os.makedirs(root)
         import hashlib
-        base = os.path.join(tmp, "cc_tool", hashlib.sha1(root.encode()).hexdigest()[:12])
-        os.makedirs(base, mode=0o755)
-        os.chmod(base, 0o755)
+        tag = hashlib.sha1(root.encode()).hexdigest()[:12]
+        old = os.path.join(tmp, "cc_tool", tag)
+        os.makedirs(old, mode=0o700)
+        open(os.path.join(old, "activity.jsonl"), "w").write("{}\n")
+        check("activity: the old shared temp location is not read", activity_logs(root) == [], str(activity_logs(root)))
+        base = os.path.join(tmp, "xdg", "cc_tool", "repos", tag)
+        os.makedirs(base, mode=0o700)
+        os.chmod(base, 0o700)
         log = os.path.join(base, "activity.jsonl")
         open(log, "w").write("{}\n")
-        os.chmod(log, 0o644)
-        check("activity: private temp log is read", activity_logs(root) == [log], str(activity_logs(root)))
+        os.chmod(log, 0o600)
+        check("activity: a private log in the state dir is read", activity_logs(root) == [log], str(activity_logs(root)))
         os.chmod(log, 0o666)
-        check("activity: world-writable temp log is ignored", activity_logs(root) == [])
-        os.chmod(log, 0o644)
-        os.chmod(base, 0o777)
-        check("activity: world-writable temp dir is ignored", activity_logs(root) == [])
+        check("activity: a world-writable log is ignored", activity_logs(root) == [])
+        os.chmod(log, 0o600)
         os.chmod(base, 0o755)
+        check("activity: a state dir open to others is ignored", activity_logs(root) == [])
+        os.chmod(base, 0o700)
         os.remove(log)
         os.symlink(os.path.join(tmp, "elsewhere.jsonl"), log)
         open(os.path.join(tmp, "elsewhere.jsonl"), "w").write("{}\n")
-        check("activity: symlinked temp log is ignored", activity_logs(root) == [])
+        check("activity: a symlinked log is ignored", activity_logs(root) == [])
     finally:
-        tempfile.tempdir = saved
+        tempfile.tempdir = saved_tmp
+        if saved_xdg is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = saved_xdg
         shutil.rmtree(tmp, ignore_errors=True)
 
 

@@ -42,7 +42,8 @@ PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import auth as auth_mod  # noqa: E402
 from cc_dash.control import Control, shown_digest  # noqa: E402
-from cc_dash.server import make_server  # noqa: E402
+from cc_dash.server import make_server, start_hook_channel  # noqa: E402
+from hook_channel import hook_call  # noqa: E402  (tests/hook_channel.py: the hook side of the hook socket)
 from cc_dash.store import Store  # noqa: E402
 
 HOOK = os.path.join(REPO, "templates", "hooks", "dash-control.py")
@@ -91,6 +92,7 @@ class Srv:
         self.port = self.srv.port
         self.ctl = Control(self.store, self.port, ctl_dir=os.path.join(self.state, "cc_tool", "control"), agents_cmd=None,
                            hook_check=False)   # requests written by hand; test_planted_request checks the real rule
+        self.hook = start_hook_channel(self.ctl)
         self.ctl.start(thread=False)
         self.srv.control = self.ctl
         self.code = self.srv.auth.enable_control()
@@ -101,8 +103,13 @@ class Srv:
     def path(self, *p):
         return os.path.join(self.ctl.dir, *p)
 
-    def req(self, method, path, body=None, token=None, headers=None, lease=True):
-        """lease: send the lease key with /api/control/verify, as the hook does."""
+    def req(self, method, path, body=None, token=None, headers=None, lease=True, tcp=False):
+        """/api/control/verify goes over the hook socket, as the hook sends it (lease: with the
+        lease key); tcp=True sends it to the browser's TCP port instead."""
+        if path.startswith("/api/control/verify") and not tcp:
+            key = (headers or {}).get("X-CC-Dash-Lease") or (self.ctl.key if lease else None)
+            st, out, _h = hook_call(self.ctl.dir, key, method, path, body)
+            return st, out
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         h = {"Host": "127.0.0.1:%d" % self.port}
         if token:
@@ -140,14 +147,8 @@ class Srv:
         req = {"v": 1, "id": rid, "ts": time.time(), "pid": os.getpid(), "session": SID, "agent_id": None, "cwd": self.cwd,
                "tool": "Bash", "kind": "permission", "sig": ti.get("command", ""), "hash": os.urandom(32).hex(), "input": ti,
                "guard": "", "ask_rule": "", "session_rules": [], "deadline": time.time() + 300}
-        # As the hook does: handed over with the lease key, then the doorbell (the id only).
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        c.request("POST", "/api/control/request", body=json.dumps(req).encode(),
-                  headers={"Host": "127.0.0.1:%d" % self.port, "X-CC-Dash-Lease": self.ctl.key, "Content-Type": "application/json"})
-        resp = c.getresponse()
-        resp.read()
-        st = resp.status
-        c.close()
+        # As the hook does: handed over over the hook socket with the lease key, then the doorbell (the id only).
+        st, _out, _h = hook_call(self.ctl.dir, self.ctl.key, "POST", "/api/control/request", req)
         assert st == 200, st
         fd = os.open(self.path("req", rid + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.write(fd, json.dumps({"v": 2, "id": rid}).encode())
@@ -157,6 +158,8 @@ class Srv:
 
     def close(self):
         self.ctl.stop()
+        self.hook.shutdown()
+        self.hook.server_close()
         self.srv.shutdown()
         self.srv.server_close()
 
@@ -331,18 +334,23 @@ def test_verify_channel():
         changed = dict(r, input={"command": "ls"})
         st, _ = s.req("GET", "/api/control/verify?kind=dec&id=%s&hash=%s&shown=%s" % (r["id"], r["hash"], shown_digest(changed)))
         check("verify: a different card (request rewritten after it was shown) is 404", st == 404)
-        if auth_mod.local_pairing_supported():
-            real = auth_mod.peer_uid
-            auth_mod.peer_uid = lambda *a, **k: os.getuid() + 1
-            try:
-                check("verify: another user's socket is refused (403), even with the key", s.req("GET", q)[0] == 403)
-            finally:
-                auth_mod.peer_uid = real
-            auth_mod.peer_uid = lambda *a, **k: None
-            try:
-                check("verify: a socket whose owner cannot be found is refused (fails closed)", s.req("GET", q)[0] == 403)
-            finally:
-                auth_mod.peer_uid = real
+        from cc_dash import server as server_mod
+        real = server_mod.procs.peer_cred
+        server_mod.procs.peer_cred = lambda sock: (os.getpid(), os.getuid() + 1)
+        try:
+            check("verify: another user at the hook socket is refused (403), even with the key", s.req("GET", q)[0] == 403)
+        finally:
+            server_mod.procs.peer_cred = real
+        server_mod.procs.peer_cred = lambda sock: (None, None)
+        try:
+            check("verify: a peer the kernel cannot name is refused (fails closed)", s.req("GET", q)[0] == 403)
+        finally:
+            server_mod.procs.peer_cred = real
+        st, out = s.req("GET", q, tcp=True)
+        check("verify is not served on the browser's TCP port (the hook socket only)", st in (401, 404), (st, out))
+        st, out = s.req("POST", "/api/control/request", r)
+        check("the request handover is not served on the browser's TCP port", st in (401, 404, 405), (st, out))
+        check("verify answers carry the HMAC proof under the lease key", hook_call(s.ctl.dir, s.ctl.key, "GET", q)[2]["_proof_ok"])
         st, out = s.req("POST", "/api/control/message", {"session": SID, "text": "run the linter"}, token=ctok)
         mid = out["message"]["id"]
         mq = "/api/control/verify?kind=msg&id=%s&session=%s&agent=" % (mid, SID)
@@ -822,7 +830,8 @@ def test_real_process_code_never_on_disk():
     while time.time() < end and _alive(pid2):
         time.sleep(0.1)
     out = open(log2, "rb").read()
-    check("no terminal: cc-dash --control refuses to start (says why)", not _alive(pid2) and (b"needs a terminal" in out or b"was detached" in out), out[-200:])
+    check("no terminal: cc-dash --control refuses to start (says why)", not _alive(pid2) and (b"needs a terminal" in out or b"was detached" in out
+                                                                                     or b"fresh session" in out), out[-200:])
     check("no terminal: nothing that looks like a code was printed", not CODE_RE.search(out.decode("utf-8", "replace")))
 
 

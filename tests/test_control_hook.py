@@ -32,6 +32,9 @@ PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else
 HOOK = os.path.join(REPO, "templates", "hooks", "dash-control.py")
 SETTINGS = os.path.join(REPO, "templates", "settings.json")
 RESULTS = []
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from state_guard import StateGuard  # noqa: E402  (tests/state_guard.py)
+STATE_GUARD = StateGuard()         # the real state dir, before anything here runs a hook
 BASE = tempfile.mkdtemp(prefix="cc-control-hook-")
 SID = "0f0e0d0c-1111-2222-3333-444455556666"
 AGENT = "a1b2c3d4e5f6a7b8c"
@@ -42,9 +45,25 @@ def check(name, cond, detail=""):
     RESULTS.append((name, bool(cond), str(detail)))
 
 
+def proof(nonce, data, key=None):
+    """X-CC-Dash-Proof, as cc-dash computes it: HMAC-SHA256 under the lease key of nonce + newline + body."""
+    import hmac
+    return hmac.new((key or LEASE_KEY).encode(), (nonce or "").encode() + b"\n" + data, "sha256").hexdigest()
+
+
+def bind_hook_sock(ctl):
+    """A listening Unix socket at <ctl>/hook.sock, made as cc-dash makes it (cc_procs.bind_private_socket)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cc_procs_th", os.path.join(REPO, "templates", "hooks", "cc_procs.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.bind_private_socket(ctl)[0]
+
+
 class FakeDash:
-    """Stands in for cc-dash's GET /api/control/verify, in THIS process (so the
-    lease's pid, os.getpid(), owns the answering socket, as the hook checks).
+    """Stands in for cc-dash's hook channel (GET /api/control/verify, POST
+    /api/control/request over <control dir>/hook.sock), in THIS process (so the
+    lease's pid, os.getpid(), is the process listening, as the hook checks).
     It confirms what the test "sent from the dashboard" (Box.write of a dec/,
     msg/ or stop/ file); a planted file (Box.write(..., planted=True)) has no
     record. Like cc-dash, messages and stops are confirmed once."""
@@ -76,6 +95,7 @@ class FakeDash:
                 out = json.dumps({"ok": True} if ok else {"ok": False}).encode()
                 self.send_response(200 if ok else 403)
                 self.send_header("Content-Length", str(len(out)))
+                self.send_header("X-CC-Dash-Proof", proof(self.headers.get("X-CC-Dash-Nonce"), out))
                 self.end_headers()
                 self.wfile.write(out)
 
@@ -90,12 +110,26 @@ class FakeDash:
                 body = json.dumps(dict(rec, ok=True) if ok else {"ok": False}).encode()
                 self.send_response(200 if ok else 404)
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-CC-Dash-Proof", proof(self.headers.get("X-CC-Dash-Nonce"), body))
                 self.end_headers()
                 self.wfile.write(body)
-        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.srv.daemon_threads = True
-        self.port = self.srv.server_address[1]
-        threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+            def address_string(self):
+                return "hook"
+        self.handler = H
+
+    def listen(self, ctl):
+        """Serve the hook channel at <ctl>/hook.sock (one per Box)."""
+        import socketserver
+        import threading
+
+        class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+        srv = S(os.path.join(ctl, "hook.sock"), self.handler, bind_and_activate=False)
+        srv.socket.close()
+        srv.socket = bind_hook_sock(ctl)
+        threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        return srv
 
     def register(self, rel, obj):
         sub, name = rel.split("/", 1)
@@ -138,15 +172,17 @@ class Box:
         self.env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
         self.env.update(HOME=self.home, XDG_STATE_HOME=self.state, CLAUDE_CONFIG_DIR=self.cfg,
                         CC_DASH_LEASE_ANY_PROGRAM="1")   # the fake dashboard is this test process
+        self.srv = dash().listen(self.ctl)
         if lease:
             self.lease(wait=wait)
 
-    def lease(self, expires=None, pid=None, wait=300, mode=0o600, port=None, key=LEASE_KEY):
+    def lease(self, expires=None, pid=None, wait=300, mode=0o600, sock=None, key=LEASE_KEY):
         p = os.path.join(self.ctl, "lease")
         if os.path.lexists(p):
             os.unlink(p)
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        os.write(fd, json.dumps({"v": 1, "pid": pid or os.getpid(), "launch": "test", "port": port or dash().port, "key": key,
+        os.write(fd, json.dumps({"v": 1, "pid": pid or os.getpid(), "launch": "test", "port": 1, "key": key,
+                                 "sock": sock or os.path.join(self.ctl, "hook.sock"),
                                  "expires": expires if expires is not None else time.time() + 3600, "wait": wait}).encode())
         os.close(fd)
         os.chmod(p, mode)
@@ -593,6 +629,7 @@ def test_guard_reason():
     lone = os.path.join(BASE, "lonehooks")
     os.makedirs(lone, exist_ok=True)
     shutil.copy(HOOK, os.path.join(lone, "dash-control.py"))
+    shutil.copy(os.path.join(REPO, "templates", "hooks", "cc_procs.py"), os.path.join(lone, "cc_procs.py"))
     pp = subprocess.Popen([PY, os.path.join(lone, "dash-control.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, env=b.env)
     pp.stdin.write(json.dumps(perm(ti={"command": "ls"}, cwd=repo)).encode())
@@ -674,8 +711,11 @@ def test_ask_rule_and_session():
 
 # ── files are a doorbell: planted files and a fake verifier do nothing ─────
 SPOOF_SERVER = r'''
-import http.server, json, os, sys
+import hmac, http.server, json, os, socket, socketserver, sys
 from urllib.parse import parse_qs, urlsplit
+spool, path, key = sys.argv[1], sys.argv[2], sys.argv[3]
+def proof(h, data):
+    return hmac.new(key.encode(), (h.headers.get("X-CC-Dash-Nonce") or "").encode() + b"\n" + data, "sha256").hexdigest()
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
@@ -685,14 +725,23 @@ class H(http.server.BaseHTTPRequestHandler):
         with open(os.path.join(sys.argv[1], rid + ".json"), "wb") as fh:
             fh.write(body)
         out = b'{"ok": true}'
-        self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+        self.send_response(200); self.send_header("Content-Length", str(len(out))); self.send_header("X-CC-Dash-Proof", proof(self, out))
+        self.end_headers(); self.wfile.write(out)
     def do_GET(self):
         q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
         body = json.dumps({"ok": True, "id": q.get("id"), "hash": q.get("hash"), "action": "allow",
                            "session": q.get("session"), "agent_id": None, "text": "forged"}).encode()
-        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
-s = http.server.HTTPServer(("127.0.0.1", 0), H)
-print(s.server_address[1], flush=True)
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.send_header("X-CC-Dash-Proof", proof(self, body))
+        self.end_headers(); self.wfile.write(body)
+    def address_string(self):
+        return "spoof"
+# Put its own socket at the path (renamed over cc-dash's: the directory is yours, so anything running as you can).
+tmp = path + ".spoof"
+l = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+l.bind(tmp); os.chmod(tmp, 0o600); l.listen(8); os.rename(tmp, path)
+s = socketserver.UnixStreamServer(path, H, bind_and_activate=False)
+s.socket.close(); s.socket = l
+print("ready", flush=True)
 s.serve_forever()
 '''
 
@@ -759,22 +808,37 @@ def test_planted_and_spoofed():
         dash().accept = True
     check("handover refused: the hook exits silently (terminal), no doorbell, no outcome file",
           p.returncode == 0 and p.stdout == b"" and b.reqs() == [] and os.listdir(b.path("res")) == [], (p.stdout, b.reqs()))
-    # No dashboard listening on the lease's port at all.
-    import socket as _socket
-    s = _socket.socket()
-    s.bind(("127.0.0.1", 0))
-    dead_port = s.getsockname()[1]
-    s.close()
+    # No dashboard listening on the hook socket at all.
     b = Box()
-    b.lease(port=dead_port)
+    b.srv.server_close()
+    os.unlink(b.path("hook.sock"))
     p, ms = b.run(perm(ti={"command": "make unreachable"}))
     check("dashboard unreachable: the hook exits silently at once (terminal), no doorbell",
           p.returncode == 0 and p.stdout == b"" and b.reqs() == [] and ms < 3000, (p.stdout, b.reqs(), ms))
 
-    # A fake verifier: another process on another port that takes every request and says yes to everything.
+    # The lease names a socket elsewhere than <control dir>/hook.sock: not used.
+    b = Box()
+    other = os.path.join(b.root, "elsewhere")
+    os.makedirs(other, mode=0o700)
+    dash().listen(other)
+    b.lease(sock=os.path.join(other, "hook.sock"))
+    p, _ = b.run(perm(ti={"command": "make deploy elsewhere"}))
+    check("lease names a hook socket outside the control directory: not used, terminal",
+          p.stdout == b"" and b.reqs() == [] and not any((r.get("input") or {}).get("command") == "make deploy elsewhere"
+                                                        for r in dash().requests.values()), (p.stdout, b.reqs()))
+    # A socket file that is not 0600, or a plain file, at the path: not used.
+    for label, mode in (("a hook socket others may use (0666)", 0o666),):
+        b = Box()
+        os.chmod(b.path("hook.sock"), mode)
+        p, _ = b.run(perm(ti={"command": "make deploy %s" % label}))
+        check("%s: not used, terminal" % label, p.stdout == b"" and b.reqs() == [], (p.stdout, b.reqs()))
+
+    # A fake verifier: another process puts its own socket at the hook socket's path, takes every request
+    # and says yes to everything, with valid proofs (it read the lease key).
     spool = os.path.join(BASE, "spool")
     os.makedirs(spool, exist_ok=True)
-    sp = subprocess.Popen([PY, "-c", SPOOF_SERVER, spool], stdout=subprocess.PIPE)
+    spoof_box = Box()
+    sp = subprocess.Popen([PY, "-c", SPOOF_SERVER, spool, spoof_box.path("hook.sock"), LEASE_KEY], stdout=subprocess.PIPE)
 
     def spooled(cmd, timeout=8):
         end = time.time() + timeout
@@ -789,19 +853,19 @@ def test_planted_and_spoofed():
             time.sleep(0.05)
         return None
     try:
-        port = int(sp.stdout.readline())
-        b = Box()
-        b.lease(port=port)                                    # the lease's pid is still this process
+        sp.stdout.readline()
+        b = spoof_box                                         # the lease's pid is still this process
         p, _ = b.run(perm(ti={"command": "make deploy spoofed"}))
-        check("spoofed dashboard on another port (not the lease's pid): its answer to the handover is not believed, "
-              "the hook exits silently (terminal), no doorbell", p.stdout == b"" and b.reqs() == [], (p.stdout, b.reqs()))
+        check("a socket planted at the hook socket's path by another process (not the lease's pid): not believed, "
+              "nothing handed to it, the hook exits silently (terminal), no doorbell",
+              p.stdout == b"" and b.reqs() == [] and spooled("make deploy spoofed", 1) is None, (p.stdout, b.reqs()))
 
         sleeper = subprocess.Popen([PY, "-c", "import time; time.sleep(60)"])
         try:
             b = Box()
             b.lease(pid=sleeper.pid)                          # a live pid that is not the one answering
             p, _ = b.run(perm(ti={"command": "make deploy sleeper"}))
-            check("lease names a live pid that does not own the answering socket: not believed, terminal",
+            check("lease names a live pid that is not the process listening on the hook socket: not believed, terminal",
                   p.stdout == b"" and b.reqs() == [], (p.stdout, b.reqs()))
         finally:
             sleeper.kill()
@@ -810,8 +874,8 @@ def test_planted_and_spoofed():
         # The documented limit: a program that rewrites the lease to name ITSELF and
         # serves the answers runs as you; the guards block the plain ways there (and
         # the hook's program check, off here, refuses anything but the real cc-dash).
-        b = Box()
-        b.lease(port=port, pid=sp.pid)
+        b = spoof_box
+        b.lease(pid=sp.pid)
         p = b.start(perm(ti={"command": "make deploy limit"}))
         r = spooled("make deploy limit")
         if r is not None:
@@ -1352,6 +1416,8 @@ def main():
         shutil.rmtree(BASE, ignore_errors=True)
     for k, v in TIMINGS.items():
         print("  timing: %-55s %s" % (k, v))
+    why = STATE_GUARD.problem()
+    check("the real state dir is untouched by this run", not why, why)
     fails = [r for r in RESULTS if not r[1]]
     print("total=%d  pass=%d  fail=%d" % (len(RESULTS), len(RESULTS) - len(fails), len(fails)))
     for name, _, detail in fails:

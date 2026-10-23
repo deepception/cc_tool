@@ -27,6 +27,9 @@ PY = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else
 HOOK = os.path.join(REPO, "templates", "hooks", "attention.py")
 SETTINGS = os.path.join(REPO, "templates", "settings.json")
 RESULTS = []
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from state_guard import StateGuard  # noqa: E402  (tests/state_guard.py)
+STATE_GUARD = StateGuard()         # the real state dir, before anything here runs a hook
 BASE = tempfile.mkdtemp(prefix="cc-attention-hook-")
 SID = "0f0e0d0c-1111-2222-3333-444455556666"
 
@@ -278,6 +281,8 @@ def main():
                 check(fn.__name__ + " raised", False, f"{type(e).__name__}: {e}")
     finally:
         shutil.rmtree(BASE, ignore_errors=True)
+    why = STATE_GUARD.problem()
+    check("the real state dir is untouched by this run", not why, why)
     fails = [r for r in RESULTS if not r[1]]
     print("total=%d  pass=%d  fail=%d" % (len(RESULTS), len(RESULTS) - len(fails), len(fails)))
     for name, _, detail in fails:

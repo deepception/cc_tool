@@ -38,7 +38,7 @@ fi
 # it straight to this terminal (/dev/tty). fd 3 is a pipe that carries nothing:
 # cc-dash closes it once the code is shown, so `| cat` holds the prompt until
 # then and the code lands above it, not in the middle of your next command.
-CCDASH_LINE='ccdash() { local b d="${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool"; b="$(command -v cc-dash)" || { echo "cc-dash not on PATH" >&2; return 1; }; pkill -u "$USER" -f "$b" 2>/dev/null && sleep 1; mkdir -p "$d" && (umask 077; nohup "$b" --ready-fd 3 "$@" 3>&1 >>"$d/cc-dash.log" 2>&1 </dev/null &) | cat && echo "cc-dash is opening in your browser (log: $d/cc-dash.log)"; }'
+CCDASH_LINE='ccdash() { local b r d="${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool"; b="$(command -v cc-dash)" || { echo "cc-dash not on PATH" >&2; return 1; }; pkill -u "$USER" -f "$b" 2>/dev/null && sleep 1; mkdir -p "$d" || return 1; r="$( (umask 077; nohup "$b" --ready-fd 3 "$@" 3>&1 >>"$d/cc-dash.log" 2>&1 </dev/null &) )"; [ "$r" = refused ] && return 1; echo "cc-dash is opening in your browser (log: $d/cc-dash.log)"; }'
 
 if grep -qF -- '--ready-fd 3' "$PROFILE" 2>/dev/null; then
     echo "✓ ccdash already defined ($PROFILE)"
