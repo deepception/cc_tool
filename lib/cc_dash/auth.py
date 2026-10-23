@@ -327,6 +327,22 @@ def peer_uid(client_addr, server_port, tables=("/proc/net/tcp", "/proc/net/tcp6"
 
     /proc/net/tcp lists every socket as `local_address rem_address st ... uid`;
     the browser's socket has local = its (ip, port) and remote = (127.0.0.1, server_port)."""
+    cols = _peer_row(client_addr, server_port, tables)
+    try:
+        return int(cols[7]) if cols else None
+    except ValueError:
+        return None
+
+
+def peer_inode(client_addr, server_port, tables=("/proc/net/tcp", "/proc/net/tcp6")):
+    """The inode of the client end of a 127.0.0.1 connection to server_port, or
+    None: which process holds it is then a look into /proc/<pid>/fd."""
+    cols = _peer_row(client_addr, server_port, tables)
+    return cols[9] if cols and len(cols) >= 10 and cols[9] != "0" else None
+
+
+def _peer_row(client_addr, server_port, tables):
+    """The /proc/net/tcp{,6} columns of the client end of a connection to server_port, or None."""
     try:
         ip, port = client_addr[0], int(client_addr[1])
     except (TypeError, ValueError, IndexError):
@@ -348,10 +364,7 @@ def peer_uid(client_addr, server_port, tables=("/proc/net/tcp", "/proc/net/tcp6"
                     if len(cols) < 8:
                         continue
                     if cols[1].upper() in (want_local4, want_local6) and cols[2].upper().endswith(":" + want_rport):
-                        try:
-                            return int(cols[7])
-                        except ValueError:
-                            return None
+                        return cols
         except OSError:
             continue
     return None

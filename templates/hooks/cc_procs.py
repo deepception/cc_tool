@@ -10,19 +10,32 @@ Standard library only, no package imports.
 Everything here reads /proc (Linux). Where there is no /proc the process checks
 cannot run; callers say what they do then.
 
-  dashboard_problem(pid, root)  why pid is not the cc-dash of the checkout at
-                                root, launched the way cc-dash launches itself
-                                and from outside Claude Code ('' when it is)
+  dashboard_problem(pid, root, python)
+                                why pid is not the cc-dash of the checkout at
+                                root, run by the recorded Python interpreter,
+                                launched the way cc-dash launches itself and
+                                from outside Claude Code ('' when it is)
   hook_problem(pid, root)       why pid is not a dash-control.py hook installed
                                 by that checkout ('' when it is)
   manifest_problem(root, m)     why cc-dash's code under root is not what the
                                 manifest m recorded ('' when it is); build_manifest
-                                makes one (cc-setup)
+                                makes one (cc-setup), with the interpreter
   code_after_start(pid, ...)    why the dashboard pid may not be running that code
                                 (it changed after the process started)
-  claude_lineage(pid)           why pid counts as started inside Claude Code
+  claude_lineage(pid)           why pid counts as started inside Claude Code (or
+                                cannot be told apart from that: a leader that
+                                cannot be inspected counts)
+  driver_detached(pid)          a terminal driver (script, expect, ...) among its
+                                parents or its leaders' parents, itself detached
+  terminal_problem(pid, terminals)
+                                a holder of the master side of its terminal that
+                                is not one of your recorded terminals, or is, or
+                                descends from, Claude Code (fail closed);
+                                detect_terminals records them (cc-setup)
   fresh_session(pid)            a process that leads a session it started after
                                 being re-parented (a typical double-fork escape)
+  detached(pid)                 re-parented to init or a subreaper with no
+                                controlling terminal left
 """
 import os
 import re
@@ -81,16 +94,25 @@ def _link(pid, name, proc="/proc"):
 def ancestors(pid=None, n=64, proc="/proc"):
     """(pid, comm, exe, argv) of pid (default: this process's parent) and each of
     its ancestors up to init, from /proc; [] elsewhere."""
-    out, pid = [], os.getppid() if pid is None else pid
+    return chain(os.getppid() if pid is None else pid, n, proc)[0]
+
+
+def chain(pid, n=64, proc="/proc"):
+    """(ancestors(pid), complete): complete is False when a process on the way
+    up could not be read (gone, or hidden), so the list may miss a link. Init,
+    or a parent outside this pid namespace (ppid 0), ends a complete chain."""
+    out = []
     for _ in range(n):
-        if not isinstance(pid, int) or pid <= 1:
-            break
+        if not isinstance(pid, int):
+            return out, False
+        if pid <= 1:
+            return out, True
         st = proc_stat(pid, proc)
         if st is None:
-            break
+            return out, False
         out.append((pid, st["comm"], _link(pid, "exe", proc) or "", cmdline(pid, proc) or []))
         pid = st["ppid"]
-    return out
+    return out, False
 
 
 def is_claude(comm, exe, argv):
@@ -121,25 +143,536 @@ def env_problem(env):
     return ""
 
 
+def _leaders(pid, st):
+    """(label, leader pid) of the session and process-group leaders that are not pid itself."""
+    return [(label, leader) for label, leader in (("session", st["sid"]), ("process-group", st["pgrp"])) if leader != pid]
+
+
 def claude_lineage(pid, proc="/proc", parents=None):
     """Why pid counts as started inside Claude Code: the claude CLI is among its
     parents, or its session or process-group leader descends from it (they
-    outlive a double fork). '' otherwise. `parents` overrides the parent chain."""
+    outlive a double fork). Fails closed: a leader that is gone, hidden or in
+    another pid namespace, or a parent chain that cannot be read to the end,
+    counts too, because then nobody can tell. '' otherwise. `parents`
+    overrides the parent chain."""
     st = proc_stat(pid, proc)
+    if st is None:
+        return "process %d cannot be inspected" % pid
     if parents is None:
-        parents = ancestors(st["ppid"], proc=proc) if st else []
+        parents, complete = chain(st["ppid"], proc=proc)
+        if not complete:
+            return "its parent chain cannot be read to the end (a process on the way is gone or hidden)"
     for p, comm, exe, argv in parents:
         if is_claude(comm, exe, argv):
             return "process %d, %s, is among its parents" % (p, comm)
-    if st is None:
-        return ""
-    for label, leader in (("session", st["sid"]), ("process-group", st["pgrp"])):
-        if leader in (0, pid):
-            continue
-        for p, comm, exe, argv in ancestors(leader, proc=proc):
+    for label, leader in _leaders(pid, st):
+        if leader <= 0:
+            return "its %s leader is outside this pid namespace, so it cannot be inspected" % label
+        up, complete = chain(leader, proc=proc)
+        if not up:
+            return "its %s leader (process %d) is gone or cannot be inspected" % (label, leader)
+        for p, comm, exe, argv in up:
             if is_claude(comm, exe, argv):
                 return "its %s leader descends from process %d, %s" % (label, p, comm)
+        if not complete:
+            return "the parent chain of its %s leader (process %d) cannot be read to the end" % (label, leader)
     return ""
+
+
+# Programs that run a command on a terminal of their own making and read what it
+# writes there. One of them that was itself detached (re-parented to init or a
+# subreaper) is how something running as you gets a terminal, and with it the
+# control code, without you: `setsid -f script -qc "cc-dash --control" /dev/null`.
+# tmux and screen are not on the list: you run cc-dash in them yourself.
+PTY_DRIVERS = {"script", "expect", "expectk", "unbuffer", "empty", "socat", "ttyrec", "dtach", "abduco", "pty-run"}
+_SCRIPT_HOSTS = {"sh", "bash", "dash", "zsh", "ksh", "tclsh", "wish", "perl", "python"}
+
+
+def _bare(name):
+    """A program name without a version suffix: tclsh8.6 -> tclsh, python3.12 -> python."""
+    name = os.path.basename(name or "")
+    return re.sub(r"[\d.]+$", "", name) or name
+
+
+def is_pty_driver(comm, exe, argv):
+    """True for a terminal driver from PTY_DRIVERS, also when an interpreter runs
+    it as a script (unbuffer is a Tcl script: `tclsh /usr/bin/unbuffer ...`)."""
+    names = {_bare(comm), _bare(exe)} | ({_bare(argv[0])} if argv else set())
+    if names & PTY_DRIVERS:
+        return True
+    if names & _SCRIPT_HOSTS and argv:
+        script = next((a for a in argv[1:3] if a and not a.startswith("-")), "")
+        return _bare(script) in PTY_DRIVERS
+    return False
+
+
+def driver_detached(pid, proc="/proc", parents=None):
+    """Why pid runs under a terminal driver (PTY_DRIVERS) that was itself
+    detached: one among its parents, or among its session or process-group
+    leaders and their parents, re-parented to init or a subreaper. ''
+    otherwise (also when the chains cannot be read: claude_lineage refuses
+    that). `parents` overrides the parent chain."""
+    st = proc_stat(pid, proc)
+    if st is None:
+        return ""
+    chains = [parents if parents is not None else chain(st["ppid"], proc=proc)[0]]
+    chains += [chain(leader, proc=proc)[0] for _label, leader in _leaders(pid, st) if leader > 0]
+    for up in chains:
+        for p, comm, exe, argv in up:
+            if is_pty_driver(comm, exe, argv):
+                pst = proc_stat(p, proc)
+                if pst is None or reparented(pst, proc):
+                    return ("process %d, %s, a program that runs commands on a terminal of its own, was detached "
+                            "(re-parented to pid %s)" % (p, comm, pst["ppid"] if pst else "?"))
+    return ""
+
+
+# ── who holds the terminal ──────────────────────────────────────────────────
+# The control code goes to the dashboard's controlling terminal, so whoever holds
+# the master side of that pseudo-terminal can read it. That is the human's
+# terminal emulator, sshd, or the human's own tmux/screen server, never the
+# claude CLI or something it started. Found structurally, not by name: the
+# dashboard's tty_nr names /dev/pts/<n>, and the process with a /dev/ptmx fd
+# whose /proc/<p>/fdinfo says `tty-index: <n>` holds its master.
+PTMX = ("/dev/ptmx", "/dev/pts/ptmx")
+
+
+def pts_index(tty_nr):
+    """The /dev/pts number of a tty_nr (from /proc/<pid>/stat), or None when it is
+    not a pseudo-terminal (a virtual console or serial line has no master)."""
+    if not isinstance(tty_nr, int) or tty_nr <= 0:
+        return None
+    major = (tty_nr >> 8) & 0xfff
+    minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xfff00)
+    return (major - 136) * 256 + minor if 136 <= major <= 143 else None
+
+
+def pty_master_holders(index, proc="/proc"):
+    """The pids holding the master side of /dev/pts/<index>: a /dev/ptmx fd whose
+    fdinfo says `tty-index: <index>`. Processes whose fds cannot be read (other
+    users', non-dumpable ones) are not seen."""
+    out = []
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        d = "%s/%s/fd" % (proc, name)
+        try:
+            fds = os.listdir(d)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(d, fd)) not in PTMX:
+                    continue
+                with open("%s/%s/fdinfo/%s" % (proc, name, fd), encoding="ascii", errors="replace") as fh:
+                    m = re.search(r"^tty-index:\s*(\d+)\s*$", fh.read(4096), re.M)
+            except OSError:
+                continue
+            if m and int(m.group(1)) == index:
+                out.append(int(name))
+                break
+    return sorted(out)
+
+
+def _inherited_from(h, hosts, proc="/proc"):
+    """True when holder h descends from one of `hosts` (pids holding the same
+    master): it inherited the fd from that terminal, as the shells some
+    terminals start keep their siblings' masters (a leaked fd)."""
+    up, complete = chain(h, proc=proc)
+    return complete and any(p in hosts for p, _c, _e, _a in up[1:])
+
+
+def terminal_problem(pid, proc="/proc", terminals=None, mountinfo="/proc/self/mountinfo", cache=None):
+    """Why the terminal pid writes to (and the control code with it) may be read
+    by something other than your own terminal. The processes holding the master
+    side of its controlling pseudo-terminal (pty_master_holders) are judged:
+
+      with `terminals` (the recorded terminal hosts, terminal_entry dicts; [] when
+      none were recorded): each holder must run one of them (/proc/<p>/exe, see
+      terminal_host_ok), or descend from a holder that does (an inherited fd);
+      and, as extra signals, no holder may be the claude CLI, descend from it, or
+      carry a variable Claude Code sets for its tools.
+
+    Fails closed: nobody visible holding the master, or a holder whose program,
+    parents or environment cannot be read, counts. '' when the holders pass, and
+    when pid has no controlling terminal or one that is not a pseudo-terminal
+    (the detach rules judge the first; nothing as you can hold a console's
+    master). terminals=None skips the recorded-host rule (only the signals)."""
+    st = proc_stat(pid, proc)
+    if st is None:
+        return "process %d cannot be inspected" % pid
+    index = pts_index(st["tty"])
+    if index is None:
+        return ""
+    holders = pty_master_holders(index, proc)
+    if not holders:
+        return ("nobody visible holds the master side of its terminal (/dev/pts/%d), so who reads it cannot be "
+                "told" % index)
+    if terminals is not None:
+        exes = {h: _link(h, "exe", proc) for h in holders}
+        hosts = [h for h in holders if exes[h] and terminal_host_ok(exes[h], terminals, "%s/%d/exe" % (proc, h), mountinfo, cache)]
+        for h in holders:
+            if h not in hosts and not _inherited_from(h, hosts, proc):
+                return ("the terminal showing the control code (/dev/pts/%d) is held by %s (process %d), which is not one "
+                        "of your recorded terminals; run cc-update-project from your terminal to record it"
+                        % (index, exes[h] or "a program that cannot be read", h))
+    for h in holders:
+        # The terminal programs themselves (not a shell that inherited the fd from one, as the shells
+        # of an IDE's terminals keep their siblings' masters) must not be interpreters by content.
+        copy = interpreter_copy("%s/%d/exe" % (proc, h), cache) if not _inherited_from(h, holders, proc) else ""
+        if copy:
+            return ("process %d, which holds its terminal (/dev/pts/%d), runs a copy of %s, an interpreter or shell"
+                    % (h, index, copy))
+        env = environ(h, proc)
+        if env is None:
+            return "cannot read the environment of process %d, which holds its terminal (/dev/pts/%d)" % (h, index)
+        seen = [k for k in CLAUDE_ENV_SIGNALS if env.get(k)]
+        if seen:
+            return ("process %d, which holds its terminal (/dev/pts/%d), carries %s (set by Claude Code)"
+                    % (h, index, ", ".join(seen)))
+        # The environment checks apply to every holder; the argv switches too, except for a shell (by
+        # content) that inherited the fd from a terminal: an IDE terminal's zsh runs with -i, interactive.
+        inherited_shell = _inherited_from(h, holders, proc) and is_shell("%s/%d/exe" % (proc, h), cache)
+        why = debug_problem(h, proc, switches=not inherited_shell)
+        if why:
+            return "%s; it holds its terminal (/dev/pts/%d)" % (why, index)
+        up, complete = chain(h, proc=proc)
+        for p, comm, exe, argv in up:
+            if is_claude(comm, exe, argv):
+                return ("process %d, which holds its terminal (/dev/pts/%d), %s process %d, %s"
+                        % (h, index, "is" if p == h else "descends from", p, comm))
+        if not up or not complete:
+            return "the parent chain of process %d, which holds its terminal (/dev/pts/%d), cannot be read" % (h, index)
+    return ""
+
+
+# ── your terminals, as cc-setup recorded them ───────────────────────────────
+# An AppImage (Cursor's, say) runs from a FUSE mount at /tmp/.mount_<name><6
+# random characters>/ that changes every launch, so its programs are recorded by
+# image name, path inside the image, size and full sha256, never by mount path
+# alone (a plain directory of that name could be made once the mount is gone).
+APPIMAGE_RE = re.compile(r"^(/tmp/\.mount_(.+?)[A-Za-z0-9]{6})/(.+)$")
+
+
+def _full_hash(fd):
+    import hashlib
+    d = hashlib.sha256()
+    os.lseek(fd, 0, 0)
+    while True:
+        b = os.read(fd, 1 << 20)
+        if not b:
+            break
+        d.update(b)
+    return d.hexdigest()
+
+
+class TerminalCache:
+    """Full sha256s of terminal-host programs (an AppImage's binary is about 200
+    MB, half a second to hash), in this process's memory only: a hook process
+    lives for one event, so it hashes such a program at most once per
+    permission request, and cc-dash once at startup. Never kept in a file: one
+    a Bash write could forge would let another program pass for your terminal.
+    An entry counts only for exactly the (st_dev, st_ino, size, mtime_ns,
+    ctime_ns) and mount it was made for (any change rehashes). `hashed` counts
+    the full hashes this object computed."""
+
+    def __init__(self):
+        self.entries, self.hashed = {}, 0
+
+    def sha256(self, open_path, mount=""):
+        """Full sha256 of the file at open_path (e.g. /proc/<pid>/exe, the very
+        file running), from memory when its key still matches."""
+        fd = os.open(open_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        try:
+            st = os.fstat(fd)
+            key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, mount)
+            h = self.entries.get(key)
+            if h is None:
+                h = self.entries[key] = _full_hash(fd)
+                self.hashed += 1
+            return h
+        finally:
+            os.close(fd)
+
+
+TERMINAL_HASHES = TerminalCache()      # this process's, shared by every check in it
+
+
+def terminal_entry(path):
+    """What cc-setup records for a terminal host program: {"path": real path},
+    plus {"appimage": {"name", "rel", "size", "sha256"}} when it runs from an
+    AppImage mount (the full sha256). None when the path is not an executable file."""
+    real = os.path.realpath(path)
+    if not (os.path.isfile(real) and os.access(real, os.X_OK)):
+        return None
+    e = {"path": real}
+    m = APPIMAGE_RE.match(real)
+    if m:
+        e["appimage"] = {"name": m.group(2), "rel": m.group(3), "size": os.stat(real).st_size,
+                         "sha256": TerminalCache().sha256(real)}
+    return e
+
+
+def _fuse_mount(mountpoint, mountinfo="/proc/self/mountinfo"):
+    """The mount ID of mountpoint when it is a FUSE mount (an AppImage's), from
+    mountinfo, else ''."""
+    try:
+        with open(mountinfo, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                left, _, right = line.partition(" - ")
+                f = left.split()
+                if len(f) >= 5 and f[4] == mountpoint and right.split()[:1] and right.split()[0].startswith("fuse"):
+                    return f[0]
+    except OSError:
+        pass
+    return ""
+
+
+def terminal_host_ok(exe, terminals, open_path=None, mountinfo="/proc/self/mountinfo", cache=None):
+    """True when the program at real path `exe` is one of the recorded terminal
+    hosts: the same real path (a program installed normally), or, for an
+    AppImage, the same image name and path inside it, on a FUSE mount, with the
+    same size and full sha256 (read through open_path, e.g. /proc/<pid>/exe,
+    the very file running; `cache`, a TerminalCache, default this process's
+    TERMINAL_HASHES, spares rehashing within the process)."""
+    terminals = [t for t in terminals or [] if isinstance(t, dict)]
+    if any(t.get("path") == exe and not isinstance(t.get("appimage"), dict) for t in terminals):
+        return True
+    m = APPIMAGE_RE.match(exe or "")
+    if not m:
+        return False
+    cache = cache if cache is not None else TERMINAL_HASHES
+    for t in terminals:
+        a = t.get("appimage")
+        if isinstance(a, dict) and a.get("name") == m.group(2) and a.get("rel") == m.group(3) \
+                and isinstance(a.get("sha256"), str):
+            try:
+                st = os.stat(open_path or exe)
+                mount = _fuse_mount(m.group(1), mountinfo)
+                if st.st_size == a.get("size") and mount and \
+                        cache.sha256(open_path or exe, "%s %s" % (mount, m.group(1))) == a["sha256"]:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+# Programs never recorded as a terminal host, whatever holds the terminal: a generic
+# interpreter or pty driver, judged by its program's name family (python3.12 ->
+# python), can run anything, so recording it would let any copy of it host the code.
+# tmux and screen stay recordable: you use them, an agent-started one carries Claude
+# Code's variables, and one that does not is the documented same-user limit.
+NOT_RECORDABLE = {"python", "node", "nodejs", "deno", "bun", "perl", "ruby", "sh", "bash", "zsh", "fish", "dash",
+                  "ksh", "mksh", "tcsh", "csh", "busybox", "tclsh", "wish", "lua", "luajit", "php", "pwsh", "java",
+                  "script", "expect", "expectk", "unbuffer", "socat", "empty", "ttyrec", "dtach", "abduco", "pty-run"}
+# A program that would run injected code: Electron or Node told to act as plain Node,
+# preload options, or debugger and eval switches.
+DEBUG_ENV = ("ELECTRON_RUN_AS_NODE", "NODE_OPTIONS")
+
+
+# Switches that make a program run code it was handed, bare or as --switch=value.
+DEBUG_ARGS = {"-e", "--eval", "-p", "--print", "-r", "--require", "--import", "--loader", "--experimental-loader",
+              "--js-flags", "-i", "--interactive"}
+DEBUG_ARG_PREFIXES = ("--inspect", "--remote-debugging")
+
+
+def debug_arg(a):
+    """True for an argv entry that makes a program run code it was handed (DEBUG_ARGS
+    bare or with =value, --inspect*, --remote-debugging*, any --*-preload*, and
+    --enable-logging= with a file target)."""
+    name, eq, value = a.partition("=")
+    if name in DEBUG_ARGS or name.startswith(DEBUG_ARG_PREFIXES):
+        return True
+    if name.startswith("--") and "-preload" in name:
+        return True
+    return name == "--enable-logging" and bool(eq) and value not in ("", "stderr")
+
+
+def debug_problem(pid, proc="/proc", switches=True):
+    """Why pid (a terminal host) may run code it was handed rather than its own:
+    ELECTRON_RUN_AS_NODE, NODE_OPTIONS or an ELECTRON_* debug or inspect
+    variable in its environment, or (with `switches`) a debug_arg switch in its
+    argv. '' otherwise; an unreadable environment counts."""
+    env = environ(pid, proc)
+    if env is None:
+        return "cannot read the environment of process %d" % pid
+    bad = sorted(k for k in env if k in DEBUG_ENV or (k.startswith("ELECTRON_") and ("INSPECT" in k or "DEBUG" in k)))
+    if bad:
+        return "process %d carries %s, which can make it run other code" % (pid, ", ".join(bad))
+    for a in (cmdline(pid, proc) or [])[1:] if switches else []:
+        if debug_arg(a):
+            return "process %d was started with %s, which can make it run other code" % (pid, a)
+    return ""
+
+
+# Interpreters and shells, also under another name: a copy of python3 renamed
+# `myterm` is still python3. Judged by content: the sha256 of every program of
+# these names on PATH and in the usual directories, hashed only when the size
+# matches (node is 120 MB), once per process, in memory only.
+INTERPRETER_NAMES = ("node", "nodejs", "deno", "bun", "perl", "ruby", "bash", "sh", "dash", "zsh", "fish", "ksh", "tclsh",
+                     "expect", "script", "socat", "unbuffer")
+INTERPRETER_GLOBS = ("python3*", "python*")
+_INTERPRETERS = []
+
+
+def interpreters():
+    """{real path: size} of the interpreters and shells on this system (cached)."""
+    if not _INTERPRETERS:
+        import glob
+        dirs = [d for d in (os.environ.get("PATH") or "").split(os.pathsep) if os.path.isabs(d)]
+        dirs += ["/usr/bin", "/bin", "/usr/local/bin"]
+        found = {}
+        for d in dict.fromkeys(dirs):
+            cands = [os.path.join(d, n) for n in INTERPRETER_NAMES]
+            for g in INTERPRETER_GLOBS:
+                cands += glob.glob(os.path.join(glob.escape(d), g))
+            for c in cands:
+                real = os.path.realpath(c)
+                try:
+                    st = os.stat(real)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and os.access(real, os.X_OK):
+                    found[real] = st.st_size
+        _INTERPRETERS.append(found)
+    return _INTERPRETERS[0]
+
+
+SHELLS = {"bash", "sh", "dash", "zsh", "fish", "ksh"}
+
+
+def is_shell(open_path, cache=None):
+    """True when the program at open_path has, by content, the sha256 of one of the
+    shells (SHELLS) found on this system (sh is often dash under another name)."""
+    copy = interpreter_copy(open_path, cache)
+    if not copy:
+        return False
+    cache = cache if cache is not None else TERMINAL_HASHES
+    mine = cache.sha256(copy)
+    for p, n in interpreters().items():
+        if os.path.basename(p) in SHELLS and n == interpreters()[copy]:
+            try:
+                if cache.sha256(p) == mine:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def interpreter_copy(open_path, cache=None):
+    """The real path of the interpreter or shell whose content the program at
+    open_path (e.g. /proc/<pid>/exe) has, or ''. Only same-size candidates are
+    hashed; hashes are kept in `cache` (default this process's TERMINAL_HASHES)."""
+    cache = cache if cache is not None else TERMINAL_HASHES
+    try:
+        size = os.stat(open_path).st_size
+    except OSError:
+        return ""
+    same = [p for p, n in interpreters().items() if n == size]
+    if not same:
+        return ""
+    try:
+        mine = cache.sha256(open_path)
+    except OSError:
+        return ""
+    for p in same:
+        try:
+            if cache.sha256(p) == mine:
+                return p
+        except OSError:
+            continue
+    return ""
+
+
+def recording_problem(pid=None, proc="/proc", env=None):
+    """Why cc-setup running as pid (default: this process) must not record any
+    terminal: it runs under Claude Code (one of its tool variables in `env`,
+    default os.environ; a claude process among its parents) or its parent chain
+    cannot be read to the end. An agent could otherwise run cc-update-project
+    on a terminal of its own making and have that program recorded."""
+    env = os.environ if env is None else env
+    seen = [k for k in CLAUDE_ENV_SIGNALS if env.get(k)]
+    if seen:
+        return "it runs with %s set, so inside Claude Code" % ", ".join(seen)
+    pid = os.getpid() if pid is None else pid
+    st = proc_stat(pid, proc)
+    if st is None:
+        return "its own process cannot be inspected"
+    up, complete = chain(st["ppid"], proc=proc)
+    for p, comm, exe, argv in up:
+        if is_claude(comm, exe, argv):
+            return "process %d, %s, is among its parents (Claude Code)" % (p, comm)
+    if not complete:
+        return "its parent chain cannot be read to the end"
+    return ""
+
+
+def detect_terminals(pid=None, proc="/proc", skipped=None):
+    """The real paths of the programs holding the master side of pid's
+    controlling terminal (default: this process's): the terminal it runs in
+    (gnome-terminal-server, konsole, kitty, Cursor's or VS Code's pty host, a
+    tmux or screen server). Left out: holders that only inherited the fd from
+    another holder (a shell that keeps its siblings' masters), the holders'
+    parents (your shell, the user manager), and any holder that is, descends
+    from or carries the variables of Claude Code, whose parent chain cannot be
+    read, that runs with debug or eval switches (debug_problem), or whose
+    program is a generic interpreter or pty driver (NOT_RECORDABLE). `skipped`
+    (a list) receives (path, why) for each holder left out for those reasons.
+    None when pid has no pseudo-terminal at all."""
+    pid = os.getpid() if pid is None else pid
+    st = proc_stat(pid, proc)
+    index = pts_index(st["tty"]) if st else None
+    if index is None:
+        return None
+    holders = pty_master_holders(index, proc)
+    roots = [h for h in holders if not _inherited_from(h, holders, proc)]
+    out = set()
+    for h in roots:
+        exe = _link(h, "exe", proc)
+        if not exe or exe.endswith(" (deleted)"):
+            continue
+        path = os.path.realpath(exe) if proc == "/proc" else exe
+        env = environ(h, proc)
+        up, complete = chain(h, proc=proc)
+        why = ""
+        if _bare(path) in NOT_RECORDABLE:
+            why = "a generic interpreter or terminal driver is never recorded"
+        elif interpreter_copy("%s/%d/exe" % (proc, h)):
+            why = "it is a copy of %s; a generic interpreter or terminal driver is never recorded" % (
+                interpreter_copy("%s/%d/exe" % (proc, h)))
+        elif env is None or any(env.get(k) for k in CLAUDE_ENV_SIGNALS):
+            why = "it carries Claude Code's variables" if env is not None else "its environment cannot be read"
+        elif any(is_claude(c, e, a) for _p, c, e, a in up) or not complete:
+            why = "it is, or descends from, Claude Code" if complete else "its parent chain cannot be read"
+        else:
+            why = debug_problem(h, proc)
+        if why:
+            if skipped is not None:
+                skipped.append((path, why))
+            continue
+        out.add(path)
+    return sorted(out)
+
+
+def merge_terminals(old, paths):
+    """Recorded terminal entries: `old` (kept, they are the user's) plus an entry
+    for each of `paths`, without duplicates."""
+    out, seen = [], set()
+    for e in list(old or []) + [terminal_entry(p) for p in paths or []]:
+        if not isinstance(e, dict) or not isinstance(e.get("path"), str):
+            continue
+        a = e.get("appimage") if "appimage" in e else None
+        if a is not None and not (isinstance(a, dict) and isinstance(a.get("sha256"), str)):
+            continue                       # an AppImage record without its full sha256 matches nothing
+        key = ("img", a.get("name"), a.get("rel"), a.get("size"), a.get("sha256")) if a else ("path", e["path"])
+        if key not in seen:
+            seen.add(key)
+            out.append(e)
+    return out
 
 
 def reparented(st, proc="/proc"):
@@ -156,43 +689,130 @@ def fresh_session(pid, proc="/proc"):
     return ""
 
 
+def detached(pid, proc="/proc"):
+    """Why pid looks detached from any terminal: re-parented to init or a
+    user-manager subreaper, and no controlling terminal left."""
+    st = proc_stat(pid, proc)
+    if st is not None and st["tty"] == 0 and reparented(st, proc):
+        return "it was detached (re-parented to pid %d) and has no controlling terminal" % st["ppid"]
+    return ""
+
+
 def _is_python(exe):
     return bool(exe) and os.path.basename(exe).startswith("python")
 
 
-def dashboard_problem(pid, root, proc="/proc"):
-    """'' when pid is cc-dash from the checkout at `root`, started the way
-    bin/cc-dash starts itself and from outside Claude Code; else the reason.
+# ── the interpreter cc-dash runs on ─────────────────────────────────────────
+# cc-setup records it (python_record) in the manifest beside the hooks. bin/cc-dash
+# re-executes the interpreter its shebang resolved (/proc/self/exe) and nothing
+# else: no file anything running as you can write picks what it executes.
 
-    The kernel's view decides: /proc/<pid>/exe must be a Python interpreter, and
-    its argv must be bin/cc-dash's own re-exec, `python -I <root>/bin/cc-dash`
-    (resolved against the process's working directory). -I keeps PYTHON*
-    variables, the user site directory and the current directory out of it.
-    Then cc-dash's own launch rules, checked from outside so a modified copy
-    cannot skip them: no Claude Code, PYTHON* or LD_* variable in its environment, no
-    claude process among its parents or its session and process-group leaders'
-    parents, and not a fresh session after a re-parent."""
+
+def python_record(path=None):
+    """{"path": real path, "sha256": ...} of an interpreter: by default the one
+    running this code (the kernel's /proc/self/exe; sys.executable can name
+    something else, e.g. with zsh's exported ARGV0)."""
+    import sys
+    if path is None:
+        path = "/proc/self/exe" if os.path.exists("/proc/self/exe") else sys.executable
+    real = os.path.realpath(path)
+    return {"path": real, "sha256": file_hash(real)}
+
+
+def exe_identity(pid, proc="/proc"):
+    """(path, sha256) of the program pid runs. The hash is of the very file the
+    kernel executed (/proc/<pid>/exe opened, not its path: a binary replaced
+    since does not count), cached by inode, size, mtime and ctime. (path, None)
+    when it cannot be read, (None, None) when the process is gone."""
+    link = _link(pid, "exe", proc)
+    if link is None:
+        return None, None
+    import hashlib
+    try:
+        fd = os.open("%s/%d/exe" % (proc, pid), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return link, None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return link, None
+        key = ("exe", st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        h = _HASHES.get(key)
+        if h is None:
+            d = hashlib.sha256()
+            while True:
+                b = os.read(fd, 1 << 20)
+                if not b:
+                    break
+                d.update(b)
+            h = _HASHES[key] = d.hexdigest()
+        return link, h
+    except OSError:
+        return link, None
+    finally:
+        os.close(fd)
+
+
+def python_problem(pid, python, proc="/proc"):
+    """'' when pid runs exactly the interpreter `python` records (its real path,
+    and a file with its sha256); else why not. A binary merely named python is
+    not enough."""
+    if not (isinstance(python, dict) and isinstance(python.get("path"), str) and os.path.isabs(python["path"])
+            and isinstance(python.get("sha256"), str) and re.match(r"^[0-9a-f]{64}$", python["sha256"])):
+        return "there is no record of the Python interpreter cc-dash runs on (run cc-update-project)"
+    link, h = exe_identity(pid, proc)
+    if link is None:
+        return "process %d is gone or cannot be inspected" % pid
+    if link != python["path"]:
+        return ("process %d runs %s, not %s, the Python interpreter cc-setup recorded (run cc-update-project if "
+                "you changed python3)" % (pid, link, python["path"]))
+    if h is None:
+        return "cannot read the program process %d runs" % pid
+    if h != python["sha256"]:
+        return ("process %d runs a %s that is not the one cc-setup recorded (its sha256 differs; run cc-update-project "
+                "if python3 was upgraded, then restart cc-dash)" % (pid, link))
+    return ""
+
+
+def dashboard_problem(pid, root, proc="/proc", python=None, terminals=None, cache=None):
+    """'' when pid is cc-dash from the checkout at `root`, run by the interpreter
+    cc-setup recorded, started the way bin/cc-dash starts itself and from
+    outside Claude Code; else the reason.
+
+    The kernel's view decides: /proc/<pid>/exe must be the recorded interpreter
+    (`python`, {"path", "sha256"} from the manifest; None: the interpreter
+    running this code), the same real path and the same sha256, and its argv
+    must be bin/cc-dash's own re-exec, exactly `<that path> -I <root>/bin/cc-dash`
+    (flags for cc-dash may follow). -I keeps PYTHON* variables, the user site
+    directory and the current directory out of it. Then cc-dash's own launch
+    rules, checked from outside so a modified copy cannot skip them: no Claude
+    Code, PYTHON* or LD_* variable in its environment, no claude process among
+    its parents or its session and process-group leaders' parents (a leader that
+    cannot be inspected counts), no detached terminal driver (script, expect ...)
+    on the way, every holder of its terminal's master side one of your recorded
+    terminals (`terminals`, from the manifest; None skips that rule) and none
+    of them Claude Code (terminal_problem), not a fresh session after a re-parent,
+    and not re-parented with no controlling terminal left."""
     if not isinstance(pid, int) or pid <= 1:
         return "the lease names no process"
-    exe = _link(pid, "exe", proc)
-    if exe is None:
-        return "process %d is gone or cannot be inspected" % pid
-    if not _is_python(exe):
-        return "process %d runs %s, not Python" % (pid, exe)
+    if python is None:
+        python = python_record()
+    why = python_problem(pid, python, proc)
+    if why:
+        return why
     argv = cmdline(pid, proc) or []
-    if len(argv) < 3 or argv[1] != "-I":
-        return "process %d was not started the way cc-dash starts itself (python -I .../bin/cc-dash)" % pid
-    cwd = _link(pid, "cwd", proc)
-    if cwd is None:
-        return "cannot read the working directory of process %d" % pid
-    script = os.path.realpath(os.path.join(cwd, argv[2]))
     want = os.path.join(os.path.realpath(root), "bin", "cc-dash")
-    if script != want:
+    if len(argv) < 3 or argv[0] != python["path"] or argv[1] != "-I":
+        return "process %d was not started the way cc-dash starts itself (%s -I %s)" % (pid, python["path"], want)
+    if argv[2] != want:
+        cwd = _link(pid, "cwd", proc) or "/"
+        script = os.path.realpath(os.path.join(cwd, argv[2]))
         return "process %d runs %s, not %s (the cc_tool checkout this project was set up from)" % (pid, script, want)
     env = environ(pid, proc)
     if env is None:
         return "cannot read the environment of process %d" % pid
-    why = env_problem(env) or claude_lineage(pid, proc) or fresh_session(pid, proc)
+    why = (env_problem(env) or claude_lineage(pid, proc) or driver_detached(pid, proc)
+           or terminal_problem(pid, proc, terminals=terminals, cache=cache) or fresh_session(pid, proc) or detached(pid, proc))
     return ("process %d: %s" % (pid, why)) if why else ""
 
 
@@ -214,6 +834,25 @@ def read_pin(hooks_dir):
     finally:
         os.close(fd)
     return raw if os.path.isabs(raw) and "\n" not in raw else ""
+
+
+def holds_socket(pid, inode, proc="/proc"):
+    """True when pid has the socket with this inode (from /proc/net/tcp) open."""
+    if not isinstance(pid, int) or pid <= 1 or not inode or str(inode) == "0":
+        return False
+    target = "socket:[%s]" % inode
+    d = "%s/%d/fd" % (proc, pid)
+    try:
+        names = os.listdir(d)
+    except (OSError, TypeError):
+        return False
+    for n in names:
+        try:
+            if os.readlink(os.path.join(d, n)) == target:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def holds(pid, ident, proc="/proc"):
@@ -356,16 +995,26 @@ def file_hash(path, st=None):
     return h
 
 
-def build_manifest(root):
-    """What cc-setup records beside the hooks: {"v": 2, "root", "files": {path:
-    sha256}, "dirs": [path]} for scan_code's scope. Raises ValueError when the
+MANIFEST_V = 3
+
+
+def build_manifest(root, python=None, terminals=None):
+    """What cc-setup records beside the hooks: {"v": 3, "root", "files": {path:
+    sha256}, "dirs": [path], "python": {"path", "sha256"}} for scan_code's scope
+    and the interpreter cc-dash runs on (`python`, default python_record(): the
+    one running this, which for cc-setup is the python3 on PATH, the one
+    bin/cc-dash's `#!/usr/bin/env python3` finds), and the terminal hosts
+    (`terminals`, terminal_entry dicts; default: the terminal this runs in,
+    detect_terminals). Raises ValueError when the
     scope holds a symlink or a special file (the hook would refuse it anyway)."""
     root = os.path.realpath(root)
     files, dirs, bad = scan_code(root)
     if bad:
         raise ValueError("not a plain file or directory: %s" % ", ".join(bad))
-    return {"v": 2, "root": root, "files": {rel: file_hash(os.path.join(root, rel), st) for rel, st in sorted(files.items())},
-            "dirs": sorted(dirs)}
+    return {"v": MANIFEST_V, "root": root,
+            "files": {rel: file_hash(os.path.join(root, rel), st) for rel, st in sorted(files.items())},
+            "dirs": sorted(dirs), "python": python or python_record(),
+            "terminal_hosts": merge_terminals([], detect_terminals() or []) if terminals is None else terminals}
 
 
 def manifest_problem(root, manifest):
@@ -375,8 +1024,8 @@ def manifest_problem(root, manifest):
     differs."""
     root = os.path.realpath(root)
     files = manifest.get("files") if isinstance(manifest, dict) else None
-    if (not isinstance(files, dict) or manifest.get("v") != 2 or manifest.get("root") != root
-            or not isinstance(manifest.get("dirs"), list)):
+    if (not isinstance(files, dict) or manifest.get("v") != MANIFEST_V or manifest.get("root") != root
+            or not isinstance(manifest.get("dirs"), list) or not isinstance(manifest.get("python"), dict)):
         return CODE_CHANGED + " (the record is missing, old, or for another checkout)"
     have_files, have_dirs, bad = scan_code(root)
     if bad:

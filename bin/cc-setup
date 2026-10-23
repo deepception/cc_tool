@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # cc-setup: Configure Claude Code tools (hooks + settings + skills + CLAUDE.md) in a project.
-# Usage: cc-setup [project_path] [--vault] [--devcontainer [--cloud aws|gcp|none] [--firewall on|off]]
+# Usage: cc-setup [project_path] [--vault] [--reset-terminals] [--devcontainer [--cloud aws|gcp|none] [--firewall on|off]]
+#   --reset-terminals  replace the recorded terminal hosts (control mode) with this terminal's, instead of adding it
 set -euo pipefail
 
 CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -8,11 +9,13 @@ CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_DIR=""
 WITH_DEVCONTAINER=0
 WITH_VAULT=0
+RESET_TERMINALS=0
 DEVCONTAINER_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --vault) WITH_VAULT=1; shift ;;
+        --reset-terminals) RESET_TERMINALS=1; shift ;;
         --devcontainer) WITH_DEVCONTAINER=1; shift ;;
         --cloud|--cloud=*|--firewall|--firewall=*|--force)
             DEVCONTAINER_ARGS+=("$1")
@@ -99,14 +102,22 @@ find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -name "*.sh" -exec chmod +x {} \;
 # file, or the hooks beside it, without your approval. cc-update-project
 # refreshes it (it runs this script).
 # Beside it, cc_dash_manifest.json: the sha256 of cc-dash's code in this checkout
-# (bin/cc-dash, cc_procs.py, lib/cc_dash/). The hook trusts a dashboard only while
-# that code is unchanged, so a Bash edit of the checkout cannot vouch for itself.
-# After a `git pull` of cc_tool, cc-update-project re-records it.
+# (bin/cc-dash, cc_procs.py, lib/cc_dash/), and the real path and sha256 of the
+# python3 cc-dash runs on. The hook trusts a dashboard only while that code is
+# unchanged and only when the process runs that very interpreter, so a Bash edit
+# of the checkout cannot vouch for itself and a binary merely named python3 is
+# not trusted. After a `git pull` of cc_tool, or a python3 upgrade,
+# cc-update-project re-records it. bin/cc-dash re-executes the interpreter its
+# shebang resolved, so run cc-setup with the python3 you run cc-dash with.
+# The manifest also lists your terminal programs (terminal_hosts): what holds the
+# terminal cc-setup runs in, plus CC_DASH_TERMINALS. The control code is shown
+# only on a terminal one of them holds.
 # And the project goes into ${XDG_STATE_HOME:-~/.local/state}/cc_tool/projects.json
 # (0600): cc-dash shows a permission request only from a registered project's hook.
-python3 - "$CC_TOOL_DIR" "$PROJECT_DIR" <<'EOF'
+python3 - "$CC_TOOL_DIR" "$PROJECT_DIR" "$RESET_TERMINALS" <<'EOF'
 import importlib.util, json, os, sys
 root, project = os.path.realpath(sys.argv[1]), os.path.realpath(sys.argv[2])
+reset_terminals = sys.argv[3] == "1"
 hooks = os.path.join(project, ".claude", "hooks")
 
 
@@ -136,7 +147,49 @@ sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("cc_procs", os.path.join(root, "templates", "hooks", "cc_procs.py"))
 procs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(procs)
-write(os.path.join(hooks, procs.MANIFEST_NAME), json.dumps(procs.build_manifest(root), indent=1, sort_keys=True) + "\n")
+# The interpreter is this helper's own (`python3 -` above, found on PATH the way
+# bin/cc-dash's `#!/usr/bin/env python3` finds it), by the kernel's /proc/self/exe.
+python = procs.python_record()
+# The terminals the control code may be shown in: whatever holds the master side of the
+# terminal this runs in (its fdinfo tty-index), plus CC_DASH_TERMINALS=/path1:/path2, plus
+# what was recorded before (kept: they are yours). The hook refuses a dashboard whose
+# terminal is held by anything else.
+mpath = os.path.join(hooks, procs.MANIFEST_NAME)
+try:
+    with open(mpath, encoding="utf-8") as fh:
+        old = json.load(fh).get("terminal_hosts") or []
+except (OSError, ValueError, AttributeError):
+    old = []
+refusal = procs.recording_problem()
+skipped = []
+if refusal:
+    # Run from inside Claude Code (an agent's Bash call, maybe on a terminal of its own
+    # making): record nothing, keep what was recorded, ignore CC_DASH_TERMINALS.
+    detected, extra, bad, terminals = [], [], [], old
+    print("  • control mode: no terminal recorded, because %s; the recorded list is kept." % refusal)
+    print("    Run cc-update-project from your own terminal to record it.")
+else:
+    detected = procs.detect_terminals(skipped=skipped)
+    extra = [p for p in os.environ.get("CC_DASH_TERMINALS", "").split(":") if p]
+    bad = [p for p in extra if procs.terminal_entry(p) is None or procs._bare(os.path.realpath(p)) in procs.NOT_RECORDABLE
+           or procs.interpreter_copy(os.path.realpath(p))]
+    terminals = procs.merge_terminals([] if reset_terminals else old, (detected or []) + [p for p in extra if p not in bad])
+write(mpath, json.dumps(procs.build_manifest(root, python, terminals), indent=1, sort_keys=True) + "\n")
+for path, why in skipped:
+    print("  • control mode: not recording %s as a terminal: %s" % (path, why))
+if not refusal and detected is None:
+    print("  • control mode: this is not running on a terminal, so no terminal was recorded for it. Run")
+    print("    cc-update-project once from the terminal you will run `ccdash --control` in.")
+elif not refusal and not detected:
+    print("  • control mode: could not see a program that may be recorded holding this terminal; nothing new recorded")
+    print("    (name it with CC_DASH_TERMINALS=/path/to/terminal cc-update-project).")
+for p in bad:
+    print("  • CC_DASH_TERMINALS: %s is not an executable file, or is a generic interpreter or terminal driver; "
+          "not recorded" % p)
+if reset_terminals and not refusal:
+    print("  • control mode: --reset-terminals: the earlier recorded terminals were replaced")
+if terminals:
+    print("  • control mode: terminals recorded for the control code: " + ", ".join(t["path"] for t in terminals))
 base = os.environ.get("XDG_STATE_HOME") or ""
 if not os.path.isabs(base):
     base = os.path.join(os.path.expanduser("~"), ".local", "state")

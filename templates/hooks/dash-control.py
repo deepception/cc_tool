@@ -15,13 +15,19 @@ one shell test per event, not an interpreter start.
 
 PermissionRequest (synchronous; also the dialog behind AskUserQuestion and
 ExitPlanMode). The terminal dialog opens at once and stays answerable; the first
-answer wins. This hook writes req/<id>.json and keeps it open while it waits
-(cc-dash shows a request only from a hook process that holds that very file:
-cc_procs.py hook_problem). The request carries session, agent, cwd,
-tool, input, kind, a sha256 of tool + canonical input, and why it asked (what
-bash-guard decides for the command, from its own classify() loaded from this
-directory, or a matching permissions.ask rule). The hook polls dec/<id>.json
-every 200 ms. A decision applies only when it names this request's hash.
+answer wins. This hook sends the request to cc-dash directly (POST
+/api/control/request on the lease's port, with the lease's key, answered by a
+socket the lease's pid owns), and cc-dash shows only content that arrived that
+way from a socket this very hook process owns, from a dash-control.py installed
+by its checkout (cc_procs.py hook_problem). No file carries it, so rewriting
+one changes nothing shown. cc-dash unreachable or refusing: the hook exits
+silently and the prompt stays in the terminal. Then it writes req/<id>.json, a
+doorbell holding only the id, and keeps it while it waits. The request carries
+session, agent, cwd, tool, input, kind, a sha256 of tool + canonical input, and
+why it asked (what bash-guard decides for the command, from its own classify()
+loaded from this directory, or a matching permissions.ask rule). The hook polls
+dec/<id>.json every 200 ms. A decision applies only when it names this
+request's hash.
   allow          {"behavior": "allow"}; AskUserQuestion: updatedInput = the
                  input plus "answers"; ExitPlanMode: updatedInput = the input
                  echoed (a bare allow leaves the plan dialog up). A Bash command
@@ -42,7 +48,7 @@ its batch ended (PostToolBatch), or the turn moved on (UserPromptSubmit, Stop,
 SubagentStop, SessionEnd); or the session registry
 (~/.claude/sessions/<claude pid>.json, found through the parent process chain;
 undocumented, best effort) leaves "waiting". Also when the lease goes, and after
-the lease's wait (default 300 s). On exit it removes its request and writes
+the lease's wait (default 300 s). On exit it removes its doorbell and writes
 res/<id>.json (applied, terminal, released, lease, timeout).
 
 PreToolUse (gated on `pending`): a stop queued for this session/agent
@@ -77,12 +83,20 @@ cannot be moved onto a request file rewritten after it was shown.
 Which dashboard. The lease is a file anything running as you can write, so its
 pid is trusted only when that process is cc-dash from the checkout cc-setup
 pinned for this project (.claude/hooks/cc_tool_root, beside this hook; .claude/
-is a protected path in Claude Code), launched the way bin/cc-dash launches
-itself (`python -I <root>/bin/cc-dash`, judged by /proc/<pid>/exe and its
-argv), and from outside Claude Code: no Claude Code or PYTHON* variable in its
-/proc/<pid>/environ, no claude process among its parents or its session and
-process-group leaders' parents, not a fresh session after a re-parent; no
-LD_* variable either. And its code must be what cc-setup recorded: the sha256 of
+is a protected path in Claude Code), run by the python3 cc-setup recorded in
+cc_dash_manifest.json (/proc/<pid>/exe at that real path, and the file the
+kernel runs with that sha256: a binary merely named python is not enough),
+launched the way bin/cc-dash launches itself (argv exactly `<that python> -I
+<root>/bin/cc-dash`, flags after it), and from outside Claude Code: no Claude
+Code or PYTHON* variable in its /proc/<pid>/environ, no claude process among its
+parents or its session and process-group leaders' parents (a leader or a chain
+that cannot be inspected counts as one), no detached terminal driver (script,
+expect, unbuffer ...) on the way, every holder of its terminal's master side
+(found by fdinfo tty-index; it reads the control code) one of the terminal
+programs cc-setup recorded in the manifest (terminal_hosts) and none of them
+Claude Code or carrying its variables, not a fresh session after a re-parent, not
+re-parented with no controlling terminal; no LD_* variable either. And its code
+must be what cc-setup recorded: the sha256 of
 bin/cc-dash, cc_procs.py and every entry under lib/ (nothing unlisted, no
 symlink), in cc_dash_manifest.json beside this hook ("cc-dash's code changed
 since cc-setup ran; run cc-update-project to re-record it if you changed it
@@ -301,9 +315,19 @@ def dashboard_problem(pid):
     if mod is None:
         return "cc_procs.py is not next to this hook (run cc-update-project)"
     try:
-        manifest = os.path.join(os.path.dirname(os.path.realpath(__file__)), mod.MANIFEST_NAME)
-        # the recorded code, a real cc-dash process, and that process started after the code last changed
-        return code_problem(root, mod) or mod.dashboard_problem(pid, root) or mod.code_after_start(pid, root, manifest)
+        manifest, why = read_manifest(mod)
+        if why:
+            return why
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), mod.MANIFEST_NAME)
+        # The recorded code, a real cc-dash process on the recorded interpreter, and that
+        # process started after the code last changed.
+        terminals = manifest.get("terminal_hosts") if isinstance(manifest.get("terminal_hosts"), list) else []
+        # An AppImage terminal host is hashed in full once in this process (cc_procs.TERMINAL_HASHES,
+        # memory only), then every later check in it (each verify, the lease every second) reuses it.
+        why = mod.manifest_problem(root, manifest) or mod.dashboard_problem(
+            pid, root, python=manifest.get("python"), terminals=terminals)
+        return (why
+                or mod.code_after_start(pid, root, path))
     except Exception as e:  # noqa: BLE001
         return "the process check failed (%s)" % type(e).__name__
 
@@ -317,6 +341,13 @@ def code_problem(root, mod=None):
     mod = mod or _procs()
     if mod is None:
         return "cc_procs.py is not next to this hook (run cc-update-project)"
+    manifest, why = read_manifest(mod)
+    return why or mod.manifest_problem(root, manifest)
+
+
+def read_manifest(mod):
+    """(cc_dash_manifest.json beside this hook as a dict, '') or (None, why not):
+    only a plain file we own that nobody else can write counts."""
     raw = None
     p = os.path.join(os.path.dirname(os.path.realpath(__file__)), getattr(mod, "MANIFEST_NAME", "cc_dash_manifest.json"))
     try:
@@ -334,8 +365,8 @@ def code_problem(root, mod=None):
     except ValueError:
         manifest = None
     if not isinstance(manifest, dict):
-        return "no cc_dash_manifest.json beside this hook (run cc-update-project)"
-    return mod.manifest_problem(root, manifest)
+        return None, "no cc_dash_manifest.json beside this hook (run cc-update-project)"
+    return manifest, ""
 
 
 def is_cc_dash(pid):
@@ -399,33 +430,51 @@ def answered_by(pid, port, my_port):
     return str(pid) in out.split()
 
 
-def verify(ls, **query):
-    """cc-dash's own record for a file we are about to act on, or None.
-
-    Asks GET /api/control/verify on the lease's port, and believes the answer
-    only when the socket that sent it belongs to the lease's pid."""
+def ask_dashboard(ls, method, path, body=None):
+    """cc-dash's JSON answer to `method path` on the lease's port, with the
+    lease's per-launch key, or None. Believed only when the socket that answered
+    belongs to the lease's pid, and that pid is (still) the cc-dash this hook
+    trusts; and only an {"ok": true} answer."""
     import http.client
-    from urllib.parse import urlencode
     port, pid, key = ls.get("port"), ls.get("pid"), ls.get("key")
     if not isinstance(port, int) or not 0 < port < 65536 or not isinstance(pid, int) or not isinstance(key, str) or not key:
         return None
     if not is_cc_dash(pid):                # checked again now, not only when the lease was read
         return None
+    headers = {"Host": "127.0.0.1:%d" % port, "X-CC-Dash-Lease": key}
+    data = None
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
+        headers["Content-Type"] = "application/json"
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=VERIFY_TIMEOUT)
     try:
-        c.request("GET", "/api/control/verify?" + urlencode({k: v for k, v in query.items() if v is not None}),
-                  headers={"Host": "127.0.0.1:%d" % port, "X-CC-Dash-Lease": key})
+        c.request(method, path, body=data, headers=headers)
         r = c.getresponse()
-        body = r.read(65536)
+        raw = r.read(65536)
         # Checked while the connection is still open, so the server's end is in its fd table.
         if r.status != 200 or not answered_by(pid, port, c.sock.getsockname()[1]):
             return None
-        d = json.loads(body)
+        d = json.loads(raw)
     except (OSError, ValueError, http.client.HTTPException, AttributeError):
         return None
     finally:
         c.close()
     return d if isinstance(d, dict) and d.get("ok") is True else None
+
+
+def verify(ls, **query):
+    """cc-dash's own record for a file we are about to act on, or None: GET
+    /api/control/verify (ask_dashboard)."""
+    from urllib.parse import urlencode
+    return ask_dashboard(ls, "GET", "/api/control/verify?" + urlencode({k: v for k, v in query.items() if v is not None}))
+
+
+def send_request(ls, req):
+    """Hand the request to cc-dash directly: POST /api/control/request (ask_dashboard).
+    cc-dash shows only what arrives this way, from a socket this very process
+    owns, so rewriting a file cannot change what the card shows. True when
+    cc-dash took it."""
+    return ask_dashboard(ls, "POST", "/api/control/request", req) is not None
 
 
 # ── what a call is (kept in step with attention.py and lib/cc_dash/control.py) ─
@@ -1149,7 +1198,12 @@ def permission_request(d, ctl, ls):
     import signal
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda *_: sys.exit(0))   # killed (terminal "No", or the timeout): still clean up
-    held = write_private(req_path, req, keep=True)     # open until we exit: cc-dash checks we hold this inode
+    # The content goes to cc-dash over the keyed, owner-checked channel, never through a file.
+    # cc-dash unreachable or refusing: the prompt stays in the terminal, as with no dashboard.
+    if not send_request(ls, req):
+        return
+    # req/<id>.json is only a doorbell (the id): cc-dash shows it while this file is here.
+    held = write_private(req_path, {"v": 2, "id": rid}, keep=True)
     res = {"v": 1, "id": rid, "session": req["session"], "agent_id": req["agent_id"], "outcome": "terminal"}
     watch = Resolution(d, started)
     try:

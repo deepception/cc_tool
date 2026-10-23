@@ -137,11 +137,20 @@ class Srv:
     def fake_request(self, ti=None):
         ti = ti or {"command": "rm -rf build"}
         rid = "%x-%s" % (int(time.time() * 1000), os.urandom(6).hex())
-        req = {"v": 1, "id": rid, "ts": time.time(), "session": SID, "agent_id": None, "cwd": self.cwd, "tool": "Bash",
-               "kind": "permission", "sig": ti.get("command", ""), "hash": os.urandom(32).hex(), "input": ti, "guard": "",
-               "ask_rule": "", "session_rules": [], "deadline": time.time() + 300}
+        req = {"v": 1, "id": rid, "ts": time.time(), "pid": os.getpid(), "session": SID, "agent_id": None, "cwd": self.cwd,
+               "tool": "Bash", "kind": "permission", "sig": ti.get("command", ""), "hash": os.urandom(32).hex(), "input": ti,
+               "guard": "", "ask_rule": "", "session_rules": [], "deadline": time.time() + 300}
+        # As the hook does: handed over with the lease key, then the doorbell (the id only).
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("POST", "/api/control/request", body=json.dumps(req).encode(),
+                  headers={"Host": "127.0.0.1:%d" % self.port, "X-CC-Dash-Lease": self.ctl.key, "Content-Type": "application/json"})
+        resp = c.getresponse()
+        resp.read()
+        st = resp.status
+        c.close()
+        assert st == 200, st
         fd = os.open(self.path("req", rid + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.write(fd, json.dumps(req).encode())
+        os.write(fd, json.dumps({"v": 2, "id": rid}).encode())
         os.close(fd)
         self.ctl.scan()
         return req
@@ -150,6 +159,24 @@ class Srv:
         self.ctl.stop()
         self.srv.shutdown()
         self.srv.server_close()
+
+
+# The terminal hosts the fake /proc tests record (cc_procs.terminal_problem's allowlist).
+FAKE_TERMINALS = [{"path": "/usr/libexec/gnome-terminal-server"}]
+
+
+def fake_master(d, index):
+    """In a fake /proc/<pid> d: a /dev/ptmx fd whose fdinfo names pty `index`, as a terminal
+    emulator's master looks (cc_procs.terminal_problem)."""
+    os.makedirs(os.path.join(d, "fd"), exist_ok=True)
+    os.makedirs(os.path.join(d, "fdinfo"), exist_ok=True)
+    if not os.path.exists(os.path.join(d, "environ")):
+        with open(os.path.join(d, "environ"), "wb") as fh:
+            fh.write(b"HOME=/h\0PATH=/usr/bin\0")
+    if not os.path.lexists(os.path.join(d, "fd", "9")):
+        os.symlink("/dev/ptmx", os.path.join(d, "fd", "9"))
+    with open(os.path.join(d, "fdinfo", "9"), "w") as fh:
+        fh.write("pos:\t0\nflags:\t0100002\nmnt_id:\t29\nino:\t90\ntty-index:\t%d\n" % index)
 
 
 def plant(path, obj):
@@ -413,7 +440,7 @@ def test_launch_refusals():
         # The same program check as the hook: a pid that IS cc-dash from this checkout
         # (fake /proc: python -I <repo>/bin/cc-dash, clean environment, a terminal shell parent).
         lp = os.path.join(BASE, "leaseproc")
-        for pid, comm, ppid, argv, exe in ((sleeper.pid, "python3", 70, ["python3", "-I", os.path.join(REPO, "bin", "cc-dash"), "--control"], PY),
+        for pid, comm, ppid, argv, exe in ((sleeper.pid, "python3", 70, [PY, "-I", os.path.join(REPO, "bin", "cc-dash"), "--control"], PY),
                                            (70, "zsh", 60, ["zsh"], "/usr/bin/zsh"),
                                            (60, "gnome-terminal-", 1, ["gnome-terminal-server"], "/usr/libexec/gnome-terminal-server")):
             os.makedirs(os.path.join(lp, str(pid)), exist_ok=True)
@@ -425,8 +452,10 @@ def test_launch_refusals():
                 fh.write(b"HOME=/h\0PATH=/usr/bin\0")
             os.symlink(exe, os.path.join(lp, str(pid), "exe"))
             os.symlink(REPO, os.path.join(lp, str(pid), "cwd"))
+            if pid == 60:                  # the terminal emulator holds the master of /dev/pts/0 (tty_nr 34816)
+                fake_master(os.path.join(lp, str(pid)), 0)
         plant_lease(sleeper.pid)
-        why = server_mod.control_refusal(d, proc=lp, env={}, ancestors=[])
+        why = server_mod.control_refusal(d, proc=lp, env={}, ancestors=[], terminals=FAKE_TERMINALS)
         check("a live lease held by a real cc-dash of this checkout: takeover refused", "holds the control lease" in why, why)
     finally:
         sleeper.kill()
@@ -460,6 +489,8 @@ def test_launch_refusals():
         if os.path.lexists(link):
             os.unlink(link)
         os.symlink(exe, link)
+        if pid == 110:                     # the terminal emulator holds the master of /dev/pts/0 (tty_nr 34816)
+            fake_master(os.path.join(fp, str(pid)), 0)
 
     def build(sid_leader_parent, me_tty=34816, me_pgrp=300, me_sid=200, me_ppid=50):
         shutil.rmtree(fp, ignore_errors=True)
@@ -470,27 +501,27 @@ def test_launch_refusals():
         proc(300, "bash", 200, 300, 200, 34816, ["bash"], "/usr/bin/bash")
         proc(400, "python3", me_ppid, me_pgrp, me_sid, me_tty, ["python3", "cc-dash", "--control"], "/usr/bin/python3")
     build(sid_leader_parent=100)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
     check("fake /proc: a clean parent chain but a session leader that descends from claude: refused",
           "session leader descends from process 100" in why, why)
     build(sid_leader_parent=110, me_sid=400, me_pgrp=300)
     proc(300, "bash", 100, 300, 300, 34816, ["bash"], "/usr/bin/bash")
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
     check("fake /proc: a process-group leader that descends from claude: refused", "process-group leader descends" in why, why)
     build(sid_leader_parent=110, me_tty=0, me_sid=400, me_pgrp=400)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
     check("fake /proc: re-parented to the user manager with no controlling terminal: refused",
           "must be started from your own terminal" in why, why)
     # What `ccdash` really does (measured): own process group, the shell's session,
     # re-parented to the user manager, the terminal still open.
     build(sid_leader_parent=110, me_sid=200, me_pgrp=400)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
     check("fake /proc: detached into its own process group, shell's session, terminal open (what `ccdash` does): allowed", why == "", why)
     build(sid_leader_parent=110, me_sid=400, me_pgrp=400)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
     check("fake /proc: leads a fresh session (setsid) and was re-parented: refused", "leads a fresh session" in why, why)
     build(sid_leader_parent=110, me_ppid=300)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
     check("fake /proc: started from a terminal shell, leaders clean: allowed", why == "", why)
 
 
@@ -516,20 +547,29 @@ def test_card_binding_with_real_hook():
             for n in os.listdir(s.path("req")):
                 if n.endswith(".json"):
                     path = s.path("req", n)
-                    req = json.load(open(path))
+                    with s.ctl.lock:
+                        r = s.ctl.requests.get(n[:-5])
+                        req = dict(r) if r is not None else None
             time.sleep(0.03)
-        check("binding: the hook wrote its request", req is not None)
-        # An agent rewrites the request before cc-dash reads it: benign text, same id and hash.
-        forged = dict(req, input={"command": "ls"}, sig="ls")
+        check("binding: the hook handed its request over and rang the doorbell", req is not None)
+        # An agent rewrites the request file while the hook waits: benign text, same id and hash.
+        # The file is only a doorbell; the card shows what the hook handed over, unchanged.
+        forged = dict(req, input={"command": "ls"}, sig="ls", status=None, seen_at=None)
         os.unlink(path)
         plant(path, forged)
         s.ctl.scan()
         shown = next(x for x in s.req("GET", "/api/control/state", token=tok)[1]["requests"] if x["id"] == req["id"])
-        check("binding: the dashboard shows the forged text", shown["input"] == {"command": "ls"}, shown["input"])
+        check("N2 binding: rewriting the waiting request file changes nothing shown (the real command, still open)",
+              shown["input"] == {"command": "git push --force origin main"} and shown["status"] == "open", shown)
+        # A card digest that is not the hook's (as if the card had shown other content) still cannot borrow
+        # an approval: the hook checks the digest of what it handed over.
+        with s.ctl.lock:
+            s.ctl.requests[req["id"]]["input"] = {"command": "ls"}
         st, out = s.req("POST", "/api/control/decide", {"id": req["id"], "action": "allow", "hash": req["hash"], "confirm": "approve"},
                         token=ctok)   # bash-guard refuses this command, so the card asks for the typed approve
         time.sleep(1.0)
-        check("binding: the approval of the forged card is not applied to the real call", st == 200 and p.poll() is None, (st, p.poll()))
+        check("binding: the approval of a card showing other content is not applied to the real call", st == 200 and p.poll() is None,
+              (st, p.poll()))
         # Only `sig`, the one-line summary, rewritten: the card does not show it (it shows the input,
         # and an alert row's text comes from the input too), so it is not in the digest, and the
         # card a human approves still shows the real call.
@@ -551,29 +591,58 @@ def test_card_binding_with_real_hook():
 
 # ── a real cc-dash --control process ───────────────────────────────────────
 def _env(root):
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "XDG_STATE"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "XDG_STATE", "ELECTRON_", "NODE_OPTIONS"))}
     env.update(HOME=os.path.join(root, "home"), XDG_STATE_HOME=os.path.join(root, "state"), CLAUDE_CONFIG_DIR=make_cfg(root),
                PYTHONDONTWRITEBYTECODE="1")
     os.makedirs(env["HOME"], exist_ok=True)
+    # As cc-update-project run from the terminal leaves it: a registered project whose manifest
+    # records the terminal host: the compiled terminal program LAUNCHER runs for a "pty:" tty.
+    proj = os.path.join(root, "proj")
+    os.makedirs(os.path.join(proj, ".claude", "hooks"), exist_ok=True)
+    with os.fdopen(os.open(os.path.join(proj, ".claude", "hooks", "cc_dash_manifest.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
+        json.dump({"terminal_hosts": [{"path": relay_program() or "/nonexistent/relayterm"}]}, fh)
+    os.makedirs(os.path.join(env["XDG_STATE_HOME"], "cc_tool"), mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(env["XDG_STATE_HOME"], "cc_tool", "projects.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, json.dumps({"v": 1, "projects": [proj]}).encode())
+    os.close(fd)
     return env
 
 
 # Starts cc-dash detached from this process tree, as a terminal would: the
 # launcher forks, exits, and the child (reparented away from us) becomes a
-# session leader whose controlling terminal is the given pty ("-": none).
-# cc-dash --control refuses to start under a Claude Code process, and these
-# tests may themselves run under one.
+# session leader whose controlling terminal is the given tty ("-": none), with
+# cc-dash as its child. "pty:<file>": instead, a compiled terminal program
+# (tests/pty_relay.py; cc-dash shows its code only on a terminal held by a
+# recorded terminal program, never by an interpreter) opens the pseudo-terminal,
+# holds its master and copies what is written there to <file>; cc-dash leads its
+# session on it. cc-dash --control refuses to start under a Claude Code process,
+# or on a terminal whose master a Claude Code process holds, and these tests may
+# themselves run under one: so the master is never held by the test process.
 LAUNCHER = r"""
-import os, sys
-tty, log, pidw = sys.argv[1], sys.argv[2], int(sys.argv[3]); cmd = sys.argv[4:]
+import os, subprocess, sys
+tty, log, pidw, relay, keep = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]; cmd = sys.argv[6:]
+keep = [int(x) for x in keep.split(",") if x]
 if os.fork():
     os._exit(0)
 os.setsid()
+lf = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+if tty.startswith("pty:"):
+    nul = os.open(os.devnull, os.O_RDWR)
+    os.dup2(nul, 0)
+    os.dup2(lf, 1); os.dup2(lf, 2)
+    with open(tty[4:], "ab", buffering=0) as out:
+        # cc-dash's stdout and stderr go to the log, as `ccdash` sends them; the terminal stays its tty.
+        p = subprocess.Popen([relay, "50", "160", "/bin/sh", "-c", 'exec "$@" >>"$0" 2>&1', log] + cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.PIPE,
+                             pass_fds=keep)
+    os.write(pidw, (p.stderr.readline().strip() or b"0")); os.close(pidw)
+    for n in keep:                     # the launcher holds no extra fds (e.g. the --ready-fd pipe)
+        os.close(n)
+    p.wait()
+    os._exit(0)
 fd = os.open(tty if tty != "-" else os.devnull, os.O_RDWR)
 os.dup2(fd, 0)
-lf = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 os.dup2(lf, 1); os.dup2(lf, 2)
-# Like a terminal: a "shell" leads the session and owns the pty, cc-dash runs as its child.
+# Like a terminal: a "shell" leads the session and owns the tty, cc-dash runs as its child.
 child = os.fork()
 if child:
     os.write(pidw, str(child).encode()); os.close(pidw)
@@ -585,12 +654,21 @@ if child:
 os.close(pidw)
 os.execvpe(cmd[0], cmd, os.environ)
 """
+_RELAY = []
+
+
+def relay_program():
+    """The compiled terminal program (tests/pty_relay.py), built once; None without a C compiler."""
+    if not _RELAY:
+        from pty_relay import build_relay
+        _RELAY.append(build_relay(os.path.join(BASE, "relay", "relayterm")))
+    return _RELAY[0]
 
 
 def _launch_detached(cmd, env, log, tty="-", keep=()):
     pr, pw = os.pipe()
-    subprocess.run([PY, "-c", LAUNCHER, tty, log, str(pw)] + cmd, env=env, pass_fds=(pw,) + tuple(keep),
-                   timeout=30, check=True)
+    subprocess.run([PY, "-c", LAUNCHER, tty, log, str(pw), relay_program() or "-", ",".join(str(k) for k in keep)] + cmd,
+                   env=env, pass_fds=(pw,) + tuple(keep), timeout=30, check=True)
     os.close(pw)
     pid = int(os.read(pr, 32) or b"0")
     os.close(pr)
@@ -620,20 +698,17 @@ def _stop(pid):
         time.sleep(0.1)
 
 
-def _read_pty(fd, secs, until=None):
+def _read_term(path, secs, until=None):
+    """What has been written to a "pty:<path>" terminal (LAUNCHER), within secs or until until(out)."""
     out, end = b"", time.time() + secs
     while time.time() < end:
-        r, _, _ = select.select([fd], [], [], 0.1)
-        if r:
-            try:
-                b = os.read(fd, 4096)
-            except OSError:
-                break
-            if not b:
-                break
-            out += b
-            if until and until(out):
-                break
+        try:
+            out = open(path, "rb").read()
+        except OSError:
+            out = b""
+        if until and until(out):
+            break
+        time.sleep(0.1)
     return out
 
 
@@ -652,17 +727,19 @@ def _scan_tree(root, needles):
 
 
 def test_real_process_code_never_on_disk():
+    if relay_program() is None:
+        check("real cc-dash --control: no C compiler for the terminal program (tests/pty_relay.py); skipped", True)
+        return
     root = os.path.join(BASE, "proc")
     env = _env(root)
     log = os.path.join(root, "cc-dash.log")
-    master, slave = os.openpty()
+    tty1 = os.path.join(root, "tty1.out")
     rfd, wfd = os.pipe()
     pid = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0", "--ready-fd", str(wfd)],
-                           env, log, tty=os.ttyname(slave), keep=(wfd,))
-    os.close(slave)
+                           env, log, tty="pty:" + tty1, keep=(wfd,))
     os.close(wfd)
     try:
-        term = _read_pty(master, 20, until=lambda b: CODE_RE.search(b.decode("utf-8", "replace")) is not None)
+        term = _read_term(tty1, 20, until=lambda b: CODE_RE.search(b.decode("utf-8", "replace")) is not None)
         m = CODE_RE.search(term.decode("utf-8", "replace"))
         code = m.group(1) if m else ""
         check("real cc-dash --control: the control code is written to its terminal", bool(code), term[-300:])
@@ -705,36 +782,34 @@ def test_real_process_code_never_on_disk():
             check("the code from the terminal unlocks control", st3 == 200 and out3.get("scope") == "control", (st3, out3))
         # A second control-mode cc-dash (an agent's, say) cannot take the lease over.
         log2 = os.path.join(root, "second.log")
-        m2, s2 = os.openpty()
-        pid2 = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0"], env, log2, tty=os.ttyname(s2))
-        os.close(s2)
-        term2 = _read_pty(m2, 15)
+        tty2 = os.path.join(root, "tty2.out")
+        pid2 = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0"], env, log2, tty="pty:" + tty2)
+        end = time.time() + 20
+        while time.time() < end and _alive(pid2):
+            time.sleep(0.1)
+        term2 = _read_term(tty2, 1)
         end = time.time() + 20
         while time.time() < end and _alive(pid2):
             time.sleep(0.1)
         out2 = open(log2, "rb").read()
         check("a second cc-dash --control while one holds a live lease: refused, no code shown",
               not _alive(pid2) and b"holds the control lease" in out2 and not CODE_RE.search(term2.decode("utf-8", "replace")), (out2[-300:], term2[-200:]))
-        os.close(m2)
         lease = json.load(open(os.path.join(env["XDG_STATE_HOME"], "cc_tool", "control", "lease")))
         check("the first dashboard still holds the lease", lease.get("pid") == pid, lease.get("pid"))
     finally:
         _stop(pid)
-        os.close(master)
         os.close(rfd)
 
     # Under a Claude Code shell (CLAUDECODE=1): refused, whatever the terminal.
     root3 = os.path.join(BASE, "incc")
     env3 = dict(_env(root3), CLAUDECODE="1")
     log3 = os.path.join(root3, "cc-dash.log")
-    m3, s3 = os.openpty()
-    pid3 = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0"], env3, log3, tty=os.ttyname(s3))
-    os.close(s3)
-    term3 = _read_pty(m3, 10)
+    tty3 = os.path.join(root3, "tty3.out")
+    pid3 = _launch_detached([PY, CC_DASH, "--control", "--no-open", "--port", "0"], env3, log3, tty="pty:" + tty3)
     end = time.time() + 20
     while time.time() < end and _alive(pid3):
         time.sleep(0.1)
-    os.close(m3)
+    term3 = _read_term(tty3, 1)
     check("CLAUDECODE=1: cc-dash --control refuses to start, no code shown", b"not from inside a Claude Code session" in open(log3, "rb").read()
           and not CODE_RE.search(term3.decode("utf-8", "replace")), open(log3, "rb").read()[-200:])
 

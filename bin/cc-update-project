@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # cc-update-project: Update cc_tool-managed files (hooks, skills, permissions deny-list)
 # in an existing project. For first-time setup use cc-setup. For external deps use cc-update.
-# Usage: cc-update-project [project_path]
+# Usage: cc-update-project [project_path] [--reset-terminals]
+#   --reset-terminals  replace the recorded terminal hosts (control mode) with this terminal's
 set -euo pipefail
 
 CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROJECT_DIR="${1:-$(pwd)}"
+SETUP_FLAGS=()
+PROJECT_DIR=""
+for a in "$@"; do
+    case "$a" in
+        --reset-terminals) SETUP_FLAGS+=("$a") ;;
+        -*) echo "Unknown flag: $a" >&2; exit 1 ;;
+        *) PROJECT_DIR="$a" ;;
+    esac
+done
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 PROJECT_DIR="$(realpath "$PROJECT_DIR")"
 
 if [[ ! -f "$PROJECT_DIR/.claude/settings.json" ]]; then
@@ -18,7 +28,7 @@ fi
 echo "Updating cc_tool-managed files in: $PROJECT_DIR"
 echo ""
 echo "=== Step 1: refresh hooks and skills ==="
-"$CC_TOOL_DIR/bin/cc-setup" "$PROJECT_DIR"
+"$CC_TOOL_DIR/bin/cc-setup" "$PROJECT_DIR" ${SETUP_FLAGS[@]+"${SETUP_FLAGS[@]}"}
 
 echo ""
 echo "=== Step 2: merge new deny entries ==="

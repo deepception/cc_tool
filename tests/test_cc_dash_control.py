@@ -152,9 +152,19 @@ class Srv:
         req = {"v": 1, "id": rid, "ts": time.time(), "pid": os.getpid(), "session": SID, "agent_id": agent, "cwd": self.cwd,
                "tool": tool, "kind": kind, "sig": ti.get("command", ""), "hash": os.urandom(32).hex(), "input": ti,
                "guard": guard, "ask_rule": ask_rule, "session_rules": rules or [], "deadline": time.time() + 300}
+        # As the hook does: handed over with the lease key (POST /api/control/request), then
+        # the doorbell req/<id>.json holding only the id.
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        c.request("POST", "/api/control/request", body=json.dumps(req).encode(),
+                  headers={"Host": "127.0.0.1:%d" % self.port, "X-CC-Dash-Lease": self.ctl.key, "Content-Type": "application/json"})
+        resp = c.getresponse()
+        resp.read()
+        st = resp.status
+        c.close()
+        assert st == 200, st
         p = self.path("req", rid + ".json")
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.write(fd, json.dumps(req).encode())
+        os.write(fd, json.dumps({"v": 2, "id": rid}).encode())
         os.close(fd)
         self.ctl.scan()
         return req

@@ -13,18 +13,23 @@ checks that the answer came from the process the lease names (the socket's
 owner in /proc). A planted file without a matching record does nothing, and
 files this launch did not issue are not shown either. A decision is also bound
 to what the card showed (a digest of every field the card renders: tool,
-input, cwd, flags, session rules, MCP server), so a request file rewritten
-under the dashboard's eyes cannot borrow an approval.
+input, cwd, flags, session rules, MCP server), so an approval can only ever
+apply to the very request it was given for.
 
-Requests. A req/ file is shown only while the process it names (`pid`) is a
-dash-control.py hook installed from this checkout: /proc/<pid>/exe a Python
-interpreter running exactly <project>/.claude/hooks/dash-control.py (the
-project from that process's own CLAUDE_PROJECT_DIR), whose cc_tool_root names
-this checkout, holding that very file open, from a project cc-setup registered
-in projects.json (procs.hook_problem). Anything else is a
-planted card (one could ask for the control code): it is not shown, and the
-audit log records it. Text sent from the dashboard (deny reasons, answers,
-messages) that contains the control code is refused by the server.
+Requests. The hook hands its request over directly: POST /api/control/request
+with the lease key (receive_request). It is taken only from a socket owned by
+the process the request names (`pid`; the server finds the socket's owner in
+/proc), and only while that process is a dash-control.py hook installed from
+this checkout: /proc/<pid>/exe a Python interpreter running exactly
+<project>/.claude/hooks/dash-control.py (the project from that process's own
+CLAUDE_PROJECT_DIR), whose cc_tool_root names this checkout, from a project
+cc-setup registered in projects.json (procs.hook_problem). A req/<id>.json file
+is only a doorbell: the card is shown while it exists, but its content is never
+read, so rewriting it changes nothing shown. A doorbell with no handed-over
+request, or a request from anything but a hook, is a planted card (one could
+ask for the control code): it is not shown, and the audit log records it. Text
+sent from the dashboard (deny reasons, answers, messages) that contains the
+control code is refused by the server.
 
 The lease. A 0700 directory ${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/
 holds a 0600 `lease` (pid, launch id, expiry ~6 s ahead, the hook's wait)
@@ -32,8 +37,9 @@ rewritten every 2 s. templates/hooks/dash-control.py does nothing unless the
 lease is fresh and its pid alive, so a stopped or crashed dashboard releases
 every waiting hook within seconds.
 
-Permission prompts (also questions and plans). The hook writes req/<id>.json,
-with a sha256 of tool + canonical input, and polls dec/<id>.json; decide()
+Permission prompts (also questions and plans). The hook hands over the request,
+with a sha256 of tool + canonical input, rings req/<id>.json, and polls
+dec/<id>.json; decide()
 writes the decision there by atomic rename, carrying that hash, and the hook's
 outcome comes back in res/<id>.json (applied, terminal, released, lease,
 timeout). A request that bash-guard asked about (the hook runs bash-guard's
@@ -95,6 +101,7 @@ KEEP_RESOLVED = 600.0          # resolved requests stay in the state for the UI 
 MSG_TTL = 24 * 3600.0          # queued or delivered messages older than this are dropped
 STOP_TTL = 600.0               # a stop with no tool call to land on expires
 MAX_BODY = 64 * 1024
+MAX_REQUEST_BODY = 1024 * 1024  # POST /api/control/request: the hook copies up to 256 KB of tool input
 MAX_TEXT = 8000
 MAX_REASON = 4000
 RATE_N, RATE_SECS = 6, 10.0    # at most this many approvals per client in this window
@@ -451,6 +458,44 @@ class Control:
         d = read_json(os.path.join(os.path.dirname(self.dir), "projects.json"), 1 << 20) or {}
         return {os.path.realpath(p) for p in d.get("projects") or [] if isinstance(p, str) and os.path.isabs(p)}
 
+    # Every field a request may carry, as dash-control.py sends it; anything else is dropped.
+    REQUEST_KEYS = ("v", "id", "ts", "pid", "session", "agent_id", "agent_type", "cwd", "transcript", "tool", "kind", "sig",
+                    "hash", "input", "input_truncated", "mode", "deadline", "guard", "ask_rule", "session_rules", "server")
+
+    def receive_request(self, body, peer_pid=None):
+        """(http status, response) for POST /api/control/request: the hook hands over
+        the request it waits on. The only way a request reaches a card: req/ files
+        are doorbells, and their content is never read, so rewriting one changes
+        nothing shown. With the hook check on (Linux), `peer_pid` (the process
+        that owns the connecting socket, found by the server) must be the pid the
+        request names, and that process a dash-control.py hook installed from this
+        checkout for a registered project (procs.hook_problem); anything else is
+        refused and audited. Each request id is taken once."""
+        rid = body.get("id")
+        if not isinstance(rid, str) or not REQ_ID.match(rid) or not isinstance(body.get("session"), str) \
+                or not isinstance(body.get("hash"), str) or body.get("kind") not in DECIDE_ACTIONS:
+            return 400, {"ok": False, "error": "Not a request."}
+        now = self.clock()
+        if self.hook_check:
+            pid = body.get("pid")
+            why = "the connecting socket does not belong to process %s, which the request names" % pid \
+                if peer_pid is None or peer_pid != pid else procs.hook_problem(pid, self.root, projects=self.projects())
+            if why:
+                with self.lock:
+                    self.planted[rid] = now
+                self.log(None, "refused", kind="req", item=rid, session=body["session"][:100] or None,
+                         tool=_str(body.get("tool"), 100) or None,
+                         result="a request no dash-control hook sent was not shown (%s)" % why)
+                return 403, {"ok": False}
+        d = {k: body[k] for k in self.REQUEST_KEYS if k in body}
+        d["session"] = d["session"][:100]
+        with self.lock:
+            if rid in self.requests or rid in self.planted:
+                return 409, {"ok": False, "error": "That request id is taken."}
+            d.update(status="open", seen_at=now)
+            self.requests[rid] = d
+        return 200, {"ok": True}
+
     def _scan_requests(self, now):
         req_dir, res_dir = os.path.join(self.dir, "req"), os.path.join(self.dir, "res")
         present = set()
@@ -463,24 +508,16 @@ class Control:
             present.add(rid)
             if rid in self.requests:
                 r = self.requests[rid]
+                r.pop("gone_at", None)
                 if r["status"] == "open" and self.hook_check and not procs.proc_stat(r.get("pid") or 0):
                     present.discard(rid)   # its hook is gone: closed below after the grace period
                 continue
-            d, ident = read_json_ident(os.path.join(req_dir, n))
-            if d is None or d.get("id") != rid or not isinstance(d.get("session"), str) or not isinstance(d.get("hash"), str):
-                continue
-            # The hook keeps the file it wrote open while it waits: the very inode read here.
-            why = procs.hook_problem(d.get("pid"), self.root, ident=ident, projects=self.projects()) if self.hook_check else ""
-            if why:
-                present.discard(rid)
-                self.planted[rid] = now
-                self.log(None, "refused", kind="req", item=rid, session=d.get("session")[:100] or None,
-                         tool=_str(d.get("tool"), 100) or None,
-                         result="a request file no dash-control hook wrote was not shown (%s)" % why)
-                continue
-            d["status"] = "open"
-            d["seen_at"] = now
-            self.requests[rid] = d
+            # A doorbell with no request handed over by its hook (which sends the request
+            # before it writes the doorbell): planted. Its content is never read.
+            present.discard(rid)
+            self.planted[rid] = now
+            self.log(None, "refused", kind="req", item=rid,
+                     result="a request file with no request from a dash-control hook behind it was not shown")
         for rid in [k for k, t in self.planted.items() if now - t > KEEP_RESOLVED]:
             del self.planted[rid]
         results = {}
@@ -494,10 +531,8 @@ class Control:
                 results[rid] = d
         for rid, res in results.items():
             r = self.requests.get(rid)
-            if r is None:          # opened and closed between two scans
-                r = self.requests[rid] = {"id": rid, "session": res.get("session") or "", "agent_id": res.get("agent_id"),
-                                          "kind": "permission", "tool": "", "input": {}, "ts": res.get("ts") or now,
-                                          "status": "open", "seen_at": now}
+            if r is None:          # no hook handed this request over: nothing to close
+                continue
             self._resolve(r, res.get("outcome") or "closed", res.get("ts") or now)
         for rid, r in list(self.requests.items()):
             if r["status"] in ("open", "sent") and rid not in present and rid not in results:

@@ -16,8 +16,10 @@ whose POSTs need a control-scoped token (POST /api/control/unlock with the
 control code cc-dash wrote to its terminal), Content-Type application/json and
 an Origin equal to the dashboard's own. GET /api/control/verify is the hook's
 question ("did the dashboard send this?"); it carries no token, answers only a
-socket owned by this user, and confirms only what this launch issued. Without
---control those paths are 404 and every POST but /api/pair is 405.
+socket owned by this user, and confirms only what this launch issued. POST
+/api/control/request is the hook handing over the request it waits on: same
+gate, and the hook process the request names must own the connecting socket.
+Without --control those paths are 404 and every POST but /api/pair is 405.
 """
 import argparse
 import errno
@@ -33,8 +35,8 @@ from urllib.parse import parse_qs, urlsplit
 from . import attention
 from . import procs
 from . import plans   # plan progress (/api/plans)
-from .auth import Auth, local_pairing_supported, same_user
-from .control import MAX_BODY, Control
+from .auth import Auth, local_pairing_supported, peer_inode, same_user
+from .control import MAX_BODY, MAX_REQUEST_BODY, Control
 from .docs import Docs, DocsError
 from .store import Store, config_dir
 from .parser import tilde
@@ -228,14 +230,14 @@ class Handler(BaseHTTPRequestHandler):
         p = eng.detail(q.get("project", "")[:200], q.get("path", "")[:1024], al)
         return self._json(200, p) if p else self._json(404, {"error": "No plan at that path in that project."})
 
-    def _read_body(self):
+    def _read_body(self, limit=MAX_BODY):
         """The JSON object body, or (status, error) when there is none."""
         try:
             n = int(self.headers.get("Content-Length") or "-1")
         except ValueError:
             n = -1
-        if n < 0 or n > MAX_BODY:
-            return None, (413 if n > MAX_BODY else 411, {"error": "Body missing or too large."})
+        if n < 0 or n > limit:
+            return None, (413 if n > limit else 411, {"error": "Body missing or too large."})
         try:
             body = json.loads(self.rfile.read(n) or b"null")
         except ValueError:
@@ -287,6 +289,30 @@ class Handler(BaseHTTPRequestHandler):
         code, out = ctl.verify(q)
         return self._json(code, out)
 
+    def _request(self, ctl):
+        """POST /api/control/request: a dash-control.py hook hands over the permission
+        request it waits on. The only way a request reaches a card (a req/ file is
+        a doorbell). Same gate as _verify (the lease key, a socket of this user),
+        and the process the request names must own the connecting socket
+        (/proc/net/tcp inode -> /proc/<pid>/fd); control.receive_request then checks
+        that process is a hook installed from this checkout."""
+        import hmac
+        key = self.headers.get("X-CC-Dash-Lease") or ""
+        if not key or not hmac.compare_digest(key, ctl.key):
+            return self._json(403, {"ok": False})
+        if local_pairing_supported() and not same_user(self.client_address, self.server.port):
+            return self._json(403, {"ok": False})
+        body, err = self._read_body(MAX_REQUEST_BODY)
+        if err:
+            return self._json(*err)
+        peer = None
+        if local_pairing_supported():
+            inode = peer_inode(self.client_address, self.server.port)
+            pid = body.get("pid")
+            peer = pid if inode and isinstance(pid, int) and procs.holds_socket(pid, inode) else None
+        code, out = ctl.receive_request(body, peer_pid=peer)
+        return self._json(code, out)
+
     def _unlock(self, auth):
         """POST /api/control/unlock {"code"}: the control code from cc-dash's terminal
         buys a control-scoped token (auth.py)."""
@@ -324,6 +350,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._pair_local(auth)
         if path == "/api/control/unlock" and ctl is not None and auth is not None:
             return self._unlock(auth)
+        if path == "/api/control/request" and ctl is not None:     # the hook's handover, no token (see _request)
+            return self._request(ctl)
         if ctl is None or auth is None or path not in self.POSTS:
             return self._no_body()
         why = auth.check_write(self.headers, (self.headers.get("Host") or "").strip().lower())
@@ -450,7 +478,67 @@ _is_claude = procs.is_claude
 CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 
-def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=None, root=None, note=None):
+def read_manifest(path, limit=1 << 20):
+    """(manifest dict, '') read the way the control hook reads its own: opened
+    without following a symlink, a plain file we own that nobody else can write,
+    under `limit` bytes; else (None, why not)."""
+    import stat as stat_mod
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None, ""
+    except OSError as e:
+        return None, "cannot be opened safely (%s)" % (e.strerror or type(e).__name__)
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            return None, "is not a plain file"
+        if st.st_uid != os.getuid():
+            return None, "is not yours"
+        if st.st_mode & 0o022:
+            return None, "can be written by others"
+        if st.st_size >= limit:
+            return None, "is too large"
+        raw = os.read(fd, limit)
+    except OSError as e:
+        return None, "cannot be read (%s)" % (e.strerror or type(e).__name__)
+    finally:
+        os.close(fd)
+    try:
+        m = json.loads(raw)
+    except ValueError:
+        return None, "is not JSON"
+    return (m, "") if isinstance(m, dict) else (None, "is not a JSON object")
+
+
+def recorded_terminals(state=None, unsafe=None):
+    """The terminal hosts cc-setup recorded for any project it registered (the
+    terminal_hosts of each <project>/.claude/hooks/cc_dash_manifest.json listed
+    in projects.json): you run cc-dash from one terminal for many projects, and
+    cc-dash itself belongs to none of them. Each manifest is read as the hook
+    reads its own (read_manifest); an unsafe one is skipped and (path, why) is
+    appended to `unsafe`. Each project's hook checks its own protected record,
+    which is what binds; this is cc-dash's own first look."""
+    from .control import read_json
+    state = state or attention.state_dir()
+    reg = read_json(os.path.join(state, "projects.json"), 1 << 20) or {}
+    out = []
+    for proj in reg.get("projects") or []:
+        if not isinstance(proj, str) or not os.path.isabs(proj):
+            continue
+        path = os.path.join(proj, ".claude", "hooks", procs.MANIFEST_NAME)
+        m, why = read_manifest(path)
+        if m is None:
+            if why and unsafe is not None:
+                unsafe.append((path, why))
+            continue
+        hosts = m.get("terminal_hosts")
+        out += [h for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else []
+    return procs.merge_terminals(out, [])
+
+
+def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=None, root=None, note=None, terminals=None,
+                    unsafe=None):
     """Why control mode must not start here, or ''.
 
     Control mode is how the human approves agents, so it refuses (1) to take
@@ -466,6 +554,8 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
     from .control import read_json, unlink
     env = os.environ if env is None else env
     d = ctl_dir or os.path.join(attention.state_dir(), "control")
+    # The terminals the holder of this process's terminal may be (procs.terminal_problem).
+    terminals = recorded_terminals(os.path.dirname(d), unsafe) if terminals is None else terminals
     lease_path = os.path.join(d, "lease")
     lease = read_json(lease_path, 4096)
     if lease is not None and isinstance(lease.get("expires"), (int, float)) and lease["expires"] > time.time():
@@ -480,7 +570,7 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
             except OSError:
                 alive = False
         if alive:
-            why = procs.dashboard_problem(pid, root or CC_TOOL_DIR, proc) \
+            why = procs.dashboard_problem(pid, root or CC_TOOL_DIR, proc, terminals=terminals) \
                 if (proc != "/proc" or os.path.isdir("/proc/self")) else ""
             if not why:
                 return ("another cc-dash --control (pid %d) is running and holds the control lease. Stop it first "
@@ -495,25 +585,75 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
     me = os.getpid() if me is None else me
     st = _proc_stat(me, proc)
     if ancestors is None:
-        ancestors = _ancestors(st["ppid"], proc=proc) if st else _ancestors(proc=proc)
+        if st is None:                         # no /proc: only the environment can be checked
+            ancestors = []
+        else:
+            ancestors, complete = procs.chain(st["ppid"], proc=proc)
+            if not complete:
+                return ("cc-dash --control must be started from your own terminal: its parent chain cannot be read "
+                        "to the end (a process on the way is gone or hidden).")
     for pid, comm, exe, argv in ancestors:
         if _is_claude(comm, exe, argv):
             return INSIDE_CLAUDE + " (process %d, %s, is among its parents)." % (pid, comm)
     if st is None:
         return ""
     # The session leader and the process-group leader outlive a double fork: if
-    # either is, or descends from, the claude CLI, this was started inside it.
-    why = procs.claude_lineage(me, proc, parents=[])
+    # either is, or descends from, the claude CLI, this was started inside it; if
+    # either cannot be inspected, nobody can tell, and that counts the same.
+    # The same checks as the hook's (procs.dashboard_problem), in the same order.
+    why = procs.claude_lineage(me, proc, parents=ancestors)
     if why:
         return INSIDE_CLAUDE + " (%s)." % why
+    # A terminal driver (script, expect ...) that was itself detached: something gave
+    # this process a terminal it reads, the control code included.
+    why = procs.driver_detached(me, proc, parents=ancestors)
+    if why:
+        return "cc-dash --control must be started from your own terminal: %s." % why
+    # Whoever holds the master side of this terminal reads the control code: it must be
+    # one of your recorded terminals, and not Claude Code or something it started.
+    why = procs.terminal_problem(me, proc, terminals=terminals)
+    if why:
+        return "cc-dash --control must be started from your own terminal: %s." % why
     # A typical double-fork escape: re-parented to init or a user-manager subreaper
     # and no controlling terminal left.
     if procs.fresh_session(me, proc):          # setsid'd itself, then lost its parent: a fresh detached session
         return ("cc-dash --control must be started from your own terminal: this process leads a fresh session "
                 "and was re-parented to pid %d." % st["ppid"])
-    if st["tty"] == 0 and procs.reparented(st, proc):
+    if procs.detached(me, proc):
         return ("cc-dash --control must be started from your own terminal: this process was detached (re-parented "
                 "to pid %d) and has no controlling terminal." % st["ppid"])
+    return ""
+
+
+def own_process_group():
+    """Lead a process group of our own when none of stdin, stdout and stderr is
+    a terminal (so leaving the terminal's foreground group cannot stop cc-dash
+    on a read or a write; the control code goes to /dev/tty with SIGTTOU
+    ignored): `ccdash` starts cc-dash in a pipeline whose group leader, a
+    subshell, exits at once, and the control hook refuses a dashboard whose
+    process-group leader it cannot inspect. cc-dash run directly in a terminal
+    already leads its own group, or follows a wrapper that is still alive."""
+    try:
+        if not any(os.isatty(fd) for fd in (0, 1, 2)) and os.getpgrp() != os.getpid():
+            os.setpgid(0, 0)
+    except OSError:
+        pass
+
+
+def launch_note():
+    """A warning for the terminal when this dashboard is not in the form the
+    control hook trusts (procs.dashboard_problem): `<interpreter> -I
+    <checkout>/bin/cc-dash`, bin/cc-dash's own re-exec. Whether the interpreter
+    is the one cc-setup recorded only the hook can tell (the record is per
+    project, in its protected .claude/hooks/). '' when it is, or when there is
+    no /proc to tell."""
+    if not os.path.exists("/proc/self/exe"):
+        return ""
+    exe = os.path.realpath("/proc/self/exe")
+    want = os.path.join(CC_TOOL_DIR, "bin", "cc-dash")
+    if (procs.cmdline(os.getpid()) or [])[:3] != [exe, "-I", want]:
+        return ("cc-dash: warning: started as `%s`, not the way bin/cc-dash starts itself (%s -I %s); the control hook "
+                "will not trust it. Start it with cc-dash or ccdash." % (" ".join((procs.cmdline(os.getpid()) or [])[:3]), exe, want))
     return ""
 
 
@@ -565,7 +705,11 @@ def main(argv=None):
     if srv.port != a.port and a.port:
         print(f"cc-dash: port {a.port} is busy, using {srv.port}.")
     if a.control:
-        why = control_refusal(note=lambda text: print(text, file=sys.stderr))
+        own_process_group()
+        unsafe = []           # project manifests skipped for the terminal list: noted now, audited once control starts
+        why = control_refusal(note=lambda text: print(text, file=sys.stderr), unsafe=unsafe)
+        for path, reason in unsafe:
+            print("cc-dash: ignored %s for the recorded terminals: it %s." % (tilde(path), reason), file=sys.stderr)
         if why:
             print("cc-dash: " + why, file=sys.stderr)
             srv.server_close()
@@ -582,6 +726,9 @@ def main(argv=None):
             srv.control = Control(store, srv.port, wait=a.control_wait,
                                   sockets=os.environ.get("CC_DASH_CONTROL_TRANSPORT") != "hook")
             srv.control.start()
+            for path, reason in unsafe:
+                srv.control.log(None, "refused", kind="manifest", item=path,
+                                result="a project manifest was ignored for the recorded terminals: it %s" % reason)
         except OSError as e:
             print(f"cc-dash: cannot start control mode: {e}", file=sys.stderr)
             srv.server_close()
@@ -589,6 +736,9 @@ def main(argv=None):
         print("cc-dash: control mode is on: approvals, answers, plans and messages from the dashboard, after the "
               "control code shown on the terminal is typed into it.")
         print(f"cc-dash: audit log {tilde(srv.control.audit_path)}")
+        note = launch_note()
+        if note:
+            print(note, file=sys.stderr)
         _ready(a)
     t0 = time.time()
     store.refresh(force=True)

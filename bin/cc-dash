@@ -13,17 +13,22 @@ Usage: cc-dash [--port 7878] [--no-open] [--days 7] [--project <text>] [--contro
 import os
 import sys
 
-# Run isolated: re-execute once as `python -I <this script> ...` without PYTHON*
-# or LD_* variables, so no PYTHONPATH, PYTHONSTARTUP, user site directory
-# (usercustomize, .pth files), current directory or preloaded library can put
-# other code into the dashboard. The control hook trusts a dashboard only in
-# exactly this form (templates/hooks/cc_procs.py).
-# The interpreter is the kernel's (/proc/self/exe): with zsh's exported ARGV0,
-# sys.executable can name the terminal's AppImage instead of Python.
+# Run isolated: re-execute once as `<python> -I <this script's real path> ...`
+# without PYTHON* or LD_* variables, so no PYTHONPATH, PYTHONSTARTUP, user site
+# directory (usercustomize, .pth files), current directory or preloaded library
+# can put other code into the dashboard. The control hook trusts a dashboard
+# only in exactly this form, run by exactly the interpreter cc-setup recorded in
+# the protected .claude/hooks/ manifest (templates/hooks/cc_procs.py
+# dashboard_problem).
+# <python> is the interpreter already running this, the one the shebang
+# resolved, by the kernel's /proc/self/exe (with zsh's exported ARGV0,
+# sys.executable can name the terminal's AppImage instead of Python). Never one
+# named in a file or a variable: anything running as you can write those, and
+# would pick what your own terminal runs.
 if not sys.flags.isolated:
     exe = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "LD_"))}
-    os.execve(exe, [exe, "-I", sys.argv[0]] + sys.argv[1:], env)
+    os.execve(exe, [exe, "-I", os.path.realpath(__file__)] + sys.argv[1:], env)
 
 sys.dont_write_bytecode = True  # "writes nothing" includes __pycache__ next to lib/
 # ... and reads none either: a .pyc planted in lib/cc_dash/__pycache__ (an unchecked-hash

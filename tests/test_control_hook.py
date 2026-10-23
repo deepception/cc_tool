@@ -53,6 +53,8 @@ class FakeDash:
         import http.server
         import threading
         self.issued, self.asked = {}, []
+        self.requests = {}          # what hooks handed over (POST /api/control/request), by request id
+        self.accept = True          # False: refuse every handover, as a dashboard that does not take it
         fake = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -60,6 +62,22 @@ class FakeDash:
 
             def log_message(self, *a):
                 pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(n) or b"null")
+                except ValueError:
+                    body = None
+                ok = (fake.accept and self.path == "/api/control/request" and isinstance(body, dict)
+                      and self.headers.get("X-CC-Dash-Lease") == LEASE_KEY and isinstance(body.get("id"), str))
+                if ok:
+                    fake.requests[body["id"]] = body
+                out = json.dumps({"ok": True} if ok else {"ok": False}).encode()
+                self.send_response(200 if ok else 403)
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
 
             def do_GET(self):
                 from urllib.parse import parse_qs, urlsplit
@@ -149,15 +167,20 @@ class Box:
         os.replace(p + ".t", p)
 
     def reqs(self):
+        """The doorbells in req/ (file names)."""
         return sorted(n for n in os.listdir(self.path("req")) if n.endswith(".json"))
 
+    def content(self, name):
+        """What the hook behind doorbell `name` handed to the dashboard, or None."""
+        return dash().requests.get(name[:-5])
+
     def wait_req(self, timeout=8):
+        """The first request whose doorbell rang, as the dashboard received it."""
         end = time.time() + timeout
         while time.time() < end:
-            r = self.reqs()
-            if r:
-                with open(self.path("req", r[0])) as fh:
-                    return json.load(fh)
+            for n in self.reqs():
+                if self.content(n) is not None:
+                    return self.content(n)
             time.sleep(0.03)
         return None
 
@@ -333,6 +356,25 @@ def test_allow_deny():
     b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "release", "why": "terminal"})
     rc, out, _ = finish(p)
     check("release (terminal, from claude agents): silent, outcome terminal", out == b"" and (b.res(r["id"]) or {}).get("outcome") == "terminal")
+
+
+def test_request_channel():
+    """N2: the request content goes to cc-dash over the keyed channel (POST
+    /api/control/request); req/<id>.json is only a doorbell with the id, so there
+    is no content in a file to rewrite."""
+    b = Box()
+    p = b.start(perm(ti={"command": "make channel"}))
+    r = b.wait_req()
+    names = b.reqs()
+    door = json.load(open(b.path("req", names[0]))) if names else None
+    check("channel: the request reaches the dashboard over POST /api/control/request, with the lease key",
+          r is not None and r["input"]["command"] == "make channel" and r["session"] == SID and isinstance(r["pid"], int), r)
+    check("channel: req/<id>.json is only a doorbell holding the id, no content",
+          r is not None and door == {"v": 2, "id": r["id"]}, door)
+    if r is not None:
+        b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "allow"})
+    rc, out, _ = finish(p)
+    check("channel: a decision for it still applies", b'"allow"' in (out or b""), out)
 
 
 def test_question_plan():
@@ -520,8 +562,8 @@ def test_guard_reason():
     r2 = None
     while time.time() < end and r2 is None:
         for n in b.reqs():
-            d2 = json.load(open(b.path("req", n)))
-            if d2["id"] != r["id"]:
+            d2 = b.content(n)
+            if d2 is not None and d2["id"] != r["id"]:
                 r2 = d2
         time.sleep(0.05)
     check("bash-guard ask: a parallel identical call is flagged too", r2 and r2["guard"].startswith("NEEDS APPROVAL"), (r2 or {}).get("guard"))
@@ -632,11 +674,18 @@ def test_ask_rule_and_session():
 
 # ── files are a doorbell: planted files and a fake verifier do nothing ─────
 SPOOF_SERVER = r'''
-import http.server, json, sys
+import http.server, json, os, sys
 from urllib.parse import parse_qs, urlsplit
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
+    def do_POST(self):          # takes every handed-over request, and keeps a copy in argv[1]
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        rid = json.loads(body).get("id")
+        with open(os.path.join(sys.argv[1], rid + ".json"), "wb") as fh:
+            fh.write(body)
+        out = b'{"ok": true}'
+        self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
     def do_GET(self):
         q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
         body = json.dumps({"ok": True, "id": q.get("id"), "hash": q.get("hash"), "action": "allow",
@@ -690,56 +739,86 @@ def test_planted_and_spoofed():
     p, _ = b.run(base("PreToolUse", tool_name="Bash", tool_input={"command": "ls"}))
     check("planted stop: the tool call goes on", p.stdout == b"" and not os.path.exists(b.path("stopped", SID + ".main.json")), p.stdout)
 
-    # The lease's key travels with every verify request; without it nobody answers.
+    # The lease's key travels with the handover and every verify request; without it
+    # the dashboard takes nothing, and the prompt stays in the terminal.
     for label, key in (("no key in the lease", None), ("a wrong key", "x" * 32)):
         b = Box()
         b.lease(key=key)
-        p = b.start(perm(ti={"command": "make deploy"}))
-        r = b.wait_req()
-        b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "allow"})
-        time.sleep(0.8)
-        check("verify with %s: the decision is not applied" % label, p.poll() is None)
-        b.lease()
-        b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "release"})
-        finish(p)
+        p, _ = b.run(perm(ti={"command": "make deploy %s" % label}))
+        check("handover with %s: nothing taken, the hook exits silently (terminal), no doorbell" % label,
+              p.returncode == 0 and p.stdout == b"" and b.reqs() == [] and b.res("x", 0.1) is None
+              and not any((r.get("input") or {}).get("command") == "make deploy %s" % label for r in dash().requests.values()),
+              (p.stdout, b.reqs()))
 
-    # A fake verifier: another process on another port that says yes to everything.
-    sp = subprocess.Popen([PY, "-c", SPOOF_SERVER], stdout=subprocess.PIPE)
+    # The handover is refused (a dashboard that does not take it): silent, terminal.
+    b = Box()
+    dash().accept = False
+    try:
+        p, _ = b.run(perm(ti={"command": "make refused"}))
+    finally:
+        dash().accept = True
+    check("handover refused: the hook exits silently (terminal), no doorbell, no outcome file",
+          p.returncode == 0 and p.stdout == b"" and b.reqs() == [] and os.listdir(b.path("res")) == [], (p.stdout, b.reqs()))
+    # No dashboard listening on the lease's port at all.
+    import socket as _socket
+    s = _socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead_port = s.getsockname()[1]
+    s.close()
+    b = Box()
+    b.lease(port=dead_port)
+    p, ms = b.run(perm(ti={"command": "make unreachable"}))
+    check("dashboard unreachable: the hook exits silently at once (terminal), no doorbell",
+          p.returncode == 0 and p.stdout == b"" and b.reqs() == [] and ms < 3000, (p.stdout, b.reqs(), ms))
+
+    # A fake verifier: another process on another port that takes every request and says yes to everything.
+    spool = os.path.join(BASE, "spool")
+    os.makedirs(spool, exist_ok=True)
+    sp = subprocess.Popen([PY, "-c", SPOOF_SERVER, spool], stdout=subprocess.PIPE)
+
+    def spooled(cmd, timeout=8):
+        end = time.time() + timeout
+        while time.time() < end:
+            for n in os.listdir(spool):
+                try:
+                    d = json.load(open(os.path.join(spool, n)))
+                except ValueError:
+                    continue
+                if (d.get("input") or {}).get("command") == cmd:
+                    return d
+            time.sleep(0.05)
+        return None
     try:
         port = int(sp.stdout.readline())
         b = Box()
         b.lease(port=port)                                    # the lease's pid is still this process
-        p = b.start(perm(ti={"command": "make deploy"}))
-        r = b.wait_req()
-        b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "allow"}, planted=True)
-        time.sleep(1.0)
-        check("spoofed verifier on another port (not the lease's pid): refused, the prompt stays", p.poll() is None)
-        b.lease()
-        b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "release"})
-        finish(p)
+        p, _ = b.run(perm(ti={"command": "make deploy spoofed"}))
+        check("spoofed dashboard on another port (not the lease's pid): its answer to the handover is not believed, "
+              "the hook exits silently (terminal), no doorbell", p.stdout == b"" and b.reqs() == [], (p.stdout, b.reqs()))
 
         sleeper = subprocess.Popen([PY, "-c", "import time; time.sleep(60)"])
         try:
             b = Box()
             b.lease(pid=sleeper.pid)                          # a live pid that is not the one answering
-            p = b.start(perm(ti={"command": "make deploy"}))
-            r = b.wait_req()
-            b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "allow"})
-            time.sleep(1.0)
-            check("lease names a live pid that does not own the answering socket: refused", p.poll() is None)
-            p.kill()
-            finish(p)
+            p, _ = b.run(perm(ti={"command": "make deploy sleeper"}))
+            check("lease names a live pid that does not own the answering socket: not believed, terminal",
+                  p.stdout == b"" and b.reqs() == [], (p.stdout, b.reqs()))
         finally:
             sleeper.kill()
             sleeper.wait()
 
         # The documented limit: a program that rewrites the lease to name ITSELF and
-        # serves the answers runs as you; the guards block the plain ways there.
+        # serves the answers runs as you; the guards block the plain ways there (and
+        # the hook's program check, off here, refuses anything but the real cc-dash).
         b = Box()
         b.lease(port=port, pid=sp.pid)
-        p = b.start(perm(ti={"command": "make deploy"}))
-        r = b.wait_req()
-        b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "allow"}, planted=True)
+        p = b.start(perm(ti={"command": "make deploy limit"}))
+        r = spooled("make deploy limit")
+        if r is not None:
+            end = time.time() + 5
+            while time.time() < end and not b.reqs():
+                time.sleep(0.03)
+            b.write("dec/%s.json" % r["id"], {"id": r["id"], "hash": r["hash"], "action": "allow"}, planted=True)
         rc, out, _ = finish(p)
         check("documented limit: a same-user program that rewrites the lease to name itself is believed",
               b'"allow"' in out, out)
@@ -1171,11 +1250,16 @@ def test_lease_program_check():
                       env=dict(clean, PYTHONPATH="/nonexistent"))
         claudeenv = start([PY, "-I", os.path.join(REPO, "bin", "cc-dash"), "--no-open", "--port", "0", "--days", "1"],
                           env=dict(clean, CLAUDECODE="1"))
-        # zsh's exported ARGV0 (Cursor's AppImage terminal): judged by the real binary.
-        renamed = start(["/some/Editor.AppImage", "-I", os.path.join(REPO, "bin", "cc-dash"), "--no-open", "--port", "0", "--days", "1"])
+        # zsh's exported ARGV0 (Cursor's AppImage terminal): bin/cc-dash re-executes itself with
+        # the recorded interpreter's own path as argv[0], so the dashboard passes ...
+        renamed = start(["/some/Editor.AppImage", os.path.join(REPO, "bin", "cc-dash"), "--no-open", "--port", "0", "--days", "1"])
+        # ... while the interpreter started directly under another argv[0] is not cc-dash's own re-exec.
+        renamed_direct = start(["/some/Editor.AppImage", "-I", os.path.join(REPO, "bin", "cc-dash"), "--no-open", "--port", "0",
+                                "--days", "1"])
         time.sleep(1.0)
         why = {k: mod.dashboard_problem(q.pid) for k, q in (("a", a), ("b", b), ("c", c), ("n", n), ("real", real),
-                                                             ("pyenv", pyenv), ("claudeenv", claudeenv), ("renamed", renamed))}
+                                                             ("pyenv", pyenv), ("claudeenv", claudeenv), ("renamed", renamed),
+                                                             ("renamed_direct", renamed_direct))}
         check("lease program: the review's fake checkout, started as `python3 fake/bin/cc-dash`, is not trusted",
               mod.is_cc_dash(a.pid) is False and "the way cc-dash starts itself" in why["a"], why["a"])
         check("lease program: the fake checkout started with -I is not trusted (not the pinned checkout)",
@@ -1196,9 +1280,11 @@ def test_lease_program_check():
               "PYTHONPATH" in why["pyenv"], why["pyenv"])
         check("lease program: started with Claude Code's environment (CLAUDECODE): not trusted",
               "CLAUDECODE" in why["claudeenv"], why["claudeenv"])
-        check("lease program: judged by the real binary, not a renamed argv[0]",
-              "not Python" not in why["renamed"] and "starts itself" not in why["renamed"]
+        check("lease program: started under a renamed argv[0] (zsh's ARGV0), cc-dash's re-exec still passes",
+              "starts itself" not in why["renamed"] and "interpreter" not in why["renamed"]
               and (why["renamed"] == "" if not inside else "parents" in why["renamed"] or "leader" in why["renamed"]), why["renamed"])
+        check("lease program: the interpreter run directly with another argv[0] is not cc-dash's own re-exec",
+              "the way cc-dash starts itself" in why["renamed_direct"], why["renamed_direct"])
         for q in procs_:
             q.kill()
             q.wait()
@@ -1251,7 +1337,7 @@ def test_forged_lease_fake_checkout():
 
 def main():
     try:
-        for fn in (test_gating, test_allow_deny, test_question_plan, test_terminal, test_lease_loss_timeout_signal, test_lease_program_check,
+        for fn in (test_gating, test_allow_deny, test_request_channel, test_question_plan, test_terminal, test_lease_loss_timeout_signal, test_lease_program_check,
                    test_forged_lease_fake_checkout,
                    test_safe_files, test_guard_reason, test_ask_rule_and_session, test_planted_and_spoofed, test_ask_rule_forms,
                    test_stop_and_socket, test_messages,
