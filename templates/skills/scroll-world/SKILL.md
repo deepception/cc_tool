@@ -13,12 +13,14 @@ description: >
   the fallback biller. Use when the user wants a "3D world" /
   "browse-through-the-industry" hero, a scroll cinematic, a diorama landing, or to
   turn a business into a scrollable world.
-allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Skill
 ---
 
 <!-- Vendored from https://github.com/oso95/scroll-world (MIT, (c) 2026 cyw);
      LICENSE ships alongside this file. Copied verbatim, including
-     `references/`; cc_tool has made no changes to the body. Requires paid
+     `references/`; cc_tool has made no changes to the body. cc_tool dropped
+     upstream's `allowed-tools: Bash, Read, Write, Edit, AskUserQuestion, Skill`
+     line: that field pre-approves the tools (no permission prompt) during the
+     turn that invokes the skill, and Claude can invoke this one on its own. Requires paid
      external services not bundled with cc_tool (Higgsfield credits, Monid
      CLI billed per video clip in USD) and references an `higgsfield-generate`
      sibling skill that does not exist in this repo or in cc_tool — see the
