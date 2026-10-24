@@ -37,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import attention
+from . import limits    # subscription usage limits bin/cc-statusline recorded
 from . import procs
 from . import plans   # plan progress (/api/plans)
 from .auth import Auth, local_pairing_supported
@@ -163,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/docs/"):
                 return self._docs(path, q)
             if path == "/api/live":
-                return self._json(200, store.live_payload())
+                return self._json(200, dict(store.live_payload(), usage_limits=limits.payload()))
             if path == "/api/sessions":
                 return self._json(200, store.sessions_payload())
             if path == "/api/overview":

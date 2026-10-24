@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$SCRIPT_DIR/bin"
 
-chmod +x "$BIN_DIR/cc-setup" "$BIN_DIR/cc-update" "$BIN_DIR/cc-install-superpowers" "$BIN_DIR/cc-install-security" "$BIN_DIR/cc-install-tasteskill" "$BIN_DIR/cc-devcontainer" "$BIN_DIR/cc-token" "$BIN_DIR/cc-update-project" "$BIN_DIR/cc-update-permissions" "$BIN_DIR/cc-vault" "$BIN_DIR/cc-dash"
+chmod +x "$BIN_DIR/cc-setup" "$BIN_DIR/cc-update" "$BIN_DIR/cc-install-superpowers" "$BIN_DIR/cc-install-security" "$BIN_DIR/cc-install-tasteskill" "$BIN_DIR/cc-devcontainer" "$BIN_DIR/cc-token" "$BIN_DIR/cc-update-project" "$BIN_DIR/cc-update-permissions" "$BIN_DIR/cc-vault" "$BIN_DIR/cc-dash" "$BIN_DIR/cc-statusline"
 
 # ── 1. PATH ───────────────────────────────────────────────────────────────────
 if [[ -f "$HOME/.zshrc" ]]; then
@@ -55,6 +55,12 @@ else
     echo "$CCDASH_LINE" >> "$PROFILE"
     echo "✓ Added ccdash to $PROFILE (run: ccdash, or ccdash --control)"
 fi
+
+# Claude Code hands a subscription's 5-hour and weekly usage limits only to the
+# status line command, so cc-dash shows them only when cc-statusline is the
+# user-level status line (every session in every project then records them).
+# An existing status line is left alone.
+"$BIN_DIR/cc-statusline" --install || echo "  (cc-dash will show no usage limits until cc-statusline is your status line)"
 
 # ── 2. Global plugins (bin/ not in PATH yet, call via full path) ──────────────
 echo ""

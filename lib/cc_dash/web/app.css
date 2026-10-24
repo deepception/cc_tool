@@ -141,6 +141,24 @@ button { font: inherit; color: inherit; }
 .count:empty { display: none; }
 .tabs .count { background: color-mix(in srgb, var(--good-dot) 16%, transparent); color: var(--good); }
 .top-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); color: var(--ink-3); font-size: var(--fs-12); min-width: 0; }
+/* Usage limits chip (app.js limitsChip): the subscription's 5-hour and weekly windows */
+.ul-top { display: inline-flex; align-items: center; gap: var(--sp-3); flex: none; white-space: nowrap; font-variant-numeric: tabular-nums; cursor: default; }
+.ul-top[hidden] { display: none; }
+/* hairline dividers: before the chip, between its windows, and before the time window */
+.ul-top::before, .ul-top::after, .ul-item + .ul-item::before { content: ""; width: 1px; height: 14px; background: var(--line-2); flex: none; }
+.ul-top::after { margin-left: var(--sp-1); }
+.ul-top::before { margin-right: var(--sp-1); }
+.ul-item { display: inline-flex; align-items: center; gap: var(--sp-1); }
+.ul-item + .ul-item::before { margin-right: var(--sp-2); }
+.ul-bar { width: 24px; height: 4px; border-radius: var(--r-pill); background: var(--line-2); overflow: hidden; }
+.ul-fill { display: block; height: 100%; border-radius: inherit; background: var(--ink-3); }
+.ul-pct { color: var(--ink-2); }
+.ul-item.warn .ul-fill { background: var(--warn-dot); }
+.ul-item.warn .ul-pct { color: var(--warn); }
+.ul-item.bad .ul-fill { background: var(--bad); }
+.ul-item.bad .ul-pct { color: var(--bad); }
+@media (max-width: 640px) { .ul-top { gap: var(--sp-2); } .ul-bar { display: none; } }
+@media (max-width: 420px) { .ul-top { display: none; } }   /* the bar must fit a 360 px phone */
 .scope { min-width: 0; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: var(--sp-2); }
 /* Sync bar (app.js syncFillRun): a hairline that fills until the next poll
    answer is due and empties when it lands. Neutral ink, never a status colour,
@@ -185,6 +203,7 @@ h3 { font-size: var(--fs-13); font-weight: 600; margin: 0; }
 .panel-b { padding: var(--sp-4) var(--sp-5) var(--sp-5); min-width: 0; overflow-x: auto; }
 .panel-b table td, .panel-b table th { white-space: nowrap; }
 .panel-b table td:first-child { white-space: normal; }
+
 .grid { display: grid; gap: var(--sp-4); }
 /* Sections of a page stack 16px apart; nothing sets its own margin for that. */
 .stack { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }

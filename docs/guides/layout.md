@@ -11,11 +11,13 @@ cc_tool/
     cc-devcontainer              drop .devcontainer/ to sandbox Claude Code in Docker
     cc-token                     generate/refresh CLAUDE_CODE_OAUTH_TOKEN on host (for sandboxed containers)
     cc-dash                      local read-only dashboard of Claude Code sessions (Python stdlib server on 127.0.0.1)
+    cc-statusline                user-level status line (set by install.sh): model, context, 5-hour and weekly usage limits; saves each session's latest limits reading for cc-dash
   lib/cc_dash/                   cc-dash internals, standard library only
     pricing.py                   per-model prices and the per-message cost estimate
     parser.py                    incremental JSONL reader and per-transcript accumulator
     store.py                     transcript discovery, subagent and workflow linkage, guard-log attribution, JSON payloads
     server.py                    HTTP server: loopback bind, Host-header check, fixed asset map, CLI flags
+    limits.py                    usage limits for /api/live: the freshest reading cc-statusline saved, per window, marked expired past its reset
     attention.py                 open alerts for /api/alerts: tails the attention hook's log, resolve rules, session registry, transcript fallback
     routing.py                   /api/routing: who picked each subagent's model and effort, work-type heuristic, cache-expiry rewrites, flags against the managed block's routing
     docs.py                      Docs view: per-project file tree, search, one-time HTML frame tickets; path allowlisting, secret refusal, redaction
@@ -90,6 +92,7 @@ cc_tool/
     test_cc_dash_routing.py      cc-dash routing: work-type rules, model source, effort, expiry rewrites, flags and savings, scope, endpoint auth, the panel in a browser (content, no churn on polls)
     test_attention_hook.py       attention.py: event lines per hook event, file modes, rotation, symlink/hard-link/FIFO refusal, silence, garbage input, latency, settings registration
     test_cc_dash_alerts.py       /api/alerts: open/resolve state machine, out-of-order lines, staleness, registry, transcript fallback and dedupe, rotation, shape, timing
+    test_usage_limits.py         cc-statusline line and records (modes, symlinks, unchanged readings, pruning, --install), limits.py, /api/live
     test_cc_dash_docs.py         Docs view: project allowlist, traversal/symlink/secret refusal, size caps, tree sections, search bounds, HTML sandbox CSP, renderer (node), hostile-doc browser check
   .claude/
     workflows/                   saved Workflow definitions (run via the Workflow tool)
@@ -109,6 +112,7 @@ python3 tests/test_cc_dash.py           # cc-dash: parser, aggregation, server s
 python3 tests/test_attention_hook.py    # attention hook: event log, modes, refusals
 python3 tests/test_cc_dash_alerts.py    # cc-dash alerts: state machine, endpoint, timing
 python3 tests/test_cc_dash_docs.py      # cc-dash Docs view: path safety, sandbox, renderer
+python3 tests/test_usage_limits.py     # cc-statusline and cc-dash usage limits
 python3 tests/test_cc_dash_routing.py   # cc-dash Routing panel: classifier, flags, rewrites, endpoint, browser
 python3 tests/test_route_nudge.py       # route-nudge hook: nudge, silence, effort suffix, rollout
 ```
