@@ -64,7 +64,7 @@ description: >-               # keyword-rich, tells Claude WHEN to use this skil
 user-invocable: true           # false only for pure reference/knowledge skills
 # disable-model-invocation: true   # ONLY if skill has dangerous side effects
 # argument-hint: [target]         # ONLY if skill accepts arguments
-# allowed-tools: Read, Grep       # ONLY if restricting tools is needed
+# allowed-tools: Bash(git status *)  # pre-approves, never restricts: ONLY narrow, safe patterns
 # context: fork                   # ONLY for isolated, self-contained tasks
 # agent: Explore                  # ONLY with context: fork
 ---
@@ -84,9 +84,10 @@ user-invocable: true           # false only for pure reference/knowledge skills
    - Yes → add `argument-hint` showing expected args
    - No → omit
 
-4. Should the skill restrict tool usage?
-   - Only if there's a security/environment reason → add `allowed-tools`
-   - Otherwise → omit (all tools available)
+4. Should the skill pre-approve tools?
+   - `allowed-tools` lets the listed tools run without a permission prompt during the turn that invokes the skill; it restricts nothing (`disallowed-tools` does)
+   - Only for narrow patterns the skill always runs and that are safe unprompted (`Bash(git status *)`) → add `allowed-tools`
+   - Otherwise → omit (the user's permission settings decide)
 
 5. Should the skill run in isolation?
    - Only for self-contained research/analysis tasks → `context: fork`
@@ -181,7 +182,7 @@ When updating an existing skill:
 - **Vague descriptions**: "Helps with X" instead of being specific about when and why
 - **Unnecessary frontmatter**: Adding fields with default values. Omit them
 - **Duplicate coverage**: Skill that restates CLAUDE.md content. Reference it instead
-- **Over-restricting tools**: Adding `allowed-tools` without a clear security reason
+- **Over-granting tools**: `allowed-tools: Bash` lets every shell command run unprompted while the skill runs. List narrow patterns or omit it
 - **Missing trigger phrases**: Description that doesn't match how users actually ask for it
 - **Over-forceful phrasing**: `CRITICAL` / `MUST` / `ALWAYS` / anti-laziness language. See Writing style; plain imperatives read more reliably
 - **Cargo-cult prescription**: porting every enumerated step from a prior-model skill unchanged. Review whether the current model's default behavior already exceeds the scaffold. Today's models are more capable unscaffolded than the ones most existing skills were written for

@@ -2,14 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(claude --version)",
-      "Bash(env)",
       "Bash(npm show:*)",
       "Bash(npm root:*)",
-      "Read(//usr/lib/node_modules/@anthropic-ai/**)",
-      "Read(//usr/local/lib/node_modules/@anthropic-ai/claude-code/**)",
-      "Bash(sudo npm:*)",
-      "Bash(claude plugin:*)",
-      "Bash(/home/lukasz/Files/hobby/cc_tool/bin/cc-update)"
+      "Read(**/node_modules/@anthropic-ai/**)",
+      "Read(~/.local/share/claude/**)",
+      "Bash(cc-update)"
     ]
   }
 }
