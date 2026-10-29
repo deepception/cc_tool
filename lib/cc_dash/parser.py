@@ -35,6 +35,22 @@ Effort and thinking (see tree.py for how they roll up):
   - thinking / redacted_thinking content blocks: usually a signature only
     (thinking display "updates" or "omitted"), sometimes with text.
   - usage.speed == "fast" marks fast mode.
+
+Minute buckets (`Acc.mins`, the Factory floor's last-hour charts, graph.py):
+epoch minute -> [tok_opus, tok_sonnet, tok_haiku, tok_fable, tok_other, tools,
+errors, active], flat ints (every transcript keeps one).
+  - tokens: a message's new tokens, in the minute of its first record (msg_ts,
+    as the burn rate counts it) under its model's family; a later record that
+    rewrites the usage takes the old amount out and puts the new one in, so a
+    message counts once at its latest usage. No msg_ts, no minute.
+  - tools: tool_use blocks at their record's minute; errors: those whose result
+    was an error or a guard block, in the tool_use's minute.
+  - active: 1 when the transcript wrote a timestamped assistant / user / system
+    record in that minute, or a tool call was running across it (tool_use to
+    tool_result, filled when the result arrives).
+Only the SERIES_KEEP_MINS minutes up to the newest one seen are kept: older
+ones are refused (never re-created after a prune, so a rewrite never takes from
+the wrong minute) and pruned once the dict passes KEEP + SERIES_SLACK_MINS.
 """
 import json
 import os
@@ -50,6 +66,11 @@ TEXT_ASSIST = 600
 TEXT_TARGET = 200
 TEXT_ERROR = 400
 ACTIVE_GAP = 1800          # a pause longer than this between records is idle time, not work
+SERIES_KEEP_MINS = 64      # minute buckets kept before the newest (graph.py's hour: 60 + alignment + slack)
+SERIES_SLACK_MINS = 16     # ...and pruned once the dict holds this many more (amortised)
+SERIES_FAMILIES = ("opus", "sonnet", "haiku", "fable", "other")   # Acc.mins token columns, in order
+_FAM_COL = {f: i for i, f in enumerate(SERIES_FAMILIES)}
+M_TOOLS, M_ERRORS, M_ACTIVE = 5, 6, 7   # the other Acc.mins columns
 
 # Record types that carry nothing the dashboard shows. Checked against the raw
 # line prefix so json.loads never runs on them (some are large).
@@ -286,6 +307,8 @@ class Acc:
         self.usage = {}                       # model -> [msgs, in, out, cread, cw5, cw1h, cost]
         self.msg_usage = {}                   # message id -> (model, (in,out,cr,cw5,cw1h), cost, hour)
         self.hours = {}                       # epoch hour -> {"c": {family: cost}, "tok", "tools", "err", "msgs"}
+        self.mins = {}                        # epoch minute -> [tok x5 families, tools, errors, active] (module docstring)
+        self.min_top = 0                      # the newest minute mins has seen; minutes <= min_top - KEEP are refused
         self.tools = {}                       # tool -> [calls, errors, dur_sum, dur_n]
         self.pending = {}                     # tool_use id -> its timeline event (dict)
         self.spawns = []                      # Agent/Task/Workflow calls
@@ -327,6 +350,49 @@ class Acc:
         if b is None:
             b = self.hours[h] = {"c": {}, "m": {}, "tok": 0, "tools": 0, "err": 0, "msgs": 0}
         return b
+
+    def _min(self, t, create=True):
+        """The minute row of time t (module docstring), made when missing; None when t is older than the
+        kept span, or (create=False) when the row is not there. Rows are pruned here, amortised: the
+        dict never holds more than SERIES_KEEP_MINS + SERIES_SLACK_MINS of them."""
+        m = int(t // 60)
+        mins = self.mins
+        if not create:
+            return None if m <= self.min_top - SERIES_KEEP_MINS else mins.get(m)
+        if m > self.min_top:
+            self.min_top = m
+        elif m <= self.min_top - SERIES_KEEP_MINS:
+            return None
+        r = mins.get(m)
+        if r is None:
+            if len(mins) >= SERIES_KEEP_MINS + SERIES_SLACK_MINS:
+                cut = self.min_top - SERIES_KEEP_MINS
+                for k in [k for k in mins if k <= cut]:
+                    del mins[k]
+            r = mins[m] = [0, 0, 0, 0, 0, 0, 0, 0]
+        return r
+
+    def _min_tokens(self, mid, model, tup, sign):
+        """Add (sign=1) or take out (sign=-1) one message's new tokens in the minute of its first record."""
+        mt = self.msg_ts.get(mid)
+        n = tup[0] + tup[1] + tup[3] + tup[4]
+        if not mt or n <= 0:
+            return
+        r = self._min(mt, sign > 0)
+        if r is not None:
+            c = _FAM_COL.get(pricing.family(model), 4)
+            r[c] = max(0, r[c] + sign * n)
+
+    def _min_span(self, t0, t1):
+        """Mark the minutes strictly between a tool call's start (t0) and its result (t1) active; the two
+        ends are marked by their own records. At most SERIES_KEEP_MINS minutes, never a refused one."""
+        m1 = int(t1 // 60)
+        m = max(int(t0 // 60) + 1, m1 - SERIES_KEEP_MINS + 1, self.min_top - SERIES_KEEP_MINS + 1)
+        while m < m1:
+            r = self._min(m * 60)
+            if r is not None:
+                r[M_ACTIVE] = 1
+            m += 1
 
     def _event(self, ev):
         self.events.append(ev)
@@ -399,6 +465,9 @@ class Acc:
         if t in ("assistant", "user", "system"):
             ts = parse_ts(rec.get("timestamp"))
             if ts:
+                r = self._min(ts)
+                if r is not None:
+                    r[M_ACTIVE] = 1
                 if self.first_ts is None or ts < self.first_ts:
                     self.first_ts = ts
                 if self.last_ts is None or ts > self.last_ts:
@@ -498,6 +567,7 @@ class Acc:
                 hour = int(ts // 3600) if ts else (prev[3] if prev else 0)
                 if prev is not None:
                     self._apply_usage(prev[0], prev[1], prev[2], prev[3], -1)
+                    self._min_tokens(mid, prev[0], prev[1], -1)
                 else:
                     self.api_msgs += 1
                     self.models[model] = self.models.get(model, 0) + 1
@@ -520,6 +590,7 @@ class Acc:
                             em[eff] = em.get(eff, 0) + 1
                 self.msg_usage[mid] = (model, tup, cost, hour)
                 self._apply_usage(model, tup, cost, hour, 1)
+                self._min_tokens(mid, model, tup, 1)
             det = u.get("output_tokens_details")
             if isinstance(det, dict) and isinstance(det.get("thinking_tokens"), int):
                 self._think_usage(mid, model, tup[1], det["thinking_tokens"])
@@ -627,6 +698,9 @@ class Acc:
         if ts:
             self.tool_ts.append(ts)
             self._hour(ts)["tools"] += 1
+            r = self._min(ts)
+            if r is not None:
+                r[M_TOOLS] += 1
         target = tool_target(name, ti)
         ev = {"k": "tool", "t": ts, "name": name, "target": target, "id": tid, "status": "pending"}
         if name in _SPAWN_TOOLS or name == "Workflow":
@@ -706,6 +780,14 @@ class Acc:
                 if st:
                     st[2] += ev["dur"]
                     st[3] += 1
+            t0 = ev.get("t")
+            if t0:
+                if ev["status"] != "ok":        # error or blocked: in the tool_use's minute, if it was counted there
+                    r = self._min(t0, False)
+                    if r is not None:
+                        r[M_ERRORS] += 1
+                if ts and ts > t0:
+                    self._min_span(t0, ts)
         if is_err:
             self.tool_errors += 1
             if blocked:

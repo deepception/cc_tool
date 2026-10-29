@@ -23,7 +23,18 @@
    - Motion: state changes only. Colour 120ms, popovers 150ms, toasts 200ms,
      the drawer 260ms; reduced motion keeps opacity and drops movement. The one
      continuous motion is the header sync bar: a linear transform fill clocked
-     to the real poll, which reduced motion replaces with text. */
+     to the real poll, which reduced motion replaces with text.
+   - The one exception: the Factory floor's stage (factory.css, .fx-stage) is
+     deliberately not flat. Inside it: a ground lit from above, glass nodes
+     and lens-like project hubs with a specular highlight, edges with
+     particles flowing at the rate of token burn, an amber halo that breathes
+     on what needs you, and frosted (backdrop-filter) panels: the instrument
+     panel (totals, alerts), zoom, the activity column (recent actions and
+     the last hour's charts) and the inspector, which share one slot. Its
+     tokens are defined once there, derived from these. Colour meaning, type, spacing,
+     radii and motion timings stay as above, reduced motion stops the flow
+     and the breathing, and everything outside the stage (its page head
+     included) keeps this flat system. */
 
 :root {
   color-scheme: light;
@@ -139,9 +150,12 @@ button { font: inherit; color: inherit; }
 .tabs a[aria-current="page"]::after { content: ""; position: absolute; left: var(--sp-3); right: var(--sp-3); bottom: -1px; height: 2px; background: var(--ink); border-radius: 2px 2px 0 0; }
 .count { font: 500 var(--fs-11)/1 var(--font); font-variant-numeric: tabular-nums; min-width: 18px; text-align: center; padding: 3px var(--sp-1h); border-radius: var(--r-pill); background: var(--sunk); color: var(--ink-2); }
 .count:empty { display: none; }
-.tabs .count { background: color-mix(in srgb, var(--good-dot) 16%, transparent); color: var(--good); }
 .top-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-2); color: var(--ink-3); font-size: var(--fs-12); min-width: 0; }
-.scope { min-width: 0; max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: var(--sp-2); }
+/* Scope: the window picker (a dropdown, so nothing here may clip) and the
+   quiet text after it, which is what gives way first when the bar gets tight. */
+.scope { display: flex; align-items: center; gap: var(--sp-1); min-width: 0; margin-right: var(--sp-2); white-space: nowrap; }
+.scope-txt { min-width: 0; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+.scope-txt .sep { display: none; }
 /* Sync bar (app.js syncFillRun): a hairline that fills until the next poll
    answer is due and empties when it lands. Neutral ink, never a status colour,
    except the failed red when cc-dash stops responding. The fill is a Web
@@ -177,6 +191,7 @@ h3 { font-size: var(--fs-13); font-weight: 600; margin: 0; }
 .sub { color: var(--ink-3); margin-top: var(--sp-1); }
 .fade-in { animation: fade var(--t-toast) var(--ease) both; }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes leave { to { opacity: 0; } }   /* alerts.css: a toast on its way out */
 .stale { opacity: .55; transition: opacity var(--t-toast) ease; }
 
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-l); }
@@ -319,134 +334,39 @@ tbody tr.sel { background: var(--select); box-shadow: inset 2px 0 0 var(--ink); 
 .usage th:first-child { width: 22%; }
 .usage td:first-child { overflow: hidden; text-overflow: ellipsis; }
 
-/* ── Live cards ──────────────────────────────────────────────────────── */
+/* ── Cards (the Plans page's running plans) ──────────────────────────── */
 .live-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: var(--sp-4); align-items: start; }
 @media (max-width: 1240px) { .live-grid { grid-template-columns: minmax(0, 1fr); } }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-l); padding: var(--sp-4) var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); cursor: pointer; transition: border-color var(--t-fast) ease, background-color var(--t-fast) ease; min-width: 0; }
 .card:hover { border-color: var(--line-2); }
-.card.sel { border-color: var(--ink-3); }
 .card:focus-visible { outline-offset: 2px; border-radius: var(--r-l); }
 .card-top { display: flex; align-items: center; gap: var(--sp-2h); min-width: 0; font-size: var(--fs-12); color: var(--ink-3); }
 .card-top .proj { color: var(--ink); font-weight: 600; font-size: var(--fs-13); }
 .card-top .pill, .card-top .model { flex: none; }
 .card-title { font-size: var(--fs-16); font-weight: 600; letter-spacing: -.012em; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+/* "What it is doing now": a sunk box on plan cards and in the Factory inspector. */
 .now { border-radius: var(--r-m); background: var(--sunk); border: 1px solid var(--line); padding: var(--sp-2h) var(--sp-3); min-width: 0; }
 .now-label { font-size: var(--fs-11); color: var(--ink-3); font-weight: 500; display: flex; gap: var(--sp-2); align-items: center; margin-bottom: var(--sp-1); }
 .now-body { font-family: var(--mono); font-size: var(--fs-12); color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .now-text { color: var(--ink-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.recent { display: grid; gap: var(--sp-0h); font-size: var(--fs-12); }
-.recent div { display: grid; grid-template-columns: 58px 92px minmax(0, 1fr); gap: var(--sp-2h); color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.recent .rn { color: var(--ink-2); font-family: var(--mono); font-size: var(--fs-11); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.recent .rt { font-family: var(--mono); font-size: var(--fs-11); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.subs { border-top: 1px solid var(--line); padding-top: var(--sp-3); display: grid; gap: var(--sp-1h); }
-.subs-h { font-size: var(--fs-11); color: var(--ink-3); font-weight: 500; }
-.sub-row { display: grid; grid-template-columns: 14px minmax(0, 1.3fr) minmax(0, 1fr) 64px 70px; gap: var(--sp-2h); align-items: center; font-size: var(--fs-12); font-variant-numeric: tabular-nums; }
-.sub-row .d { font-weight: 500; }
 .card-foot { display: flex; gap: var(--sp-5); color: var(--ink-3); font-size: var(--fs-12); border-top: 1px solid var(--line); padding-top: var(--sp-3); flex-wrap: wrap; }
 .card-foot b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
 
-/* ── Live agents board ───────────────────────────────────────────────── */
-/* One section per session; inside, one row per agent in spawn-tree order.
-   Motion only marks change: a new agent or session fades in, a row that just
-   finished, failed or started needing you gets a one-time wash. */
-.board-wrap { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: var(--sp-4); align-items: start; }
-@media (max-width: 1180px) { .board-wrap { grid-template-columns: minmax(0, 1fr); } }
-.board { display: grid; gap: var(--sp-3); min-width: 0; }
-.agroup { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-l); overflow: hidden; min-width: 0; }
-.agroup-h { display: flex; align-items: center; gap: var(--sp-2h); min-height: 40px; padding: var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--line); font-size: var(--fs-12); color: var(--ink-3); min-width: 0; background: color-mix(in srgb, var(--sunk) 45%, var(--surface)); font-variant-numeric: tabular-nums; }
-.agroup-h b { color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
-.agroup-h .tag { flex: 0 1 auto; }
-.g-proj { color: var(--ink); font-weight: 600; font-size: var(--fs-13); white-space: nowrap; border-radius: var(--r-s); }
-a.g-proj:hover { text-decoration: underline; text-decoration-color: var(--axis); text-underline-offset: 3px; }
-.g-needs { color: var(--warn); font-weight: 500; white-space: nowrap; }
-.agroup.loose { border-color: color-mix(in srgb, var(--warn-dot) 40%, var(--line)); }
-.arow { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.5fr) 90px 86px 64px; gap: var(--sp-4); align-items: center; min-height: 52px; padding: var(--sp-2) var(--sp-4); border-top: 1px solid var(--line); cursor: pointer; min-width: 0; transition: background-color var(--t-fast) ease; }
-.agroup-b > :first-child { border-top: 0; }
-.arow:hover { background: var(--hover); }
-.arow:focus-visible { outline-offset: -2px; border-radius: 0; }
-.arow.sel { background: var(--select); box-shadow: inset 2px 0 0 var(--ink); }
-.arow.c-needs { background: var(--needs-wash); box-shadow: inset 2px 0 0 var(--warn-dot); }
-.arow.c-needs:hover { background: color-mix(in srgb, var(--warn-dot) 12%, transparent); }
-.arow.c-done, .arow.c-stalled { color: var(--ink-3); }
-.arow.c-done .a-label, .arow.c-stalled .a-label { color: var(--ink-2); font-weight: 400; }
-.a-id { display: flex; align-items: center; gap: var(--sp-2h); min-width: 0; padding-left: calc(var(--d, 0) * 18px); }
-.a-branch { flex: none; width: 9px; height: 14px; margin: -10px -4px 0 -14px; border-left: 1px solid var(--axis); border-bottom: 1px solid var(--axis); border-bottom-left-radius: var(--r-s); }
-.a-idt { min-width: 0; flex: 1; }
-.a-label { font-weight: 500; color: var(--ink); }
-.a-meta { display: flex; align-items: center; gap: var(--sp-2h); font-size: var(--fs-12); color: var(--ink-3); min-width: 0; white-space: nowrap; overflow: hidden; }
-.a-meta > * { flex: none; }
-.a-meta > :last-child { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* ── State glyphs and the tool-call sparkline ────────────────────────── */
+/* app.js glyph(): a check, a cross, a dot or a ring, in the status colours
+   (plan tasks, the Factory floor). */
 .sg { width: 12px; height: 12px; flex: none; color: var(--ink-4); }
 .sg-working { color: var(--good-dot); }
 .sg-needs { color: var(--warn-dot); }
 .sg-failed { color: var(--bad); }
 .sg-done { color: var(--ink-3); }
-.a-act { min-width: 0; }
-.a-state { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.a-state .st { color: var(--ink); font-weight: 500; }
-.a-state .st b { font-weight: 500; font-size: var(--fs-12); }
-.c-done .a-state .st, .c-stalled .a-state .st, .c-idle .a-state .st { color: var(--ink-2); font-weight: 400; }
-.c-stalled .a-state .st { color: var(--warn); }
-.a-detail { font-size: var(--fs-12); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-height: 18px; }
-.a-detail.mono { font-size: var(--fs-11); line-height: 18px; }
-.needs-pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.a-spark { display: flex; flex-direction: column; align-items: flex-end; min-width: 0; }
+/* Tool calls per minute (the Factory inspector; the Overview's cost trend uses
+   .spark-bar below): finished minutes in the main tone, the still-filling one
+   lighter, an empty minute a faint tick. */
 .spark { display: block; overflow: visible; }
-/* Finished minutes in the main tone, the still-filling one lighter, failed
-   calls red on top, an empty minute a faint tick; the hovered minute in ink. */
 .spark .sp { fill: var(--series-main); }
 .spark .sp-now { fill: var(--series-sub); }
 .spark .sp0 { fill: var(--axis); opacity: .6; }
-.spark .sp-err { fill: var(--bad); }
-.spark .sb.hov { fill: var(--ink); opacity: 1; }
-.a-rate { font-size: var(--fs-12); line-height: 18px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.a-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; font-size: var(--fs-12); line-height: 18px; color: var(--ink-2); }
-.a-num > :first-child { color: var(--ink); font-size: var(--fs-13); }
-.wfrow { display: flex; align-items: center; gap: var(--sp-2h); min-height: 36px; padding: var(--sp-1h) var(--sp-4) var(--sp-1h) calc(var(--sp-4) + var(--d, 0) * 18px); border-top: 1px solid var(--line); font-size: var(--fs-12); color: var(--ink-3); min-width: 0; }
-.wfrow .a-branch { margin-right: 0; }
-.wf-name { color: var(--ink); font-weight: 500; }
-.feed { position: sticky; top: calc(var(--h-top) + var(--sp-4)); max-height: calc(100vh - var(--h-top) - var(--sp-8)); display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
-.feed-h { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); min-height: 48px; padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--line); }
-.feed-note { font-size: var(--fs-12); font-variant-numeric: tabular-nums; }
-.feed-note.paused { color: var(--ink-2); font-weight: 500; }
-.feed-list { overflow-y: auto; padding: var(--sp-1) 0 var(--sp-2); overscroll-behavior: contain; }
-.feed-empty { padding: var(--sp-4); }
-.fi { padding: var(--sp-1h) var(--sp-4); cursor: pointer; min-width: 0; transition: background-color var(--t-fast) ease; }
-.fi:hover { background: var(--hover); }
-.fi-1 { display: flex; align-items: center; gap: var(--sp-2); font-size: var(--fs-11); color: var(--ink-3); min-width: 0; font-variant-numeric: tabular-nums; }
-.fi-1 .key { width: 8px; height: 8px; border-radius: 2px; }
-.fi-who { color: var(--ink-2); font-weight: 500; }
-.fi-run { color: var(--good); margin-left: auto; white-space: nowrap; }
-.fi-1 .bad { margin-left: auto; }
-.fi-2 { display: flex; gap: var(--sp-2); font-family: var(--mono); font-size: var(--fs-11); min-width: 0; margin-top: 1px; }
-.fi-tool { color: var(--ink); flex: none; }
-.fi-target { color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.fi.err .fi-tool { color: var(--bad); }
-@media (prefers-reduced-motion: no-preference) {
-  .agroup.enter, .arow.enter, .card.enter { animation: fade var(--t-toast) var(--ease) both; }
-  .arow.flash { animation: wash 1s var(--ease) both; }
-  .arow.leaving, .agroup.leaving, .card.leaving { animation: leave var(--t-toast) var(--ease) both; pointer-events: none; }
-}
-@keyframes leave { to { opacity: 0; } }
-@keyframes wash { from { background-color: color-mix(in srgb, var(--ink) 9%, transparent); } }
-.arow.c-needs.flash { animation-name: wash-warn; }
-@keyframes wash-warn { from { background-color: color-mix(in srgb, var(--warn-dot) 26%, transparent); } }
-@media (max-width: 900px) {
-  .arow { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 76px 70px; gap: var(--sp-3); }
-  .arow .a-num:last-child, .arow .a-spark .spark { display: none; }   /* the rate figure stays */
-  .agroup-h .faint { display: none; }
-}
-/* Phone: the activity drops under the name, the token count stays on the right. */
-@media (max-width: 640px) {
-  .arow { grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--sp-0h); column-gap: var(--sp-3); padding: var(--sp-2h) var(--sp-4); }
-  .arow .a-id { grid-column: 1; grid-row: 1; }
-  .arow .a-num { grid-column: 2; grid-row: 1; }
-  .arow .a-act { grid-column: 1; grid-row: 2; padding-left: 22px; }
-  .arow .a-spark { grid-column: 2; grid-row: 2; align-self: start; }
-  .agroup-h { flex-wrap: wrap; row-gap: var(--sp-0h); }
-  .agroup-h .spacer { flex-basis: 100%; height: 0; }
-  .agroup-h .tag { max-width: 60vw; }
-}
 
 /* ── The decision card ───────────────────────────────────────────────────
    One anatomy wherever a decision shows (session and subagent pages, toast,
@@ -631,6 +551,30 @@ details.how[open] summary { margin-bottom: var(--sp-2h); }
 .picker.title .picker-pop { font-size: var(--fs-13); font-weight: 400; letter-spacing: -.003em; }
 .picker.title .picker-label:empty::before { width: 140px; height: 16px; }
 
+/* The window picker in the header: the same dropdown, sized to the bar's
+   controls and quiet at rest (no border, like the title picker). The list is
+   a plain listbox that takes focus, so a keyboard user gets the inset ring on
+   the row the arrows are on. */
+.picker.win { flex: none; }
+.picker.win .picker-btn { height: var(--h-ctl-s); max-width: none; padding: 0 var(--sp-2) 0 var(--sp-2h); gap: var(--sp-1); border-color: transparent; background: transparent;
+  color: var(--ink-2); font-size: var(--fs-12); }
+.picker.win .picker-btn:hover, .picker.win .picker-btn[aria-expanded="true"] { border-color: transparent; background: var(--hover); color: var(--ink); }
+.picker.win .picker-pop { left: auto; right: 0; width: 200px; transform-origin: top right; font-size: var(--fs-13); font-weight: 400; letter-spacing: -.003em; }
+.picker.win .picker-opt { grid-template-columns: minmax(0, 1fr) auto; padding: 0 var(--sp-2h); }
+.picker.win .picker-list:focus-visible { outline: none; }
+.picker.win .picker-list:focus-visible .picker-opt.active { outline: 2px solid var(--focus); outline-offset: -2px; }
+/* Phone: the bar has no room for a sentence, so the button becomes a square
+   like its neighbours and says "7d" (the label's data-short); the full label
+   stays in the DOM and in the accessible name. */
+@media (max-width: 520px) {
+  .scope { margin-right: 0; }
+  .picker.win .picker-btn { min-width: 32px; justify-content: center; padding: 0 var(--sp-1); border-color: var(--line); background: var(--surface); font-weight: 600; }
+  .picker.win .picker-btn:hover, .picker.win .picker-btn[aria-expanded="true"] { border-color: var(--line-2); background: var(--raised); }
+  .picker.win .picker-btn .chev { display: none; }
+  .picker.win .picker-label { font-size: 0; }
+  .picker.win .picker-label::after { content: attr(data-short); font-size: var(--fs-12); }
+}
+
 /* ── Project picker, project table, timeline order ───────────────────── */
 .page-tools { display: flex; align-items: center; gap: var(--sp-2h); font-size: var(--fs-12); }
 .picker { position: relative; }
@@ -691,7 +635,7 @@ details.how[open] summary { margin-bottom: var(--sp-2h); }
 
 /* ── Responsive ──────────────────────────────────────────────────────── */
 @media (max-width: 1100px) {
-  .scope { display: none; }
+  .scope-txt { display: none; }
 }
 @media (max-width: 900px) {
   .top-in { gap: var(--sp-4); padding: 0 var(--sp-4); }
@@ -701,20 +645,21 @@ details.how[open] summary { margin-bottom: var(--sp-2h); }
   .kpi.hero .value { font-size: var(--fs-28); }
   .d-title { font-size: var(--fs-20); }
 }
-/* Phone: the bar keeps logo, tabs and the bell on one line. The shortcut
-   help goes (no keyboard); the sync bar narrows, and on failure it keeps the
-   red dot without the words. */
+/* Phone: the bar keeps logo, tabs, the sync bar and the bell on one line.
+   The shortcut help goes (no keyboard); the sync bar narrows, and on failure
+   it keeps the red dot without the words. */
 @media (max-width: 640px) {
   .top-in { gap: var(--sp-2); padding: 0 var(--sp-3) 0 var(--sp-4); }
   .brand span { display: none; }
   .tabs a { padding: 0 var(--sp-2h); }
-  .tabs a[aria-current="page"]::after { left: 10px; right: 10px; }
+  .tabs a[aria-current="page"]::after { left: var(--sp-2h); right: var(--sp-2h); }
   .sync { gap: var(--sp-1h); margin-right: 0; }
   .sync-bar { width: 40px; }
   .sync-msg { display: none; }
   .sync-txt { min-width: 0 !important; }
   #help-btn { display: none; }
-  .icon-btn { width: 32px; height: 32px; }
+  .icon-btn, .picker.win .picker-btn { height: 32px; }
+  .icon-btn { width: 32px; }
   .search { flex: 1 1 100%; min-width: 0; }
   .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .kpi { padding: var(--sp-3h) var(--sp-4); }
@@ -733,17 +678,30 @@ details.how[open] summary { margin-bottom: var(--sp-2h); }
   .error-box { grid-template-columns: auto minmax(0, 1fr); }
   .error-box .btn { grid-column: 2; grid-row: 3; justify-self: start; margin-top: var(--sp-2); }
 }
-/* Four tabs (Live, Sessions, Overview, Docs) still fit one line down to 320px. */
-@media (max-width: 440px) {
+/* The two tabs (Factory, Projects), the sync hairline and the buttons fit
+   one line down to 320px. With the self-heal square (selfheal.css) one more
+   32px button, the bar's gaps and the tab padding give a little at 400px and
+   narrower, and tighten further below 380px. */
+@media (max-width: 400px) {
+  .top-right { gap: var(--sp-1h); }
   .tabs a { padding: 0 var(--sp-2); }
   .tabs a[aria-current="page"]::after { left: var(--sp-2); right: var(--sp-2); }
 }
 @media (max-width: 380px) {
-  .top-in { gap: var(--sp-1); padding: 0 var(--sp-2) 0 var(--sp-3); }
-  .tabs a { padding: 0 var(--sp-1); }
-  .tabs a[aria-current="page"]::after { left: var(--sp-1); right: var(--sp-1); }
+  .top-in, .top-right { gap: var(--sp-1); }
+  .top-in { padding: 0 var(--sp-2) 0 var(--sp-3); }
+  .tabs a { padding: 0 var(--sp-1h); }
+  .tabs a[aria-current="page"]::after { left: var(--sp-1h); right: var(--sp-1h); }
 }
-@media (max-width: 340px) { .tabs a { font-size: var(--fs-12); } }
+/* 320px with the window picker and the self-heal square beside the bell and
+   theme button: the squares go back to the desktop 28px and the bar gives up a
+   few pixels of padding (from 350px, where 32px squares stop fitting). */
+@media (max-width: 350px) {
+  .top-in { padding-left: var(--sp-2); }
+  .tabs a { padding: 0 3px; }
+  .tabs a[aria-current="page"]::after { left: 3px; right: 3px; }
+  .icon-btn, .picker.win .picker-btn { width: 28px; min-width: 28px; height: 28px; }
+}
 /* Reduced motion: every keyframe animation above is opt-in under
    no-preference; here the remaining movement goes too. Colour and opacity
    transitions stay, they carry state. */

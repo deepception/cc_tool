@@ -14,9 +14,11 @@ Builds fake ${CLAUDE_CONFIG_DIR}/projects sessions in a temp dir:
   C  two subagents that spawned each other (a cycle), nothing from the main thread
   D  a chain of 30 nested subagents (past the depth bound)
 then checks the tree, the totals, the effort sources, thinking, the session
-payload, the Live board chip, Overview, the endpoint's auth and (with Chrome
-and playwright-core) the Agents tab in a browser. Nothing outside the temp
-dir is touched.
+payload, the effort on the board's rows (/api/live) and on the Factory floor's
+nodes (/api/graph), Overview, the endpoint's auth and (with Chrome and
+playwright-core) the Agents tab in a browser, the effort chip in the floor's
+inspector head (where the Live board's chip used to show), and the control row
+on an agent's page. Nothing outside the temp dir is touched.
 
 Run:  python3 tests/test_cc_dash_tree.py
 """
@@ -33,6 +35,7 @@ from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "lib"))
+from cc_dash import graph as graph_mod  # noqa: E402
 from cc_dash import tree as agent_tree  # noqa: E402
 from cc_dash.parser import Acc, FileCache  # noqa: E402
 from cc_dash.server import make_server  # noqa: E402
@@ -56,6 +59,7 @@ def iso(t):
 
 BASE = tempfile.mkdtemp(prefix="cc-dash-tree-")
 CFG = os.path.join(BASE, "claude")
+os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "state")      # attention.py reads the hooks' log from here: no real one is ever read
 WORK = os.path.join(BASE, "work", "demo")
 os.makedirs(WORK)
 PDIR = os.path.join(CFG, "projects", WORK.replace("/", "-"))
@@ -446,6 +450,10 @@ def test_tree():
     lv_rows = {a["key"]: a for a in live["agents"]}
     main_row = lv_rows.get(SA)
     check("live: main thread shows its recorded effort", main_row and main_row["effort"] == "high" and main_row["effort_source"] == "recorded", main_row and main_row["effort"])
+    # the Factory floor takes the same field (its inspector head draws the chip from it)
+    floor_node = {n["id"]: n for n in graph_mod.payload(st)["nodes"]}.get("s:" + SA, {})
+    check("floor: the session node carries the board row's effort and where it came from",
+          floor_node.get("effort") == "high" and floor_node.get("effort_source") == "recorded", (floor_node.get("effort"), floor_node.get("effort_source")))
     ov = st.overview_payload()
     om = next((x for x in ov["models"] if x["model"] == OPUS), {})
     check("overview: recorded effort per model", om.get("effort", {}).get("high", 0) >= 4, om.get("effort"))
@@ -598,6 +606,20 @@ const { chromium } = require(process.env.PW);
   doneMode = true;
   await page.waitForTimeout(7500);
   out.ctlDone = await ctl();
+  // The effort chip on the Factory floor: the session's inspector head names its recorded effort (a solid chip, not an inferred one).
+  await page.goto(`http://127.0.0.1:${process.env.PORT}/#/factory`, { waitUntil: 'load' });
+  const nid = 's:' + process.env.SID;
+  await page.waitForSelector('.gx-node[data-id=' + JSON.stringify(nid) + ']', { timeout: 15000 });
+  await page.waitForTimeout(800);
+  await page.evaluate((id) => { try { window.ccFactory.graph().center(id, { animate: false }); } catch (e) { /* no engine */ } }, nid);
+  await page.waitForTimeout(250);
+  const pt = await page.evaluate((id) => { const r = document.querySelector('.gx-node[data-id=' + JSON.stringify(id) + ']').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }, nid);
+  await page.mouse.click(pt.x, pt.y);
+  await page.waitForFunction(() => { const a = document.querySelector('aside.fx-inspector'); return a && !a.hidden; }, null, { timeout: 4000 });
+  out.floorChip = await page.evaluate(() => {
+    const head = document.querySelector('aside.fx-inspector .fx-insp-kind');
+    return { text: head.textContent.replace(/\s+/g, ' ').trim(), tags: [...head.querySelectorAll('.tag')].map((t) => ({ text: t.textContent.trim(), inferred: t.classList.contains('inferred'), title: t.title })) };
+  });
   out.errors = errs;
   await browser.close();
   console.log(JSON.stringify(out));
@@ -650,6 +672,9 @@ def test_browser():
     check("markdown: headings scaled to the timeline (14px at most)", md.get("heading") in ("13px", "14px"), md.get("heading"))
     check("markdown: a live timeline with Markdown entries morphs in place across polls", o["agentPolls"] >= 2 and o["agentFlicker"] == {"childList": 0, "attributes": 0, "characterData": 0}, (o["agentPolls"], o["agentFlicker"]))
     cr, cd = o.get("ctlRunning") or {}, o.get("ctlDone") or {}
+    chip = [t for t in (o.get("floorChip") or {}).get("tags", []) if t["text"].startswith("effort")]
+    check("floor: the inspector head carries the recorded effort chip (solid, with where it came from)",
+          len(chip) == 1 and chip[0]["text"] == "effort high" and not chip[0]["inferred"] and "recorded" in chip[0]["title"], o.get("floorChip"))
     check("control: a running subagent shows Stop and its (empty) history", cr.get("panel") and cr.get("stop") and cr.get("history"), cr)
     check("control: once done, no Stop row, no empty history, no panel", cd and not cd.get("stop") and not cd.get("history") and not cd.get("panel"), cd)
 

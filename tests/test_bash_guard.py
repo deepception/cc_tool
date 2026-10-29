@@ -74,6 +74,18 @@ def make_fixtures(base):
     open(os.path.join(badrules, ".claude", "guard-rules.json"), "w").write("{not json")
     global RULES, BADRULES
     RULES, BADRULES = rules, badrules
+    # Upstreams for `git pull --ff-only` on master: `other` tracks master on a network
+    # remote (the one form that runs without asking); BADUP tracks another branch;
+    # LOCALUP's remote is a local path. Config only: nothing is ever fetched.
+    global BADUP, LOCALUP
+    BADUP = _repo(os.path.join(base, "repo_badup"), "master")
+    LOCALUP = _repo(os.path.join(base, "repo_localup"), "master")
+    for repo, url, merge in ((other, "https://example.invalid/o/r.git", "refs/heads/master"),
+                             (BADUP, "https://example.invalid/o/r.git", "refs/heads/feature"),
+                             (LOCALUP, os.path.join(base, "elsewhere"), "refs/heads/master")):
+        _git(repo, "remote", "add", "origin", url)
+        _git(repo, "config", "branch.master.remote", "origin")
+        _git(repo, "config", "branch.master.merge", merge)
     # Decoy secret-ish files so probes look realistic. Contents are dummies;
     # the guard is static-analysis only and never opens them.
     for d in (notgit, master, feature):
@@ -131,7 +143,7 @@ MASTER, FEATURE, OTHER, NOTGIT = make_fixtures(BASE)
 CASES = [
     # ── Protected-branch commit ────────────────────────────────────────────
     ("C01", "commit", MASTER, "git commit -m 'x'", D),
-    ("C02", "commit", MASTER, "git commit --amend --no-edit", A),
+    ("C02", "commit", MASTER, "git commit --amend --no-edit", K),               # merge gate: an amend moves master
     ("C03", "commit", FEATURE, "git commit -m 'x'", A),
     ("C04", "commit", MASTER, "git -C . commit -m 'x'", D),                      # BG-2
     ("C05", "commit", MASTER, "git --git-dir=.git --work-tree=. commit -m 'x'", D),  # BG-2
@@ -171,7 +183,7 @@ CASES = [
     ("P15", "push", FEATURE, "git -C %s push origin master" % OTHER, D),
     ("P16", "push", FEATURE, "git push origin 'master'", D),
     ("P17", "push", FEATURE, "git push origin ma'ster'", D),
-    ("P18", "push", FEATURE, "B=master; git push origin $B", A),                 # inherent gap
+    ("P18", "push", FEATURE, "B=master; git push origin $B", K),                 # merge gate: a built branch name asks
     ("P19", "push", FEATURE, "sh -c 'git push origin master'", A),               # inherent gap
     ("P20", "push", FEATURE, "echo 'git push origin master'", A),
     ("P21", "push", FEATURE, "git push origin master # ship it", D),
@@ -181,9 +193,9 @@ CASES = [
     ("P25", "push", FEATURE, 'git push origin master "', D),                     # regex fallback
     ("P26", "push", FEATURE, "git push --receive-pack=x origin master", D),
     ("P27", "push", FEATURE, "git push -o ci.skip origin master", D),
-    ("P28", "push", FEATURE, "git push origin $'mas\\x74er'", A),                # inherent gap
-    ("P29", "push", FEATURE, "git push origin ma`echo s`ter", A),                # inherent gap
-    ("P30", "push", FEATURE, 'git push origin "$(echo master)"', A),             # inherent gap
+    ("P28", "push", FEATURE, "git push origin $'mas\\x74er'", K),                # merge gate: a built branch name asks
+    ("P29", "push", FEATURE, "git push origin ma`echo s`ter", K),                # merge gate: a built branch name asks
+    ("P30", "push", FEATURE, 'git push origin "$(echo master)"', K),             # merge gate: a built branch name asks
     ("P31", "push", FEATURE, "git push origin мaster", A),
     ("P32", "push", FEATURE, "git push origin master​", A),
     ("P33", "push", FEATURE, "gh pr merge --squash", A),
@@ -442,7 +454,7 @@ CASES = [
     ("R49", "restore", FEATURE, "git restore --staged --worktree .", K),
     ("R50", "restore", FEATURE, "git restore -SW .", K),
     ("R51", "restore", FEATURE, "git restore -S .", A),
-    ("R52", "fallback", FEATURE, "git push origin feat 2>&1 | tail -f log'", A),
+    ("R52", "fallback", FEATURE, "git push origin feat 2>&1 | tail -f log'", K),   # merge gate: unparseable git asks
     ("R53", "fallback", FEATURE, "git push -f origin feat '", D),
     ("R54", "comment", FEATURE, "echo \"$(echo \" #\")\"; rm -rf ~", D),
     ("R55", "comment", FEATURE, "x=$(date # when\n); rm -rf ~", D),
@@ -893,6 +905,373 @@ CASES = [
     ("CD27", "ccdash", FEATURE, "jq -c .message ~/.claude/projects/x/s.jsonl", A),
     ("CD28", "ccdash", FEATURE, "ls ~/Files/hobby/cc_tool/docs", A),
     ("CD29", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/controller.txt", A),
+    # ── gh api: `Bash(gh api *)` is allowlisted for reads, so a write asks (v0.3.1) ──
+    # reads run without a prompt
+    ("GH01", "ghapi", FEATURE, "gh api repos/o/r", A),
+    ("GH02", "ghapi", FEATURE, "gh api -X GET repos/o/r", A),
+    ("GH03", "ghapi", FEATURE, "gh api --method=get repos/o/r/pulls", A),
+    ("GH04", "ghapi", FEATURE, "gh api --paginate repos/o/r/issues", A),
+    ("GH05", "ghapi", FEATURE, "gh api repos/o/r --jq .name", A),
+    ("GH06", "ghapi", FEATURE, "gh api -H 'Accept: application/vnd.github+json' repos/o/r", A),
+    ("GH07", "ghapi", FEATURE, "gh api user | jq .login", A),
+    ("GH08", "ghapi", FEATURE, "gh api -X GET search/issues -f q='repo:o/r is:open'", A),     # GET: fields are the query string
+    ("GH09", "ghapi", FEATURE, "gh api repos/o/r/pulls --jq '.[] | select(.draft) | .number' 2>&1 | head -5", A),
+    ("GH10", "ghapi", FEATURE, "gh api -X DELETE -X GET repos/o/r", A),                     # pflag: the last -X wins
+    ("GH11", "ghapi", FEATURE, "gh api repos/$OWNER/$REPO/pulls --jq '.[].number'", K),    # unknown variables: bash may split them
+    ("GH12", "ghapi", FEATURE, "EP=repos/o/r; gh api $EP", K),                             # no variable is resolved (round 3)
+    ("GH13", "ghapi", FEATURE, "M=GET; gh api -X $M repos/o/r", K),
+    ("GH14", "ghapi", FEATURE, "gh api repos/o/r -- -X DELETE", A),                         # after --: positionals
+    ("GH15", "ghapi", FEATURE, "echo repos/o/r | xargs gh api", A),
+    ("GH16", "ghapi", FEATURE, "gh pr merge --squash", A),                                  # not gh api: Claude Code prompts
+    # writes ask: methods, in every pflag spelling
+    ("GH20", "ghapi", FEATURE, "gh api -X DELETE repos/o/r", K),
+    ("GH21", "ghapi", FEATURE, "gh api -XPOST repos/o/r/issues", K),
+    ("GH22", "ghapi", FEATURE, "gh api -X=POST repos/o/r/issues", K),
+    ("GH23", "ghapi", FEATURE, "gh api -iXPOST repos/o/r/issues", K),                       # clustered short options
+    ("GH24", "ghapi", FEATURE, "gh api --method PATCH repos/o/r", K),
+    ("GH25", "ghapi", FEATURE, "gh api --method=put repos/o/r/collaborators/u", K),
+    ("GH26", "ghapi", FEATURE, "gh api -X GET -X DELETE repos/o/r", K),                     # pflag: the last -X wins
+    ("GH27", "ghapi", FEATURE, "gh api repos/o/r -X delete", K),                            # options after the endpoint
+    ("GH28", "ghapi", FEATURE, "gh -X DELETE api repos/o/r", K),                            # cobra passes it on to api
+    ("GH29", "ghapi", FEATURE, "/usr/bin/gh api -X DELETE repos/o/r", K),
+    # writes ask: a request body (fields without -X GET become a POST)
+    ("GH30", "ghapi", FEATURE, "gh api repos/o/r/issues -f title=x", K),
+    ("GH31", "ghapi", FEATURE, "gh api repos/o/r/issues -Ftitle=x", K),
+    ("GH32", "ghapi", FEATURE, "gh api repos/o/r/issues -ftitle=x", K),
+    ("GH33", "ghapi", FEATURE, "gh api repos/o/r/issues --raw-field title=x", K),
+    ("GH34", "ghapi", FEATURE, "gh api repos/o/r/issues --field=title=x", K),
+    ("GH35", "ghapi", FEATURE, "gh api repos/o/r/merges -f base=main -f head=x", K),
+    ("GH36", "ghapi", FEATURE, "gh api repos/o/r/issues --input f.json", K),
+    ("GH37", "ghapi", FEATURE, "gh api repos/o/r/issues --input -", K),
+    ("GH38", "ghapi", FEATURE, "gh api -X GET repos/o/r --input f.json", K),               # --input always asks
+    ("GH39", "ghapi", FEATURE, "gh api -X GET search/code -F q=@notes.txt", K),           # -F @file: not visible in the command
+    # writes ask: other ways to a mutating request
+    ("GH40", "ghapi", FEATURE, "gh api -H 'X-HTTP-Method-Override: DELETE' repos/o/r", K),
+    ("GH41", "ghapi", FEATURE, "gh api --meth DELETE repos/o/r", K),                        # unknown option (pflag has no abbreviations)
+    ("GH42", "ghapi", FEATURE, "gh api 2>/dev/null repos/o/r -X DELETE", K),                # words after a redirect stay in the call
+    ("GH43", "ghapi", FEATURE, 'gh api "$EP"', K),                                          # unknown expansion could be an option
+    ("GH44", "ghapi", FEATURE, "M=DELETE; gh api -X $M repos/o/r", K),
+    ("GH45", "ghapi", FEATURE, "F=-XDELETE; gh api $F repos/o/r", K),
+    ("GH46", "ghapi", FEATURE, 'gh api -X "$(echo GET)" repos/o/r', K),
+    ("GH47", "ghapi", FEATURE, 'gh api repos/o/r -H "$H"', K),
+    ("GH48", "ghapi", FEATURE, "gh api repos/o/r 'unbalanced", K),                          # unparseable: cannot clear it
+    # GraphQL: a literal query without `mutation` is a read; anything else asks
+    ("GH50", "ghapi", FEATURE, "gh api graphql -f query='query { viewer { login } }'", A),
+    ("GH51", "ghapi", FEATURE, "gh api graphql -f query='{ viewer { login } }'", A),
+    ("GH52", "ghapi", FEATURE, "gh api graphql -f query='query($o: String!) { repository(owner: $o, name: \"r\") { id } }' -F o=x", K),  # quotes are gone: $o may be bash's
+    ("GH52b", "ghapi", FEATURE, "gh api graphql -f query=\"query(\\$o: String!) { repository(owner: $o, name: \\\"r\\\") { id } }\" -F o=x", K),  # bash expands this $o
+    ("GH52c", "ghapi", FEATURE, "gh api graphql -f query='{ repository(owner: \"o\", name: \"r\") { issues(first: 5) { nodes { title } } } }'", A),  # values inline
+    ("GH52d", "ghapi", FEATURE, "gh api graphql -f query=mu{t,}ation{x}", K),               # brace expansion: fails closed
+    ("GH53", "ghapi", FEATURE, "gh api /graphql -f query='{ viewer { login } }'", A),
+    ("GH54", "ghapi", FEATURE, "gh api graphql -f query='mutation { addStar(input: {starrableId: \"x\"}) { clientMutationId } }'", K),
+    ("GH55", "ghapi", FEATURE, "gh api /graphql -f query='mutation{x}'", K),
+    ("GH56", "ghapi", FEATURE, "gh api https://api.github.com/graphql -f query='mutation{x}'", K),
+    ("GH57", "ghapi", FEATURE, "gh api -X GET graphql -f query='mutation{x}'", K),
+    ("GH58", "ghapi", FEATURE, "gh api graphql -F query=@q.graphql", K),
+    ("GH59", "ghapi", FEATURE, "gh api graphql -F query=@-", K),
+    ("GH60", "ghapi", FEATURE, "gh api graphql -f query=\"$Q\"", K),                         # a shell variable, not a GraphQL one
+    ("GH61", "ghapi", FEATURE, "gh api graphql -f query=\"query { $(cat q) }\"", K),
+    ("GH62", "ghapi", FEATURE, "gh api graphql --input q.json", K),
+    ("GH63", "ghapi", FEATURE, "gh api graphql -F owner=x", K),                             # no query written out
+    ("GH64", "ghapi", FEATURE, "gh api graphql -f query='{ viewer { login } }' -F query='mutation{x}'", K),
+    ("GH65", "ghapi", FEATURE, "gh api 'graphql?query=mutation%7Bx%7D'", K),
+    ("GH66", "ghapi", FEATURE, "gh api graphql -X POST -f query='{ viewer { login } }'", K),  # an explicit non-GET method always asks
+    ("GH67", "ghapi", FEATURE, "gh api graphql -f query='{ search(query: \"mutation testing\", type: REPOSITORY, first: 1) { repositoryCount } }'", K),  # the word anywhere asks: no GraphQL parse
+    # compounds, pipelines, subshells, substitutions, wrappers, runners: reads pass, writes ask
+    ("GH70", "ghapi", FEATURE, "gh api -X DELETE repos/o/r | jq .", K),
+    ("GH71", "ghapi", FEATURE, "gh api repos/o/r | jq .name && echo ok", A),
+    ("GH72", "ghapi", FEATURE, "git status && gh api -X POST repos/o/r/forks", K),
+    ("GH73", "ghapi", FEATURE, "git status && gh api repos/o/r/forks", A),
+    ("GH74", "ghapi", FEATURE, "true; gh api repos/o/r/issues -f title=x", K),
+    ("GH75", "ghapi", FEATURE, "true; gh api repos/o/r/issues", A),
+    ("GH76", "ghapi", FEATURE, "false || gh api -X DELETE repos/o/r", K),
+    ("GH77", "ghapi", FEATURE, "false || gh api repos/o/r", A),
+    ("GH78", "ghapi", FEATURE, "(gh api -X DELETE repos/o/r)", K),
+    ("GH79", "ghapi", FEATURE, "(gh api user)", A),
+    ("GH80", "ghapi", FEATURE, "echo $(gh api -X DELETE repos/o/r)", K),
+    ("GH81", "ghapi", FEATURE, "X=$(gh api user --jq .login); echo $X", A),
+    ("GH82", "ghapi", FEATURE, "X=\"$(gh api repos/o/r/issues -f title=x)\"", K),          # $( … ) inside quotes
+    ("GH83", "ghapi", FEATURE, "L=\"$(gh api user --jq .login)\"", A),
+    ("GH84", "ghapi", FEATURE, "echo `gh api -X DELETE repos/o/r`", K),
+    ("GH85", "ghapi", FEATURE, "env GH_HOST=github.com gh api -X DELETE repos/o/r", K),
+    ("GH86", "ghapi", FEATURE, "GH_TOKEN=x command gh api -X DELETE repos/o/r", K),
+    ("GH87", "ghapi", FEATURE, "time nice -n 5 timeout 30 gh api -X DELETE repos/o/r", K),
+    ("GH88", "ghapi", FEATURE, "echo repos/o/r | xargs gh api -X DELETE", K),
+    ("GH89", "ghapi", FEATURE, "for r in a b; do gh api -X DELETE repos/o/$r; done", K),
+    ("GH90", "ghapi", FEATURE, "f(){ gh api -X DELETE \"repos/o/$1\"; }; f r", K),
+    ("GH91", "ghapi", FEATURE, "sh -c 'gh api -X DELETE repos/o/r'", K),                     # followed, as deletions are
+    ("GH92", "ghapi", FEATURE, "bash <<'EOF'\ngh api -X DELETE repos/o/r\nEOF", K),
+    ("GH93", "ghapi", FEATURE, "bash <<< 'gh api -X DELETE repos/o/r'", K),
+    ("GH94", "ghapi", FEATURE, "echo 'gh api -X DELETE repos/o/r' | sh", K),
+    ("GH95", "ghapi", FEATURE, "echo 'gh api -X DELETE repos/o/r'", A),                      # text nothing runs
+    ("GH96", "ghapi", FEATURE, "git commit -m 'docs: never gh api -X DELETE'", A),
+    ("GH97", "ghapi", FEATURE, "cat > notes.md <<'EOF'\ngh api -X DELETE repos/o/r\nEOF", A),  # heredoc data
+    # review of b33f289: the guard fails closed on expansions anywhere in a word
+    ("GH100", "ghapi", FEATURE, "gh api repos/o/r/$(printf 'x -XDELETE')", K),
+    ("GH101", "ghapi", FEATURE, "gh api x$FLAGS", K),
+    ("GH102", "ghapi", FEATURE, "gh api --method=$M repos/o/r", K),
+    ("GH103", "ghapi", FEATURE, 'gh api -X"$M" repos/o/r', K),
+    ("GH104", "ghapi", FEATURE, 'gh api "repos/o/r/$X"', K),
+    ("GH105", "ghapi", FEATURE, "gh api repos/o/r/`printf x`", K),
+    ("GH106", "ghapi", FEATURE, "gh api repos/o/r/${X}", K),
+    ("GH107", "ghapi", FEATURE, "gh api repos/o/r/${X:-x}", K),
+    ("GH108", "ghapi", FEATURE, "X='a -XDELETE'; gh api repos/o/r/$X", K),               # a known value bash would split
+    ("GH109", "ghapi", FEATURE, "X=; gh api repos/o/r -H $X --method=GET -f a=b", K),    # empty: the word vanishes
+    ("GH110", "ghapi", FEATURE, "X=pulls; gh api repos/o/r/$X", K),                      # known, but IFS may split it (round 3)
+    ("GH111", "ghapi", FEATURE, "gh api repos/o/r/$((1+1)) -XDELETE", K),
+    ("GH112", "ghapi", FEATURE, "gh api {-XDELETE,x} repos/o/r", K),                      # brace expansion
+    ("GH113", "ghapi", FEATURE, "gh api repos/o/r {-XDELETE,}", K),
+    ("GH114", "ghapi", FEATURE, "gh api repos/o/r *", K),                                 # glob: a file named -XDELETE
+    ("GH115", "ghapi", FEATURE, "gh api repos/o/r/issues?state=open", K),
+    ("GH116", "ghapi", FEATURE, "gh api 'repos/o/r/issues?state=open'", A),               # quoted: no glob
+    ("GH117", "ghapi", FEATURE, "gh api repos/{owner}/{repo}/pulls", A),                  # gh's placeholders, no brace expansion
+    ("GH118", "ghapi", FEATURE, "gh api graphql -f query='{ viewer { login } }' $'-XDELETE'", K),  # ANSI-C quoting
+    ("GH119", "ghapi", FEATURE, "gh api repos/o/r XDELETE", K),                    # bash-guard's own markers in the input
+    # review of b33f289: redirections read from the raw command, quote-aware
+    ("GH120", "ghapi", FEATURE, "gh api -t '>' -X DELETE repos/o/r", K),
+    ("GH121", "ghapi", FEATURE, "gh api -q 1 >/dev/null -XDELETE repos/o/r", K),
+    ("GH122", "ghapi", FEATURE, 'gh api -t ">" -X DELETE repos/o/r', K),
+    ("GH123", "ghapi", FEATURE, "gh api -t \\> -X DELETE repos/o/r", K),
+    ("GH124", "ghapi", FEATURE, "gh api -t '<<<' -X DELETE repos/o/r", K),
+    ("GH125", "ghapi", FEATURE, "gh api repos/o/r '|' -X DELETE", K),                     # a quoted pipe is a word
+    ("GH126", "ghapi", FEATURE, "gh api repos/o/r ';' -X DELETE", K),
+    ("GH127", "ghapi", FEATURE, "gh api repos/o/r '&&' -X DELETE", K),
+    ("GH128", "ghapi", FEATURE, "gh api repos/o/r >|/tmp/x -XDELETE", K),                 # >| is a redirection too
+    ("GH129", "ghapi", FEATURE, "gh api repos/o/r <(true) -XDELETE", K),                  # process substitution
+    ("GH130", "ghapi", FEATURE, "gh api repos/o/r 2>/dev/null -X DELETE", K),
+    ("GH131", "ghapi", FEATURE, "gh api -X 2>/dev/null DELETE repos/o/r", K),
+    ("GH132", "ghapi", FEATURE, "find . -name x -exec gh api -X DELETE repos/o/r ';'", K),
+    ("GH133", "ghapi", FEATURE, 'X="$(gh api user --jq \'.login\')"', K),                 # quotes inside "$( … )": fails closed
+    # reads stay prompt-free
+    ("GH140", "ghapi", FEATURE, "gh api repos/o/r > out.json", A),
+    ("GH141", "ghapi", FEATURE, "gh api repos/o/r 2>&1 | jq .name", A),
+    ("GH142", "ghapi", FEATURE, "gh api repos/o/r --jq '.[] | .x'", A),
+    ("GH143", "ghapi", FEATURE, "gh api repos/o/r 2>/dev/null >> out.json", A),
+    ("GH144", "ghapi", FEATURE, "gh api repos/o/r --jq '.[] | select(.a > 1) | .x' 2>&1", A),
+    ("GH145", "ghapi", FEATURE, "gh api -t '{{.name}}' repos/o/r", A),
+    ("GH146", "ghapi", FEATURE, "gh api 'search/issues?q=a,b' -X GET", A),
+    ("GH147", "ghapi", FEATURE, "find . -name x -exec gh api repos/o/r \\;", A),
+    ("GH148", "ghapi", FEATURE, "diff <(cat api.txt) <(cat gh-notes.txt)", A),            # no gh api call: the rules above stay off
+    ("GH149", "ghapi", FEATURE, "printf $'a\\n' > high-api.md", A),
+    ("GH150", "ghapi", FEATURE, "g'h' a\\pi -X DELETE repos/o/r", K),                      # quoting does not hide the call
+    ("GH151", "ghapi", FEATURE, "X=GET; f(){ gh api -X $X repos/o/r; }; X=DELETE; f", K),  # a body runs with later values
+    ("GH152", "ghapi", FEATURE, "X=GET gh api -X $X repos/o/r", K),                        # a prefix assignment is not in effect yet
+    ("GH153", "ghapi", FEATURE, "X=GET; gh api -X $X repos/o/r", K),                       # round 3: no known-variable exception
+    ("GH154", "ghapi", FEATURE, "trap 'gh api -X DELETE repos/o/r' EXIT", K),
+    # round 3: IFS anywhere, and command names bash builds
+    ("GH160", "ghapi", FEATURE, "IFS=/; X=a/-XDELETE; gh api repos/$X", K),
+    ("GH161", "ghapi", FEATURE, "IFS=- gh api repos/o/r", K),
+    ("GH162", "ghapi", FEATURE, "read IFS; gh api repos/o/r", K),
+    ("GH163", "ghapi", FEATURE, "export IFS=/; gh api repos/o/r", K),
+    ("GH164", "ghapi", FEATURE, "declare IFS=/; gh api repos/o/r", K),
+    ("GH165", "ghapi", FEATURE, 'X="a b"; gh api "repos/o/r/$X"', K),                       # double quotes: still an expansion
+    ("GH166", "ghapi", FEATURE, "$G api -X DELETE repos/o/r", K),
+    ("GH167", "ghapi", FEATURE, "${G} api -X DELETE repos/o/r", K),
+    ("GH168", "ghapi", FEATURE, "`printf gh` api -XDELETE r", K),
+    ("GH169", "ghapi", FEATURE, "$(echo gh) api -XDELETE r", K),
+    ("GH170", "ghapi", FEATURE, '"$(echo gh)" api -XDELETE r', K),
+    ("GH171", "ghapi", FEATURE, "/usr/bin/g? api -XDELETE r", K),
+    ("GH172", "ghapi", FEATURE, "/usr/bin/g[h] api repos/o/r", K),
+    ("GH173", "ghapi", FEATURE, "g$x api -XDELETE r", K),
+    ("GH174", "ghapi", FEATURE, "g$Xh api repos/o/r", K),
+    ("GH175", "ghapi", FEATURE, 'g""h api -XDELETE r', K),                                  # quotes resolve to gh: the call itself asks
+    ("GH176", "ghapi", FEATURE, "g\\h api -XDELETE r", K),
+    ("GH177", "ghapi", FEATURE, "env $G api -XDELETE r", K),
+    ("GH178", "ghapi", FEATURE, "xargs $G api -XDELETE r", K),
+    ("GH179", "ghapi", FEATURE, 'command "$G" api -XDELETE r', K),
+    ("GH180", "ghapi", FEATURE, "G='gh api'; $G -X DELETE repos/o/r", K),
+    ("GH181", "ghapi", FEATURE, "{g,}h api -XDELETE r", K),
+    ("GH182", "ghapi", FEATURE, "$HOME/bin/gh api repos/o/r", K),                          # a home path is still built by bash
+    # round 3: plain literal reads stay prompt-free
+    ("GH190", "ghapi", FEATURE, "gh api repos/o/r", A),
+    ("GH191", "ghapi", FEATURE, "gh api --paginate repos/o/r/issues", A),
+    ("GH192", "ghapi", FEATURE, "gh api repos/o/r --jq '.[] | .x'", A),
+    ("GH193", "ghapi", FEATURE, "gh api repos/o/r > out.json", A),
+    ("GH194", "ghapi", FEATURE, "gh api repos/o/r 2>&1 | jq .name", A),
+    ("GH195", "ghapi", FEATURE, 'g""h api repos/o/r', A),                                   # this is gh api, a read
+    ("GH196", "ghapi", FEATURE, "cd $HOME && gh api user", A),                              # the expansion is not in the gh api call
+    ("GH197", "ghapi", FEATURE, "gh api repos/o/r --jq '.[] | select(.a == $x)'", A),       # single-quoted: literal
+    # ── Landing work on a protected branch (the merge gate): asked ─────────
+    ("LG01", "landing", MASTER, "git merge feature/x", K),
+    ("LG02", "landing", MASTER, "git merge --squash feature/x", K),
+    ("LG03", "landing", MASTER, "git merge --squash feature/x && git commit -m x", D),     # the commit is still refused
+    ("LG04", "landing", FEATURE, "git merge master", K),                                    # round 4 (B): names master
+    ("LG05", "landing", FEATURE, "git -C %s merge feature/x" % MASTER, K),                  # -C: that repo's branch counts
+    ("LG06", "landing", MASTER, "git -C %s merge master" % FEATURE, K),                     # round 4 (B): names master
+    ("LG07", "landing", MASTER, "git merge --abort", A),
+    ("LG08", "landing", MASTER, "git rebase feature/x", K),
+    ("LG09", "landing", MASTER, "git rebase --abort", A),
+    ("LG10", "landing", MASTER, "git rebase --continue", K),
+    ("LG11", "landing", MASTER, "git cherry-pick abc123", K),
+    ("LG12", "landing", MASTER, "git cherry-pick --abort", A),
+    ("LG13", "landing", MASTER, "git revert abc123", K),
+    ("LG14", "landing", MASTER, "git am < fix.patch", K),
+    ("LG15", "landing", MASTER, "git merge-base master feature/x", A),                      # not a merge
+    ("LG16", "landing", MASTER, "git log --merges", A),
+    # pull: only --ff-only from the branch's own verified upstream runs without asking
+    ("LG20", "landing", MASTER, "git pull", K),
+    ("LG21", "landing", MASTER, "git pull --ff-only", K),                                   # no upstream to vouch for
+    ("LG22", "landing", OTHER, "git pull --ff-only", A),                                    # master on its network remote
+    ("LG23", "landing", OTHER, "git pull --ff-only -q --prune", A),
+    ("LG24", "landing", OTHER, "git pull", K),
+    ("LG25", "landing", OTHER, "git pull --ff-only origin feature", K),
+    ("LG26", "landing", OTHER, "git pull --ff-only --rebase", K),
+    ("LG27", "landing", OTHER, "git -c remote.origin.url=https://evil.invalid/x pull --ff-only", K),
+    ("LG28", "landing", OTHER, "GIT_CONFIG_COUNT=1 git pull --ff-only", K),
+    ("LG29", "landing", OTHER, "git config branch.master.merge refs/heads/x && git pull --ff-only", K),
+    ("LG30", "landing", BADUP, "git pull --ff-only", K),                                    # tracks another branch
+    ("LG31", "landing", LOCALUP, "git pull --ff-only", K),                                  # remote is a local path
+    ("LG32", "landing", FEATURE, "git pull", A),
+    # reset to another commit
+    ("LG40", "landing", MASTER, "git reset --hard origin/master", K),
+    ("LG41", "landing", MASTER, "git reset --soft HEAD~1", K),
+    ("LG42", "landing", MASTER, "git reset HEAD", A),                                       # unstage: HEAD stays put
+    ("LG43", "landing", FEATURE, "git reset --soft HEAD~1", A),
+    # wherever HEAD is: pointing a protected branch elsewhere
+    ("LG50", "landing", FEATURE, "git update-ref refs/heads/master abc123", K),
+    ("LG51", "landing", FEATURE, "git update-ref -m msg refs/heads/main abc123", K),
+    ("LG52", "landing", FEATURE, "git update-ref --stdin < refs.txt", K),
+    ("LG53", "landing", FEATURE, "git update-ref refs/heads/feature/y abc123", A),
+    ("LG54", "landing", FEATURE, "git branch -f master feature/x", K),
+    ("LG55", "landing", FEATURE, "git branch -M feature/x main", K),
+    ("LG56", "landing", FEATURE, "git branch new-feature", A),
+    ("LG57", "landing", FEATURE, "git checkout -B master", K),
+    ("LG58", "landing", FEATURE, "git switch -C main origin/main", K),
+    ("LG59", "landing", FEATURE, "git worktree add -B master ../w", K),
+    ("LG60", "landing", FEATURE, "git fetch origin feature:master", K),
+    ("LG61", "landing", FEATURE, "git fetch origin", A),
+    ("LG62", "landing", FEATURE, "git checkout master && git merge feature/x", K),          # HEAD moves first
+    ("LG63", "landing", FEATURE, "git switch - && git merge feature/x", K),                 # could be master
+    ("LG64", "landing", FEATURE, "git checkout -b fix && git merge master", K),             # round 4 (B): names master
+    # the configuration the pull exception trusts
+    ("LG70", "landing", FEATURE, "git config remote.origin.url https://evil.invalid/x", K),
+    ("LG71", "landing", FEATURE, "git config --get remote.origin.url", A),
+    ("LG72", "landing", FEATURE, "git config remote.origin.url", A),                        # no value: a read
+    ("LG73", "landing", FEATURE, "git config --global url.https://evil.invalid/.insteadOf https://github.com/", K),
+    ("LG74", "landing", FEATURE, "git remote set-url origin https://evil.invalid/x", K),
+    ("LG75", "landing", FEATURE, "git remote -v", A),
+    ("LG76", "landing", MASTER, "git branch -u origin/feature", K),
+    ("LG77", "landing", FEATURE, "git config user.name x", A),
+    ("LG78", "landing", MASTER, "git merge feature/x -m 'unbalanced", K),                  # unparseable: the regex fallback
+    ("LG79", "landing", FEATURE, "git merge master -m 'unbalanced", K),                    # round 4 (C): any branch
+    # round 4: the reviewer's forms
+    ("LG80", "landing", FEATURE, "git fetch origin a:b c:master", K),                       # every refspec, not the first
+    ("LG81", "landing", FEATURE, "git update-ref --stdin", K),
+    ("LG82", "landing", FEATURE, "git config remote.origin.fetch +refs/heads/x:refs/remotes/origin/master", K),
+    ("LG83", "landing", FEATURE, "git remote add evil https://evil.invalid/x", K),
+    ("LG84", "landing", FEATURE, "git remote set-branches origin x", K),
+    ("LG85", "landing", MASTER, "git config alias.m merge; git m feature/x", K),
+    ("LG86", "landing", FEATURE, "git config alias.m merge", K),                            # an alias write asks anywhere
+    ("LG87", "landing", FEATURE, "git -c alias.m=merge m feature/x", K),
+    ("LG88", "landing", MASTER, "git -c alias.m=merge m feature/x", K),
+    ("LG89", "landing", FEATURE, "git branch -fM x master", K),                             # a cluster
+    ("LG90", "landing", FEATURE, "git checkout --force-create=master", K),                  # --opt=value
+    ("LG91", "landing", FEATURE, "git checkout -Bmaster", K),                               # attached value
+    ("LG92", "landing", FEATURE, "git checkout -b x --track origin/master", K),
+    ("LG93", "landing", FEATURE, "git branch -t evil/main", K),                             # the local branch it makes is main
+    ("LG94", "landing", FEATURE, "git checkout @{-1} && git merge feature/x", K),           # HEAD may be master now
+    ("LG95", "landing", FEATURE, "git merge @{-1}", K),
+    ("LG96", "landing", FEATURE, "git symbolic-ref HEAD refs/heads/master", K),
+    ("LG97", "landing", FEATURE, "git symbolic-ref --short HEAD", A),                      # a read
+    ("LG98", "landing", FEATURE, "git -C . merge feature/y 'unbalanced", K),               # unparseable, any branch
+    ("LG99", "landing", FEATURE, "git -c core.pager=cat log", A),                           # -c of a harmless key, a read
+    ("LG138", "landing", FEATURE, 'git checkout -B "$B" origin/feature', K),               # resets a branch the shell names
+    ("LG139", "landing", FEATURE, 'git checkout "$B"', A),                                  # only moves HEAD ...
+    ("LG140", "landing", FEATURE, 'git checkout "$B" && git merge feature/y', K),          # ... so what follows asks
+    # round 4 (A): on a protected branch, only commands that cannot move it run
+    ("LG100", "landing", MASTER, "git m feature/x", K),                                    # unknown subcommand (an alias)
+    ("LG101", "landing", MASTER, "git tag v1.0", K),
+    ("LG102", "landing", MASTER, "git worktree add ../w -b feat", K),
+    ("LG103", "landing", MASTER, "git -c core.pager=cat log", K),                           # any -c on a protected branch
+    ("LG104", "landing", MASTER, "GIT_DIR=/tmp/x/.git git status", K),
+    ("LG105", "landing", MASTER, "git config user.name x", K),                             # config: reads only
+    ("LG106", "landing", MASTER, "git gc", K),
+    ("LG110", "landing", MASTER, "git status", A),
+    ("LG111", "landing", MASTER, "git log --oneline -5", A),
+    ("LG112", "landing", MASTER, "git diff HEAD~1", A),
+    ("LG113", "landing", MASTER, "git show HEAD:README.md", A),
+    ("LG114", "landing", MASTER, "git fetch", A),
+    ("LG115", "landing", MASTER, "git fetch origin --prune", A),
+    ("LG116", "landing", MASTER, "git fetch origin feature/x", K),                         # an explicit refspec
+    ("LG117", "landing", MASTER, "git branch", A),
+    ("LG118", "landing", MASTER, "git branch -a -vv", A),
+    ("LG119", "landing", MASTER, "git branch new-feature", A),
+    ("LG120", "landing", MASTER, "git checkout -b new-feature", A),
+    ("LG121", "landing", MASTER, "git switch -c new-feature", A),
+    ("LG122", "landing", MASTER, "git checkout feature/x", A),
+    ("LG123", "landing", MASTER, "git stash", A),
+    ("LG124", "landing", MASTER, "git tag -l", A),
+    ("LG125", "landing", MASTER, "git rev-parse HEAD", A),
+    ("LG126", "landing", MASTER, "git config --get user.email", A),
+    ("LG127", "landing", MASTER, "git config --list", A),
+    ("LG128", "landing", MASTER, "git remote -v", A),
+    ("LG129", "landing", MASTER, "git add README.md", A),
+    ("LG130", "landing", MASTER, "git mv a.txt b.txt", A),
+    ("LG131", "landing", MASTER, "git blame README.md", A),
+    ("LG132", "landing", MASTER, "git ls-files", A),
+    ("LG133", "landing", MASTER, "git worktree list", A),
+    ("LG134", "landing", FEATURE, "git rebase -i HEAD~3", K),                               # round 6: its todo list can run git
+    ("LG135", "landing", FEATURE, "git diff master...HEAD", A),                             # a read names master freely
+    ("LG136", "landing", FEATURE, "git log origin/main..HEAD", A),
+    ("LG137", "landing", FEATURE, "git merge-base main HEAD", A),
+    # round 5, class 1: refs written from stdin or by plumbing
+    ("LG150", "landing", FEATURE, "git fetch --stdin origin < refs.txt", K),
+    ("LG151", "landing", FEATURE, "git fast-import < stream.fi", K),
+    ("LG152", "landing", FEATURE, "git fetch --update-head-ok origin x:y", K),
+    ("LG153", "landing", FEATURE, "git fetch --std origin < refs.txt", K),                 # an abbreviation of --stdin
+    ("LG154", "landing", FEATURE, "git receive-pack .", K),
+    ("LG155", "landing", MASTER, "git fetch --stdin origin < refs.txt", K),                # never on the allowlist
+    ("LG156", "landing", FEATURE, "git rev-list --stdin < shas.txt", A),                   # a read
+    # class 2: a rebase that moves other branches
+    ("LG160", "landing", FEATURE, "git rebase --update-refs feature/y", K),
+    ("LG161", "landing", FEATURE, "git -c rebase.updateRefs=true rebase feature/y", K),
+    ("LG162", "landing", FEATURE, "git config rebase.updateRefs true", K),
+    ("LG163", "landing", FEATURE, "git rebase --upd feature/y", K),                         # an abbreviation
+    ("LG164", "landing", FEATURE, "git rebase --no-update-refs feature/y", A),
+    # class 3: abbreviated options and <remote>/<protected>
+    ("LG170", "landing", FEATURE, "git checkout -b x --tra origin/master", K),
+    ("LG171", "landing", FEATURE, "git branch --set-up=origin/main", K),
+    ("LG172", "landing", FEATURE, "git branch --forc x feature/y", K),                       # --force, abbreviated
+    ("LG173", "landing", FEATURE, "git switch --force-c x", K),
+    ("LG174", "landing", FEATURE, "git worktree add --checkou ../w", K),
+    ("LG175", "landing", FEATURE, "git branch -u evil/master", K),                           # any remote's master
+    ("LG176", "landing", FEATURE, "git branch --show-current", A),
+    ("LG177", "landing", FEATURE, "git branch --no-color", A),                               # a known option, negated
+    # class 4: configuration redirected through the environment
+    ("LG180", "landing", MASTER, "HOME=/tmp/x git status", K),
+    ("LG181", "landing", MASTER, "XDG_CONFIG_HOME=/tmp/x git log", K),
+    ("LG182", "landing", MASTER, "env GIT_DIR=/tmp/x/.git git status", K),
+    ("LG183", "landing", OTHER, "env HOME=/tmp/x git pull --ff-only", K),
+    ("LG184", "landing", OTHER, "HOME=/tmp/x; git pull --ff-only", K),                       # an exported variable, reassigned
+    ("LG185", "landing", MASTER, "export HOME=/tmp/x; git status", K),
+    ("LG186", "landing", FEATURE, "HOME=/tmp/x git status", A),                              # asks only on a protected branch
+    ("LG187", "landing", MASTER, "git add .", A),                                            # `.` is a path here, not source
+    # round 6, class 1: anything that can assign a variable or change directory, on a protected branch
+    ("LG190", "landing", MASTER, "printf -v HOME %s /tmp/x; git status", K),
+    ("LG191", "landing", MASTER, "let n=1; git status", K),
+    ("LG192", "landing", MASTER, "read HOME < h.txt; git status", K),
+    ("LG193", "landing", MASTER, "mapfile -t L < h.txt; git status", K),
+    ("LG194", "landing", MASTER, "getopts a OPT; git status", K),
+    ("LG195", "landing", MASTER, "cd /tmp && git status", K),
+    ("LG196", "landing", MASTER, "pushd /tmp && git status", K),
+    ("LG197", "landing", MASTER, "if source ./x.sh; then git status; fi", K),               # after if, not at a command start
+    ("LG198", "landing", OTHER, "true && . ./x.sh && git pull --ff-only", K),               # after &&
+    ("LG199", "landing", MASTER, "while read l; do git status; done < f.txt", K),
+    ("LG200", "landing", MASTER, "echo $HOME && git status", K),                            # a name git reads from the environment
+    ("LG201", "landing", MASTER, "ls && git status && git log --oneline", A),
+    ("LG202", "landing", FEATURE, "cd /tmp && git status", A),                              # asks only on a protected branch
+    # round 6, class 2: interactive rebase, --exec and editors, on any branch
+    ("LG210", "landing", FEATURE, "git rebase --interactive feature/y", K),
+    ("LG211", "landing", FEATURE, "git rebase --inter feature/y", K),                       # an abbreviation
+    ("LG212", "landing", FEATURE, "git rebase --exec 'make test' feature/y", K),
+    ("LG213", "landing", FEATURE, "git rebase -x 'git branch -f x HEAD' feature/y", K),
+    ("LG214", "landing", FEATURE, "git -c sequence.editor=true rebase feature/y", K),
+    ("LG215", "landing", FEATURE, "git -c core.editor=true commit --amend", K),
+    ("LG216", "landing", FEATURE, "GIT_SEQUENCE_EDITOR=true git rebase feature/y", K),
+    ("LG217", "landing", FEATURE, "EDITOR=true git commit --amend", K),
+    ("LG218", "landing", FEATURE, "git config core.editor vim", K),
+    ("LG219", "landing", FEATURE, "git pull --rebase=interactive", K),
+    ("LG220", "landing", FEATURE, "git rebase feature/y", A),
 ]
 
 

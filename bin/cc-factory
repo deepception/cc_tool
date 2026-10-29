@@ -1,0 +1,2257 @@
+#!/usr/bin/env python3
+"""cc-factory: work orders, gates and lanes of the software factory, from the shell.
+
+An order is a markdown file, <repo>/factory/orders/FO-NNN-<slug>.md (the spec). Its
+lifecycle (status, station, gates, lane, run id) is an append-only ledger,
+<git common dir>/cc_tool/factory/ledger.jsonl: outside the working tree, so never
+committed, and shared by the main checkout and every worktree. This script is the only
+writer of that ledger; cc-dash and the /factory skill read it through
+lib/cc_dash/factory.py.
+
+Writes only: factory/ and .gitignore (init, new), .claude/workflows/factory-line.js (init),
+the ledger, lane worktrees and branches under .claude/worktrees/ (lane), and the git-ignored
+.factory-holdout/ (holdout). It never merges, pushes or deletes anything, never runs a shell,
+and never executes anything read from an order file: git gets argument lists, branch names
+come from the order id and a slug of its title, and order text is never copied into the
+ledger. Notes are redacted for secret shapes and clipped to 500 characters; the merge-gate
+briefing `record` prints (git facts, the holdout's scenario ids, review's decision text) goes
+whole to the terminal and, redacted and capped at 12000 characters, into the `briefing` field
+of the review status event, where `show` prints it again. Scenario files are read only to count
+and number them and to flag rework feedback that shares word 5-grams with them; no scenario
+text and no verify reason is ever printed or written. Besides the project it reads
+templates/hooks/cc_procs.py of its own checkout (approve, reject) and, for record
+--workflow-run, the run Claude Code saved under ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/.
+Python 3 standard library only.
+
+Usage:
+  cc-factory [-C DIR] init [PROJECT] [--force]
+  cc-factory new TITLE... [--priority p1|p2|p3] [--line NAME]
+  cc-factory list [--all] [--json]                    (alias: status)
+  cc-factory show ID [--json] [--events N]
+  cc-factory mark ID [STATUS] [--station S --state start|pass|fail|waiting]
+                     [--run-id R] [--branch B] [--worktree W] [--note TEXT] [--no-holdout]
+  cc-factory approve ID [--gate spec|merge] [--into REF] [--note TEXT]   (a human, in a terminal)
+  cc-factory reject ID [--gate spec|merge] [--rework] [--note TEXT]      (a human, in a terminal)
+  cc-factory lane ID [--base REF] [--json]            (last stdout line: the worktree)
+  cc-factory holdout ID                               (last stdout line: the directory)
+  cc-factory run-args ID                              (JSON for the Workflow tool)
+  cc-factory record ID --workflow-run wf_...          (the result Claude Code saved for that run)
+  cc-factory record ID [--run-id R] [--file F]        (or the run's result JSON on stdin)
+
+-C DIR picks the project (default: the current directory; the nearest ancestor with a
+.git, then the main checkout when that is a linked worktree). Exit codes: 0 ok, 1 usage
+error or unknown id, 2 refused (BLOCKED: <reason>. Suggestion: <what to do>. on stderr).
+
+The human gates: `approved` and `done` are written only by `approve`, and `review` only by
+`record` of a run that passed every station of the line on its final attempt (mark refuses all
+three, and an order file's frontmatter status counts only as queued or spec). `approve` and
+`reject` refuse to run under Claude Code: they apply the rules `cc-dash --control` starts by
+(templates/hooks/cc_procs.py, recording_problem: Claude Code's variables, the claude CLI among
+the parents or the session and process-group leaders' parents, unreadable counted as inside, a
+detached terminal driver, a fresh session after a re-parent, and a controlling pseudo-terminal
+of its own); where there is no /proc (macOS) only Claude Code's variables and a terminal on
+stdin are checked. Nothing turns the check off. `approve` writes a sha256 of the order body,
+the line and its threshold into the spec gate's event, and `run-args` and `record` refuse when
+it no longer matches; `approve --gate merge` checks with git that the lane branch is merged.
+On a line whose spec gate is human, `lane` and `run-args` also need the spec gate's pass in
+the ledger, and both refuse a lane whose commit tracks files under .factory-holdout/.
+"""
+import os
+import sys
+
+# Run isolated, exactly as bin/cc-dash does: re-execute once as
+# `<python> -I <this script's real path> ...` without PYTHON* or LD_* variables, so no
+# PYTHONPATH, user site directory, current directory or preloaded library can put other
+# code into a tool that writes the ledger. <python> is the interpreter already running
+# this (the kernel's /proc/self/exe where there is one), never one named in a file or a
+# variable.
+if not sys.flags.isolated:
+    exe = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "LD_"))}
+    os.execve(exe, [exe, "-I", os.path.realpath(__file__)] + sys.argv[1:], env)
+
+sys.dont_write_bytecode = True
+sys.pycache_prefix = os.path.join(os.devnull, "cc-factory-no-pycache")
+# The repo is this script's parent's parent (realpath so a symlinked cc-factory finds lib/).
+CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+import argparse  # noqa: E402
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+import math  # noqa: E402
+import re  # noqa: E402
+import secrets  # noqa: E402
+import select  # noqa: E402
+import stat  # noqa: E402
+import subprocess  # noqa: E402
+import termios  # noqa: E402
+import time  # noqa: E402
+
+try:
+    import fcntl  # noqa: E402
+except ImportError:  # pragma: no cover - not POSIX
+    fcntl = None
+
+LIB_PATH = os.path.join(CC_TOOL_DIR, "lib", "cc_dash", "factory.py")
+TEMPLATE_DIR = os.path.join(CC_TOOL_DIR, "templates", "factory")
+LINE_JS_REL = os.path.join(".claude", "workflows", "factory-line.js")
+F = None  # lib/cc_dash/factory.py, loaded by path in main()
+
+TERMINAL = ("done", "rejected")
+LANE_OK = ("approved", "building", "verifying", "review", "failed", "blocked")
+# Statuses only a gate decision writes (approve), never `mark`: status -> the command a human runs instead.
+GATE_ONLY = {"approved": "a human passes the spec gate with cc-factory approve %s",
+             "done": "a human passes the merge gate, after merging, with cc-factory approve %s --gate merge"}
+PROCS_PATH = os.path.join(CC_TOOL_DIR, "templates", "hooks", "cc_procs.py")
+MIN_SCENARIOS = 3            # mark ID spec wants at least this many holdout scenarios (or --no-holdout)
+RUN_ID_RE = re.compile(r"wf_[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+MAX_RUN_FILE_BYTES = 8 * 1024 * 1024
+SCAN_PROJECTS = 2000         # projects/ entries looked at when the run is not under the main checkout's
+SCAN_ENTRIES = 50000         # session entries looked at in all
+MAX_SCENARIO_BYTES = 256 * 1024
+LIST_CAP_FILES = 40          # diffstat lines in the briefing before "… N more"
+LIST_CAP_COMMITS = 30
+MAX_RESULT_BYTES = 1024 * 1024
+MAX_RECORD_EVENTS = 100
+MAX_TEMPLATE_BYTES = 64 * 1024
+IGNORE_COMMENT = "# cc_tool factory: holdout scenarios and lane worktrees"
+IGNORE_LINES = ((".factory-holdout/", (".factory-holdout", ".factory-holdout/", "/.factory-holdout", "/.factory-holdout/")),
+                (".claude/worktrees/", (".claude/worktrees", ".claude/worktrees/", "/.claude/worktrees", "/.claude/worktrees/")))
+_GIT_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+             "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_O_DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC
+
+
+class Refuse(Exception):
+    """A refusal: BLOCKED on stderr, exit 2."""
+
+    def __init__(self, reason, suggestion=""):
+        Exception.__init__(self, reason)
+        self.reason, self.suggestion = reason, suggestion
+
+
+class Usage(Exception):
+    """A usage error or an unknown id: message on stderr, exit 1."""
+
+
+def refuse(reason, suggestion=""):
+    raise Refuse(reason, suggestion)
+
+
+def block_message(reason, suggestion=""):
+    """`BLOCKED: <reason>. Suggestion: <what to do>.` (the shape every cc_tool guard uses)."""
+    reason = reason.strip()
+    if not reason.endswith((".", "!", "?")):
+        reason += "."
+    msg = "BLOCKED: " + reason
+    if suggestion:
+        suggestion = suggestion.strip()
+        if not suggestion.endswith((".", "!", "?")):
+            suggestion += "."
+        msg += " Suggestion: " + suggestion
+    return msg
+
+
+# ── Text hygiene ──────────────────────────────────────────────────────────────
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\Z)", re.S),
+    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{8,}"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+)
+_SECRET_PAIR = re.compile(
+    r"(?i)\b([\w.-]{0,40}(?:password|passwd|secret|token|api[_-]?key)[\w.-]{0,40})([\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s,;]+)")
+
+
+def redact(text, limit=2000):
+    """Secret shapes replaced by [redacted]: a small subset of what the write guard blocks,
+    deliberately greedy (a ledger note is better over-redacted than leaking). Only the first
+    `limit` characters are looked at and kept."""
+    text = text[:limit]
+    for rx in _SECRET_PATTERNS:
+        text = rx.sub("[redacted]", text)
+    return _SECRET_PAIR.sub(lambda m: m.group(1) + m.group(2) + "[redacted]", text)
+
+
+def clean_note(text):
+    """A note as the ledger keeps it: redacted first, then clipped to 500 characters."""
+    return F.clip(redact(text if isinstance(text, str) else ("" if text is None else str(text))), F.NOTE_MAX).strip()
+
+
+def clean_briefing(text):
+    """The merge-gate briefing as the ledger keeps it: redacted, clipped to BRIEFING_MAX (marked)."""
+    text = redact(text, 4 * F.BRIEFING_MAX)
+    if len(text) > F.BRIEFING_MAX:
+        tail = "\n… (clipped here for the ledger; cc-factory record printed all of it)"
+        text = text[:F.BRIEFING_MAX - len(tail)] + tail
+    return F.clip(text, F.BRIEFING_MAX).strip()
+
+
+def one_line(s, n=200):
+    """Printable single-line text: control characters (escape sequences) gone, clipped with '...'."""
+    s = " ".join(_CTRL.sub(" ", s if isinstance(s, str) else ("" if s is None else str(s))).split())
+    return s if len(s) <= n else s[: max(0, n - 3)] + "..."
+
+
+def block_text(s, n=4000):
+    """Printable multi-line text: no control characters except newline and tab."""
+    s = F.clip(s, n) if isinstance(s, str) else ""
+    return re.sub(r"[\x7f-\x9f]", "", s)
+
+
+def fmt_ts(t, fmt="%Y-%m-%d %H:%M:%S"):
+    try:
+        return time.strftime(fmt, time.localtime(t))
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "-"
+
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+def git(args, cwd, timeout=60):
+    """Run git with an argument list (never a shell) and the repository-redirecting variables removed."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_VARS}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        return subprocess.run(["git"] + list(args), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, errors="replace", timeout=timeout)
+    except FileNotFoundError:
+        refuse("git is not installed", "install git, then retry")
+    except subprocess.TimeoutExpired:
+        refuse("git %s timed out" % (args[0] if args else ""), "check the repository, then retry")
+
+
+def git_out(args, cwd, what, suggestion):
+    r = git(args, cwd)
+    if r.returncode != 0:
+        refuse("%s failed: %s" % (what, one_line(r.stderr or r.stdout, 240) or "git exited %d" % r.returncode), suggestion)
+    return r.stdout
+
+
+def blob_oid(data):
+    """Git's own object id for a blob, to compare a file with tree entries without extracting anything."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+# ── Files ─────────────────────────────────────────────────────────────────────
+def real_dir(path):
+    """True for a real directory (a symlink to one does not count)."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def read_file(path, limit):
+    """Up to `limit` bytes of a regular file, opened O_NOFOLLOW|O_NONBLOCK; None when it is anything else."""
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, limit)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def write_new(path, data, mode=0o644):
+    """Create `path` with O_EXCL|O_NOFOLLOW (FileExistsError when anything is there, even a symlink)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, mode)
+    try:
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+    finally:
+        os.close(fd)
+
+
+def replace_file(path, data, mode=0o644):
+    """Write `path` through a fresh sibling file renamed over it (rename never follows a symlink)."""
+    tmp = "%s.%d.%s.tmp" % (path, os.getpid(), os.urandom(4).hex())
+    write_new(tmp, data, mode)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def mkdir_real(path):
+    """mkdir (0755) unless it exists; True only when `path` is then a real directory, not a symlink to one."""
+    try:
+        os.mkdir(path, 0o755)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    return real_dir(path)
+
+
+# ── The ledger: the one place anything is written to it ──────────────────────
+def _open_dir_fd(name, dir_fd=None):
+    try:
+        fd = os.open(name, _O_DIR, dir_fd=dir_fd)
+    except OSError as e:
+        refuse("the ledger directory %s cannot be opened safely (%s)" % (one_line(os.path.basename(name) or name, 300), e.strerror or e),
+               "remove whatever replaced it (a symlink?) under the git common dir's cc_tool/ and retry")
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        os.close(fd)
+        refuse("the ledger directory %s is not a directory of yours" % one_line(name, 300), "check the owner of <git common dir>/cc_tool/, then retry")
+    return fd, st
+
+
+def ledger_dir_fd(main):
+    """An fd on <common>/cc_tool/factory: created 0700 if missing, then opened O_DIRECTORY|O_NOFOLLOW and
+    checked (a real directory, ours, group/other bits cleared). <common>/cc_tool may already exist 0755
+    (the hooks make it); that is accepted untouched."""
+    path = F.ledger_path(main)
+    if not path:
+        refuse("%s has no usable git directory, so there is nowhere to keep the ledger" % one_line(main, 300),
+               "run cc-factory inside a git repository (git init first)")
+    fdir = os.path.dirname(path)
+    ccdir = os.path.dirname(fdir)
+    try:
+        os.mkdir(ccdir, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        refuse("cannot create %s (%s)" % (one_line(ccdir, 300), e.strerror or e), "check the permissions of the git directory")
+    cc_fd, _ = _open_dir_fd(ccdir)
+    try:
+        try:
+            os.mkdir(os.path.basename(fdir), 0o700, dir_fd=cc_fd)
+        except FileExistsError:
+            pass
+        except OSError as e:
+            refuse("cannot create the ledger directory (%s)" % (e.strerror or e), "check the permissions of %s" % one_line(ccdir, 300))
+        fd, st = _open_dir_fd(os.path.basename(fdir), dir_fd=cc_fd)
+    finally:
+        os.close(cc_fd)
+    if st.st_mode & 0o077:
+        try:
+            os.fchmod(fd, 0o700)
+        except OSError:
+            pass
+    return fd
+
+
+def open_ledger(main):
+    """The ledger as an O_APPEND fd, opened relative to the checked directory (O_NOFOLLOW|O_NONBLOCK, 0600);
+    it must be a regular file of ours with one link, else a refusal."""
+    name = F.LEDGER_REL[-1]
+    dfd = ledger_dir_fd(main)
+    try:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | _NOFOLLOW | _NONBLOCK | _CLOEXEC
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        except OSError as e:
+            refuse("the ledger cannot be opened safely (%s)" % (e.strerror or e),
+                   "remove whatever sits at <git common dir>/cc_tool/factory/%s (a symlink or a pipe?) and retry" % name)
+    finally:
+        os.close(dfd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+        os.close(fd)
+        refuse("the ledger is not a plain file of yours with a single link",
+               "move %s aside and retry" % name)
+    if st.st_mode & 0o077:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+    return fd
+
+
+def make_rec(oid, event, **kw):
+    """A ledger record, checked against the library's own validator: every key we set must survive it."""
+    rec = {"t": round(time.time(), 3), "order": oid, "event": event, "by": "cc-factory"}
+    for k, v in kw.items():
+        if v is None or v == "":
+            continue
+        rec[k] = v
+    ok = F.valid_event(rec)
+    bad = [k for k in rec if k != "by" and (ok is None or ok.get(k) != rec[k])]
+    if ok is None or bad:
+        refuse("the ledger would not accept this event (%s)" % (", ".join(bad) if ok is not None else "invalid event"),
+               "check the %s value: ids look like FO-001, run ids and branches are short plain tokens"
+               % (bad[0] if bad and bad[0] not in ("t", "order", "event") else "arguments"))
+    return rec
+
+
+def encode_event(rec):
+    """The ledger line for rec; refused when the reader would skip it (over 60 KiB: it would vanish from the fold)."""
+    line = (json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8", "replace")
+    if len(line) > 60 * 1024:
+        refuse("the ledger event would be %d bytes, over what the reader accepts" % len(line), "shorten the note")
+    return line
+
+
+def write_event(fd, rec):
+    """Exactly one write of the whole JSON line (O_APPEND keeps parallel writers from interleaving)."""
+    line = encode_event(rec)
+    n = os.write(fd, line)
+    if n != len(line):
+        try:
+            os.write(fd, b"\n")  # end the torn line so the next record starts clean
+        except OSError:
+            pass
+        refuse("the ledger write was cut short (%d of %d bytes)" % (n, len(line)), "check the disk space, then retry")
+
+
+def append_event(main, rec):
+    fd = open_ledger(main)
+    try:
+        write_event(fd, rec)
+    finally:
+        os.close(fd)
+
+
+def ledger_events(main):
+    p = F.ledger_path(main)
+    return F.read_ledger(p) if p else []
+
+
+# ── Project and order lookup ──────────────────────────────────────────────────
+def find_root(start):
+    """The nearest ancestor of `start` (itself included) that has a .git, or None."""
+    d = os.path.realpath(start)
+    while True:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def resolve_main(args):
+    start = args.C or os.getcwd()
+    if not os.path.isdir(start):
+        raise Usage("-C %s is not a directory" % one_line(start, 300))
+    root = find_root(start)
+    if root is None:
+        refuse("%s is not inside a git repository" % one_line(os.path.realpath(start), 300),
+               "run cc-factory from the project (or pass -C DIR); git init first for a new project")
+    return F.main_checkout(root)
+
+
+def need_id(s):
+    oid = F.norm_id(s)
+    if not oid:
+        raise Usage("%r is not an order id (expected FO-001 or 1)" % one_line(s, 40))
+    return oid
+
+
+def load_order(main, oid):
+    """(folded order dict, parsed order file, this order's ledger events). Unknown id: Usage."""
+    path = F.find_order(main, oid)
+    if not path:
+        have = [n for n, _ in F.order_files(main)]
+        raise Usage("no order %s in %s%s" % (oid, one_line(os.path.join(main, "factory", "orders"), 300),
+                                             " (orders: FO-%03d..FO-%03d)" % (have[0], have[-1]) if have else " (none yet: cc-factory new TITLE)"))
+    raw = F.read_order(main, path)
+    if raw is None:
+        refuse("the order file %s cannot be read safely" % one_line(os.path.relpath(path, main), 300),
+               "it must be a regular file (not a symlink) under 256 KiB")
+    events = [e for e in ledger_events(main) if e.get("order") == oid]
+    cfg = F.line_config(main)
+    return F.fold(raw, events, F.line_for(cfg, raw.get("line")), time.time()), raw, events
+
+
+def line_of(main, order):
+    return F.line_for(F.line_config(main), order.get("line"))
+
+
+def reload_order(main, oid):
+    return load_order(main, oid)[0]
+
+
+# ── Output helpers ────────────────────────────────────────────────────────────
+def table(headers, rows, caps):
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, c in enumerate(r):
+            widths[i] = max(widths[i], min(len(c), caps[i]))
+    out = []
+    for r in [headers] + rows:
+        cells = []
+        for i, c in enumerate(r):
+            c = c if len(c) <= caps[i] else c[: caps[i] - 3] + "..."
+            cells.append(c if i == len(r) - 1 else c.ljust(widths[i]))
+        out.append("  ".join(cells).rstrip())
+    return out
+
+
+def print_json(obj):
+    """Machine JSON: ASCII only, so no control or escape character from an order reaches a terminal raw."""
+    print(json.dumps(obj, indent=2, ensure_ascii=True))
+
+
+# ── init ──────────────────────────────────────────────────────────────────────
+def write_template(root, rel, src_name, force):
+    """One scaffold file: created when absent, kept when present, replaced with --force."""
+    src = read_file(os.path.join(TEMPLATE_DIR, src_name), 256 * 1024)
+    if src is None:
+        raise Usage("templates/factory/%s is missing from this cc_tool checkout" % src_name)
+    dst = os.path.join(root, rel)
+    if os.path.lexists(dst):
+        if not force:
+            print("  ✓ %s already present, kept (--force replaces it)" % rel)
+            return
+        try:
+            replace_file(dst, src)
+        except OSError as e:
+            print("  ⚠ %s not replaced (%s)" % (rel, e.strerror or e))
+            return
+        print("  ✓ %s replaced" % rel)
+        return
+    try:
+        write_new(dst, src)
+    except OSError as e:
+        print("  ⚠ %s not written (%s)" % (rel, e.strerror or e))
+        return
+    print("  ✓ %s written" % rel)
+
+
+def update_gitignore(root):
+    path = os.path.join(root, ".gitignore")
+    raw = b""
+    if os.path.lexists(path):
+        data = read_file(path, 1024 * 1024)
+        if data is None:
+            print("  ⚠ .gitignore is not a plain file; add these lines yourself: %s"
+                  % " ".join(l for l, _ in IGNORE_LINES))
+            return
+        raw = data
+    lines = [l.strip() for l in raw.decode("utf-8", "replace").splitlines()]
+    missing = [l for l, variants in IGNORE_LINES if not any(v in lines for v in variants)]
+    if not missing:
+        print("  ✓ .gitignore already ignores .factory-holdout/ and .claude/worktrees/")
+        return
+    add = ([] if IGNORE_COMMENT in lines else [IGNORE_COMMENT]) + missing
+    text = ("\n" if raw and not raw.endswith(b"\n") else "") + "\n".join(add) + "\n"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | _NOFOLLOW | _CLOEXEC, 0o644)
+    except OSError as e:
+        print("  ⚠ .gitignore not updated (%s); add: %s" % (e.strerror or e, " ".join(missing)))
+        return
+    try:
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+    print("  ✓ .gitignore: added %s" % ", ".join(missing))
+
+
+def shipped_oids(rel):
+    """Blob ids of every version of `rel` in cc_tool's own git history (the test bin/cc-setup's skill refresh uses)."""
+    oids = set()
+    posix = rel.replace(os.sep, "/")
+    try:
+        log = git(["-C", CC_TOOL_DIR, "log", "--all", "--format=%H", "--", posix], CC_TOOL_DIR)
+        if log.returncode != 0:
+            return oids
+        for commit in log.stdout.split()[:300]:
+            tree = git(["-C", CC_TOOL_DIR, "ls-tree", commit, "--", posix], CC_TOOL_DIR)
+            for line in tree.stdout.splitlines():
+                meta, _, _p = line.partition("\t")
+                parts = meta.split()
+                if len(parts) == 3 and parts[1] == "blob":
+                    oids.add(parts[2])
+    except Refuse:
+        pass  # no usable git: nothing is known to be shipped, so a differing copy counts as edited
+    return oids
+
+
+def refresh_line_js(root, force):
+    src_path = os.path.join(CC_TOOL_DIR, LINE_JS_REL)
+    dst_path = os.path.join(root, LINE_JS_REL)
+    src = read_file(src_path, MAX_RESULT_BYTES)
+    if src is None:
+        print("  ⚠ %s is not in this cc_tool checkout yet; skipped (re-run cc-factory init after cc-update)" % LINE_JS_REL)
+        return
+    if os.path.realpath(dst_path) == os.path.realpath(src_path):
+        print("  ✓ %s is cc_tool's own copy, nothing to do" % LINE_JS_REL)
+        return
+    parent = os.path.dirname(dst_path)
+    # Never write through a symlinked .claude/ or .claude/workflows/ (a cloned repo could ship
+    # one pointing anywhere): an existing one must be a real directory before any branch below.
+    for d in (os.path.dirname(parent), parent):
+        if os.path.lexists(d) and not real_dir(d):
+            print("  ⚠ %s is not a real directory; %s not copied" % (os.path.relpath(d, root), LINE_JS_REL))
+            return
+    if os.path.lexists(dst_path):
+        have = read_file(dst_path, MAX_RESULT_BYTES)
+        if have is None:
+            print("  ⚠ %s is not a plain file; left alone" % LINE_JS_REL)
+            return
+        if have == src:
+            print("  ✓ %s up to date" % LINE_JS_REL)
+            return
+        if force:
+            verdict = "replaced (--force)"
+        elif blob_oid(have) in shipped_oids(LINE_JS_REL):
+            verdict = "refreshed (it was an older shipped version)"
+        else:
+            print("  ℹ %s differs from cc_tool's and matches no shipped version (local edits): left alone,"
+                  " --force replaces it" % LINE_JS_REL)
+            return
+        try:
+            replace_file(dst_path, src)
+        except OSError as e:
+            print("  ⚠ %s not updated (%s)" % (LINE_JS_REL, e.strerror or e))
+            return
+        print("  ✓ %s %s" % (LINE_JS_REL, verdict))
+        return
+    if not (mkdir_real(os.path.join(root, ".claude")) and mkdir_real(parent)):
+        print("  ⚠ %s is not a real directory; %s not copied" % (os.path.relpath(parent, root), LINE_JS_REL))
+        return
+    try:
+        write_new(dst_path, src)
+    except OSError as e:
+        print("  ⚠ %s not copied (%s)" % (LINE_JS_REL, e.strerror or e))
+        return
+    print("  ✓ %s copied" % LINE_JS_REL)
+
+
+def cmd_init(args):
+    start = args.project or args.C or os.getcwd()
+    if not os.path.isdir(start):
+        raise Usage("%s is not a directory" % one_line(start, 300))
+    start = os.path.realpath(start)
+    found = find_root(start)
+    has_git = found is not None
+    root = F.main_checkout(found) if has_git else start
+    print("Setting up the software factory in: %s" % root)
+    if has_git and root != start:
+        print("  (the project's main checkout; %s is inside it)" % start)
+    if not has_git:
+        print("  ⚠ not a git repository: files are scaffolded, but the ledger needs one (git init, then re-run)")
+    print("")
+    if not (mkdir_real(os.path.join(root, "factory")) and mkdir_real(os.path.join(root, "factory", "orders"))):
+        refuse("factory/ or factory/orders/ exists but is not a real directory", "move it aside (a symlink?) and re-run cc-factory init")
+    write_template(root, "factory/README.md", "README.md", args.force)
+    write_template(root, "factory/line.json", "line.json", args.force)
+    write_template(root, "factory/order-template.md", "order-template.md", args.force)
+    keep = os.path.join(root, "factory", "orders", ".gitkeep")
+    if os.path.lexists(keep):
+        print("  ✓ factory/orders/ ready")
+    else:
+        try:
+            write_new(keep, b"")
+            print("  ✓ factory/orders/ created")
+        except OSError as e:
+            print("  ⚠ factory/orders/.gitkeep not written (%s)" % (e.strerror or e))
+    update_gitignore(root)
+    rc, problem = 0, None
+    if has_git:
+        try:
+            os.close(ledger_dir_fd(root))
+            print("  ✓ ledger directory %s (0700)" % os.path.dirname(F.ledger_path(root)))
+        except Refuse as e:
+            rc, problem = 2, e
+            print("  ⚠ ledger directory not ready: %s" % e.reason)
+    refresh_line_js(root, args.force)
+    print("")
+    print("Done. Orders live in factory/orders/, the line in factory/line.json (see factory/README.md).")
+    print("")
+    print("  New order:   cc-factory new \"Add CSV export\" --priority p2")
+    print("  The floor:   cc-factory list          (or the Factory tab in cc-dash)")
+    print("  Approve:     cc-factory approve FO-001      (after you read the spec)")
+    print("  Run:         /factory run FO-001            (in Claude Code; builds in its own lane)")
+    print("")
+    print("  Commit factory/ and .gitignore: orders and the line are source. The ledger is not;")
+    print("  it lives in the git directory.")
+    if problem is not None:
+        raise problem
+    return rc
+
+
+# ── new ───────────────────────────────────────────────────────────────────────
+_YAML_START = set("-?:,[]{}#&*!|>'\"%@` ")
+_YAML_WORDS = {"null", "true", "false", "yes", "no", "on", "off", "~", "y", "n"}
+_NUMLIKE = re.compile(r"^[-+]?(\d[\d_]*\.?\d*|\.\d+)([eE][-+]?\d+)?$|^0[xob][0-9a-fA-F_]+$")
+
+
+def yaml_title(title):
+    """The title as a frontmatter value: JSON-quoted whenever a plain YAML scalar would be ambiguous."""
+    if (not title or title[0] in _YAML_START or ":" in title or "#" in title or title != title.strip()
+            or title.lower() in _YAML_WORDS or _NUMLIKE.match(title)):
+        return json.dumps(title, ensure_ascii=False)
+    return title
+
+
+_PLACEHOLDER = re.compile(
+    r'(?m)^(?P<k>title:[ \t]*)(?P<q>"?)\{\{title\}\}(?P=q)[ \t]*$|\{\{(?P<n>id|title|priority|created|line)\}\}')
+
+
+def render_order(template, values):
+    """Every placeholder replaced in ONE pass, so a value that itself contains {{id}} stays as typed."""
+    def sub(m):
+        if m.group("k") is not None:
+            return m.group("k") + yaml_title(values["title"])
+        return values[m.group("n")]
+    return _PLACEHOLDER.sub(sub, template)
+
+
+def read_template(main):
+    mine = read_file(os.path.join(main, "factory", "order-template.md"), MAX_TEMPLATE_BYTES)
+    data = mine if mine is not None else read_file(os.path.join(TEMPLATE_DIR, "order-template.md"), MAX_TEMPLATE_BYTES)
+    if data is None:
+        refuse("no order template found (factory/order-template.md or templates/factory/order-template.md)",
+               "run cc-factory init")
+    return data.decode("utf-8", "replace")
+
+
+def clean_title(words):
+    t = " ".join(_CTRL.sub(" ", " ".join(words)).split())
+    return t[:200].rstrip()
+
+
+def cmd_new(args):
+    main = resolve_main(args)
+    title = clean_title(args.title)
+    if not title:
+        raise Usage("the title is empty")
+    orders = os.path.join(main, "factory", "orders")
+    if not real_dir(os.path.join(main, "factory")) or not real_dir(orders):
+        refuse("factory/orders/ does not exist in %s" % one_line(main, 300), "run cc-factory init first")
+    priority = args.priority or "p2"
+    line_name = args.line or "default"
+    cfg = F.line_config(main)
+    if line_name not in cfg["lines"]:
+        refuse("%r is not a line in factory/line.json" % one_line(line_name, 40),
+               "use one of: %s" % ", ".join(sorted(cfg["lines"])))
+    template = read_template(main)
+    lfd = open_ledger(main)  # before anything is created: a refused ledger leaves no orphan order file
+    try:
+        dfd = os.open(orders, _O_DIR)
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(dfd, fcntl.LOCK_EX)  # two `new` at once must not pick the same number
+                except OSError:
+                    pass
+            slug = F.slugify(title)
+            for _ in range(50):
+                num = F.max_order_num(main) + 1
+                if num > 999999:
+                    refuse("order numbers are used up (FO-999999)", "archive old orders")
+                oid = F.norm_id(str(num))
+                name = "%s-%s.md" % (oid, slug)
+                text = render_order(template, {"id": oid, "title": title, "priority": priority,
+                                               "created": time.strftime("%Y-%m-%d"), "line": line_name})
+                try:
+                    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, 0o644, dir_fd=dfd)
+                except FileExistsError:
+                    continue
+                try:
+                    os.write(fd, text.encode("utf-8"))
+                finally:
+                    os.close(fd)
+                break
+            else:
+                refuse("could not find a free order number", "retry")
+        finally:
+            os.close(dfd)
+        write_event(lfd, make_rec(oid, "created", status="queued"))
+    finally:
+        os.close(lfd)
+    print("%s  factory/orders/%s" % (oid, name))
+    return 0
+
+
+# ── list / show ───────────────────────────────────────────────────────────────
+def cmd_list(args):
+    main = resolve_main(args)
+    orders = F.project_orders(main, time.time())
+    if args.json:
+        print_json(orders)
+        return 0
+    if not real_dir(os.path.join(main, "factory", "orders")):
+        print("no factory/orders/ here. Run cc-factory init to set the factory up.")
+        return 0
+    shown = [o for o in orders if args.all or o["status"] not in TERMINAL]
+    if shown:
+        rows = []
+        for o in shown:
+            g = o.get("gate")
+            rows.append([o["id"], o["priority"], o["status"], o.get("station") or "-",
+                         g["name"] if g and g.get("waiting") else "-",
+                         (o.get("lane") or {}).get("branch") or "-", one_line(o["title"], 80)])
+        for line in table(["ID", "PRI", "STATUS", "STATION", "GATE", "LANE", "TITLE"], rows, [8, 3, 9, 8, 5, 40, 80]):
+            print(line)
+        print("")
+    counts, waiting = {}, 0
+    for o in orders:
+        counts[o["status"]] = counts.get(o["status"], 0) + 1
+        g = o.get("gate")
+        waiting += bool(g and g.get("waiting"))
+    hidden = sum(counts.get(s, 0) for s in TERMINAL) if not args.all else 0
+    if not orders:
+        print("no orders yet. Create one: cc-factory new \"Title\"")
+        return 0
+    parts = ["%d %s" % (counts[s], s) for s in F.ALL_STATUSES if counts.get(s)]
+    foot = "%d order%s: %s" % (len(orders), "" if len(orders) == 1 else "s", ", ".join(parts))
+    if waiting:
+        foot += "; %d waiting at a gate (GATE column)" % waiting
+    if hidden:
+        foot += "; %d finished hidden (--all shows them)" % hidden
+    print(foot)
+    return 0
+
+
+def holdout_files(main, oid):
+    """The names of the order's scenario files: regular *.md files (not symlinks) directly in
+    .factory-holdout/FO-NNN, both levels real directories, at most 1000 entries looked at; sorted."""
+    d = os.path.join(main, F.HOLDOUT_DIR, oid)
+    if not real_dir(os.path.join(main, F.HOLDOUT_DIR)) or not real_dir(d):
+        return []
+    names = []
+    try:
+        with os.scandir(d) as it:
+            for i, e in enumerate(it):
+                if i >= 1000:
+                    break
+                if e.name.endswith(".md") and e.is_file(follow_symlinks=False):
+                    names.append(e.name)
+    except OSError:
+        pass
+    return sorted(names)
+
+
+def holdout_count(main, oid):
+    return len(holdout_files(main, oid))
+
+
+def scenario_number(name):
+    """The S-number of a scenario file: the first digits of its name's prefix (the part before the
+    first '-'), so S01-x.md and s1.md are both 1; None when the prefix has no digits."""
+    m = re.search(r"[0-9]{1,9}", name[:-3].split("-", 1)[0] if name.endswith(".md") else name.split("-", 1)[0])
+    return int(m.group(0)) if m else None
+
+
+def sid(n):
+    return "S%02d" % n
+
+
+def line_has_verify(line):
+    """True when the line has a station that checks the holdout (holdout true, or named verify, as the
+    workflow runs a station of that name as its verify kind)."""
+    return any(s.get("holdout") is True or s.get("name") == "verify" for s in line["stations"])
+
+
+def describe_event(e):
+    bits = [e["event"]]
+    for k in ("gate", "station", "state", "status"):
+        if e.get(k):
+            bits.append("%s=%s" % (k, e[k]))
+    for k in ("attempt", "cause", "recommendation", "flag", "run_id", "branch"):
+        if e.get(k):
+            bits.append("%s=%s" % (k, e[k]))
+    if e.get("merge_sha"):
+        bits.append("merge_sha=%s" % e["merge_sha"][:12])
+    if e.get("note"):
+        bits.append("note=%s" % json.dumps(one_line(e["note"], 160), ensure_ascii=False))
+    return " ".join(bits)
+
+
+def cmd_show(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    o, raw, events = load_order(main, oid)
+    shown = events[-args.events:] if args.events > 0 else []
+    scenarios = holdout_count(main, oid)
+    last = next((e for e in reversed(events) if e.get("briefing")), None)
+    briefing = {"text": last["briefing"], "run_id": last.get("run_id") or "", "t": last["t"]} if last else None
+    if args.json:
+        # The same dict `list --json` has for this order (status, gate, lane at the top level), plus additive keys.
+        print_json(dict(o, holdout_scenarios=scenarios, recent_events=shown, briefing=briefing))
+        return 0
+    g = o.get("gate")
+    lane = o.get("lane") or {}
+    print("%s  %s" % (o["id"], one_line(o["title"], 200)))
+    print("  status    %s%s" % (o["status"], "   (station %s)" % o["station"] if o.get("station") else ""))
+    print("  priority  %s     line %s     rework %d" % (o["priority"], o.get("line") or "default", o["rework"]))
+    print("  file      %s" % one_line(o["path"], 300))
+    print("  created   %s     updated %s     events %d" % (fmt_ts(o["created"], "%Y-%m-%d %H:%M") if o["created"] else "-",
+                                                         fmt_ts(o["updated"], "%Y-%m-%d %H:%M") if o["updated"] else "-", o["events"]))
+    print("  gate      %s" % ("%s (waiting for a human)" % g["name"] if g and g.get("waiting") else "-"))
+    print("  lane      %s" % (lane.get("branch") or "-"))
+    if lane.get("worktree"):
+        print("            %s" % lane["worktree"])
+    print("  run id    %s" % (o.get("run_id") or "-"))
+    print("  holdout   %d scenario%s in %s/%s" % (scenarios, "" if scenarios == 1 else "s", F.HOLDOUT_DIR, oid))
+    print("  stations")
+    for s in o["stations"]:
+        print(("    %-10s %-12s %-8s %s" % (s["name"], one_line(s["title"], 12), s["status"], fmt_ts(s["t"], "%H:%M:%S") if s["t"] else "")).rstrip())
+    if shown:
+        print("  last %d event%s" % (len(shown), "" if len(shown) == 1 else "s"))
+        for e in shown:
+            print("    %s  %s" % (fmt_ts(e["t"]), describe_event(e)))
+    if briefing:
+        print("  merge-gate briefing of run %s, recorded %s" % (one_line(briefing["run_id"], 80) or "-", fmt_ts(briefing["t"])))
+        print("    " + block_text(briefing["text"], F.BRIEFING_MAX).replace("\n", "\n    "))
+    return 0
+
+
+# ── mark / approve / reject ───────────────────────────────────────────────────
+def cmd_mark(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    o, _raw, _events = load_order(main, oid)
+    status = args.status
+    if status is not None and status not in F.ALL_STATUSES:
+        refuse("%r is not an order status" % one_line(status, 40),
+               "use one of: %s" % ", ".join(s for s in F.ALL_STATUSES if s not in GATE_ONLY and s != "review"))
+    if status in GATE_ONLY:
+        refuse("%s is a human gate's decision, which mark does not record" % status, GATE_ONLY[status] % oid)
+    if status == "review":
+        refuse("review is the line's verdict; only cc-factory record of a passing run writes it",
+               "run the line (/factory run %s), then record what it returned: cc-factory record %s --workflow-run <runId>" % (oid, oid))
+    if args.no_holdout and status != "spec":
+        raise Usage("--no-holdout goes with status spec: cc-factory mark %s spec --no-holdout" % oid)
+    if (args.station is None) != (args.state is None):
+        raise Usage("--station and --state go together")
+    line = line_of(main, o)
+    if args.station is not None:
+        names = [s["name"] for s in line["stations"]]
+        if args.station not in names:
+            refuse("%r is not a station of the %s line" % (one_line(args.station, 40), o.get("line") or "default"),
+                   "use one of: %s" % ", ".join(names))
+    scenarios = None
+    if status == "spec" and line_has_verify(line):
+        scenarios = holdout_count(main, oid)
+        if scenarios < MIN_SCENARIOS and not args.no_holdout:
+            refuse("%s has %d holdout scenario%s in %s/%s, and its line's verify station needs at least %d to check the work against"
+                   % (oid, scenarios, "" if scenarios == 1 else "s", F.HOLDOUT_DIR, oid, MIN_SCENARIOS),
+                   "write at least %d scenarios (S01-<slug>.md, S02-...) into the directory cc-factory holdout %s prints, then mark it "
+                   "spec again; or pass --no-holdout to record that this order goes without (the merge gate will then say no hidden "
+                   "scenario checked the work)" % (MIN_SCENARIOS, oid))
+    note = clean_note(args.note) if args.note is not None else ""
+    if status is None and args.station is None and not (note or args.run_id or args.branch or args.worktree):
+        raise Usage("nothing to record: give a STATUS, --station with --state, or --note")
+    kind = "status" if status is not None else ("station" if args.station is not None else "note")
+    rec = make_rec(oid, kind, status=status, station=args.station, state=args.state, run_id=args.run_id,
+                   branch=args.branch, worktree=args.worktree, note=note, scenarios=scenarios,
+                   no_holdout=True if args.no_holdout else None)
+    append_event(main, rec)
+    o2 = reload_order(main, oid)
+    what = {"status": "status %s" % status, "station": "station %s %s" % (args.station, args.state), "note": "note"}[kind]
+    if kind == "status" and args.station is not None:
+        what += ", station %s %s" % (args.station, args.state)
+    if scenarios is not None:
+        what += " (%d holdout scenario%s%s)" % (scenarios, "" if scenarios == 1 else "s", ", --no-holdout" if args.no_holdout else "")
+    print("%s  %s recorded; now %s%s" % (oid, what, o2["status"], " at station %s" % o2["station"] if o2["station"] else ""))
+    return 0
+
+
+def spec_gate_event(events):
+    """The order's latest spec-gate decision in the ledger (a gate event with state pass or fail), or None."""
+    for e in reversed(events):
+        if e.get("event") == "gate" and e.get("gate") == "spec" and e.get("state") in ("pass", "fail"):
+            return e
+    return None
+
+
+def spec_approved(events):
+    """True when the order's latest spec-gate decision in the ledger is a pass (`cc-factory approve`)."""
+    e = spec_gate_event(events)
+    return e is not None and e["state"] == "pass"
+
+
+def need_spec_approval(oid, line, events, what):
+    """On a line whose spec gate is human, refuse `what` unless the ledger holds the spec gate's pass:
+    a status from `mark` or from the order file's frontmatter does not open the gate."""
+    if line["gates"]["spec"] == "human" and not spec_approved(events):
+        refuse("%s has no spec-gate approval in the ledger, so it gets no %s (a status set with mark or in the order file "
+               "does not pass the gate)" % (oid, what), "a human reads the spec, then runs cc-factory approve %s" % oid)
+
+
+def spec_hash(body, line):
+    """sha256 over what the spec gate approves: the order body, the line (stations, gates, retries) and
+    the holdout threshold, as canonical JSON."""
+    doc = {"body": body, "line": {"stations": line["stations"], "gates": line["gates"], "retries": line["retries"]},
+           "threshold": F.line_threshold(line)}
+    cmds = {k: line[k] for k in F.COMMAND_KEYS if line.get(k)}
+    if cmds:   # verify runs these: changing them after approval needs a new approval (absent, the hash is as before)
+        doc["line"]["commands"] = cmds
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def spec_change(oid, line, events, body):
+    """Why the approved spec is not the current one ('' when it is, or on a line whose spec gate is
+    automatic): the approval carries no hash, or the hash of body + line + threshold differs."""
+    if line["gates"]["spec"] != "human":
+        return ""
+    e = spec_gate_event(events)
+    if e is None or e["state"] != "pass":
+        return "%s has no spec-gate approval in the ledger" % oid
+    if not e.get("spec_hash"):
+        return "the spec changed since approval (the approval carries no spec hash, so what was approved is unknown); re-approve"
+    if e["spec_hash"] != spec_hash(body, line):
+        return "the spec changed since approval (the order body, its line or the threshold differ from what was approved); re-approve"
+    return ""
+
+
+def gate_args(o, args, verb):
+    status = o["status"]
+    if status in TERMINAL:
+        refuse("%s is already %s" % (o["id"], status), "nothing to %s; `cc-factory show %s` has its history" % (verb, o["id"]))
+    gate = args.gate or ("merge" if status == "review" else "spec")
+    if gate == "merge" and status != "review":
+        refuse("the merge gate opens when a run reaches review, and %s is %s" % (o["id"], status),
+               "run the line first (/factory run %s), or use --gate spec" % o["id"])
+    return gate
+
+
+# ── Who is at the keyboard: approve and reject are a human's ─────────────────
+def load_procs():
+    """templates/hooks/cc_procs.py of this cc_tool checkout, loaded by path the way bin/cc-setup does."""
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("cc_procs", PROCS_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError("no loader for %s" % PROCS_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+NO_PROC = "no-proc"
+
+
+def origin_problem():
+    """Why this cc-factory may not take a human's gate decision; '' when it may: exactly
+    cc_procs.recording_problem(), the rules `cc-dash --control` starts by, plus a controlling
+    pseudo-terminal of its own. Without /proc (macOS) nothing can tell this process from one an agent
+    started, so the answer is NO_PROC: the gates are Linux-only, as control mode is. Fails closed:
+    cc_procs that cannot be loaded, or that raises or answers oddly, is a reason."""
+    try:
+        procs = load_procs()
+    except Exception as e:  # noqa: BLE001 - any failure to load is a refusal
+        return "it cannot tell who started it: %s could not be loaded (%s)" % (
+            os.path.relpath(PROCS_PATH, CC_TOOL_DIR), one_line("%s: %s" % (type(e).__name__, e), 160))
+    try:
+        if procs.have_proc() is not True:
+            return NO_PROC
+        why = procs.recording_problem()
+    except Exception as e:  # noqa: BLE001
+        return "it cannot tell who started it (%s)" % one_line("%s: %s" % (type(e).__name__, e), 160)
+    if not isinstance(why, str):
+        return "it cannot tell who started it (cc_procs gave no answer)"
+    return one_line(why, 300)
+
+
+def need_human(decision, command):
+    why = origin_problem()
+    if why == NO_PROC:
+        refuse("%s is a human's decision, and this system has no /proc, which factory gates need to tell your terminal from "
+               "an agent's: in this release they work on Linux only" % decision,
+               "run %s on a Linux machine, from your own terminal" % command)
+    if why:
+        refuse("%s is a human's decision, and this cc-factory was not started from your own terminal (%s)" % (decision, why.rstrip(".")),
+               "run it from your own terminal: %s" % command)
+
+
+CONFIRM_TIMEOUT = 300
+# The challenge: uppercase letters and digits a person cannot misread (no 0/O, 1/I/L).
+CHALLENGE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+CHALLENGE_LEN = 6
+
+
+def tty_problem(what):
+    """'' when a fresh random code, shown only on this process's controlling terminal (/dev/tty, opened
+    directly: never stdin, which a pipe can fill, and never stdout, stderr or the ledger), was typed
+    back there after the question; else why not. Input typed ahead of the question is discarded
+    first, and the answer is compared in constant time."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | getattr(os, "O_NOCTTY", 0) | _CLOEXEC)
+    except OSError as e:
+        return "it has no terminal of its own to confirm on (/dev/tty: %s)" % (e.strerror or e)
+    code = "".join(secrets.choice(CHALLENGE_ALPHABET) for _ in range(CHALLENGE_LEN))
+    try:
+        try:
+            termios.tcflush(fd, termios.TCIFLUSH)
+            os.write(fd, ("cc-factory: %s.\nType the code %s and press Enter to confirm (anything else cancels): " % (what, code)).encode("utf-8", "replace"))
+        except (termios.error, OSError) as e:
+            return "its terminal could not be used to confirm (%s)" % one_line(str(e), 120)
+        buf, deadline = b"", time.monotonic() + CONFIRM_TIMEOUT
+        while b"\n" not in buf and b"\r" not in buf and len(buf) < 256:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return "nothing was typed on its terminal within %d seconds" % CONFIRM_TIMEOUT
+            try:
+                ready, _, _ = select.select([fd], [], [], left)
+                chunk = os.read(fd, 256) if ready else None
+            except OSError as e:
+                return "its terminal could not be read (%s)" % (e.strerror or e)
+            if chunk is None:
+                continue
+            if not chunk:
+                break
+            buf += chunk
+        answer = re.split(rb"[\r\n]", buf, maxsplit=1)[0].strip().upper()
+        if not hmac.compare_digest(answer, code.encode("ascii")):
+            return "what was typed on its terminal is not the code it showed there"
+        return ""
+    finally:
+        os.close(fd)
+
+
+def confirm_human(oid, decision, command):
+    """The last step before a gate decision is written: the code shown on the terminal, typed back."""
+    why = tty_problem(decision)
+    if why:
+        refuse("%s needs the code shown on your terminal typed back to confirm, and %s" % (decision, why.rstrip(".")),
+               "run it from your own terminal and type the code it shows: %s" % command)
+
+
+# ── The merge gate's evidence: the lane branch is merged ─────────────────────
+def last_lane(events):
+    """The order's latest lane event that names a branch, or None."""
+    return next((e for e in reversed(events) if e.get("event") == "lane" and e.get("branch")), None)
+
+
+def rev(main, ref):
+    """The full sha `ref` names as a commit, or '' (never handed to git as an option)."""
+    if not ref or ref.startswith("-"):
+        return ""
+    r = git(["rev-parse", "--verify", "--quiet", ref + "^{commit}"], main)
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", sha) else ""
+
+
+def merge_commit(main, head, target):
+    """The commit that brought `head` into `target` (head an ancestor of target): head itself when it
+    sits on target's first-parent line (a fast-forward), else the oldest commit on that line that
+    descends from head (the merge commit)."""
+    if head == target:
+        return head
+    out = git_out(["rev-list", "--ancestry-path", "--parents", "%s..%s" % (head, target)], main,
+                  "git rev-list", "check the repository")
+    parents = {}
+    for ln in out.splitlines():
+        parts = ln.split()
+        if parts:
+            parents[parts[0]] = parts[1:]
+    cur = target
+    for _ in range(len(parents) + 1):
+        ps = parents.get(cur) or []
+        if not ps:
+            return cur
+        if ps[0] == head:
+            return head
+        if ps[0] not in parents:
+            return cur
+        cur = ps[0]
+    return cur
+
+
+SHA_RE = re.compile(r"[0-9a-f]{40,64}")
+
+
+def reviewed_head(oid, events):
+    """The lane head the latest review status was recorded for (cc-factory record stores it); refused
+    when there is none, since the merge gate passes exactly the commit that was reviewed."""
+    ev = next((e for e in reversed(events) if e.get("event") == "status" and e.get("status") == "review"), None)
+    head = ev.get("lane_head") if ev else None
+    if not (isinstance(head, str) and SHA_RE.fullmatch(head)):
+        refuse("%s's review in the ledger records no reviewed lane head, so cc-factory cannot tell which commit the merge gate "
+               "would pass" % oid,
+               "send it back for a run recorded with cc-factory record %s --workflow-run <runId> (cc-factory reject %s --gate merge --rework)"
+               % (oid, oid))
+    return head
+
+
+def merged_lane(main, oid, events, into, reviewed):
+    """(lane head, target, merge sha) when exactly the reviewed lane head is merged into `into`
+    (default: the main checkout's HEAD): the branch has not moved since the review, the target holds
+    the reviewed commit, and the commit that brought it in merged that commit, not a later one.
+    Refused otherwise."""
+    lane = last_lane(events)
+    if lane is None:
+        refuse("%s has no lane in the ledger, so there is no branch whose merge could be checked" % oid,
+               "make the lane (cc-factory lane %s) and run the line" % oid)
+    branch = lane["branch"]
+    shown = branch if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", branch) else "<lane branch>"
+    head = rev(main, "refs/heads/" + branch)
+    if not head:
+        refuse("the lane branch %s cannot be read, so cc-factory cannot check that it is merged" % one_line(branch, 200),
+               "restore the branch at the reviewed commit (git branch %s %s), then retry" % (shown, reviewed))
+    base = lane.get("base") or ""
+    if base and head.startswith(base):
+        refuse("the lane branch %s has no commits past its base, so nothing was merged" % shown,
+               "send it back (cc-factory reject %s --gate merge --rework) or drop it (cc-factory reject %s --gate merge)" % (oid, oid))
+    back = "send it back for another run (cc-factory reject %s --gate merge --rework)" % oid
+    if head != reviewed:
+        later = git(["rev-list", "--count", "%s..%s" % (reviewed, head)], main).stdout.strip()
+        refuse("the lane branch %s moved after the review: reviewed %s, now %s%s, so the merge gate would pass commits no station "
+               "reviewed" % (shown, reviewed[:10], head[:10], " (%s commit%s later)" % (later, "" if later == "1" else "s") if later.isdigit() else ""),
+               back)
+    target = resolve_commit(main, into or "HEAD")
+    r = git(["merge-base", "--is-ancestor", reviewed, target], main)
+    if r.returncode == 1:
+        refuse("the reviewed lane head %s (%s) is not merged into %s (%s)" % (reviewed[:10], shown, one_line(into or "the main checkout's HEAD", 60), target[:10]),
+               "from the main checkout (%s) run git merge --no-ff %s first (the reviewed commit), then cc-factory approve %s --gate merge"
+               % (one_line(main, 200), reviewed, oid))
+    if r.returncode != 0:
+        refuse("git merge-base failed: %s" % (one_line(r.stderr, 200) or "exit %d" % r.returncode), "check the repository")
+    msha = merge_commit(main, reviewed, target)
+    if msha != reviewed:
+        parents = git_out(["rev-list", "--parents", "-n", "1", msha], main, "git rev-list", "check the repository").split()[1:]
+        if reviewed not in parents:
+            refuse("%s brought the lane into %s by merging %s, not the reviewed lane head %s, so commits no station reviewed came "
+                   "with it" % (msha[:10], one_line(into or "the main checkout's HEAD", 60), ", ".join(p[:10] for p in parents[1:]) or "another commit",
+                                reviewed[:10]), back + ", or undo that merge and merge exactly the reviewed commit (git merge --no-ff %s)" % reviewed)
+    return head, target, msha
+
+
+def cmd_approve(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    o, raw, events = load_order(main, oid)
+    # Who runs it is checked before the order's state: under Claude Code the answer is always
+    # "not you", whatever the state, so an agent is never steered into fixing the state first.
+    gate = args.gate or ("merge" if o["status"] == "review" else "spec")
+    command = "cc-factory approve %s --gate %s%s%s" % (oid, gate, " --into %s" % one_line(args.into, 60) if args.into else "",
+                                                       " --note ..." if args.note else "")
+    need_human("passing %s's %s gate" % (oid, gate), command)
+    gate = gate_args(o, args, "approve")
+    line = line_of(main, o)
+    if args.into and gate != "merge":
+        raise Usage("--into applies to the merge gate: cc-factory approve %s --gate merge --into REF" % oid)
+    note = clean_note(args.note) if args.note else ""
+    if gate == "spec":
+        # Behind it only when it was passed for this very spec: an order marked building without an
+        # approval, or one whose spec changed since, can still get one.
+        if o["status"] in ("building", "verifying", "review") and spec_approved(events) and not spec_change(oid, line, events, raw["body"]):
+            refuse("%s is %s; the spec gate is behind it" % (oid, o["status"]),
+                   "use --gate merge once it reaches review, or reject it")
+        h = spec_hash(raw["body"], line)
+        confirm_human(oid, "pass %s's spec gate (approve the spec as it is now, sha256 %s)" % (oid, h[:16]), command)
+        append_event(main, make_rec(oid, "gate", gate="spec", state="pass", status="approved", note=note, spec_hash=h))
+        print("%s  spec gate passed: approved (spec sha256 %s)" % (oid, h[:16]))
+        if line_has_verify(line):
+            n = holdout_count(main, oid)
+            print("holdout: %d scenario%s in %s/%s%s" % (n, "" if n == 1 else "s", F.HOLDOUT_DIR, oid,
+                                                      "; with none, no hidden scenario will check the work" if n == 0 else ""))
+        print("next: cc-factory lane %s, then /factory run %s" % (oid, oid))
+        return 0
+    reviewed = reviewed_head(oid, events)
+    head, target, msha = merged_lane(main, oid, events, args.into, reviewed)
+    confirm_human(oid, "pass %s's merge gate (the reviewed lane head %s, merged into %s by %s)"
+                  % (oid, head[:10], one_line(args.into or "HEAD", 60), msha[:10]), command)
+    append_event(main, make_rec(oid, "gate", gate="merge", state="pass", status="done", note=note,
+                                merge_sha=msha, lane_head=head, target=target))
+    print("%s  merge gate passed: done" % oid)
+    print("reviewed lane head %s is in %s (%s), merged by %s%s" % (head[:10], one_line(args.into or "HEAD", 60), target[:10], msha[:10],
+                                                                    " (a fast-forward)" if msha == head else ""))
+    return 0
+
+
+def cmd_reject(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    o, _raw, _events = load_order(main, oid)
+    gate = args.gate or ("merge" if o["status"] == "review" else "spec")   # who runs it is checked first, as in approve
+    decision = ("sending %s back from the merge gate for rework" % oid if args.rework
+                else "rejecting %s at the %s gate" % (oid, gate))
+    command = "cc-factory reject %s --gate %s%s%s" % (oid, gate, " --rework" if args.rework else "", " --note ..." if args.note else "")
+    need_human(decision, command)
+    gate = gate_args(o, args, "reject")
+    if args.rework and gate != "merge":
+        raise Usage("--rework applies to the merge gate: cc-factory reject %s --gate merge --rework" % oid)
+    confirm_human(oid, "send %s back from the merge gate for another run" % oid if args.rework
+                  else "reject %s at the %s gate" % (oid, gate), command)
+    status = "approved" if args.rework else "rejected"
+    append_event(main, make_rec(oid, "gate", gate=gate, state="fail", status=status, note=clean_note(args.note) if args.note else ""))
+    if args.rework:
+        print("%s  merge gate failed: back to approved, ready for another run" % oid)
+        print("next: /factory run %s (the lane is reused)" % oid)
+    else:
+        print("%s  %s gate failed: rejected" % (oid, gate))
+    return 0
+
+
+# ── lane / holdout / run-args ─────────────────────────────────────────────────
+def worktree_list(main):
+    """[{path, branch}] from `git worktree list --porcelain`; paths are real paths."""
+    out, cur = [], None
+    for line in git_out(["worktree", "list", "--porcelain"], main, "git worktree list", "check the repository").splitlines():
+        if line.startswith("worktree "):
+            cur = {"path": os.path.realpath(line[9:]), "branch": ""}
+            out.append(cur)
+        elif line.startswith("branch ") and cur is not None:
+            cur["branch"] = line[7:].strip()
+    return out
+
+
+def resolve_commit(main, ref):
+    if not ref or ref.startswith("-"):
+        refuse("%r is not a usable base" % one_line(ref, 60), "give a branch, tag or commit, e.g. --base HEAD")
+    r = git(["rev-parse", "--verify", "--quiet", ref + "^{commit}"], main)
+    sha = r.stdout.strip()
+    if r.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        refuse("%r does not name a commit in %s" % (one_line(ref, 60), one_line(main, 300)), "pass a commit-ish with --base, or make an initial commit first")
+    return sha
+
+
+def cmd_lane(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    o, _raw, events = load_order(main, oid)
+    line = line_of(main, o)
+    if o["status"] in TERMINAL:
+        refuse("%s is %s" % (oid, o["status"]), "a finished order has no lane to make")
+    if line["gates"]["spec"] == "human" and o["status"] not in LANE_OK:
+        refuse("the spec gate has not passed for %s (status %s)" % (oid, o["status"]),
+               "read the spec, then cc-factory approve %s" % oid)
+    need_spec_approval(oid, line, events, "lane")
+    wts = worktree_list(main)
+    prefix = "refs/heads/factory/%s-" % oid
+    found = sorted((w for w in wts if w["branch"].startswith(prefix)), key=lambda w: w["path"])
+    last_lane = next((e for e in reversed(events) if e["event"] == "lane"), None)
+    created = False
+    if found:
+        branch, wt = found[0]["branch"][len("refs/heads/"):], found[0]["path"]
+        if not os.path.isdir(wt):
+            refuse("the lane worktree %s is registered but missing" % one_line(wt, 300), "git worktree prune, then run cc-factory lane %s again" % oid)
+        base = ""
+        for e in reversed(events):
+            if e["event"] == "lane" and e.get("branch") == branch and e.get("base"):
+                base = e["base"]
+                break
+        if not base:
+            r = git(["merge-base", "HEAD", branch], main)
+            base = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else resolve_commit(main, "HEAD")
+    else:
+        slug = F.slugify(o["title"])
+        branch = "factory/%s-%s" % (oid, slug)
+        ck = git(["check-ref-format", "--branch", branch], main)
+        if ck.returncode != 0 or ck.stdout.strip() != branch:
+            refuse("%r is not a valid branch name" % branch, "retitle the order with plain words")
+        wt = os.path.join(main, ".claude", "worktrees", "%s-%s" % (oid, slug))
+        for d in (os.path.join(main, ".claude"), os.path.dirname(wt)):
+            if os.path.lexists(d) and not real_dir(d):  # a symlink here would put the lane anywhere
+                refuse("%s is not a real directory" % one_line(os.path.relpath(d, main), 300), "replace it with a directory (a symlink?), then run cc-factory lane %s again" % oid)
+        if os.path.lexists(wt):
+            refuse("%s exists but is not a worktree on %s" % (one_line(wt, 300), branch), "move it aside, then run cc-factory lane %s again" % oid)
+        base = resolve_commit(main, args.base or "HEAD")
+        exists = git(["show-ref", "--verify", "--quiet", "refs/heads/" + branch], main).returncode == 0
+        checkout = "refs/heads/" + branch if exists else base       # the commit the lane will hold
+        refuse_tracked_holdout(main, checkout, "the lane checkout would contain the scenarios",
+                               "untrack them in the main checkout: git rm -r --cached %s, then commit (the files stay on disk "
+                               "and .gitignore keeps them out); scenarios already committed stay readable in the history, so "
+                               "rewrite them; then run cc-factory lane %s again" % (F.HOLDOUT_DIR, oid))
+        # The exact record first: a path the ledger cannot hold refuses before git creates anything.
+        wt = os.path.realpath(wt)
+        rec = make_rec(oid, "lane", branch=branch, worktree=wt, base=base)
+        add = ["worktree", "add", "--", wt, branch] if exists else ["worktree", "add", "-b", branch, "--", wt, base]
+        git_out(add, main, "git worktree add", "check that %s is not checked out elsewhere and the path is free" % branch)
+        created = True
+        if os.path.realpath(wt) != wt:
+            refuse("the new lane worktree %s resolves to another path" % one_line(wt, 300),
+                   "check .claude/worktrees/ for a symlink, then run cc-factory lane %s again" % oid)
+    if not (last_lane and last_lane.get("branch") == branch and last_lane.get("worktree") == wt and last_lane.get("base") == base):
+        append_event(main, rec if created else make_rec(oid, "lane", branch=branch, worktree=wt, base=base))
+    if args.json:
+        print(json.dumps({"order": oid, "branch": branch, "worktree": wt, "base": base, "created": created}))
+        return 0
+    print("%s  lane %s: branch %s from %s" % (oid, "created" if created else "reused", branch, base[:10]))
+    if args.base and not created:
+        print("(--base ignored: the lane already exists and keeps its recorded base)")
+    print("work in the lane, not in the main checkout; merging is yours (git merge --no-ff %s)" % branch)
+    print(wt)
+    return 0
+
+
+def tracked_holdout(cwd, commit):
+    """The paths under .factory-holdout/ tracked in `commit` (in the repository of cwd); [] when none."""
+    r = git(["ls-tree", "-r", "-z", "--name-only", commit, "--", F.HOLDOUT_DIR], cwd)
+    if r.returncode != 0:
+        refuse("git could not list %s/ in %s: %s" % (F.HOLDOUT_DIR, one_line(commit, 60), one_line(r.stderr, 160)), "check the repository")
+    return [p for p in r.stdout.split("\0") if p]
+
+
+def refuse_tracked_holdout(cwd, commit, why, suggestion):
+    n = len(tracked_holdout(cwd, commit))
+    if n:
+        refuse("%d file%s under %s/ %s tracked by git at %s, so %s" % (n, "" if n == 1 else "s", F.HOLDOUT_DIR, "is" if n == 1 else "are",
+                                                                       one_line(commit, 60).replace("refs/heads/", ""), why), suggestion)
+
+
+def private_dir(path):
+    """mkdir 0700 (or accept an existing real directory of ours, tightening its mode)."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        refuse("cannot create %s (%s)" % (one_line(path, 300), e.strerror or e), "check the permissions of the project directory")
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        refuse("%s is not a directory of yours" % one_line(path, 300), "move it aside (a symlink?) and retry")
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+
+
+def cmd_holdout(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    load_order(main, oid)
+    rel = "%s/%s" % (F.HOLDOUT_DIR, oid)
+    # Tracked files are never "ignored", whatever .gitignore says: name that case for what it is.
+    t = git(["ls-files", "-z", "--", F.HOLDOUT_DIR], main)
+    if t.returncode != 0:
+        refuse("git could not list the tracked files under %s/: %s" % (F.HOLDOUT_DIR, one_line(t.stderr, 160)), "check the repository")
+    n = len([p for p in t.stdout.split("\0") if p])
+    if n:
+        refuse("%d file%s under %s/ %s tracked by git, so the scenarios would travel into every lane" % (
+            n, "" if n == 1 else "s", F.HOLDOUT_DIR, "is" if n == 1 else "are"),
+            "untrack them: git rm -r --cached %s, then commit (the files stay on disk and .gitignore keeps them out); "
+            "scenarios already committed stay readable in the history, so rewrite them" % F.HOLDOUT_DIR)
+    r = git(["check-ignore", "-q", "--", rel], main)
+    if r.returncode == 1:
+        refuse("%s/ is not git-ignored, so scenarios there would travel into every lane" % F.HOLDOUT_DIR,
+               "run cc-factory init (it adds .factory-holdout/ to .gitignore), or add the line yourself")
+    if r.returncode != 0:
+        refuse("git could not check whether %s is ignored: %s" % (rel, one_line(r.stderr, 160)), "check the repository")
+    top = os.path.join(main, F.HOLDOUT_DIR)
+    private_dir(top)
+    d = os.path.join(top, oid)
+    private_dir(d)
+    print("%s  holdout scenarios (*.md) go here; they are never given to the build agents" % oid)
+    print(d)
+    return 0
+
+
+def last_lane_base(events, branch):
+    for e in reversed(events):
+        if e["event"] == "lane" and e.get("branch") == branch and e.get("base"):
+            return e["base"]
+    return ""
+
+
+def cmd_run_args(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    o, raw, events = load_order(main, oid)
+    if o["status"] in TERMINAL:
+        refuse("%s is %s" % (oid, o["status"]), "a finished order does not run")
+    lane = o.get("lane") or {}
+    if not lane.get("branch") or not lane.get("worktree"):
+        refuse("%s has no lane yet" % oid, "run cc-factory lane %s first" % oid)
+    line = line_of(main, o)
+    need_spec_approval(oid, line, events, "run")
+    changed = spec_change(oid, line, events, raw["body"])
+    if changed:
+        refuse("%s: %s" % (oid, changed), "a human reads the spec again, then runs cc-factory approve %s" % oid)
+    wt = os.path.realpath(lane["worktree"])
+    if not os.path.isdir(wt) or wt not in [w["path"] for w in worktree_list(main)]:
+        refuse("the recorded lane worktree %s is not a registered git worktree" % one_line(lane["worktree"], 300),
+               "run cc-factory lane %s to make it again" % oid)
+    refuse_tracked_holdout(wt, "HEAD", "the build agents in the lane could read the scenarios",
+                           "remove them from the lane (git -C %s rm -r -q %s, then commit there), untrack them in the main "
+                           "checkout too (git rm -r --cached %s, then commit), and rewrite the scenarios, which the lane has "
+                           "already held" % (one_line(wt, 300), F.HOLDOUT_DIR, F.HOLDOUT_DIR))
+    project_js = os.path.join(main, LINE_JS_REL)
+    try:
+        own = stat.S_ISREG(os.lstat(project_js).st_mode)
+    except OSError:
+        own = False
+    script = project_js if own else os.path.join(CC_TOOL_DIR, LINE_JS_REL)
+    if not own and not os.path.isfile(script):
+        refuse("factory-line.js is not in the project or in cc_tool", "run cc-factory init (after cc-update, if cc_tool is old)")
+    out = {"name": "factory-line", "scriptPath": script, "args": {
+        "order": oid, "title": o["title"], "spec": raw["body"], "root": main, "worktree": wt, "branch": lane["branch"],
+        "base": last_lane_base(events, lane["branch"]), "holdout": os.path.join(main, F.HOLDOUT_DIR, oid),
+        "stations": line["stations"], "retries": line["retries"], "line": o.get("line") or "default",
+        "threshold": F.line_threshold(line)}}
+    for key in F.COMMAND_KEYS:   # human-written in line.json: the only run/test commands verify is given
+        if line.get(key):
+            out["args"][key] = line[key]
+    print(json.dumps(out, ensure_ascii=True, separators=(",", ":")))
+    return 0
+
+
+# ── record ────────────────────────────────────────────────────────────────────
+KINDS = ("plan", "build", "test", "verify", "review")
+REASONS = ("args", "infeasible", "infra", "lane-tampered")
+
+
+def int_field(v, lo=0, hi=10 ** 6):
+    return v if isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi else None
+
+
+def num_field(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+
+def read_result(path):
+    if path:
+        data = read_file(path, MAX_RESULT_BYTES + 1)
+        if data is None:
+            refuse("%s is not a readable plain file" % one_line(path, 120), "pass a real file, or pipe the result JSON on stdin")
+    else:
+        if sys.stdin is None or sys.stdin.isatty():
+            raise Usage("give the run: --workflow-run wf_..., or pipe the workflow's result JSON on stdin, or pass --file F")
+        data = sys.stdin.buffer.read(MAX_RESULT_BYTES + 1)
+    if len(data) > MAX_RESULT_BYTES:
+        refuse("the result is over 1 MiB", "record only the workflow's final result object")
+    try:
+        res = json.loads(data.decode("utf-8", "replace"))
+        if isinstance(res, str):
+            res = json.loads(res)
+    except (ValueError, RecursionError):
+        raise Usage("the result is not valid JSON")
+    if isinstance(res, dict) and "history" not in res and isinstance(res.get("result"), dict):
+        res = res["result"]
+    if not isinstance(res, dict):
+        raise Usage("the result must be a JSON object")
+    return res
+
+
+# The result Claude Code saved: ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<encoded cwd>/<session>/workflows/<runId>.json
+def claude_config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def encode_project(path):
+    """Claude Code's projects/ directory name for a session's cwd: every character but A-Z a-z 0-9 becomes '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def _subdirs(path, budget):
+    """Real (not symlinked) subdirectories of path; budget[0] counts down the entries looked at."""
+    out = []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if budget[0] <= 0:
+                    break
+                budget[0] -= 1
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        out.append(e.path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def find_run_file(main, run_id):
+    """The one saved <run_id>.json: first under the main checkout's projects/ directory (any of its
+    sessions), else a bounded scan of projects/*/*/workflows/ that must find exactly one."""
+    projects = os.path.join(claude_config_dir(), "projects")
+    name = run_id + ".json"
+    budget = [SCAN_ENTRIES]
+
+    def look(pdirs):
+        found = []
+        for pdir in pdirs:
+            for sdir in _subdirs(pdir, budget):
+                wdir = os.path.join(sdir, "workflows")
+                if real_dir(wdir) and os.path.lexists(os.path.join(wdir, name)):
+                    found.append(os.path.join(wdir, name))
+        return found
+
+    mine = os.path.join(projects, encode_project(main))
+    found = look([mine]) if real_dir(mine) else []
+    if not found:
+        found = look(_subdirs(projects, [SCAN_PROJECTS]))
+    if not found:
+        refuse("Claude Code saved no result for Workflow run %s under %s/" % (run_id, one_line(projects, 200)),
+               "check the run id (the runId the Workflow tool returned) and wait for the run's completion notice; "
+               "or save the run's result object to a file and pass --file F")
+    if len(found) > 1:
+        refuse("%d saved results for Workflow run %s under %s/, so which one is meant is unclear" % (len(found), run_id, one_line(projects, 200)),
+               "save the right run's result object to a file and pass --file F")
+    return found[0]
+
+
+def read_run_file(path, run_id):
+    """(result, args) of a saved Workflow run, an untrusted file: opened O_NOFOLLOW, a regular file of
+    yours that only you can write, at most 8 MiB, the factory-line workflow, completed."""
+    sugg = "Claude Code saves it as a file of yours only you can write; check what replaced it, or pass the result with --file F"
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC)
+    except OSError as e:
+        refuse("the saved result of %s cannot be opened safely (%s)" % (run_id, "it is a symlink" if os.path.islink(path) else e.strerror or e), sugg)
+    try:
+        st = os.fstat(fd)
+        why = ("it is not a regular file" if not stat.S_ISREG(st.st_mode) else
+               "it is not owned by you" if st.st_uid != os.getuid() else
+               "it is group- or world-writable" if st.st_mode & 0o022 else
+               "it is over 8 MiB" if st.st_size > MAX_RUN_FILE_BYTES else "")
+        if why:
+            refuse("the saved result of %s is not safe to read (%s)" % (run_id, why), sugg)
+        chunks, left = [], MAX_RUN_FILE_BYTES + 1
+        while left > 0:
+            b = os.read(fd, min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(data) > MAX_RUN_FILE_BYTES:
+        refuse("the saved result of %s is over 8 MiB" % run_id, sugg)
+    try:
+        doc = json.loads(data.decode("utf-8", "replace"))
+    except (ValueError, RecursionError):
+        refuse("the saved result of %s is not valid JSON" % run_id, "wait for the run to finish, then retry")
+    if not isinstance(doc, dict) or doc.get("runId") != run_id:
+        refuse("the file saved for %s does not describe that run" % run_id, sugg)
+    if doc.get("workflowName") != "factory-line":
+        refuse("Workflow run %s is %s, not the factory line" % (run_id, one_line(doc.get("workflowName"), 60) or "unnamed"),
+               "record the run of factory-line that ran this order")
+    if doc.get("status") != "completed":
+        refuse("Workflow run %s isn't finished (its status is %s)" % (run_id, one_line(doc.get("status"), 40) or "missing"),
+               "wait for the run's completion notice, then record it; a run that died is rerun with /factory run")
+    a = doc.get("args")
+    if isinstance(a, str):
+        try:
+            a = json.loads(a)
+            if isinstance(a, str):
+                a = json.loads(a)
+        except (ValueError, RecursionError):
+            a = None
+    res = doc.get("result")
+    if not isinstance(res, dict):
+        refuse("Workflow run %s saved no result object" % run_id, "rerun the order (/factory run)")
+    return res, a
+
+
+def check_run_args(main, oid, o, a, run_id):
+    """Refuse a saved run whose args are not this order's lane, as cc-factory run-args prints them."""
+    if not isinstance(a, dict):
+        refuse("Workflow run %s saved no args object, so it cannot be tied to %s's lane" % (run_id, oid),
+               "run the line with the args of cc-factory run-args %s" % oid)
+    got = F.norm_id(a.get("order"))
+    if got != oid:
+        refuse("Workflow run %s ran %s, not %s" % (run_id, got or one_line(a.get("order"), 20) or "no order", oid),
+               "record it against the order it ran for: cc-factory record %s --workflow-run %s" % (got or "<ID>", run_id))
+    lane = o.get("lane") or {}
+    if not lane.get("branch") or not lane.get("worktree"):
+        refuse("%s has no lane in the ledger, so Workflow run %s cannot be tied to it" % (oid, run_id), "run cc-factory lane %s first" % oid)
+    want = {"root": main, "worktree": lane["worktree"], "holdout": os.path.join(main, F.HOLDOUT_DIR, oid)}
+    for k in ("root", "worktree", "holdout"):
+        v = a.get(k)
+        ok = isinstance(v, str) and v.startswith("/") and "\x00" not in v and os.path.realpath(v) == os.path.realpath(want[k])
+        if not ok:
+            refuse("Workflow run %s's args.%s (%s) is not %s's (%s)" % (run_id, k, one_line(v, 200) or "missing", oid, one_line(want[k], 200)),
+                   "rerun the order with the args of cc-factory run-args %s" % oid)
+    if a.get("branch") != lane["branch"]:
+        refuse("Workflow run %s's args.branch (%s) is not %s's lane branch (%s)" % (run_id, one_line(a.get("branch"), 200) or "missing",
+                                                                                 oid, one_line(lane["branch"], 200)),
+               "rerun the order with the args of cc-factory run-args %s" % oid)
+
+
+def run_spec_change(raw, line, a):
+    """Why a saved run's args used another spec or line than the order has now, or ''."""
+    if a.get("spec") != raw["body"]:
+        return "the run's spec is not the order's current body"
+    if a.get("stations") != line["stations"] or a.get("retries") != line["retries"]:
+        return "the run's stations or retries are not the order's line"
+    th = num_field(a.get("threshold")) if "threshold" in a else 1.0
+    if th != F.line_threshold(line):
+        return "the run's threshold is not the line's"
+    if any((a.get(k) or "") != (line.get(k) or "") for k in F.COMMAND_KEYS):
+        return "the run's run or test command is not the line's"
+    return ""
+
+
+def parse_history(res, names):
+    """(raw history list, [entry] for the line's stations, entries skipped). An entry: station,
+    state, note, attempt (None when missing), infra (a fail whose agent returned nothing or threw)."""
+    hist = res.get("history") if isinstance(res.get("history"), list) else []
+    out, skipped = [], 0
+    for h in hist:
+        if (isinstance(h, dict) and isinstance(h.get("station"), str) and h["station"] in names
+                and h.get("state") in ("start", "pass", "fail")):
+            out.append({"station": h["station"], "state": h["state"], "note": h.get("note") if isinstance(h.get("note"), str) else "",
+                        "attempt": int_field(h.get("attempt"), 1, 999), "infra": h["state"] == "fail" and h.get("infra") is True})
+        else:
+            skipped += 1
+    return hist, out, skipped
+
+
+RERUN = "rerun the order (/factory run %s); the merge gate opens only for a run that passed every check"
+
+
+def holdout_check(main, oid, line, res, final):
+    """(problem, holdout facts) for a line with a verify station: verify's own report against the
+    scenario files on disk. problem is (reason, suggestion) or None."""
+    sugg = RERUN % oid
+    h = res.get("holdout")
+    if not isinstance(h, dict):
+        return ("the line has a verify station, but the result carries no holdout check", sugg), None
+    files = holdout_files(main, oid)
+    nums = {}
+    for name in files:
+        n = scenario_number(name)
+        if n is None:
+            return ("a scenario file in %s/%s has no S-number in its name, so its verdict cannot be matched" % (F.HOLDOUT_DIR, oid),
+                    "name every scenario file S<n>-<slug>.md, then rerun the order"), None
+        if n in nums:
+            return ("two scenario files in %s/%s share %s" % (F.HOLDOUT_DIR, oid, sid(n)),
+                    "give each scenario file its own S-number, then rerun the order"), None
+        nums[n] = name
+    disk = len(files)
+    att = int_field(h.get("attempt"), 0, 999)
+    if att != final:
+        return ("the holdout check is from attempt %s, not the final attempt %d" % (att if att is not None else "?", final), sugg), None
+    sf = int_field(h.get("scenarioFiles"), 0, 10 ** 6)
+    if sf != disk:
+        return ("verify reported reading %s scenario file%s, and %s/%s holds %d" % (
+            sf if sf is not None else "no count of", "" if sf == 1 else "s", F.HOLDOUT_DIR, oid, disk), sugg), None
+    sc = h.get("scenarios")
+    if not isinstance(sc, list):
+        return ("the holdout check has no verdict list", sugg), None
+    verdicts = {}
+    for v in sc[:10000]:
+        m = re.fullmatch(r"[Ss]([0-9]{1,9})", v.get("id") if isinstance(v, dict) and isinstance(v.get("id"), str) else "")
+        if not m or not isinstance(v.get("satisfied"), bool):
+            return ("a holdout verdict is not {id: S<n>, satisfied: true or false}", sugg), None
+        n = int(m.group(1))
+        if n in verdicts:
+            return ("the holdout check has two verdicts for %s" % sid(n), sugg), None
+        verdicts[n] = v["satisfied"]
+    if len(verdicts) != disk:
+        return ("verify returned %d distinct verdict%s for %d scenario file%s" % (
+            len(verdicts), "" if len(verdicts) == 1 else "s", disk, "" if disk == 1 else "s"), sugg), None
+    missing = sorted(set(nums) - set(verdicts))
+    if missing:
+        return ("no verdict for %s" % ", ".join(sid(n) for n in missing), sugg), None
+    ok, total = sum(1 for x in verdicts.values() if x), len(verdicts)
+    if int_field(h.get("satisfied")) != ok or int_field(h.get("total")) != total:
+        return ("the holdout counts (satisfied, total) disagree with its verdicts", sugg), None
+    want = F.line_threshold(line)
+    thr = num_field(h.get("threshold"))
+    if thr is None or thr + 1e-9 < want:
+        return ("the run's holdout threshold %s is below the line's %s" % (thr if thr is not None else "(none)", fmt_num(want)), sugg), None
+    # Observed only when verify ran the lane's code through the sandbox; anything else (no bwrap, a failed
+    # probe, an older result without the field) is a static verdict, which never makes a merge recommendation.
+    sb = h.get("sandbox") if h.get("sandbox") in ("ok", "missing", "failed", "not-run") else "unknown"
+    gs = h.get("git") if h.get("git") in ("ok", "objects-missing", "failed", "not-run") else "unknown"   # objects-missing: never fetched
+    facts = {"satisfied": ok, "total": total, "threshold": want, "ids": [(sid(n), verdicts[n]) for n in sorted(verdicts)],
+             "satisfaction": ok / total if total else None, "executed": h.get("executed") is True and sb == "ok" and gs == "ok",
+             "sandbox": sb, "git": gs}
+    if not total:
+        return None, facts
+    frac = ok / total
+    if frac + 1e-9 < want:
+        return ("the verdicts (%d of %d satisfied) are below the threshold %s, so this run did not pass" % (ok, total, fmt_num(want)), sugg), None
+    for claimed in (h.get("satisfaction"), res.get("satisfaction")):
+        c = num_field(claimed)
+        if claimed is not None and (c is None or abs(c - frac) > 1e-6):
+            return ("the result's satisfaction (%s) disagrees with its verdicts (%d of %d)" % (one_line(claimed, 20), ok, total), sugg), None
+    return None, facts
+
+
+def fmt_num(x):
+    return ("%.2f" % x).rstrip("0").rstrip(".") if isinstance(x, float) else str(x)
+
+
+def lane_facts(main, oid, lane):
+    """(problem, facts) from git about the lane: head, base, commits and the diffstat."""
+    branch, base = lane["branch"], lane.get("base") or ""
+    head = rev(main, "refs/heads/" + branch)
+    if not head:
+        return ("the lane branch %s cannot be read" % one_line(branch, 200), "make the lane again (cc-factory lane %s) and rerun" % oid), None
+    b = rev(main, base) if base else ""
+    if not b:
+        return ("the lane's recorded base is not a commit here", "make the lane again (cc-factory lane %s) and rerun" % oid), None
+    if head == b:
+        return ("the lane branch has no commits past its base, so the run built nothing to merge", RERUN % oid), None
+    st = git(["diff", "--stat", "--no-color", "--no-ext-diff", "--no-textconv", "%s...%s" % (b, head)], main)
+    lg = git(["log", "--no-color", "--no-show-signature", "--format=%h %s", "%s..%s" % (b, head)], main)
+    if st.returncode != 0 or lg.returncode != 0:
+        return ("git could not describe the lane: %s" % one_line((st.stderr if st.returncode else lg.stderr), 200), "check the repository"), None
+    return None, {"branch": branch, "base": b, "head": head,
+                  "stat": [_CTRL.sub("", ln).rstrip()[:300] for ln in st.stdout.splitlines() if ln.strip()],
+                  "commits": [" ".join(_CTRL.sub(" ", ln).split())[:300] for ln in lg.stdout.splitlines() if ln.strip()]}
+
+
+def review_check(main, oid, o, events, line, res, hist, entries, verified):
+    """(problem, facts) for a result that claims review: every check the merge gate rests on. problem is
+    (reason, suggestion) or None; facts: recommendation, why_none, holdout, lane, final. `verified`: the
+    result is Claude Code's saved run (--workflow-run) whose args matched this order's lane and spec."""
+    sugg = RERUN % oid
+    c = res.get("contract")
+    if not (isinstance(c, int) and not isinstance(c, bool) and c == 2):
+        return ("the result does not carry contract 2, the factory-line result this cc-factory checks, so it cannot open the merge gate",
+                "update the project's factory-line.js (cc-factory init; --force if it was edited), then rerun the order"), None
+    if not verified:
+        # Anyone can type a passing result on stdin or into a file; the saved run is at least tied to a
+        # Workflow run whose args were this order's lane and approved spec.
+        return ("a result read from stdin or --file can record only failed or blocked: only a Workflow run Claude Code saved, "
+                "read with --workflow-run and checked against this order's lane and spec, opens the merge gate",
+                "record the run with cc-factory record %s --workflow-run <runId>" % oid), None
+    lane = last_lane(events)
+    if lane is None or not lane.get("base"):
+        return ("%s has no lane with a recorded base in the ledger" % oid, "make it with cc-factory lane %s, then rerun" % oid), None
+    rb, rw = res.get("branch"), res.get("worktree")
+    if isinstance(rb, str) and rb and rb != lane["branch"]:
+        return ("the result is for branch %s, not %s's lane branch" % (one_line(rb, 120), oid), sugg), None
+    if (isinstance(rw, str) and rw and lane.get("worktree")
+            and ("\x00" in rw or os.path.realpath(rw) != os.path.realpath(lane["worktree"]))):
+        return ("the result is for worktree %s, not %s's lane" % (one_line(rw, 200), oid), sugg), None
+    atts = [int_field(h.get("attempt"), 1, 999) for h in hist if isinstance(h, dict)]
+    atts = [a for a in atts if a]
+    if not atts:
+        return ("the result's history has no attempt numbers, so its final attempt cannot be checked", sugg), None
+    final = max(atts)
+    for s in line["stations"]:
+        want = 1 if s["name"] == "plan" else final
+        if not any(e["station"] == s["name"] and e["state"] == "pass" and e["attempt"] == want for e in entries):
+            return ("station %s has no pass in attempt %d%s" % (s["name"], want, ", the final one" if want == final else ""), sugg), None
+    late = sorted({e["station"] for e in entries if e["state"] == "fail" and e["attempt"] == final})
+    if late:
+        return ("the final attempt (%d) also failed at %s" % (final, ", ".join(late)), sugg), None
+    facts = {"final": final, "holdout": None, "why_none": ""}
+    if line_has_verify(line):
+        problem, h = holdout_check(main, oid, line, res, final)
+        if problem:
+            return problem, None
+        facts["holdout"] = h
+        if not h["total"]:
+            spec_ev = next((e for e in reversed(events) if e.get("event") == "status" and e.get("status") == "spec"), None)
+            facts["why_none"] = "%s/%s holds no scenario files%s" % (F.HOLDOUT_DIR, oid, "; the spec was marked --no-holdout"
+                                                                      if spec_ev and spec_ev.get("no_holdout") else "")
+    else:
+        facts["why_none"] = "the order's %s line has no verify station" % (o.get("line") or "default")
+    h = facts["holdout"]
+    facts["recommendation"] = ("needs-scenarios" if not (h and h["total"]) else
+                               "merge" if h["executed"] else "needs-human-check")
+    problem, lf = lane_facts(main, oid, lane)
+    if problem:
+        return problem, None
+    facts["lane"] = lf
+    return None, facts
+
+
+# Feedback leak flag: shared word 5-grams between a rework text and the order's scenario files,
+# excluding the 5-grams the order body also has (the spec rightly appears in both).
+_WORD = re.compile(r"[^\W_]+")
+
+
+def grams(text, n=5):
+    w = _WORD.findall(text.lower())
+    return {tuple(w[i:i + n]) for i in range(len(w) - n + 1)}
+
+
+def leak_findings(main, oid, raw, res, names):
+    """[(attempt, from, kind, [(S-id, shared 5-grams)])] for each feedback text that shares 5-grams with
+    a scenario. Never the shared text itself."""
+    fb = res.get("feedback")
+    if not isinstance(fb, list) or not fb:
+        return []
+    d = os.path.join(main, F.HOLDOUT_DIR, oid)
+    scen = []
+    for name in holdout_files(main, oid):
+        data = read_file(os.path.join(d, name), MAX_SCENARIO_BYTES)
+        if data is not None:
+            n = scenario_number(name)
+            scen.append((sid(n) if n is not None else "an unnumbered scenario", grams(data.decode("utf-8", "replace"))))
+    if not scen:
+        return []
+    body = grams(raw.get("body") or "")
+    out = []
+    for item in fb[:50]:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        g = grams(item["text"][:50000]) - body
+        hits = [(label, len(g & sg)) for label, sg in scen if g & sg]
+        if hits:
+            out.append((int_field(item.get("attempt"), 1, 999), item.get("from") if item.get("from") in names else "a station",
+                        item.get("kind") if item.get("kind") in KINDS else "", hits))
+    return out
+
+
+def leak_note(f):
+    att, frm, kind, hits = f
+    return ("possible holdout leak: the rework feedback %s got from %s%s shares word 5-grams with %s; the scenario text is not "
+            "repeated here, compare the run's feedback with those scenarios" % (
+                "attempt %d" % att if att else "a build", frm, " (%s)" % kind if kind and kind != frm else "",
+                ", ".join("%s (%d)" % (label, n) for label, n in hits)))
+
+
+def capped(items, n):
+    return items if len(items) <= n else items[:n] + ["… %d more" % (len(items) - n)]
+
+
+def para(text, indent):
+    """Agent-written prose, whole: control characters gone (newlines kept), continuation lines indented."""
+    t = block_text(text, 1 << 20).strip() if isinstance(text, str) else ""
+    return t.replace("\n", "\n" + indent)
+
+
+def briefing_lines(oid, res, facts, line, summary):
+    """The merge-gate briefing: facts from git and the ledger's lane, the holdout verdict ids, and review's
+    full decision text (summary, every should-fix item, nextSteps, its own test run). Never a scenario reason."""
+    lf = facts["lane"]
+    out = ["Lane %s: %d commit%s past base %s, head %s." % (lf["branch"], len(lf["commits"]), "" if len(lf["commits"]) == 1 else "s",
+                                                              lf["base"][:10], lf["head"][:10]),
+           "Commits (git log --oneline %s..%s):" % (lf["base"][:10], lf["branch"])]
+    out += ["  " + c for c in capped(lf["commits"], LIST_CAP_COMMITS)]
+    stat_lines = lf["stat"]
+    tail = stat_lines[-1:] if stat_lines and "changed" in stat_lines[-1] else []
+    files = stat_lines[:-1] if tail else stat_lines
+    out.append("Changes (git diff --stat %s...%s):" % (lf["base"][:10], lf["branch"]))
+    out += ["  " + s for s in capped(files, LIST_CAP_FILES) + tail]
+    h = facts["holdout"]
+    if facts["recommendation"] == "needs-scenarios":
+        out.append("Holdout: NO hidden scenario checked this work (%s). The line's own tests and the review are all the checking "
+                   "there was: try the behaviour yourself before you merge." % facts["why_none"])
+    else:
+        out.append("Holdout: satisfaction %.2f (%d of %d scenarios satisfied, threshold %s): %s." % (
+            h["satisfaction"], h["satisfied"], h["total"], fmt_num(h["threshold"]),
+            ", ".join("%s %s" % (i, "satisfied" if ok else "NOT satisfied") for i, ok in h["ids"])))
+        if facts["recommendation"] == "needs-human-check":
+            out.append("Holdout verdicts are STATIC (sandbox %s, git %s): verify ran none of the lane's code, it only read it, so nothing "
+                       "observed the behaviour. Recommendation: needs-human-check, not merge: run the change yourself first." % (h["sandbox"], h["git"]))
+    st = res.get("stations") if isinstance(res.get("stations"), dict) else {}
+    rs = st.get("review") if isinstance(st.get("review"), dict) else {}
+    rv = rs.get("report") if isinstance(rs.get("report"), dict) else None
+    if not any(s["name"] == "review" or s["name"] == rs.get("name") for s in line["stations"]):
+        out.append("Review: none (the line has no review station).")
+    elif rv is None:
+        out.append("Review: no report in the result.")
+    else:
+        out.append("Review (%s): %s. %s" % (one_line(rs.get("model") or "inherit", 40), one_line(rv.get("verdict") or "-", 20),
+                                           para(rv.get("summary"), "  ")))
+        if isinstance(rv.get("meetsAcceptanceCriteria"), bool):
+            out.append("  Meets the acceptance criteria: %s." % ("yes" if rv["meetsAcceptanceCriteria"] else "NO"))
+        issues = [i for i in (rv.get("issues") if isinstance(rv.get("issues"), list) else []) if isinstance(i, dict)]
+        for sev, label in (("blocking", "Blocking"), ("should-fix", "Should-fix")):
+            items = [i for i in issues if i.get("severity") == sev]
+            if items:
+                out.append("  %s (%d):" % (label, len(items)))
+                for i in items:
+                    out.append("    - %s: %s%s%s" % (one_line(i.get("location") or "-", 200), para(i.get("problem"), "      "),
+                                                    (" Shows it: " + para(i.get("showsFailure"), "      ")) if i.get("showsFailure") else "",
+                                                    (" Fix: " + para(i.get("suggestion"), "      ")) if i.get("suggestion") else ""))
+        nits = [i for i in issues if i.get("severity") == "nit"]
+        if nits:
+            out.append("  Nits (%d): %s" % (len(nits), "; ".join("%s: %s" % (one_line(i.get("location") or "-", 80),
+                                                                            one_line(i.get("problem"), 160)) for i in nits)))
+        out.append("  Next steps: %s" % (para(rv.get("nextSteps"), "    ") or "(none given)"))
+        tr = rv.get("testRun") if isinstance(rv.get("testRun"), dict) else None
+        if tr is None:
+            out.append("  Review's own test run: not reported (review did not re-run the tests).")
+        else:
+            ran, passed = tr.get("ran") is True, tr.get("passed") is True
+            out.append("  Review's own test run: %s%s" % ("ran and passed" if ran and passed else "ran and FAILED" if ran else "did NOT run",
+                                                         (": " + one_line(tr.get("command"), 300)) if tr.get("command") else ""))
+            lines = [ln for ln in block_text(tr.get("output") if isinstance(tr.get("output"), str) else "", 1 << 20).splitlines() if ln.strip()]
+            if len(lines) > 20:
+                out.append("    … %d earlier line%s of output" % (len(lines) - 20, "" if len(lines) == 21 else "s"))
+            out += ["    " + ln[:300] for ln in lines[-20:]]
+    if summary.strip():
+        out.append("Line summary: " + para(summary, "  "))
+    return out
+
+
+def gate_commands(oid, branch, head):
+    return ["The merge gate is waiting for you. Read the briefing, look at the diff, then, in your own terminal:",
+            "  git merge --no-ff %s   (the reviewed head of %s; run by you, in the main checkout)" % (head, branch or "the lane branch"),
+            "  cc-factory approve %s --gate merge   (it asks you to type back a code it shows, and passes only that reviewed commit)" % oid,
+            "or send it back:",
+            "  cc-factory reject %s --gate merge --rework   (another run on the same lane)" % oid,
+            "  cc-factory reject %s --gate merge            (drop the order)" % oid]
+
+
+def cmd_record(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    o, raw, events = load_order(main, oid)
+    if o["status"] in TERMINAL:
+        refuse("%s is already %s" % (oid, o["status"]), "a finished order takes no more runs")
+    run_id, wf_args = args.run_id, None
+    if args.workflow_run is not None:
+        if args.file:
+            raise Usage("--workflow-run and --file are two sources of the result: give one")
+        if not RUN_ID_RE.fullmatch(args.workflow_run):
+            raise Usage("%r is not a Workflow run id (wf_ followed by letters, digits, - or _)" % one_line(args.workflow_run, 80))
+        if run_id and run_id != args.workflow_run:
+            raise Usage("--run-id %s disagrees with --workflow-run %s (the saved run's id is its run id; drop --run-id)"
+                        % (one_line(run_id, 80), args.workflow_run))
+        res, wf_args = read_run_file(find_run_file(main, args.workflow_run), args.workflow_run)
+        check_run_args(main, oid, o, wf_args, args.workflow_run)
+        run_id = args.workflow_run
+    else:
+        res = read_result(args.file)
+    named = res.get("order")
+    if isinstance(named, str) and named.strip() and F.norm_id(named) != oid:
+        refuse("the result is for %s, not %s" % (one_line(named, 20), oid), "record it against the order it ran for")
+    line = line_of(main, o)
+    names = [s["name"] for s in line["stations"]]
+    hist, entries, skipped = parse_history(res, names)
+    recs = entries
+    if len(recs) > MAX_RECORD_EVENTS:
+        skipped += len(recs) - MAX_RECORD_EVENTS
+        recs = recs[-MAX_RECORD_EVENTS:]
+    c = res.get("contract")
+    v2 = isinstance(c, int) and not isinstance(c, bool) and c == 2
+    err, st = res.get("error"), res.get("status")
+    reason = res.get("reason") if res.get("reason") in REASONS else ""
+    summary = res.get("summary") if isinstance(res.get("summary"), str) else ""
+    problem = None
+    if isinstance(err, str) and err.strip():
+        status, note_text = "blocked", err
+    elif st in ("review", "failed", "blocked"):
+        status, note_text = st, summary
+    elif v2:
+        status, note_text = "blocked", summary
+        problem = ("the result's status %s is not review, failed or blocked" % one_line(st, 30), RERUN % oid)
+    else:  # an old result without a contract: a review claim from it is checked (and refused) below
+        status, note_text = ("review" if res.get("recommendation") == "merge" else "failed"), summary
+    claimed = status
+    changed = spec_change(oid, line, events, raw["body"])
+    if not changed and wf_args is not None:
+        changed = run_spec_change(raw, line, wf_args)
+        changed = ("the spec changed since approval (%s); re-approve" % changed) if changed else ""
+    facts = None
+    if problem is None and changed:
+        problem = (changed, "a human reads the spec again and runs cc-factory approve %s; then rerun the order" % oid)
+    elif problem is None and status == "review":
+        problem, facts = review_check(main, oid, o, events, line, res, hist, entries, verified=wf_args is not None)
+    if problem:
+        status, facts = "blocked", None
+        note_text = "cc-factory record: %s (the run said %s)" % (problem[0], claimed)
+
+    briefing = []
+    if status == "review":
+        briefing = briefing_lines(oid, res, facts, line, summary)
+    leaks = leak_findings(main, oid, raw, res, names)
+    rec_kw = {"status": status, "run_id": run_id, "note": clean_note(note_text)}
+    if status == "review":
+        sat = facts["holdout"]["satisfaction"] if facts["holdout"] else None
+        rec_kw.update(recommendation=facts["recommendation"], satisfaction=sat, lane_head=facts["lane"]["head"],
+                      briefing=clean_briefing("\n".join(briefing)))
+    elif not problem and res.get("recommendation") in F.RECOMMENDATIONS and res.get("recommendation") not in ("merge", "needs-scenarios", "needs-human-check"):
+        rec_kw["recommendation"] = res["recommendation"]
+    batch = [make_rec(oid, "station", station=e["station"], state=e["state"], run_id=run_id, attempt=e["attempt"],
+                      cause="infra" if e["infra"] else None, note=clean_note(e["note"]) if e["note"] else "") for e in recs]
+    batch.append(make_rec(oid, "status", **rec_kw))
+    batch += [make_rec(oid, "note", run_id=run_id, flag="holdout-leak", note=clean_note(leak_note(f))) for f in leaks]
+    for rec in batch:
+        encode_event(rec)  # every line checked before the first is written
+    fd = open_ledger(main)
+    try:
+        for rec in batch:
+            write_event(fd, rec)
+    finally:
+        os.close(fd)
+
+    o2 = reload_order(main, oid)
+    lane = o2.get("lane") or {}
+    # Printed inside a command the human will paste: only a plain ref name from our own lane event, never text from the result.
+    branch = lane.get("branch") if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", lane.get("branch") or "") else ""
+    print("%s  %s" % (oid, one_line(o2["title"], 120)))
+    print("  recorded %d station event%s%s, then status %s%s" % (len(recs), "" if len(recs) == 1 else "s",
+                                                                 " (%d history entries skipped)" % skipped if skipped else "", status,
+                                                                 " (run %s)" % run_id if run_id else ""))
+    facts_line = []
+    if status == "review":
+        facts_line.append("recommendation: %s" % facts["recommendation"])
+        h = facts["holdout"]
+        if h and h["total"]:
+            facts_line.append("holdout satisfaction: %.0f%% (%d of %d)" % (100 * h["satisfaction"], h["satisfied"], h["total"]))
+    elif not problem:
+        facts_line.append("recommendation: %s" % one_line(res.get("recommendation") or "-", 16))
+        sat = num_field(res.get("satisfaction"))
+        if sat is not None:
+            facts_line.append("holdout satisfaction (the run's): %.0f%%" % (100 * sat if sat <= 1 else sat))
+    for k in ("attempts", "rework"):
+        if int_field(res.get(k)) is not None:
+            facts_line.append("%s: %d" % (k, res[k]))
+    if facts_line:
+        print("  " + "   ".join(facts_line))
+    for f in leaks:
+        print("  ⚠ " + one_line(leak_note(f), 400))
+    print("")
+    if problem:
+        print("The run was recorded, but the order is blocked: %s." % one_line(problem[0], 300).rstrip("."))
+        print("")
+        print(block_message("the run of %s was recorded as blocked: %s" % (oid, problem[0]), problem[1]), file=sys.stderr)
+        return 2
+    if status == "review":
+        print("Merge-gate briefing (stored in the ledger; cc-factory show %s prints it again):" % oid)
+        for ln in briefing:
+            print("  " + ln.replace("\n", "\n  "))
+        print("")
+        for ln in gate_commands(oid, branch, facts["lane"]["head"]):
+            print(ln)
+        return 0
+    print("  summary: " + (block_text(summary, 4000).strip() or "(none)").replace("\n", "\n           "))
+    print("")
+    if status == "failed":
+        print("The line ran out of retries on real station failures. Sharpen the spec or the lane, then /factory run %s again," % oid)
+        print("or drop it: cc-factory reject %s" % oid)
+    elif reason == "infra":
+        print("This was an infrastructure failure (%s), not a verdict on the work: rerun the order," % (one_line(err or summary, 200) or "a station's agent returned nothing"))
+        print("no spec change needed: /factory run %s" % oid)
+    elif reason == "lane-tampered":
+        print("The lane worktree changed while verify ran the lane's code in its throwaway copy: %s" % (one_line(err or summary, 200) or "see the summary"))
+        print("Read the lane (git -C <worktree> status, git -C <worktree> diff) before anything else. The lane's code may have")
+        print("copied the scenarios: rewrite them before any rerun, or drop the order: cc-factory reject %s" % oid)
+    elif reason == "infeasible":
+        print("The planner judged the spec infeasible as written: %s" % (one_line(err or summary, 200) or "see the summary"))
+        print("Revise the spec (a human re-approves it) and rerun, or drop it: cc-factory reject %s" % oid)
+    else:
+        print("The run is blocked: %s" % (one_line(err or summary, 200) or "see the summary"))
+        print("Fix that, then /factory run %s again%s." % (oid, " (regenerate the args with cc-factory run-args %s)" % oid if reason == "args" else ""))
+    return 0
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("cc-factory: %s\n" % message)
+        sys.exit(1)
+
+
+def build_parser():
+    def add_c(parser, default):
+        # One -C action per parser (parents= would share it, and the subparser's default would then
+        # overwrite a -C given before the subcommand). A subparser's default is "absent".
+        parser.add_argument("-C", metavar="DIR", default=default, help="project directory (default: current)")
+
+    p = Parser(prog="cc-factory",
+               description="Work orders, gates and lanes of the software factory. Orders: factory/orders/FO-NNN-<slug>.md; "
+                           "lifecycle: <git common dir>/cc_tool/factory/ledger.jsonl.")
+    add_c(p, None)
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND", parser_class=Parser)
+    sub.required = True
+
+    def add(name, func, help_, aliases=()):
+        sp = sub.add_parser(name, aliases=list(aliases), help=help_, description=help_)
+        add_c(sp, argparse.SUPPRESS)
+        sp.set_defaults(func=func)
+        return sp
+
+    sp = add("init", cmd_init, "scaffold factory/, the ignores and the ledger directory")
+    sp.add_argument("project", nargs="?", help="project directory (default: -C or the current directory)")
+    sp.add_argument("--force", action="store_true", help="replace README/line/template and factory-line.js")
+    sp = add("new", cmd_new, "create an order")
+    sp.add_argument("title", nargs="+", metavar="TITLE")
+    sp.add_argument("--priority", choices=("p1", "p2", "p3"))
+    sp.add_argument("--line", help="a line name from factory/line.json (default: default)")
+    sp = add("list", cmd_list, "orders and where each stands", aliases=("status",))
+    sp.add_argument("--all", action="store_true", help="include done and rejected")
+    sp.add_argument("--json", action="store_true", help="every order as JSON")
+    sp = add("show", cmd_show, "one order in full")
+    sp.add_argument("id")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--events", type=int, default=10, metavar="N", help="recent ledger events to show (default 10)")
+    sp = add("mark", cmd_mark, "record a status, station change or note")
+    sp.add_argument("id")
+    sp.add_argument("status", nargs="?", help="one of: " + ", ".join(("queued", "spec", "building", "verifying",
+                                                                   "blocked", "rejected", "failed"))
+                    + " (approved and done are gate decisions: cc-factory approve; review is the line's verdict: cc-factory record)")
+    sp.add_argument("--station")
+    sp.add_argument("--state", choices=("start", "pass", "fail", "waiting"))
+    sp.add_argument("--run-id")
+    sp.add_argument("--branch")
+    sp.add_argument("--worktree")
+    sp.add_argument("--note")
+    sp.add_argument("--no-holdout", action="store_true",
+                    help="with status spec: accept fewer than %d holdout scenarios on a line with a verify station "
+                         "(recorded on the event; the merge gate then says no hidden scenario checked the work)" % MIN_SCENARIOS)
+    human = (" A human's decision: refused when run under Claude Code (the rules cc-dash --control starts by, from "
+             "templates/hooks/cc_procs.py), and refused outright without /proc (Linux only in this release); then it "
+             "shows a random code on your terminal (/dev/tty only) and asks you to type it back there (never stdin; "
+             "input typed ahead of the question is discarded). Run it from your own terminal.")
+    for name, func, h in (("approve", cmd_approve, "pass a human gate"), ("reject", cmd_reject, "fail a human gate")):
+        sp = sub.add_parser(name, help=h, description=h + "." + human)
+        add_c(sp, argparse.SUPPRESS)
+        sp.set_defaults(func=func)
+        sp.add_argument("id")
+        sp.add_argument("--gate", choices=("spec", "merge"), help="default: merge when the order is in review, else spec")
+        sp.add_argument("--note")
+        if name == "approve":
+            sp.add_argument("--into", metavar="REF",
+                            help="merge gate: the branch or commit the lane was merged into (default: the main checkout's HEAD); "
+                                 "it must hold exactly the reviewed lane head (the branch unmoved since the review), and the "
+                                 "merge commit is recorded")
+        if name == "reject":
+            sp.add_argument("--rework", action="store_true", help="at the merge gate: send back for another run, do not drop the order")
+    sp = add("lane", cmd_lane, "create (or reuse) the order's branch and worktree")
+    sp.add_argument("id")
+    sp.add_argument("--base", metavar="REF", help="start point (default: the main checkout's HEAD)")
+    sp.add_argument("--json", action="store_true")
+    sp = add("holdout", cmd_holdout, "create and print the order's holdout directory")
+    sp.add_argument("id")
+    sp = add("run-args", cmd_run_args, "the Workflow tool call for the factory-line script, as JSON")
+    sp.add_argument("id")
+    sp = add("record", cmd_record, "write a finished run's result to the ledger; review only for a run that passed every check")
+    sp.add_argument("id")
+    sp.add_argument("--workflow-run", metavar="RUN_ID",
+                    help="read the result Claude Code saved for this Workflow run (wf_...) under "
+                         "${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<project>/<session>/workflows/RUN_ID.json; "
+                         "its args must be this order's lane and spec, and RUN_ID becomes the run id; the only "
+                         "source that can open the merge gate")
+    sp.add_argument("--run-id", help="the run id to record (with --workflow-run it must be the same)")
+    sp.add_argument("--file", metavar="F", help="read the result from F instead of stdin (from either, only failed or "
+                                                  "blocked: a review needs --workflow-run)")
+    return p
+
+
+def load_lib():
+    spec = importlib.util.spec_from_file_location("cc_factory_lib", LIB_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["cc_factory_lib"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main(argv=None):
+    global F
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    args = build_parser().parse_args(argv)
+    try:
+        F = load_lib()
+    except Exception as e:  # noqa: BLE001 - any failure to load the library is one message
+        print("cc-factory: cannot load %s (%s: %s)" % (LIB_PATH, type(e).__name__, e), file=sys.stderr)
+        return 1
+    try:
+        return args.func(args)
+    except Refuse as e:
+        print(block_message(e.reason, e.suggestion), file=sys.stderr)
+        return 2
+    except Usage as e:
+        print("cc-factory: %s" % e, file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

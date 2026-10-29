@@ -1,0 +1,659 @@
+/* cc-dash Factory floor (factory.js, graph.js).
+
+   The stage is the one deliberate exception to cc-dash's flat system (app.css
+   header): a softly lit canvas with glass nodes, luminous edges and frosted
+   panels. Everything outside .fx-stage (the page head, the picker, the toggles)
+   stays flat and uses app.css as it is.
+
+   The idea: token burn is light. Particles in each target's model colour flow
+   down the spawn tree at a rate tied to its tokens a minute (graph.js draws
+   them); that flow is the one signature motion. Each project hub's rim is its
+   model mix, a conic ring in --opus/--sonnet/--haiku/--fable/--other: the one
+   signature mark. Colour keeps its meaning: model identity only from the model
+   tokens (the 3px light strip of a node and the glow it spills), green, amber
+   and red only for working, needs you and failed. Amber breathes on anything
+   that needs you (opacity and scale, 2.4 s); reduced motion keeps the halo
+   still and drops every slide (graph.js stops the particles). Zoomed out to
+   where a busy floor fits, failed, stalled and needs you keep their weight
+   (a red ring, a dashed amber one, a wider halo), all static.
+
+   One light, overhead. The floor is lit by it: a soft pool in the upper middle
+   falling off to a darker rim, over a faint dot lattice (--gx-grid, drawn by
+   graph.js in world space). Everything on the floor is glass under the same
+   light. A node is a pane with thickness: a translucent fill, a specular
+   highlight where the light catches its top (--fx-sheen), the lower part a
+   shade deeper, a bright top edge and a darker bottom edge (the bevel), the
+   model strip's glow spilling onto the glass beside it only (so text sits on
+   clear glass), and one soft drop shadow. A hub is a lens: a specular crescent
+   up top, the dome turning away from the light towards its rim, the model-mix
+   ring, a soft halo in the hub's colour. Its name is fitted inside the disc at
+   every zoom (factory.js hubName), never on a pill over the rim. Active edges
+   carry two wide low-alpha under-strokes (graph.js, --gx-glow); idle ones none.
+   Glass, cheaply: no backdrop-filter, animated filter or animated shadow on
+   nodes (300 of them would cost too much); every gradient and shadow above is
+   static, painted once. Only the instrument panel (totals, alerts), zoom, the
+   activity column's two panels and the inspector are frosted (backdrop-filter),
+   all on one surface: --fx-panel with --fx-blur, the same edge, inset
+   highlight, shadow and 10 px radius, at three strengths of the same glass:
+   the column clearest (--fx-panel thinned a little, so what moves behind it
+   shows through, blurred), the instrument panel and zoom on --fx-panel, the
+   inspector, dense with text, on --fx-panel-solid.
+
+   Composition: the instrument panel spans the top of the stage and holds its
+   height while data comes and goes; under it on the right is one slot, as wide
+   as --fx-side-w, that holds the activity column (recent actions, then the
+   last hour's charts) or, while a node is selected, the inspector. One width,
+   so a pick never refits the floor. On a phone the slot is a bottom sheet and
+   the totals step aside while it is up. Only the zoom buttons float over the
+   floor; graph.js keeps nodes out from under all of it (insets, the avoid rect,
+   reframe). Mid zoom (where a busy floor fits) still shows the two lines that
+   matter on every face.
+
+   Themes. Dark: a warm near-black graphite ground (from --bg and --surface,
+   never navy), particles composited with "lighter" so they glow. Light: a pale
+   porcelain stage, not a dark box in a light page, its pool of light kept soft
+   so white panes keep their edge on it; particles at source-over (lighter
+   would wash out on white). Every token below is defined once per theme in
+   app.css's three-block pattern. Text clears 4.5:1 against what is really
+   behind it in both themes (the harness's contrast step measures every run on
+   a screenshot with the text hidden); ink-4 is not used for text on glass
+   (.faint is ink-3 inside the stage). */
+
+:root {
+  /* the ground: porcelain, lit from above, a slightly darker rim */
+  --fx-ground: color-mix(in srgb, var(--bg) 62%, #e6e1d6);
+  --fx-light: rgba(255, 255, 255, .72);
+  --fx-rim-shade: color-mix(in srgb, var(--ink) 12%, transparent);
+  --fx-stage-edge: var(--line-2);
+  --fx-stage-inset: inset 0 1px 0 rgba(255, 255, 255, .95), inset 0 -60px 90px -60px rgba(70, 58, 36, .14);
+  /* glass nodes */
+  --fx-glass: color-mix(in srgb, #fff 78%, transparent);
+  --fx-sheen: radial-gradient(130% 95% at 50% -18%, rgba(255, 255, 255, .95), rgba(255, 255, 255, 0) 66%);
+  --fx-shade: rgba(70, 58, 36, .075);
+  --fx-hi: rgba(255, 255, 255, .95);
+  --fx-dome: rgba(70, 58, 36, .2);
+  --fx-edge: rgba(23, 23, 21, .11);
+  --fx-spec: #fff;
+  --fx-glow: 12%;
+  --fx-bad: var(--bad);
+  --fx-led: 55%;
+  --fx-node-shadow: 0 1px 1.5px rgba(70, 58, 36, .13), 0 10px 24px -12px rgba(70, 58, 36, .36);
+  --fx-track: color-mix(in srgb, var(--ink) 10%, transparent);
+  /* frosted panels */
+  --fx-panel: color-mix(in srgb, #fff 80%, transparent);
+  --fx-panel-solid: color-mix(in srgb, #fff 88%, transparent);
+  --fx-panel-edge: rgba(23, 23, 21, .1);
+  --fx-panel-shadow: 0 1px 2px rgba(70, 58, 36, .07), 0 14px 36px -16px rgba(70, 58, 36, .32);
+  --fx-blur: blur(18px) saturate(1.5);
+  --fx-edge-neutral: var(--ink-4);
+  /* read by graph.js (getComputedStyle on its host) */
+  --gx-edge-alpha: .36; --gx-edge-active-alpha: .85; --gx-glow: .42; --gx-blend: source-over;
+  --gx-dim-alpha: .14; --gx-particle-size: 2.4; --gx-grid: rgba(23, 23, 21, .09);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    --fx-ground: color-mix(in srgb, var(--bg) 55%, var(--surface));
+    --fx-light: color-mix(in srgb, var(--ink) 13%, transparent);
+    --fx-rim-shade: rgba(0, 0, 0, .5);
+    --fx-stage-edge: var(--line);
+    --fx-stage-inset: inset 0 1px 0 rgba(255, 255, 255, .05), inset 0 0 120px rgba(0, 0, 0, .35);
+    --fx-glass: color-mix(in srgb, color-mix(in srgb, var(--raised), var(--ink) 5%) 86%, transparent);
+    --fx-sheen: radial-gradient(130% 95% at 50% -18%, rgba(255, 255, 255, .11), rgba(255, 255, 255, 0) 66%);
+    --fx-shade: rgba(0, 0, 0, .28);
+    --fx-hi: rgba(255, 255, 255, .15);
+    --fx-dome: rgba(0, 0, 0, .5);
+    --fx-edge: rgba(255, 255, 255, .085);
+    --fx-spec: rgba(255, 255, 255, .17);
+    --fx-glow: 18%;
+    --fx-bad: color-mix(in srgb, var(--bad) 78%, var(--ink));
+    --fx-led: 75%;
+    --fx-node-shadow: 0 1px 2px rgba(0, 0, 0, .55), 0 14px 30px -14px rgba(0, 0, 0, .85);
+    --fx-track: rgba(255, 255, 255, .1);
+    --fx-panel: color-mix(in srgb, var(--surface) 80%, transparent);
+    --fx-panel-solid: color-mix(in srgb, var(--surface) 88%, transparent);
+    --fx-panel-edge: rgba(255, 255, 255, .085);
+    --fx-panel-shadow: 0 1px 2px rgba(0, 0, 0, .45), 0 18px 44px -18px rgba(0, 0, 0, .85);
+    --gx-edge-alpha: .28; --gx-edge-active-alpha: .75; --gx-glow: .7; --gx-blend: lighter;
+    --gx-dim-alpha: .1; --gx-particle-size: 2.6; --gx-grid: rgba(239, 238, 234, .055);
+  }
+}
+:root[data-theme="dark"] {
+  --fx-ground: color-mix(in srgb, var(--bg) 55%, var(--surface));
+  --fx-light: color-mix(in srgb, var(--ink) 13%, transparent);
+  --fx-rim-shade: rgba(0, 0, 0, .5);
+  --fx-stage-edge: var(--line);
+  --fx-stage-inset: inset 0 1px 0 rgba(255, 255, 255, .05), inset 0 0 120px rgba(0, 0, 0, .35);
+  --fx-glass: color-mix(in srgb, color-mix(in srgb, var(--raised), var(--ink) 5%) 86%, transparent);
+  --fx-sheen: radial-gradient(130% 95% at 50% -18%, rgba(255, 255, 255, .11), rgba(255, 255, 255, 0) 66%);
+  --fx-shade: rgba(0, 0, 0, .28);
+  --fx-hi: rgba(255, 255, 255, .15);
+  --fx-dome: rgba(0, 0, 0, .5);
+  --fx-edge: rgba(255, 255, 255, .085);
+  --fx-spec: rgba(255, 255, 255, .17);
+  --fx-glow: 18%;
+  --fx-bad: color-mix(in srgb, var(--bad) 78%, var(--ink));
+  --fx-led: 75%;
+  --fx-node-shadow: 0 1px 2px rgba(0, 0, 0, .55), 0 14px 30px -14px rgba(0, 0, 0, .85);
+  --fx-track: rgba(255, 255, 255, .1);
+  --fx-panel: color-mix(in srgb, var(--surface) 80%, transparent);
+  --fx-panel-solid: color-mix(in srgb, var(--surface) 88%, transparent);
+  --fx-panel-edge: rgba(255, 255, 255, .085);
+  --fx-panel-shadow: 0 1px 2px rgba(0, 0, 0, .45), 0 18px 44px -18px rgba(0, 0, 0, .85);
+  --gx-edge-alpha: .28; --gx-edge-active-alpha: .75; --gx-glow: .7; --gx-blend: lighter;
+  --gx-dim-alpha: .1; --gx-particle-size: 2.6; --gx-grid: rgba(239, 238, 234, .055);
+}
+
+/* ── Page frame: the stage fills the viewport under the (flat) page head ── */
+main:has(> .fx) { padding-bottom: var(--sp-4); }
+/* The view fills the viewport and the stage takes what the head leaves; the floors only stop a
+   very short window from squeezing it to nothing (1366x650 and 375x667 fit without a scroll). */
+.fx { display: flex; flex-direction: column; height: calc(100dvh - var(--h-top) - 1px - var(--sp-8) - var(--sp-4)); min-height: 440px; }   /* 1px: the top bar's hairline */
+.fx-head { flex: none; }
+.fx-id { min-width: 0; }
+.fx-sub { overflow-wrap: anywhere; }
+.fx-tools { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.fx-tools .picker-pop { left: auto; right: 0; transform-origin: top right; }
+.fx-mode button:disabled { cursor: default; color: var(--ink-4); }
+
+/* ── The stage ───────────────────────────────────────────────────────── */
+.fx-stage {
+  --gap: var(--sp-3);
+  --fx-side-w: 360px;   /* the right-hand slot: the activity column or the inspector */
+  position: relative; flex: 1 1 auto; min-height: 340px; overflow: hidden; isolation: isolate;
+  border-radius: var(--r-l); border: 1px solid var(--fx-stage-edge);
+  background:
+    radial-gradient(70% 62% at 50% 32%, var(--fx-light), transparent 80%),
+    radial-gradient(140% 110% at 50% 40%, transparent 52%, var(--fx-rim-shade) 100%),
+    var(--fx-ground);
+  box-shadow: var(--fx-stage-inset);
+}
+.fx-graph { position: absolute; inset: 0; }
+.fx-stage.fx-stale .fx-graph, .fx-stage.fx-stale .fx-list { opacity: .55; transition: opacity var(--t-toast) ease; }
+.fx-stage[data-mode="list"] .fx-graph { visibility: hidden; }
+.fx-stage[data-mode="list"] .fx-zoom, .fx-stage.fx-empty-floor .fx-zoom { display: none; }
+
+/* Frosted panels: the instrument panel, zoom, the column's panels and the inspector share one surface. */
+.fx-top, .fx-zoom, .fx-acts, .fx-hour, .fx-inspector, .fx-list, .fx-msg > .empty, .fx-msg > .error-box {
+  background: var(--fx-panel); border: 1px solid var(--fx-panel-edge); border-radius: var(--r-l);
+  box-shadow: inset 0 1px 0 var(--fx-spec), var(--fx-panel-shadow);
+  -webkit-backdrop-filter: var(--fx-blur); backdrop-filter: var(--fx-blur);
+}
+
+/* ── The instrument panel across the top of the stage: the totals (the
+   .kpis strip, frosted), then one line (the band) with what needs you on the
+   left and the Activity toggle on the right. Always the same height, so the
+   floor under it never resizes when an alert comes or goes. ────────────── */
+.fx-top { position: absolute; z-index: 4; top: var(--gap); left: var(--gap); right: var(--gap); overflow: hidden; }
+.fx-hud { display: flex; flex-wrap: wrap; }
+.fx-kpi { flex: 1 1 auto; min-width: 0; padding: var(--sp-2h) var(--sp-4); box-shadow: -1px 0 0 var(--fx-panel-edge), 0 -1px 0 var(--fx-panel-edge); }
+.fx-kpi-l { display: flex; align-items: center; gap: var(--sp-1h); color: var(--ink-3); font-size: var(--fs-11); line-height: 16px; white-space: nowrap; }
+.fx-kpi-v { display: flex; align-items: center; gap: var(--sp-1); margin-top: var(--sp-0h); font-size: var(--fs-16); font-weight: 600; letter-spacing: -.016em; line-height: 22px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.fx-kpi-v small { font-size: var(--fs-11); font-weight: 500; letter-spacing: 0; color: var(--ink-3); }
+.fx-kpi-v b { font-weight: 600; }
+.fx-kpi-v .sg { margin-left: var(--sp-1h); }
+.fx-kpi-v .sg:first-child { margin-left: 0; }
+.fx-kpi.zero .fx-kpi-v { color: var(--ink-3); }
+.fx-kpi[data-k="needs"].on { background: color-mix(in srgb, var(--warn-dot) 15%, transparent); box-shadow: -1px 0 0 var(--fx-panel-edge), 0 -1px 0 var(--fx-panel-edge), inset 0 -2px 0 var(--warn-dot); }
+.fx-kpi[data-k="needs"].on .fx-kpi-v, .fx-kpi[data-k="needs"].on .fx-kpi-l { color: var(--warn); }
+.fx-hud .sk { --sk: color-mix(in srgb, var(--ink) 9%, transparent); --sk-hi: color-mix(in srgb, var(--ink) 4%, transparent); margin: var(--sp-0h) 0 0; }
+.fx-failed .fx-hud .sk { animation: none; }
+
+.fx-band { display: flex; align-items: center; gap: var(--sp-3); height: 40px; padding: 0 var(--sp-1h); border-top: 1px solid var(--fx-panel-edge); min-width: 0; }
+
+/* Alerts: the decision card's anatomy (amber frame, 3px amber edge), one chip each; they may take the band's width. */
+.fx-alerts { display: flex; align-items: center; gap: var(--sp-1h); flex: 1 1 auto; min-width: 0; overflow: hidden; }
+.fx-alert-w { flex: 0 1 auto; min-width: 0; }
+.fx-alert {
+  display: flex; align-items: center; gap: var(--sp-2); max-width: 100%; height: 28px; padding: 0 var(--sp-2h) 0 calc(var(--sp-2h) + 3px); position: relative;
+  font: inherit; font-size: var(--fs-12); color: var(--ink); text-align: left; cursor: pointer; font-variant-numeric: tabular-nums; white-space: nowrap;
+  border: 1px solid color-mix(in srgb, var(--warn-dot) 50%, var(--fx-panel-edge)); border-radius: var(--r-m);
+  background: color-mix(in srgb, var(--warn-dot) 14%, var(--fx-panel-solid));
+  box-shadow: inset 3px 0 0 var(--warn-dot);
+  transition: border-color var(--t-fast) ease, background-color var(--t-fast) ease;
+}
+.fx-alert:hover { border-color: var(--warn-dot); }
+.fx-alert b { color: var(--warn); font-weight: 600; white-space: nowrap; }
+.fx-alert .mono { white-space: nowrap; color: var(--ink); }
+.fx-alert-who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.fx-alert-age { color: var(--ink-2); white-space: nowrap; }
+.fx-alert-none { display: inline-flex; align-items: center; gap: var(--sp-2); padding: 0 var(--sp-2h); color: var(--ink-3); font-size: var(--fs-12); white-space: nowrap; }
+/* Control mode: the chip's Review button (control.js inline()) is the chip's own end, a second
+   segment of the same amber frame on the panel's glass; the chip shrinks first. */
+.fx-alert-w:has(> .ctl-inline) { display: flex; align-items: stretch; }
+.fx-alert-w:has(> .ctl-inline) > .fx-alert { flex: 0 1 auto; min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.fx-alert-w > .ctl-inline { flex: none; display: flex; }
+.fx-alert-w > .ctl-inline .btn.ctl-mini {
+  height: 28px; margin-left: -1px; padding: 0 var(--sp-2h); border-radius: 0 var(--r-m) var(--r-m) 0;
+  border: 1px solid color-mix(in srgb, var(--warn-dot) 50%, var(--fx-panel-edge)); background: var(--fx-panel-solid); color: var(--ink);
+  font-size: var(--fs-12); font-weight: 600; box-shadow: inset 0 1px 0 var(--fx-spec);
+}
+.fx-alert-w > .ctl-inline .btn.ctl-mini:hover { border-color: var(--warn-dot); background: color-mix(in srgb, var(--warn-dot) 10%, var(--fx-panel-solid)); }
+.fx-alert-w > .ctl-inline .btn.ctl-mini:focus-visible { position: relative; z-index: 1; }
+.fx-dot { color: var(--ink-3); flex: none; }
+
+/* The Activity toggle, at the band's right end: shows and hides the column (aria-pressed). */
+.fx-side-btn {
+  flex: none; margin-left: auto; display: inline-flex; align-items: center; gap: var(--sp-1h); height: 28px; padding: 0 var(--sp-2h);
+  border: 1px solid var(--fx-panel-edge); border-radius: var(--r-m); background: transparent; color: var(--ink-2); cursor: pointer;
+  font: inherit; font-size: var(--fs-12); font-weight: 500; white-space: nowrap;
+  transition: background-color var(--t-fast) ease, color var(--t-fast) ease, border-color var(--t-fast) ease;
+}
+.fx-side-btn:hover { background: var(--hover); color: var(--ink); }
+.fx-side-btn[aria-pressed="true"] { background: var(--select); color: var(--ink); }
+
+/* ── Zoom: + - fit, bottom right, left of the column or inspector ───── */
+.fx-zoom { position: absolute; z-index: 3; bottom: var(--gap); right: var(--gap); display: flex; flex-direction: column; gap: var(--sp-0h); padding: var(--sp-0h);
+  transform: translateX(calc(-1 * max(0px, var(--fx-right, 0px) - var(--gap)))); transition: transform var(--t-drawer) var(--ease-drawer); }
+.fx-zbtn { width: 30px; height: 30px; display: grid; place-items: center; border: 0; border-radius: var(--r-m); background: transparent; color: var(--ink-2); cursor: pointer;
+  transition: background-color var(--t-fast) ease, color var(--t-fast) ease; }
+.fx-zbtn:hover { background: var(--hover); color: var(--ink); }
+.fx-zbtn:active { background: var(--select); }
+
+/* ── The activity column: the right-hand slot while no node is selected ──
+   Two frosted panels, Recent actions over Last hour, in the slot the inspector
+   takes when a node is picked (the same top, width and gap, so the floor never
+   refits for a pick). The column itself is not glass and lets the pointer
+   through; its panels are. Recent actions gives up rows before the charts give
+   up height: factory.js (colFit) sets the list to whole rows (--fx-evs-h, the
+   next row peeking under the fade when some are cut, the rest scrolling
+   inside) and the plots to what is left: 3 rows and 40 px plots at the least
+   on a 1366 x 768 window, 1 row and 30 px down to about 670 px tall, and on a
+   slot too short even for that the column scrolls as one (.over). colFit's figures are
+   the heights below: a row 34 px, the list's panel 36 around it, the hour's
+   panel 173 around its three plots. ─────────────────────────────────────── */
+.fx-side {
+  position: absolute; z-index: 4; top: calc(var(--fx-hud-b, 72px) + var(--gap)); right: var(--gap); bottom: var(--gap); width: var(--fx-side-w); max-width: calc(100% - 2 * var(--gap));
+  display: flex; flex-direction: column; gap: var(--gap); pointer-events: none;
+  transition: transform var(--t-drawer) var(--ease-drawer), opacity var(--t-drawer) var(--ease-drawer);
+}
+@starting-style { .fx-side { opacity: 0; transform: translateX(16px); } }
+.fx-side.leaving { opacity: 0; transform: translateX(16px); transition-duration: var(--t-toast); }
+/* Its panels are the clearest glass on the stage: what moves behind shows through, blurred (text still clears 4.5:1). */
+.fx-side > section { pointer-events: auto; min-height: 0; display: flex; flex-direction: column; background: color-mix(in srgb, var(--fx-panel) 86%, transparent); }
+.fx-side.leaving > section { pointer-events: none; }
+.fx-side.over { overflow-y: auto; overscroll-behavior: contain; pointer-events: auto; }
+.fx-side.over > section { flex-shrink: 0; }
+.fx-acts { flex: 0 1 auto; padding: var(--sp-2h) var(--sp-2) var(--sp-1); }
+.fx-hour { flex: none; padding: var(--sp-2h) var(--sp-4) var(--sp-3); }
+.fx-side > .fx-hour { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; column-gap: var(--sp-2); }
+.fx-hour > :not(.fx-side-h, .fx-hour-cap) { grid-column: 1 / -1; }
+.fx-side-h { font-size: var(--fs-12); font-weight: 600; line-height: 16px; color: var(--ink-2); }
+.fx-acts > .fx-side-h { padding: 0 var(--sp-2) var(--sp-1); }
+
+/* Recent actions: two lines a row. Who (in the model's colour) and how long ago; the tool and its
+   target, and how it went in the status language's glyph and word. */
+.fx-evs { min-height: 0; max-height: var(--fx-evs-h, none); overflow-y: auto; overscroll-behavior: contain; }
+.fx-evs[data-more] { -webkit-mask-image: linear-gradient(#000 calc(100% - 14px), transparent); mask-image: linear-gradient(#000 calc(100% - 14px), transparent); }
+.fx-ev {
+  display: grid; grid-template-columns: 8px auto minmax(0, 1fr) auto; grid-template-areas: "key who who t" ". tool tgt st"; grid-template-rows: 16px 15px;
+  column-gap: var(--sp-1h); align-items: center; width: 100%; padding: 1px var(--sp-2) 2px; border: 0; border-radius: var(--r-m); background: none;
+  font: inherit; font-size: var(--fs-12); line-height: 16px; color: var(--ink); text-align: left; cursor: pointer; font-variant-numeric: tabular-nums;
+  transition: background-color var(--t-fast) ease;
+}
+.fx-ev:hover { background: var(--hover); }
+.fx-ev:focus-visible { outline-offset: -2px; }
+.fx-ev .key { grid-area: key; width: 8px; height: 8px; border-radius: 2px; }
+.fx-ev-who { grid-area: who; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.fx-ev-t { grid-area: t; color: var(--ink-3); font-size: var(--fs-11); white-space: nowrap; text-align: right; }
+.fx-ev-tool { grid-area: tool; max-width: 132px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-11); font-weight: 500; color: var(--ink); }
+.fx-ev-tgt { grid-area: tgt; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-11); color: var(--ink-3); }
+.fx-ev-st { grid-area: st; display: inline-flex; align-items: center; justify-content: flex-end; gap: var(--sp-1); font-size: var(--fs-11); color: var(--ink-3); white-space: nowrap; }
+.fx-ev[data-status="running"] .fx-ev-st { color: var(--ink-2); }
+.fx-ev[data-status="error"] .fx-ev-st { color: var(--fx-bad); }
+.fx-ev[data-status="error"] .fx-ev-st.blocked { color: var(--warn); }
+.fx-evs-none { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-2) var(--sp-1h); color: var(--ink-3); font-size: var(--fs-12); }
+@media (prefers-reduced-motion: no-preference) {
+  .fx-ev-w.enter { animation: fx-ev-in var(--t-toast) var(--ease) both; }
+}
+@keyframes fx-ev-in { from { opacity: 0; transform: translateY(-6px); } }
+
+/* Last hour: three small column charts, one scale each, in the app's chart anatomy: thin columns
+   with a 4px rounded data end on the baseline, one top gridline labelled at the right, recessive
+   hairlines, ink text. New tokens stack by model family (the model palette, with its legend);
+   tool calls in the main series tone with the failed ones as a red cap; working agents in the
+   main tone. Each header gives the hour (its total, or its peak); the still-filling bucket at the
+   right is drawn lighter, and its tooltip says "(so far)". */
+.fx-hour-cap { margin: 0 0 var(--sp-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; color: var(--ink-3); font-size: var(--fs-11); line-height: 16px; }
+.fx-chart { display: grid; gap: 3px; min-width: 0; }
+.fx-chart + .fx-chart { margin-top: var(--sp-2); }
+.fx-chart-h { display: flex; align-items: baseline; gap: var(--sp-1h); min-width: 0; font-size: var(--fs-12); line-height: 15px; white-space: nowrap; }
+.fx-chart-l { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; color: var(--ink); }
+.fx-chart-sum { flex: none; color: var(--ink-3); font-size: var(--fs-11); }
+.fx-chart-h b { color: var(--ink); font-size: var(--fs-12); font-weight: 600; }
+.fx-chart-h .key { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: var(--sp-1); background: var(--c); }
+.fx-chart-leg { display: flex; flex-wrap: wrap; gap: 0 var(--sp-3); min-height: 15px; color: var(--ink-2); font-size: var(--fs-11); line-height: 15px; }
+.fx-chart-leg span { display: inline-flex; align-items: center; gap: var(--sp-1h); }
+.fx-chart-leg .key { width: 8px; height: 8px; border-radius: 2px; }
+.fx-chart svg { display: block; width: 100%; height: auto; overflow: visible; border-radius: var(--r-xs); }
+.fx-chart svg:focus-visible { outline-offset: 3px; }
+.fx-chart text { font-family: var(--font); font-size: var(--fs-11); fill: var(--ink-3); font-variant-numeric: tabular-nums; }
+.fx-chart .grid-l { stroke: var(--grid); stroke-width: 1; shape-rendering: crispEdges; }
+.fx-chart .base-l { stroke: var(--axis); stroke-width: 1; shape-rendering: crispEdges; }
+.fx-chart .hit { fill: transparent; }
+.fx-chart .fx-wash { fill: transparent; pointer-events: none; }
+.fx-chart .fx-wash.on { fill: var(--select); }
+.fx-col > * { fill: var(--c, var(--series-main)); }
+.fx-col .fx-m { --c: var(--series-main); }
+.fx-col .fx-bad, .fx-chart-h .fx-bad { --c: var(--bad); }
+.fx-col.now { opacity: .5; }
+.fx-col.on > * { filter: brightness(1.08); }
+
+/* ── Inspector: the selected node's data, in the column's slot ──────── */
+.fx-inspector {
+  position: absolute; z-index: 5; top: calc(var(--fx-hud-b, 72px) + var(--gap)); right: var(--gap); bottom: var(--gap); width: var(--fx-side-w); max-width: calc(100% - 2 * var(--gap));
+  display: flex; flex-direction: column; overflow: hidden; background: var(--fx-panel-solid);
+  transition: transform var(--t-drawer) var(--ease-drawer), opacity var(--t-drawer) var(--ease-drawer);
+}
+@starting-style { .fx-inspector { opacity: 0; transform: translateX(16px); } }
+.fx-inspector.leaving { opacity: 0; transform: translateX(16px); pointer-events: none; transition-duration: var(--t-toast); }
+.fx-insp-head { display: flex; align-items: flex-start; gap: var(--sp-2); padding: var(--sp-3h) var(--sp-2h) var(--sp-2) var(--sp-4); }
+.fx-insp-id { flex: 1; min-width: 0; }
+.fx-insp-kind { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-1h) var(--sp-2h); font-size: var(--fs-12); color: var(--ink-3); margin-bottom: var(--sp-1); }
+.fx-insp-k { font-weight: 500; color: var(--ink-2); }
+.fx-insp-title { font-size: var(--fs-16); line-height: 1.3; letter-spacing: -.012em; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.fx-insp-close { flex: none; background: transparent; }
+.fx-insp-links { display: flex; flex-wrap: wrap; gap: var(--sp-2); padding: 0 var(--sp-4) var(--sp-3); }
+.fx-insp-links:empty { display: none; }
+.fx-link { display: inline-flex; align-items: center; height: var(--h-ctl-s); font-size: var(--fs-12); background: transparent; }
+.fx-insp-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 var(--sp-4) var(--sp-4); }
+.fx-gone { margin: 0 0 var(--sp-3); padding: var(--sp-2) var(--sp-2h); border-radius: var(--r-m); background: var(--sunk); color: var(--ink-2); font-size: var(--fs-12); }
+.fx-sec { padding: var(--sp-3) 0; border-top: 1px solid var(--fx-panel-edge); display: grid; gap: var(--sp-1h); min-width: 0; }
+.fx-sec:first-child { border-top: 0; padding-top: 0; }
+.fx-sec-h { font-size: var(--fs-12); font-weight: 600; color: var(--ink-2); }
+.fx-row { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: var(--sp-3); align-items: baseline; font-size: var(--fs-12); line-height: 18px; min-width: 0; }
+.fx-row-l { color: var(--ink-3); }
+.fx-row-v { min-width: 0; color: var(--ink); font-variant-numeric: tabular-nums; display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1h); }
+.fx-row-v .tag { flex: none; }
+.fx-ell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 100%; }
+.fx-state { display: flex; align-items: center; gap: var(--sp-2h); flex-wrap: wrap; font-size: var(--fs-12); }
+.fx-now .now-label { flex-wrap: wrap; }
+.fx-now .now-label b { font-weight: 600; color: var(--ink); }
+.fx-now .now-body { white-space: normal; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.fx-now.needs { border-color: color-mix(in srgb, var(--warn-dot) 45%, var(--line-2)); box-shadow: inset 3px 0 0 var(--warn-dot); }
+.fx-now.needs .now-label { color: var(--warn); }
+.fx-now-act { display: flex; margin-top: var(--sp-2); }   /* control mode: the Review button under the request's summary */
+.fx-now-act .btn.ctl-mini { height: var(--h-ctl-s); padding: 0 var(--sp-3); }
+.fx-said { display: grid; gap: var(--sp-0h); font-size: var(--fs-12); }
+.fx-quote { margin: 0; color: var(--ink-2); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.fx-spark-row { display: flex; align-items: flex-end; gap: var(--sp-2h); font-size: var(--fs-11); }
+.fx-spark-row .faint { color: var(--ink-3); }
+.fx-nlink { border: 0; background: none; padding: 0; font: inherit; color: var(--ink); text-align: left; cursor: pointer; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  text-decoration: underline; text-decoration-color: var(--axis); text-underline-offset: 2px; border-radius: var(--r-s); transition: text-decoration-color var(--t-fast) ease; }
+.fx-nlink:hover { text-decoration-color: currentColor; }
+.fx-plan { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-1); width: 100%; }
+.fx-plan-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fx-bar { width: 100%; height: 6px; }
+.fx-plan-row { display: grid; gap: var(--sp-1); font-size: var(--fs-12); }
+.fx-plan-h { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); min-width: 0; }
+.fx-plan-p { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--sp-2h); }
+.fx-mix { display: grid; gap: var(--sp-1h); font-size: var(--fs-12); }
+.fx-share { margin: 0; }
+.fx-legend { display: grid; gap: var(--sp-1); }
+.fx-leg { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto 40px; gap: var(--sp-2); align-items: center; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.fx-leg b { font-weight: 500; color: var(--ink); text-align: right; }
+.fx-leg-n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fx-ord { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; gap: var(--sp-2); align-items: center; font-size: var(--fs-12); }
+.fx-phases { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); color: var(--ink-3); }
+.fx-phases .done { color: var(--ink-2); }
+.fx-phases .on { color: var(--ink); font-weight: 600; }
+.fx-stations { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--sp-1); font-size: var(--fs-12); }
+.fx-st { display: grid; grid-template-columns: 12px 64px minmax(0, 1fr); gap: var(--sp-2); align-items: center; color: var(--ink-2); }
+.fx-st.on { color: var(--ink); font-weight: 500; }
+.fx-st .faint { color: var(--ink-3); font-weight: 400; }
+.fx-st.gate.wait { color: var(--ink); }
+.fx-warn { color: var(--warn); }
+.fx-stage .faint { color: var(--ink-3); }
+
+/* ── List mode: the same tree as nested buttons ──────────────────────── */
+.fx-list { position: absolute; z-index: 2; top: var(--fx-top, 84px); left: var(--gap); right: max(var(--gap), var(--fx-right, 0px)); bottom: max(var(--gap), var(--fx-bottom, 0px)); overflow: auto; overscroll-behavior: contain; padding: var(--sp-2); background: var(--fx-panel-solid); }
+.fx-ul { list-style: none; margin: 0; padding: 0; }
+.fx-ul .fx-ul { margin-left: 13px; padding-left: var(--sp-2h); border-left: 1px solid var(--fx-panel-edge); }
+.fx-li {
+  display: grid; grid-template-columns: auto 12px minmax(0, 1fr) 84px minmax(0, 220px) 72px; align-items: center; gap: var(--sp-2h);
+  width: 100%; min-height: 36px; padding: var(--sp-1) var(--sp-2h); border: 0; border-radius: var(--r-m); background: none; text-align: left; cursor: pointer;
+  font: inherit; color: var(--ink); font-variant-numeric: tabular-nums; transition: background-color var(--t-fast) ease;
+}
+.fx-li:not(:has(> .key)) { grid-template-columns: 12px minmax(0, 1fr) 84px minmax(0, 220px) 72px; }
+.fx-li:hover { background: var(--hover); }
+.fx-li.sel { background: var(--select); box-shadow: inset 2px 0 0 var(--ink); }
+.fx-li:focus-visible { outline-offset: -2px; }
+.fx-li-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.k-project > .fx-li .fx-li-name { font-weight: 600; }
+.fx-li-kind { color: var(--ink-3); font-size: var(--fs-12); }
+.fx-li-word { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: var(--fs-12); }
+.fx-li.c-needs .fx-li-word { color: var(--warn); }
+.fx-li.c-failed .fx-li-word { color: var(--bad); }
+.fx-li-fig { text-align: right; color: var(--ink-2); font-size: var(--fs-12); }
+
+/* ── Empty, loading and error, inside the stage ──────────────────────── */
+.fx-msg { position: absolute; z-index: 2; inset: var(--fx-top, 84px) max(var(--gap), var(--fx-right, 0px)) max(var(--gap), var(--fx-bottom, 0px)) var(--gap); display: grid; place-items: center; pointer-events: none; }
+.fx-msg > * { pointer-events: auto; max-width: 560px; }
+.fx-msg > .empty { background: var(--fx-panel-solid); }
+
+/* ── Glass nodes (inside graph.js's .gx-node, which owns size and position) ── */
+.gx-node { border-radius: var(--r-l); }
+.gx-node[data-kind="project"] { border-radius: 50%; }
+/* The world is scaled: graph.js puts --gx-inv (1/zoom below 1) on the focused and the selected
+   node, so the outline stays 2px and the ring 1px on screen at every zoom. */
+.gx-node:focus-visible { outline: calc(2px * var(--gx-inv, 1)) solid var(--focus); outline-offset: calc(4px * var(--gx-inv, 1)); }
+.gx-node.is-selected { z-index: 3; }
+.gx-node.fx-has-needs { z-index: 2; }
+.fx-node {
+  position: relative; box-sizing: border-box; width: 100%; height: 100%; min-width: 0;
+  display: flex; flex-direction: column; justify-content: center; gap: var(--sp-0h);
+  padding: 0 var(--sp-3) 0 calc(var(--sp-3) + 5px);
+  border-radius: var(--r-l); border: 1px solid var(--fx-edge); color: var(--ink);
+  font-size: var(--fs-12); line-height: 16px; font-variant-numeric: tabular-nums; cursor: pointer; user-select: none;
+  background:
+    var(--fx-sheen),
+    radial-gradient(44% 120% at 0% 50%, color-mix(in srgb, var(--c) var(--fx-glow), transparent), transparent),
+    linear-gradient(180deg, transparent 40%, var(--fx-shade)),
+    var(--fx-glass);
+  box-shadow: inset 0 1px 0 var(--fx-spec), inset 0 -1px 0 var(--fx-shade), var(--fx-node-shadow);
+  transition: opacity var(--t-toast) var(--ease), transform var(--t-toast) var(--ease), border-color var(--t-fast) ease, box-shadow var(--t-fast) ease;
+}
+/* The model's light strip on the left edge. */
+.fx-node.k-session::before, .fx-node.k-agent::before {
+  content: ""; position: absolute; left: 5px; top: 11px; bottom: 11px; width: 3px; border-radius: 2px;
+  background: var(--c); box-shadow: 0 0 10px 0 color-mix(in srgb, var(--c) var(--fx-led), transparent);
+}
+.fx-node.k-workflow, .fx-node.k-order { padding-left: var(--sp-3); background: var(--fx-sheen), linear-gradient(180deg, transparent 40%, var(--fx-shade)), var(--fx-glass); }
+.fx-l1, .fx-l2, .fx-l3 { display: flex; align-items: center; gap: var(--sp-1h); min-width: 0; white-space: nowrap; }
+.fx-l1 { line-height: 18px; }
+.fx-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: var(--fs-13); font-weight: 600; letter-spacing: -.008em; }
+.fx-fig { flex: none; color: var(--ink-2); }
+.fx-kind { flex: none; color: var(--ink-3); font-size: var(--fs-11); }
+.fx-oid { flex: none; color: var(--ink-2); font-weight: 500; }
+.fx-act { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--ink-2); }
+.fx-act b { color: var(--ink); font-weight: 500; margin-right: var(--sp-1h); }
+.fx-act b.mono { font-size: var(--fs-11); }
+.fx-tgt { color: var(--ink-3); }
+.fx-act .fx-tgt:not(.mono) { margin-left: var(--sp-1h); }
+.fx-tgt.mono { font-size: var(--fs-11); }
+.fx-act.fx-warn { color: var(--warn); font-weight: 500; }
+.fx-act.bad { color: var(--fx-bad); }
+.fx-l3 { color: var(--ink-3); font-size: var(--fs-11); }
+.fx-l3 .fx-act b { margin-right: 0; }
+.fx-model { display: inline-flex; align-items: center; gap: var(--sp-1); flex: none; color: var(--ink-2); }
+.fx-model .key { width: 8px; height: 8px; border-radius: 2px; }
+.fx-rate { margin-left: auto; color: var(--ink-2); flex: none; }
+.fx-node .tag { flex: none; font-size: var(--fs-11); padding: 1px var(--sp-1); line-height: 14px; }
+.fx-l2 > .tag:last-child { margin-left: auto; }
+.fx-node .sg { flex: none; }
+.fx-node .sg-stalled, .fx-kpi .sg-stalled, .fx-li .sg-stalled, .fx-ord .sg-stalled { color: var(--warn-dot); }
+.sg-blocked { color: var(--warn-dot); }
+.sg-turn { color: var(--ink-3); }
+/* quieter when finished, red edge when failed */
+.fx-node.c-done, .fx-node.c-idle, .fx-node.c-turn, .fx-node.c-failed { --fx-glow: 7%; }
+.fx-node.c-done .fx-name, .fx-node.c-idle .fx-name { color: var(--ink-2); font-weight: 500; }
+.fx-node.c-failed { border-color: color-mix(in srgb, var(--bad) 45%, var(--fx-edge)); }
+.fx-node.c-stalled { border-style: dashed; border-color: color-mix(in srgb, var(--warn-dot) 55%, var(--fx-edge)); }
+
+/* Workflow progress and the order's line: one segmented track. Done is ink,
+   the running one green, failed red, waiting at a gate amber. */
+.fx-segs, .fx-steps { display: flex; align-items: center; gap: 3px; width: 100%; height: 8px; }
+.fx-segs i, .fx-step { flex: 1 1 0; height: 5px; min-width: 3px; border-radius: 3px; background: var(--fx-track); }
+.fx-segs i[data-s="done"], .fx-step[data-status="done"] { background: var(--series-main); }
+.fx-segs i[data-s="run"], .fx-step[data-status="active"] { background: var(--good-dot); box-shadow: 0 0 8px color-mix(in srgb, var(--good-dot) 60%, transparent); }
+.fx-segs i[data-s="failed"], .fx-step[data-status="failed"] { background: var(--bad); }
+.fx-step[data-status="skipped"] { background: repeating-linear-gradient(135deg, var(--fx-track) 0 2px, transparent 2px 4px); }
+.fx-step.fx-gate { flex: none; width: 7px; height: 7px; min-width: 0; border-radius: 1.5px; transform: rotate(45deg); margin: 0 2px; background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink-3); }
+.fx-step.fx-gate[data-status="waiting"] { background: var(--warn-dot); box-shadow: 0 0 10px color-mix(in srgb, var(--warn-dot) 70%, transparent); }
+.fx-node.k-order .fx-l3 .tag { margin-left: auto; }
+
+/* Project hubs: a glass disc whose rim is the model mix. */
+.fx-node.k-project {
+  border-radius: 50%; padding: 0; align-items: center; text-align: center; gap: 0;
+  background:
+    radial-gradient(56% 32% at 50% 8%, var(--fx-hi), transparent),
+    radial-gradient(118% 118% at 50% 20%, transparent 48%, var(--fx-dome) 100%),
+    var(--fx-glass);
+  box-shadow: inset 0 1px 0 var(--fx-spec), var(--fx-node-shadow), 0 0 44px -12px color-mix(in srgb, var(--c) 55%, transparent);
+}
+.fx-rim {
+  position: absolute; inset: 3px; border-radius: 50%; background: var(--mix, var(--other)); pointer-events: none;
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 4.5px), #000 calc(100% - 4px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 4.5px), #000 calc(100% - 4px));
+}
+/* The name is fitted inside the disc by factory.js (hubName): one variant per
+   level of detail, its size and line height in --fs and --lh, one span a line.
+   factory.js assumes the 2px gap and the 16px live and cost lines below. */
+.fx-hub { position: relative; display: flex; flex-direction: column; align-items: center; gap: var(--sp-0h); width: 100%; min-width: 0; }
+.fx-hub-name { display: flex; flex-direction: column; align-items: center; font-weight: 600; letter-spacing: -.012em; }
+.fx-hn { display: none; flex-direction: column; align-items: center; font-size: var(--fs); line-height: var(--lh); }
+.fx-hn > span { white-space: nowrap; }
+.fx-hn[data-lod="near"], .gx[data-lod="mid"] .fx-hn[data-lod="mid"], .gx[data-lod="far"] .fx-hn[data-lod="far"] { display: flex; }
+.gx[data-lod="mid"] .fx-hn[data-lod="near"], .gx[data-lod="far"] .fx-hn[data-lod="near"] { display: none; }
+.fx-hub-meta { display: inline-flex; align-items: center; gap: var(--sp-1); color: var(--ink-2); font-size: var(--fs-12); line-height: 16px; }
+.fx-hub-cost { max-width: 78px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-size: var(--fs-11); line-height: 16px; }
+.fx-node.k-project.dormant { box-shadow: inset 0 1px 0 var(--fx-spec), var(--fx-node-shadow); }
+.fx-node.k-project.dormant .fx-rim { opacity: .45; }
+.fx-node.k-project.dormant .fx-hub-name { color: var(--ink-2); }
+
+/* Needs you: an amber halo that breathes (opacity and scale only). */
+.fx-halo { position: absolute; inset: -6px; border-radius: calc(var(--r-l) + 6px); pointer-events: none;
+  box-shadow: 0 0 0 1.5px var(--warn-dot), 0 0 24px 2px color-mix(in srgb, var(--warn-dot) 42%, transparent); }
+.k-project > .fx-halo { border-radius: 50%; }
+.fx-node.needs { border-color: color-mix(in srgb, var(--warn-dot) 55%, var(--fx-edge)); }
+@media (prefers-reduced-motion: no-preference) {
+  .fx-halo { animation: fx-breathe 2.4s var(--ease-in-out) infinite; }
+}
+@keyframes fx-breathe { 0%, 100% { opacity: .45; transform: scale(.992); } 50% { opacity: 1; transform: scale(1.018); } }
+
+/* Selection and focus in ink, like a selected row; the rest of the floor dims. */
+.gx-node.is-hover .fx-node { border-color: color-mix(in srgb, var(--ink) 26%, var(--fx-edge)); }
+.gx-node.is-selected .fx-node { border-color: color-mix(in srgb, var(--ink) 60%, transparent);
+  box-shadow: inset 0 1px 0 var(--fx-spec), inset 0 -1px 0 var(--fx-shade), var(--fx-node-shadow), 0 0 0 calc(1px * var(--gx-inv, 1)) var(--ink); }
+.gx-node.is-dim .fx-node { opacity: .3; }
+.gx-node.is-dim.fx-has-needs .fx-node { opacity: .6; }
+@media (prefers-reduced-motion: no-preference) {
+  .gx-node.is-entering .fx-node { opacity: 0; transform: scale(.94); }
+  .gx-node.is-leaving .fx-node { opacity: 0; transform: scale(.96); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gx-node.is-entering .fx-node, .gx-node.is-leaving .fx-node { opacity: 0; }
+  .fx-node { transition: opacity var(--t-toast) ease, border-color var(--t-fast) ease; }
+  .fx-inspector, .fx-zoom, .fx-side { transition: opacity var(--t-toast) ease; }
+  @starting-style { .fx-inspector, .fx-side { transform: none; } }
+  .fx-inspector.leaving, .fx-side.leaving { transform: none; }
+}
+
+/* Level of detail (graph.js sets data-lod from the zoom). Mid, the zoom a busy
+   floor usually fits at, keeps the two lines that matter (name and cost; what
+   it is doing) set larger, so they read at about the size the near faces do;
+   far keeps the glyph and a short name, sized so a hub's name still reads at
+   the smallest zoom. */
+.fx-fig2 { display: none; }
+.gx[data-lod="mid"] .fx-node .fx-l3, .gx[data-lod="mid"] .fx-node .fx-kind, .gx[data-lod="mid"] .fx-node .fx-l2 > .tag, .gx[data-lod="mid"] .fx-hub-cost,
+.gx[data-lod="mid"] .fx-node.k-session .fx-l1 > .fx-fig, .gx[data-lod="mid"] .fx-node.k-agent .fx-l1 > .fx-fig { display: none; }
+.gx[data-lod="mid"] .fx-fig2 { display: inline; margin-left: auto; padding-left: var(--sp-1h); color: var(--ink-3); }
+.gx[data-lod="mid"] .fx-node { gap: 3px; }
+.gx[data-lod="mid"] .fx-name { font-size: 17px; line-height: 22px; }
+.gx[data-lod="mid"] .fx-fig, .gx[data-lod="mid"] .fx-oid { font-size: 15px; }
+.gx[data-lod="mid"] .fx-node .fx-l2 { font-size: 15px; line-height: 20px; }
+.gx[data-lod="mid"] .fx-act b.mono, .gx[data-lod="mid"] .fx-tgt.mono { font-size: 14px; }
+.gx[data-lod="mid"] .fx-node .sg { width: 14px; height: 14px; }
+.gx[data-lod="mid"] .fx-hub-meta { font-size: 14px; }
+.gx[data-lod="mid"] .fx-hub-meta .sg { width: 12px; height: 12px; }
+.gx[data-lod="far"] .fx-node .fx-l2, .gx[data-lod="far"] .fx-node .fx-l3, .gx[data-lod="far"] .fx-node .fx-fig,
+.gx[data-lod="far"] .fx-node .fx-kind, .gx[data-lod="far"] .fx-node .fx-oid { display: none; }
+.gx[data-lod="far"] .fx-node .fx-l1 { gap: var(--sp-2h); white-space: normal; }
+.gx[data-lod="far"] .fx-name { font-size: 22px; line-height: 25px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+.gx[data-lod="far"] .fx-node .sg { width: 18px; height: 18px; }
+/* Far is where a busy floor fits (60 nodes and up on a desktop, every floor on a phone), and there
+   a failed node's red border, the stalled dash and the needs-you halo's ring are under a pixel on
+   screen and the glyph about five. So at far, and only there, they take weight in world px, all of
+   it static paint that takes no room: failed a red ring inside the edge, quieter than the halo
+   (failed is over, needs you is not); stalled a dashed amber one; needs you a wider halo ring (it
+   breathes as at every zoom). The focus outline and the selection ring sit outside the box. */
+.gx[data-lod="far"] .fx-node.c-failed { outline: 4px solid color-mix(in srgb, var(--bad) 78%, transparent); outline-offset: -4px; }
+.gx[data-lod="far"] .fx-node.c-stalled { outline: 5px dashed var(--warn-dot); outline-offset: -5px; }
+.gx[data-lod="far"] .fx-halo { inset: -12px; border-radius: calc(var(--r-l) + 12px);
+  box-shadow: 0 0 0 6px var(--warn-dot), 0 0 48px 8px color-mix(in srgb, var(--warn-dot) 45%, transparent); }
+.gx[data-lod="far"] .k-project > .fx-halo { border-radius: 50%; }
+
+/* Time in the current state (factory.js sinceTag): "· 4m" right after what the node is doing, the
+   rest of line 2 pushed right as before. sinceFit names the levels where it has no room (data-drop)
+   and where the target goes while it shows (data-cut on .fx-tgt), so the state words never shrink. */
+.fx-since { flex: none; color: var(--ink-3); }
+.fx-since > .fx-sep { margin-right: var(--sp-1); }
+.fx-l2:has(> .fx-since:not([hidden])) > .fx-act { flex-grow: 0; }
+.fx-l2:has(> .fx-since:not([hidden])) > .fx-since { margin-right: auto; }
+.gx[data-lod="near"] .fx-since[data-drop~="near"], .gx[data-lod="mid"] .fx-since[data-drop~="mid"] { display: none; }
+.gx[data-lod="near"] .fx-l2:has(> .fx-since[data-drop~="near"]) > .fx-act, .gx[data-lod="mid"] .fx-l2:has(> .fx-since[data-drop~="mid"]) > .fx-act { flex-grow: 1; }
+.gx[data-lod="near"] .fx-l2:has(> .fx-since:not([hidden])) .fx-tgt[data-cut~="near"], .gx[data-lod="mid"] .fx-l2:has(> .fx-since:not([hidden])) .fx-tgt[data-cut~="mid"] { display: none; }
+.gx[data-lod="near"] .fx-l2:has(> .fx-since:not([hidden])) .fx-act:has(> .fx-tgt[data-cut~="near"]) > b,
+.gx[data-lod="mid"] .fx-l2:has(> .fx-since:not([hidden])) .fx-act:has(> .fx-tgt[data-cut~="mid"]) > b { margin-right: 0; }
+/* Rework (factory.js reworkEl): "rework 2" after the order's stepper, as tall as the stepper, so an
+   order with it keeps the same lines as one without. */
+.fx-rework { flex: none; display: inline-flex; align-items: center; height: 8px; color: var(--ink-2); font-size: var(--fs-11); font-weight: 500; white-space: nowrap; }
+.gx[data-lod="mid"] .fx-rework { font-size: 14px; }
+
+/* ── Phone: the head stacks, the HUD keeps four figures, the slot (column or inspector) is a bottom sheet ── */
+@media (max-width: 640px) {
+  .fx { height: calc(100dvh - var(--h-top) - 1px - var(--sp-5) - var(--sp-4)); min-height: 520px; }
+  .fx-head { flex-direction: column; align-items: stretch; margin-bottom: var(--sp-3); }
+  .fx-tools .picker { flex: 1 1 100%; min-width: 0; }
+  .fx-tools .picker-btn { max-width: none; width: 100%; }
+  .fx-tools .picker-pop { left: 0; right: auto; transform-origin: top left; }
+  .fx-tools .picker-btn, .fx-tools .seg button { height: 40px; }
+  .fx-tools .seg { padding: 0; }
+  .fx-stage { --gap: var(--sp-2); min-height: 280px; }
+  .fx-hud { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fx-kpi[data-k="stalled"], .fx-kpi[data-k="cost"], .fx-kpi[data-k="guard"], .fx-kpi[data-k="orders"] { display: none; }
+  .fx-kpi { padding: var(--sp-1h) var(--sp-3); }
+  .fx-band { height: 44px; }
+  .fx-alert, .fx-alert-w > .ctl-inline .btn.ctl-mini, .fx-side-btn { height: 36px; }
+  .fx-now-act .btn.ctl-mini { height: 40px; }
+  .fx-zoom { flex-direction: row; }   /* a row costs a wide floor less room than a column */
+  .fx-zbtn { width: 40px; height: 40px; }
+  /* While the sheet is up the totals step aside (the band with what needs you stays), so the
+     sliver of floor above it keeps room for the node, its parent and its children. */
+  .fx-stage:has(> :is(.fx-inspector, .fx-side):not([hidden]):not(.leaving)) .fx-hud { display: none; }
+  .fx-stage:has(> :is(.fx-inspector, .fx-side):not([hidden]):not(.leaving)) .fx-band { border-top: 0; }
+  .fx-inspector { top: auto; left: 0; right: 0; bottom: 0; width: auto; max-width: none; max-height: 52%; border-radius: var(--r-l) var(--r-l) 0 0; border-bottom: 0; }
+  @starting-style { .fx-inspector, .fx-side { transform: translateY(24px); } }
+  .fx-inspector.leaving, .fx-side.leaving { transform: translateY(24px); }
+  /* The column's sheet is one pane of the same glass; its two sections share it, split by a hairline. */
+  .fx-side {
+    top: auto; left: 0; right: 0; bottom: 0; width: auto; max-width: none; max-height: 52%; display: block; gap: 0; overflow-y: auto; overscroll-behavior: contain; pointer-events: auto;
+    background: var(--fx-panel); border: 1px solid var(--fx-panel-edge); border-bottom: 0; border-radius: var(--r-l) var(--r-l) 0 0;
+    box-shadow: inset 0 1px 0 var(--fx-spec), var(--fx-panel-shadow); -webkit-backdrop-filter: var(--fx-blur); backdrop-filter: var(--fx-blur);
+  }
+  .fx-side > section { background: none; border: 0; border-radius: 0; box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
+  .fx-side > .fx-hour { border-top: 1px solid var(--fx-panel-edge); }
+  .fx-evs { overflow: visible; max-height: none; }
+  .fx-ev { padding-top: var(--sp-1h); padding-bottom: var(--sp-1h); }
+  .fx-insp-close { width: 40px; height: 40px; }
+  .fx-link { height: 40px; }
+  .fx-nlink { padding: 11px 0; margin: -11px 0; }   /* a 40px hit area without growing the row */
+  .fx-li { grid-template-columns: auto 12px minmax(0, 1fr) 64px; min-height: 44px; }
+  .fx-li:not(:has(> .key)) { grid-template-columns: 12px minmax(0, 1fr) 64px; }
+  .fx-li { position: relative; }
+  .fx-li-kind, .fx-li-word { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }   /* app.css .vh: still in the button's name */
+  .fx-row { grid-template-columns: 96px minmax(0, 1fr); }
+}
+@media (max-width: 640px) and (prefers-reduced-motion: reduce) {
+  @starting-style { .fx-inspector, .fx-side { transform: none; } }
+  .fx-inspector.leaving, .fx-side.leaving { transform: none; }
+}

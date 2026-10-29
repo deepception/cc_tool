@@ -53,11 +53,20 @@
 .al-stack > * { pointer-events: auto; }
 .al-toast { box-shadow: var(--shadow-pop); }
 html.al-drawer-open .al-stack { visibility: hidden; }
+/* On the Factory floor (factory.js sets html.al-fx while it is up) the stack keeps clear of the
+   zoom buttons and an open inspector: --al-dx / --al-dy move it left / up from where it rests,
+   gliding in step with the inspector's slide once placed (.al-fx-glide), and html.al-fx-away
+   has it step aside as for the drawer (a phone's bottom sheet). Nothing on the floor moves for
+   a toast. */
+html.al-fx .al-stack { transform: translate(calc(-1 * var(--al-dx, 0px)), calc(-1 * var(--al-dy, 0px))); }
+html.al-fx-glide .al-stack { transition: transform var(--t-drawer) var(--ease-drawer); }
+html.al-fx-away .al-stack { visibility: hidden; }
 @media (prefers-reduced-motion: no-preference) {
   .al-toast { animation: al-in var(--t-toast) var(--ease) both; }
   .al-toast.al-leave { animation: al-out var(--t-pop) var(--ease) both; }
 }
 @media (prefers-reduced-motion: reduce) {
+  html.al-fx-glide .al-stack { transition: none; }
   .al-toast { animation: fade var(--t-toast) ease both; }
   .al-toast.al-leave { animation: leave var(--t-pop) ease both; }
 }

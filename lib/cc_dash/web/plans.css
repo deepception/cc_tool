@@ -18,13 +18,10 @@
 .pl-prog-l b { font-weight: 500; color: var(--ink); }
 .pl-code { font-family: var(--mono); font-size: .94em; background: var(--sunk); border-radius: var(--r-s); padding: 0 var(--sp-1); }
 
-/* The chip on Live rows and session headers: an app.css .tag with the mini bar. */
+/* The chip on session headers: an app.css .tag with the mini bar. */
 .tag.pl-chip { display: inline-flex; align-items: center; gap: var(--sp-1h); font-family: var(--font); line-height: 16px; padding: 1px var(--sp-1h); color: var(--ink-2); max-width: 360px; transition: border-color var(--t-fast) ease, color var(--t-fast) ease; }
 .tag.pl-chip:hover { border-color: var(--line-2); color: var(--ink); }
 .tag.pl-chip > .ellipsis { min-width: 0; }
-/* On a Live row the compact chip never truncates: the row's meta line wraps it onto its own line instead. */
-.a-meta:has(> .pl-chip) { flex-wrap: wrap; row-gap: var(--sp-1); }
-.tag.pl-chip.compact > .ellipsis, .a-meta > .tag.pl-chip.compact { flex: none; }
 
 /* ── The Plans page: running plans as cards, the rest in quiet groups ─── */
 .sec-h { display: flex; align-items: baseline; gap: var(--sp-2); margin-bottom: var(--sp-3); }

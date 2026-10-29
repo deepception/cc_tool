@@ -31,7 +31,42 @@ hook uses it to learn whether a permission prompt is one this guard asked
 about.
 
 Asks (hands the decision to the user; in an unattended run that is a refusal).
-The rule is: ask before an install or a deletion, nowhere else.
+The rule is: ask before an install, a deletion, a GitHub API write or landing
+work on a protected branch, nowhere else.
+  - landing on a protected branch (the merge gate), by allowlist: with HEAD
+    on main/master/production/release (or moved to one, or to an unknown
+    branch such as `-` / @{-1}, earlier in the command), a git command runs
+    without asking only if it cannot move the branch (reads, add/mv/stash,
+    fetch without a refspec, branch listing or a new branch, checkout/switch
+    without -B/-C, config reads, the --abort of a merge or rebase, `git pull
+    --ff-only` from its own verified upstream); anything else asks, an alias
+    or unknown subcommand, `commit --amend`, `-c` and GIT_DIR / GIT_CONFIG_*
+    included. On any branch, a git command that is not a read and names a
+    protected branch (a word, refs/heads/…, origin/…, a refspec side, a
+    --track value, an attached option value) or a branch it cannot read
+    (`-`, @{-1}, an expansion) asks, as do update-ref --stdin, symbolic-ref
+    writes, remote add/set-branches/set-url/rename, and config writes to
+    alias, remote, branch, url, pull, rebase, include* or core.hooksPath.
+    Closed as classes, on any branch: refs from stdin (any `--stdin`, or a
+    prefix of it, on a command that is not a read) or from plumbing
+    (fast-import, receive-pack …), `fetch --update-head-ok`, `rebase
+    --update-refs`, an option git would read as an abbreviation (an unknown
+    long option of branch / checkout / switch / worktree / update-ref /
+    symbolic-ref), `<remote>/<protected>` after any option, and an interactive
+    rebase or one with --exec, an editor set for one command (-c
+    sequence.editor / core.editor, GIT_SEQUENCE_EDITOR, GIT_EDITOR, EDITOR,
+    VISUAL), whose todo list or editor can run any git command. On a protected
+    branch, a git command asks whenever the command line has an assignment,
+    any builtin that can assign a variable or change directory (export, read,
+    printf, let, mapfile, getopts, cd, pushd, source …, wherever it stands),
+    or the name HOME, XDG_CONFIG_HOME, PATH, GIT_*, EDITOR or VISUAL. Any git
+    command shlex cannot parse asks.
+    This is a text guard, with a documented residual class: a `cd` into
+    another repository before the git command; `.git/config` or
+    `~/.gitconfig` edited by hand through the shell (an alias or upstream
+    git then reads without a git command to see); and git run by a script or
+    `sh -c`. A git reference-transaction hook would close it. See
+    _check_protected_landing.
   - deletions: any `rm`/`rmdir`/`unlink`/`shred` word or `-delete` /
     `--delete…` flag anywhere in the command (wrappers, `sh -c`, git aliases
     and xargs included), unless the whole command is `rm [-flags]
@@ -49,10 +84,24 @@ The rule is: ask before an install or a deletion, nowhere else.
     vitest`, `npx tsc`) pass, as does an exact pinned version already in npx's
     cache (`npx agent-device@0.21.20`) and `npx --no-install …`. An unpinned
     or tagged spec that is not installed (`npx pkg`, `pkg@latest`) asks.
+  - GitHub API writes: `gh api` (allowlisted in settings.json for reads) with
+    -X/--method other than GET, -f/-F fields without `-X GET` (gh POSTs
+    them), --input, a -F value read from a file (`@…`), a method-override
+    header, an option it does not know, a GraphQL query that is not written
+    out, has a `$` or backtick or contains `mutation`, or anything bash
+    could turn into other arguments: any `$`/backtick in a word (no variable
+    is resolved), an unquoted glob or brace expansion, process substitution,
+    `$'…'`, IFS; and a command name bash builds (`$G api`, `/usr/bin/g? api`).
+    Reads pass: `gh api repos/o/r`, `--paginate`, `--jq`, `-X GET … -f q=…`
+    (a query string), `gh api graphql -f query='{ viewer { login } }'`.
+    `gh api *` is allowlisted, so unlike the rest of this file this check
+    fails closed on shell expansion (see check_gh_api, _gh_mark).
   - Deletions follow nothing: no variables, no `cd`, no caches (see
     check_deletes). npx follows variables, `cd` and subshells (see
     walk_commands), since a wrong guess there costs a download, not files; a
-    directory or variable it cannot resolve counts as not installed.
+    directory or variable it cannot resolve counts as not installed. gh api
+    follows what npx does, plus xargs/find -exec, `sh -c`, eval, trap and
+    text fed to a shell; any word that is not literal asks.
 
 Warns (additionalContext, never blocks):
   - shell writes into source files (`> x.ts`, `tee`, `sed -i`, `perl -pi`,
@@ -77,10 +126,14 @@ and reasons about tokens; it never expands anything. Anything that only becomes 
 protected branch or a secret path *after* shell expansion is invisible to it, and
 always will be — this is inherent to the approach, not a TODO:
 
-    B=master; git push origin $B     git push origin "$(echo master)" / `...` / $'mas\\x74er'
     F=.env; grep KEY $F              grep KEY .en*  (glob / brace expansion)
     sh -c '...' / bash -c '...'      eval, heredocs fed to non-shell interpreters, base64 | sh
     git${IFS}commit                  computed paths: open(chr(46)+'env')
+
+(Two checks fail closed instead, because an allow rule or the merge gate makes
+them the only barrier: a git command that takes a branch asks when one of its
+arguments is built by the shell (`git push origin $B`, `"$(echo master)"`), and
+`gh api` asks on any expansion; see _check_protected_landing and check_gh_api.)
 
 Every one of those requires the caller to be *actively evading* the guard. This
 hook's job is the other threat model: stop the ordinary form of a dangerous
@@ -859,6 +912,414 @@ def check_git(tokens) -> None:
                 f"push to protected branch '{target}'. "
                 f"Open a pull request from a feature branch instead."
             )
+
+    # 4) landing work on a protected branch without a commit or a push: a merge
+    #    and its relatives move it. Asked, not denied (after the denials above,
+    #    so `git merge --squash x && git commit` is still refused).
+    _check_protected_landing(tokens, invocations)
+
+
+# ── landing work on a protected branch (merge gate) ───────────────────────────
+# Commit and push to main/master/production/release are denied, but a merge into
+# one moves it just as well, and a human merges at the factory's merge gate. The
+# gate works by allowlist, not by listing the dangerous commands:
+#   (A) HEAD on a protected branch (or moved to one, or to an unknown branch
+#       such as `-` or @{-1}, earlier in the command line): a git command runs
+#       without asking only if it cannot move a branch (_landing_allowed): reads,
+#       add/mv/rm/restore/clean/apply/stash/push (their own checks still apply),
+#       fetch with no refspec, branch listing or creating a new branch, checkout
+#       or switch without -B/-C, tag listing, config reads, remote -v/show,
+#       worktree list, reset of the index, --abort/--quit of a merge, rebase,
+#       cherry-pick, revert or am, and `git pull --ff-only` from the branch's
+#       own verified upstream. Anything else asks: an unknown subcommand (so
+#       every alias), commit --amend, a global -c / --config-env, or a GIT_*
+#       environment prefix.
+#   (B) Any branch: a command that is not a read and whose arguments name a
+#       protected branch (a word, refs/heads/<p>, <remote>/<p>, either side of a
+#       refspec or a range, the value of --track / -t / -u, an option's attached
+#       value) asks, and so does one that names a branch by position (`-`,
+#       @{-1}) or through an expansion or glob; also update-ref --stdin,
+#       symbolic-ref writes, remote add / set-branches / set-url / rename,
+#       config -e and config writes to alias.*, remote.*, branch.*, url.*,
+#       pull.*, include*, core.hooksPath (directly, or as -c / --config-env /
+#       GIT_CONFIG_* for one command).
+#       Also as classes, on any branch: refs from stdin (--stdin or a prefix of
+#       it, on anything but a read) and ref-writing plumbing (_GIT_REF_PLUMBING),
+#       fetch --update-head-ok, rebase --update-refs (and rebase.* config), a
+#       long option of branch / checkout / switch / worktree / update-ref /
+#       symbolic-ref that is not in _GIT_KNOWN_LONG (git takes `--tra` for
+#       --track), and `<remote>/<protected>` as the last path segment of any
+#       argument, whatever option precedes it; an interactive rebase, rebase
+#       --exec, pull --rebase=interactive, and an editor set for one command
+#       (-c sequence.editor / core.editor, GIT_SEQUENCE_EDITOR, GIT_EDITOR,
+#       EDITOR, VISUAL): a todo list or an editor can run any git command. On
+#       a protected branch, a command line that may change what git inherits
+#       (_env_touched: an assignment, any variable-assigning or directory-
+#       changing builtin as any word git does not take itself, or the name
+#       HOME, XDG_CONFIG_HOME, PATH, GIT_*, EDITOR or VISUAL) asks, and the pull
+#       exception refuses it.
+#   (C) Option clusters and --opt=value are split before matching; a git
+#       subcommand that is not a plain word asks, and so does any git command in
+#       a command line shlex cannot read (check_landing_unparseable).
+# This is a text guard. Residual class, documented: a `cd` into another
+# repository before the git command (like the commit check, the repository is
+# the cwd or the -C / --git-dir the invocation names); `.git/config` or
+# `~/.gitconfig` edited by hand through the shell; and git run by `sh -c` or a
+# script. A git reference-transaction hook would close it (docs/guides/factory.md,
+# Not done yet).
+_GIT_READS = {
+    "status", "log", "diff", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "grep",
+    "blame", "annotate", "describe", "shortlog", "cat-file", "for-each-ref", "merge-base", "help", "version",
+    "show-ref", "show-branch", "name-rev", "whatchanged", "range-diff", "cherry", "diff-tree", "diff-files",
+    "diff-index", "count-objects", "check-ignore", "check-attr", "check-ref-format", "var", "format-patch",
+    "archive", "fsck", "verify-commit", "verify-tag", "difftool"}
+# Change only the work tree, the index or the stash: allowed on a protected branch
+# (the deletion guard and the others still apply).
+_GIT_TREE_ONLY = {"add", "mv", "rm", "restore", "clean", "apply", "stash", "push"}
+# Take paths, not branches: their arguments are not matched against branch names.
+_GIT_PATH_ARGS = {"add", "mv", "rm", "restore", "clean", "apply", "commit"}
+# Take branches or commits as arguments: one built by an expansion or a glob asks.
+_GIT_REF_TAKERS = {"merge", "rebase", "pull", "fetch", "push", "reset", "update-ref", "symbolic-ref", "branch",
+                   "checkout", "switch", "worktree", "cherry-pick", "revert", "tag", "replace", "notes", "bisect"}
+_MERGE_FAMILY = {"merge", "rebase", "cherry-pick", "revert", "am"}
+_MERGE_BACKOUT = {"--abort", "--quit", "--show-current-patch"}
+_BRANCH_MOVERS = {"-f", "--force", "-m", "-M", "--move", "-c", "-C", "--copy", "-u", "--set-upstream-to",
+                  "--unset-upstream", "--edit-description", "-t", "--track"}
+# Plumbing that writes refs from a stream or a remote, and other ways a ref can be
+# rewritten wholesale: asked on any branch.
+_GIT_REF_PLUMBING = {"fast-import", "receive-pack", "unpack-objects", "index-pack", "fetch-pack", "send-pack",
+                     "upload-pack", "http-fetch", "http-push", "replace"}
+# Every long option of the commands that create, move or repoint a branch. git takes
+# any unambiguous prefix of an option (`--tra` for --track), so an option not in its
+# command's list (an abbreviation, or one bash-guard does not know) asks.
+_GIT_KNOWN_LONG = {
+    "branch": {"--color", "--abbrev", "--column", "--sort", "--merged", "--contains", "--points-at", "--format",
+               "--show-current", "--list", "--all", "--remotes", "--verbose", "--quiet", "--delete", "--force",
+               "--move", "--copy", "--track", "--set-upstream-to", "--unset-upstream", "--edit-description",
+               "--create-reflog", "--recurse-submodules", "--ignore-case", "--omit-empty"},
+    "checkout": {"--quiet", "--progress", "--force", "--ours", "--theirs", "--track", "--guess", "--overlay",
+                 "--detach", "--orphan", "--ignore-skip-worktree-bits", "--merge", "--conflict", "--patch",
+                 "--ignore-other-worktrees", "--overwrite-ignore", "--recurse-submodules", "--pathspec-from-file",
+                 "--pathspec-file-nul"},
+    "switch": {"--create", "--force-create", "--detach", "--guess", "--force", "--discard-changes", "--merge",
+               "--conflict", "--quiet", "--progress", "--track", "--orphan", "--ignore-other-worktrees",
+               "--recurse-submodules"},
+    "worktree": {"--force", "--detach", "--checkout", "--lock", "--reason", "--orphan", "--quiet", "--track",
+                 "--guess-remote", "--porcelain", "--verbose", "--expire", "--dry-run", "--relative-paths"},
+    "update-ref": {"--no-deref", "--create-reflog"},
+    "symbolic-ref": {"--quiet", "--short", "--recurse", "--delete"},
+}
+_PULL_FF_SAFE = {"--ff-only", "-q", "--quiet", "-v", "--verbose", "--progress", "--no-progress",
+                 "--stat", "-n", "--no-stat", "--prune", "-p", "--no-tags"}
+_NETWORK_URL_RE = re.compile(r"^(?:https://|ssh://|git@[\w.-]+:)")
+# Configuration that decides what a git command does to a branch: aliases, remotes,
+# upstreams, URL rewriting, pull's and rebase's modes (rebase.updateRefs), the
+# editors that run an interactive rebase's todo list, included files, hooks.
+_LANDING_CONFIG_RE = re.compile(r"^(?:alias|remote|branch|url|pull|rebase|sequence|include|includeif)(?:\.|$)"
+                                r"|^core\.(?:hookspath|editor)$", re.I)
+_REV_SUFFIX_RE = re.compile(r"(?:[~^][0-9]*|@\{[^}]*\})+$")
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
+# Builtins that can assign a variable or change the directory, so what a later git
+# inherits: its configuration (HOME, XDG_CONFIG_HOME, GIT_*), the git binary itself
+# (PATH), its editor, or its repository. Matched as any word that is not one of
+# git's own arguments, not by where a command can start (if / while / && / || …).
+_VAR_ASSIGNERS = {"env", "export", "declare", "typeset", "local", "readonly", "set", "unset", "source", ".", "eval",
+                  "read", "mapfile", "readarray", "getopts", "printf", "let", "cd", "pushd", "popd", "shopt",
+                  "alias", "enable", "trap", "exec", "builtin"}
+# Variables that point git at other configuration, another git or another editor.
+_GIT_ENV_NAMES_RE = re.compile(r"(?<![A-Za-z0-9_])(?:HOME|XDG_CONFIG_HOME|PATH|GIT_[A-Za-z0-9_]*|EDITOR|VISUAL)"
+                               r"(?![A-Za-z0-9_])")
+# Editors set for one command: they run an interactive rebase's todo list or a commit
+# message editor, which can be any program, git commands that move a branch included.
+_EDITOR_ENV_RE = re.compile(r"^(?:GIT_SEQUENCE_EDITOR|GIT_EDITOR|EDITOR|VISUAL)=")
+_GIT_SUB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_LANDING_SUGGESTION = ("land work on a protected branch through a pull request (the factory's merge gate), or "
+                       "confirm with the user that this change to it is intended")
+
+
+def _protected_named(tok: str) -> str:
+    """The protected branch `tok` names, or '': the word itself, an option's
+    attached value (`--force-create=master`, `-Bmaster`), either side of a
+    refspec or a range, with `+`, `^` and revision suffixes (`~1`, `^`, `@{u}`)
+    removed, and as the last segment of a path: `refs/heads/master`,
+    `refs/remotes/<r>/master` and `<remote>/master` all count, whatever option
+    stands before them (git makes a local master from `--track <remote>/master`,
+    and takes `--tra` for --track)."""
+    cands = [tok]
+    if tok.startswith("--") and "=" in tok:
+        cands.append(tok.split("=", 1)[1])
+    elif tok.startswith("-") and len(tok) > 2:
+        cands += [tok[k:] for k in range(2, len(tok))]
+    for c in cands:
+        for part in re.split(r":|\.\.\.?", c):
+            p = _REV_SUFFIX_RE.sub("", part.lstrip("+^")).rsplit("/", 1)[-1]
+            if p in PROTECTED:
+                return p
+    return ""
+
+
+def _abbreviates(flags, full: str) -> bool:
+    """A long option in `flags` is `full` or a prefix git would take for it (`--upd` for --update-refs)."""
+    return any(f.startswith("--") and len(f) > 2 and full.startswith(f) for f in flags)
+
+
+def _git_word_positions(tokens) -> set:
+    """Indexes of the words git itself takes (everything after a `git` up to the
+    next operator): `git add .` passes `.` to git, it sources nothing."""
+    out, k = set(), 0
+    while k < len(tokens):
+        if _cmd_name(tokens[k]) == "git":
+            k += 1
+            while k < len(tokens) and not _is_op(tokens[k]):
+                out.add(k)
+                k += 1
+        else:
+            k += 1
+    return out
+
+
+def _env_touched(tokens) -> str:
+    """What in this command line may change the environment or directory a git
+    command inherits, or '': an assignment, or a builtin that can assign or
+    change directory (export, read, printf -v, let, cd, source …), as any word
+    that is not one of git's own arguments, wherever it stands (after if,
+    while, &&, || …); or any mention of HOME, XDG_CONFIG_HOME, PATH, GIT_*,
+    EDITOR or VISUAL. Fails closed: `echo export` counts too."""
+    gitwords = _git_word_positions(tokens)
+    for k, t in enumerate(tokens):
+        if _is_op(t) or k in gitwords:
+            continue
+        if _ASSIGNMENT_RE.match(t) or _cmd_name(t) in _VAR_ASSIGNERS:
+            return t
+    m = _GIT_ENV_NAMES_RE.search(" ".join(tokens))
+    return m.group(0) if m else ""
+
+
+def _git_flags(args) -> set:
+    """The options in `args` before `--`, clusters split (`-fM` is -f and -M) and
+    long ones without their `=value`."""
+    out = set()
+    for a in args:
+        if a == "--":
+            break
+        if a.startswith("--"):
+            out.add(a.split("=", 1)[0])
+        elif a.startswith("-") and len(a) > 1:
+            out.update("-" + c for c in a[1:])
+    return out
+
+
+def _git_config_values(repo, pattern):
+    """{lowercased key: [values]} for config keys matching `pattern` in the repo
+    `repo` (its -C / --git-dir options), or None when git cannot say."""
+    try:
+        out = subprocess.run(["git", *repo, "config", "--get-regexp", pattern],
+                             capture_output=True, text=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode not in (0, 1):
+        return None
+    vals: dict = {}
+    for line in out.stdout.splitlines():
+        k, _, v = line.partition(" ")
+        vals.setdefault(k.lower(), []).append(v)
+    return vals
+
+
+def _pull_from_own_upstream(args, gopts, repo, branch, tokens, invocations) -> bool:
+    """True for `git pull --ff-only` (quiet/verbose/prune flags only, no remote or
+    refspec) on `branch` whose upstream git can vouch for: the same branch on a
+    named remote with one network URL, no URL rewriting, no rebase setting, and
+    nothing in this command line that could change any of that first."""
+    if "--ff-only" not in args or any(a not in _PULL_FF_SAFE for a in args):
+        return False
+    if any(not (o in _GIT_REPO_VALUE_OPTS or o.startswith(_GIT_REPO_INLINE_OPTS) or o in ("--no-pager", "-P"))
+           for o, _v in gopts):
+        return False
+    if _env_touched(tokens) or any(s in ("config", "remote", "branch") for s, _g, _a, _r in invocations):
+        return False                              # HOME=… / GIT_*=… / export …: other configuration
+    cfg = _git_config_values(repo, r"^(branch\.%s\.(remote|merge|rebase)|pull\.rebase|remote\..*\.url"
+                                   r"|url\..*\.(push)?insteadof)$" % re.escape(branch))
+    if cfg is None or any(k.startswith("url.") for k in cfg):
+        return False
+    remote = (cfg.get(f"branch.{branch}.remote") or [""])[-1]
+    urls = cfg.get(f"remote.{remote.lower()}.url") or []
+    if remote in ("", ".") or len(urls) != 1 or not _NETWORK_URL_RE.match(urls[0]):
+        return False
+    if (cfg.get(f"branch.{branch}.merge") or [""])[-1] != f"refs/heads/{branch}":
+        return False
+    return all(v.lower() in ("false", "0", "no", "off")
+               for k in (f"branch.{branch}.rebase", "pull.rebase") for v in cfg.get(k, []))
+
+
+def _positionals(args):
+    out = []
+    for k, a in enumerate(args):
+        if a == "--":
+            return out, args[k + 1:]
+        if not a.startswith("-"):
+            out.append(a)
+    return out, []
+
+
+def _config_writes(args) -> bool:
+    """`git config <args>` sets or renames something (a read or an unset is not:
+    removing a key cannot add an alias, a remote or an upstream)."""
+    words = [a for a in args if not a.startswith("-")]
+    if words[:1] in (["get"], ["list"], ["unset"]):
+        return False
+    return words[:1] in (["set"], ["rename-section"], ["remove-section"]) or (
+        len(words) >= 2 and not any(a in _GIT_CONFIG_READ_OPTS for a in args))
+
+
+def _git_reads(sub, args, pos) -> bool:
+    """A git command that only reads: never a target in (B), always allowed in (A)."""
+    if sub in _GIT_READS:
+        return True
+    if sub == "reflog":
+        return args[:1] not in (["expire"], ["delete"])
+    if sub == "symbolic-ref":
+        return len(pos) <= 1 and not ({"-d", "--delete"} & _git_flags(args))
+    return False
+
+
+def _landing_allowed(sub, gopts, args, pos, flags, repo, branch, tokens, invocations) -> bool:
+    """(A): may this run with HEAD on protected `branch` (or an unknown one)?"""
+    if _git_reads(sub, args, pos) or sub in _GIT_TREE_ONLY:
+        return True
+    if sub in _MERGE_FAMILY:
+        return bool(flags & _MERGE_BACKOUT)
+    if sub == "fetch":                            # a remote at most: no explicit refspec, none from stdin
+        return len(pos) <= 1 and not _abbreviates(flags, "--stdin")
+    if sub == "branch":
+        return not (flags & _BRANCH_MOVERS)
+    if sub in ("checkout", "switch"):
+        return not (flags & {"-B", "-C", "--force-create"})
+    if sub == "tag":
+        return not pos or bool(flags & {"-l", "--list", "-v", "--verify"})
+    if sub == "config":
+        return not _config_writes(args) and not (flags & {"-e", "--edit"})
+    if sub == "remote":
+        return args[:1] in ([], ["-v"], ["--verbose"], ["show"], ["get-url"])
+    if sub == "worktree":
+        return args[:1] == ["list"]
+    if sub == "reset":
+        return not [p for p in pos if p not in ("HEAD", "@")]
+    if sub == "pull":
+        return branch in PROTECTED and _pull_from_own_upstream(args, gopts, repo, branch, tokens, invocations)
+    return False
+
+
+def _landing_target_problem(sub, args, gopts, tokens) -> str:
+    """(B): why this git command may point a protected branch somewhere, on any branch, or ''."""
+    flags = _git_flags(args)
+    for opt, val in gopts:
+        key = (val or "").split("=", 1)[0] if opt == "-c" else (
+            opt.split("=", 1)[1].split("=", 1)[0] if opt.startswith("--config-env=") else "")
+        if (opt == "-c" or opt.startswith("--config-env")) and (not key or _LANDING_CONFIG_RE.match(key)):
+            return f"sets '{key or opt}' for this one command, which can change what it does to a branch"
+    env = next((t for t in tokens if re.match(r"^GIT_(?:CONFIG\w*|EXEC_PATH)=", t)), "")
+    if env:
+        return f"sets {env.split('=', 1)[0]}, which can add aliases or configuration for this command"
+    editor = next((t for t in tokens if _EDITOR_ENV_RE.match(t)), "")
+    if editor:
+        return (f"sets {editor.split('=', 1)[0]}, an editor git runs as a program (a rebase todo list or a "
+                "message), which can run git commands that move any branch")
+    if sub == "rebase" and (flags & {"-i", "-x"} or _abbreviates(flags, "--interactive")
+                            or _abbreviates(flags, "--exec") or _abbreviates(flags, "--edit-todo")):
+        return ("runs an interactive rebase or --exec commands, whose todo list can run git commands that move "
+                "any branch")
+    if sub == "pull" and any(re.match(r"^--r[a-z-]*=i", a) for a in args):
+        return "pulls with an interactive rebase, whose todo list can run git commands that move any branch"
+    if sub in _GIT_REF_PLUMBING and not (sub == "replace" and flags & {"-l", "--list"}):
+        return f"runs 'git {sub}', plumbing that can write any ref, a protected branch included"
+    if _abbreviates(flags, "--stdin") and not _git_reads(sub, args, _positionals(args)[0]):
+        return "takes its refs or updates from stdin, where bash-guard cannot see whether one is a protected branch"
+    if sub == "fetch" and _abbreviates(flags, "--update-head-ok"):
+        return "may update the checked-out branch (--update-head-ok)"
+    if sub == "rebase" and _abbreviates(flags, "--update-refs"):
+        return "moves every branch that points into the rebased commits (--update-refs), a protected one included"
+    known = _GIT_KNOWN_LONG.get(sub)
+    odd = sorted(f for f in flags if known is not None and f.startswith("--") and f not in known
+                 and not (f.startswith("--no-") and "--" + f[5:] in known)) if known is not None else []
+    if odd:
+        return (f"uses '{odd[0]}', not one of git {sub}'s options as bash-guard knows them (git also takes an "
+                "abbreviation, such as --tra for --track), so it may move a branch")
+    if sub == "symbolic-ref" and not _git_reads(sub, args, _positionals(args)[0]):
+        return "repoints a symbolic ref (HEAD), so later commands can land on a protected branch"
+    if sub == "remote" and args[:1] in (["add"], ["set-branches"], ["set-url"], ["rename"]):
+        return f"runs 'remote {args[0]}', which changes what a branch fetches and pulls"
+    if sub == "config":
+        if flags & {"-e", "--edit"}:
+            return "opens the configuration in an editor"
+        key = next((a for a in args if not a.startswith("-") and _LANDING_CONFIG_RE.match(a)), "")
+        if key and _config_writes(args):
+            return f"writes '{key}', configuration that decides what git commands do to a branch"
+        return ""
+    pos, _paths = _positionals(args)
+    if _git_reads(sub, args, pos) or sub in _GIT_PATH_ARGS:
+        return ""
+    before = args[:args.index("--")] if "--" in args else args
+    listing = sub in ("branch", "tag") and bool(flags & {"-l", "--list", "--contains", "--merged", "--no-merged",
+                                                         "--points-at", "-a", "-r", "--all", "--remotes"})
+    # A plain switch only moves HEAD (to `-`, @{-1} or "$B", (A) then treats it as an
+    # unknown branch); a checkout that creates or resets a branch names it.
+    switch_only = sub in ("checkout", "switch") and not (
+        flags & {"-b", "-B", "-c", "-C", "--force-create", "--orphan", "-t", "--track"})
+    for a in before:
+        name = _protected_named(a)
+        if name:
+            return f"names protected branch '{name}' ('{a[:40]}')"
+        if switch_only:
+            continue
+        if sub in _GIT_REF_TAKERS and (a == "-" or "@{-" in a):
+            return f"names a branch by position ('{a}'), which could be a protected one"
+        if sub in _GIT_REF_TAKERS and not listing and re.search(r"[$`*?\[]", a):
+            return f"names a branch the shell builds ('{a[:40]}'), which could be a protected one"
+    return ""
+
+
+def check_landing_unparseable(cmd: str) -> None:
+    """(C) For a command shlex cannot read: any git command in it asks, whatever
+    the branch (the regex cannot tell a harmless form from the others)."""
+    if re.search(r"(?:^|[\s;&|(`])(?:\S*/)?git(?:\s|$)", cmd):
+        ask("bash-guard could not parse this command (unbalanced quotes), so it cannot tell whether the git command "
+            "in it moves a protected branch", _LANDING_SUGGESTION)
+
+
+def _check_protected_landing(tokens, invocations) -> None:
+    on: dict = {}     # repo -> the branch a checkout earlier in this command line moved HEAD to
+    for sub, gopts, args, repo in invocations:
+        shown = f"git {sub} {' '.join(args)}"[:70]
+        if not _GIT_SUB_RE.match(sub):
+            ask(f"'{shown}': the git subcommand is not written out plainly, so bash-guard cannot tell what runs",
+                _LANDING_SUGGESTION)
+        why = _landing_target_problem(sub, args, gopts, tokens)
+        if why:
+            ask(f"'{shown}' {why}", _LANDING_SUGGESTION)
+        pos, _paths = _positionals(args)
+        flags = _git_flags(args)
+        branch = on.get(repo) or current_branch(repo)
+        if branch in PROTECTED or branch.startswith("("):
+            if any(o == "-c" or o.startswith("--config-env") for o, _v in gopts):
+                ask(f"'{shown}' sets configuration (-c) for one command on protected branch '{branch}'",
+                    _LANDING_SUGGESTION)
+            env = _env_touched(tokens)
+            if env:
+                ask(f"'{shown}' runs on protected branch '{branch}' after '{env.split('=', 1)[0][:30]}' changes its "
+                    "environment, which can point git at other configuration (HOME, XDG_CONFIG_HOME, GIT_*) or "
+                    "another git", _LANDING_SUGGESTION)
+            if not _landing_allowed(sub, gopts, args, pos, flags, repo, branch, tokens, invocations):
+                hint = (" (only `git pull --ff-only` from its own upstream runs without asking)" if sub == "pull"
+                        else "")
+                ask(f"'{shown}' on protected branch '{branch}' is not one of the git commands that cannot move "
+                    f"it{hint}", _LANDING_SUGGESTION)
+        if sub in ("checkout", "switch"):
+            target = "-" if "-" in args[:args.index("--") if "--" in args else len(args)] else (pos[0] if pos else "")
+            if target == "-" or "@{-" in target or re.search(r"[$`*?\[]", target):
+                on[repo] = "(an unknown branch)"
+            elif _protected_named(target):
+                on[repo] = _protected_named(target)
 
 
 def check_git_unparseable(cmd: str) -> None:
@@ -1736,10 +2197,486 @@ def check_npx(tokens) -> None:
             _check_npx(cmd, cwd, env)
 
 
+# ── gh api guard: ask before a request that can change GitHub ─────────────────
+# settings.json allows `Bash(gh api *)` so reads run without a prompt; the same
+# rule lets `gh api -X DELETE repos/o/r` through, so a call this guard cannot
+# read as a read asks. gh parses flags with spf13/pflag and so does
+# _gh_api_parse: options anywhere before `--` (after the endpoint too), the last
+# -X/--method wins, short options cluster (`-iXPOST`) and take a value attached
+# (`-XPOST`, `-X=POST`) or as the next word, long ones `--method=POST` or
+# `--method POST`, never abbreviated (pflag has no prefix matching: `--meth` is
+# an error gh stops on, and an option this guard does not know asks). A read:
+#   - no --input, no -F value read from a file or stdin (`@path`, `@-`), no
+#     header naming a method (X-HTTP-Method-Override and the like);
+#   - -X/--method, when given, is GET (any case);
+#   - -f/-F fields only with an explicit GET, where gh sends them as the query
+#     string, not a body (`gh api -X GET search/issues -f q=…` is the documented
+#     search form), or on the GraphQL endpoint (`graphql`, `/graphql`, a URL
+#     whose path is /graphql), where reads are POSTs too;
+#   - every `query` field is written out in the command with no `$` or
+#     backtick at all, and has no `mutation` keyword (a query with GraphQL
+#     variables asks: inline the values). GraphQL names have no escapes and
+#     the `{ … }` shorthand is always a query, so a mutation cannot run without
+#     that word in the text (the word inside a string or comment asks too:
+#     nothing here parses GraphQL).
+# The call is found where npx is (walk_commands) and also, as the deletion and
+# cc-dash checks do, in commands handed to xargs / find -exec / setsid, in
+# $( … ) and backticks inside quoted words, and, when the command runs a
+# shell, eval, xargs, env -S or ssh, in any string that names gh api (sh -c,
+# echo … | sh, bash <<< …).
+# `gh api *` is allowlisted, so this guard is the only barrier, and unlike the
+# rest of this file it fails closed on shell expansion. It reads its own
+# tokens (_gh_mark): every character bash takes literally (inside quotes, or
+# escaped) is replaced by a private-use marker before shlex runs, so a quoted
+# '>' or '|' is a word, never a redirection or a pipe, an fd number counts
+# only when it touches its operator (`2>&1`, not `-q 1 >x`), and a `$` or
+# backtick still in a word is one bash expands. Every word of a gh api call
+# must be literal: any expansion asks, in double quotes too, and no variable
+# is ever resolved (a harmless-looking value still splits on a changed IFS,
+# into arguments such as -X DELETE); so does an unquoted glob or brace
+# expansion, a process substitution, arithmetic, a parenthesis after a word, a
+# $( … ) with more words after it, any mention of IFS, and quoting shlex
+# cannot follow ($'…', quotes inside a "$( … )"). In a command line that
+# mentions gh api (the word api, after gh or after anything bash builds), a
+# command whose name, or a wrapper's target, bash builds at run time (`$G api`,
+# `` `echo gh` api ``, `/usr/bin/g? api`, `$HOME/bin/gh`) asks: it could be gh.
+_GH_API_SHORT = {"X": "method", "F": "field", "f": "raw", "H": "header", "q": "", "t": "", "p": ""}
+_GH_API_SHORT_BOOL = {"i", "h"}
+_GH_API_LONG = {"method": "method", "field": "field", "raw-field": "raw", "header": "header", "input": "input",
+                "jq": "", "template": "", "preview": "", "cache": "", "hostname": ""}
+_GH_API_LONG_BOOL = {"include", "paginate", "slurp", "silent", "verbose", "help"}
+_GH_ROOT_BOOLS = {"-h", "--help", "--version"}
+_GRAPHQL_MUTATION_RE = re.compile(r"(?<![_0-9A-Za-z])mutation(?![_0-9A-Za-z])")
+_REDIRECT_OP_RE = re.compile(r"^(?:[<>]|>>|>\||[<>]&|&>>?|<>|<<-?|<<<)$")
+# _gh_mark's markers: a character bash reads literally becomes chr(_GH_PUA + its
+# code); _GH_FD prefixes an fd number glued to its redirection operator.
+_GH_LITERAL = set("$`<>|&;(){}*?[]\n\"'")
+_GH_PUA = 0xE000
+_GH_FD = ""
+_GH_PUA_RE = re.compile("[-]")
+_GH_WORD_END = set(" \t\n;&|()<>")
+_GH_RESERVED = {"if", "then", "else", "elif", "while", "until", "do", "in", "time", "!", "{"}
+_CODE_READERS = _SHELLS | {"eval", "source", ".", "xargs", "parallel", "script", "watch", "flock", "su",
+                           "runuser", "ssh", "env", "trap"}
+_GH_API_UNPARSEABLE_RE = re.compile(
+    r"(?:^|[;&|(\n])[ \t]*(?:[A-Za-z_]\w*=\S*[ \t]+)*(?:\S*/)?gh[ \t]+(?:-\S*[ \t]+)*api(?:\s|$)")
+_GH_API_SUGGESTION = ("confirm the request with the user. Reads run without approval: `gh api <endpoint>` "
+                      "(GET), `gh api -X GET <endpoint> -f key=value` (query parameters), and `gh api graphql "
+                      "-f query='…'` with the query written out, values inline (no $ variables) and no mutation")
+
+
+def _gh_lit(c: str) -> str:
+    return chr(_GH_PUA + ord(c)) if c in _GH_LITERAL else c
+
+
+def _gh_plain(s: str) -> str:
+    """Text with _gh_mark's markers turned back into the characters they stand for."""
+    return _GH_PUA_RE.sub(lambda m: "" if m.group(0) == _GH_FD else chr(ord(m.group(0)) - _GH_PUA), s)
+
+
+def _gh_mark(s: str):
+    """(text, odd) for a shell_prepass()ed command: `s` with every character
+    bash reads literally (in quotes, or escaped) that shlex or this guard would
+    read as shell syntax replaced by a marker, and an fd number that touches its
+    redirection operator (`2>`, not `2 >`) prefixed with _GH_FD. `odd` names
+    quoting shlex does not split the way bash does ('' when there is none)."""
+    out: list = []
+    odd = "private-use characters" if _GH_PUA_RE.search(s) else ""
+    stack = ["top"]
+    i, n = 0, len(s)
+    while i < n:
+        c, ctx = s[i], stack[-1]
+        if ctx in ("'", "$'"):
+            if ctx == "$'" and c == "\\" and i + 1 < n:
+                out.append("\\" + _gh_lit(s[i + 1]))
+                i += 2
+                continue
+            if c == "'":
+                stack.pop()
+                out.append(c)
+            else:
+                out.append(_gh_lit(c))
+            i += 1
+            continue
+        if ctx == '"':
+            if c == "\\" and i + 1 < n:
+                nxt = s[i + 1]
+                out.append("\\" + (nxt if nxt in '"\\' else _gh_lit(nxt)))
+                i += 2
+                continue
+            if c == '"':
+                stack.pop()
+                out.append(c)
+            elif c == "$" and s[i + 1:i + 2] == "(" and s[i + 2:i + 3] != "(":
+                stack.append("sub")
+                out.append("$(")
+                i += 2
+                continue
+            elif c == "`":
+                stack.append("bq")
+                out.append(c)
+            elif c == "$":
+                out.append(c)
+            else:
+                out.append(_gh_lit(c))
+            i += 1
+            continue
+        # unquoted: the top level, or inside $( … ) / ( … ) / backticks
+        if c == "\\" and i + 1 < n:
+            out.append("\\" + _gh_lit(s[i + 1]))
+            i += 2
+            continue
+        if c in ("'", '"'):
+            if '"' in stack:
+                odd = odd or 'quotes inside a "$( … )" or "` … `"'
+            stack.append(c)
+            out.append(c)
+            i += 1
+            continue
+        if c == "$" and s[i + 1:i + 2] == "'":
+            odd = odd or "ANSI-C quoting ($'…')"
+            stack.append("$'")
+            out.append("$'")
+            i += 2
+            continue
+        if c == "$" and s[i + 1:i + 2] == "(" and s[i + 2:i + 3] != "(":
+            stack.append("sub")
+            out.append("$(")
+            i += 2
+            continue
+        if c == "`":
+            if ctx == "bq":
+                stack.pop()
+            else:
+                stack.append("bq")
+        elif c == "(" and ctx in ("sub", "par"):
+            stack.append("par")
+        elif c == ")" and ctx in ("sub", "par"):
+            stack.pop()
+        elif c.isdigit() and (not out or out[-1][-1:] in _GH_WORD_END):
+            j = i
+            while j < n and s[j].isdigit():
+                j += 1
+            if j < n and s[j] in "<>":
+                out.append(_GH_FD + s[i:j])   # `2>&1`: the fd number belongs to the operator
+                i = j
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out), odd
+
+
+def _without_redirects(tokens):
+    """_gh_mark tokens minus redirections and their targets (`2>&1`, `> out.json`,
+    `<<< text`), so the words after one stay in their command: bash runs
+    `gh api 2>/dev/null x -X DELETE` as one call. Quoted '>' was marked, so it
+    stays a word; an fd number goes only when _gh_mark glued it to its operator."""
+    out, k = [], 0
+    while k < len(tokens):
+        if tokens[k].startswith(_GH_FD):
+            k += 1          # the fd number of `2>&1`
+            continue
+        if _REDIRECT_OP_RE.match(tokens[k]):
+            k += 2
+            continue
+        out.append(tokens[k])
+        k += 1
+    return out
+
+
+def _gh_stream_problem(tokens):
+    """Why `tokens` (_gh_mark tokens, redirections removed) hold an operator that
+    does not end a simple command, so words after it may still be arguments of
+    a gh api call; else None."""
+    subst: list = []    # for each open parenthesis: does it open a $( … )?
+    for k, t in enumerate(tokens):
+        if not _is_op(t):
+            continue
+        for ci, ch in enumerate(t):
+            if ch == "(":
+                subst.append(ci == 0 and k > 0 and not _is_op(tokens[k - 1]) and tokens[k - 1].endswith("$"))
+            elif ch == ")":
+                closes_subst = subst.pop() if subst else False
+                if closes_subst and ci == len(t) - 1 and k + 1 < len(tokens) and not _is_op(tokens[k + 1]):
+                    # shlex split `$(echo gh) api …` apart: the words after `)` belong to its command
+                    return ("has a command substitution $( … ) with more words of the same command after it, "
+                            "which bash-guard cannot place")
+        if "<" in t or ">" in t:
+            return f"has '{t}' (a process substitution or an operator bash-guard cannot place in the call)"
+        if "((" in t:
+            return "has arithmetic (( … )), which bash-guard cannot place in the call"
+        prev = tokens[k - 1] if k else ""
+        if (t.startswith("(") and not t.startswith("()") and prev and not _is_op(prev)
+                and not prev.endswith("$") and prev not in _GH_RESERVED):
+            return f"has a parenthesis after '{_gh_plain(prev)[:30]}' (an extended glob or an array), which bash-guard cannot place in the call"
+    return None
+
+
+def _gh_expands(tok: str) -> str:
+    """What in `tok` (a _gh_mark token) bash may expand into other words: a `$`
+    or backtick (variables, substitutions, in double quotes too), a glob or a
+    brace expansion; '' when it is a literal word. No value is ever resolved:
+    a variable that looks harmless can still split on a changed IFS."""
+    if "$" in tok or "`" in tok:
+        return "a shell expansion"
+    if re.search(r"[*?\[]", tok):
+        return "an unquoted glob"
+    if "{" in tok and "}" in tok and ("," in tok or ".." in tok):
+        return "an unquoted brace expansion"
+    return ""
+
+
+def _gh_api_args(cmd):
+    """The arguments of a `gh api` call, or None. Options before `api` are
+    passed on to it, as cobra does (it takes an option it does not know to
+    have a value)."""
+    args = cmd[1:]
+    k = 0
+    while k < len(args):
+        a = args[k]
+        if a == "--" or a == "-" or not a.startswith("-"):
+            return args[:k] + args[k + 1:] if a == "api" else None
+        k += 2 if "=" not in a and a not in _GH_ROOT_BOOLS and (a.startswith("--") or len(a) == 2) else 1
+    return None
+
+
+def _gh_api_parse(words):
+    """({kind: [values]}, positionals, first option gh does not have or None),
+    reading `words` as pflag does (see the comment above)."""
+    seen = {"method": [], "field": [], "raw": [], "header": [], "input": []}
+    pos, k = [], 0
+    while k < len(words):
+        a = words[k]
+        k += 1
+        if a == "--":
+            pos += words[k:]
+            break
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if name in _GH_API_LONG_BOOL:
+                continue
+            if name not in _GH_API_LONG:
+                return seen, pos, a
+            if not eq:
+                if k >= len(words):
+                    break   # "flag needs an argument": gh stops there
+                val, k = words[k], k + 1
+            if _GH_API_LONG[name]:
+                seen[_GH_API_LONG[name]].append(val)
+        elif a.startswith("-") and len(a) > 1:
+            for j in range(1, len(a)):
+                c, rest = a[j], a[j + 1:]
+                if c in _GH_API_SHORT_BOOL:
+                    if len(rest) > 1 and rest[0] == "=":
+                        break   # -i=true
+                    continue
+                if c not in _GH_API_SHORT:
+                    return seen, pos, "-" + c
+                if rest:
+                    val = rest[1:] if len(rest) > 1 and rest[0] == "=" else rest
+                elif k < len(words):
+                    val, k = words[k], k + 1
+                else:
+                    break
+                if _GH_API_SHORT[c]:
+                    seen[_GH_API_SHORT[c]].append(val)
+                break
+        else:
+            pos.append(a)
+    return seen, pos, None
+
+
+def _graphql_endpoint(ep: str) -> bool:
+    """True when gh sends `ep` to GitHub's GraphQL endpoint: `graphql`,
+    `/graphql`, or a URL whose path is /graphql (GHES: /api/graphql), with dot
+    segments and %-escapes resolved."""
+    from urllib.parse import unquote
+    path = ep.split("?", 1)[0].split("#", 1)[0]
+    if "://" in path:
+        path = path.split("://", 1)[1].partition("/")[2]
+    segs: list = []
+    for s in unquote(path).lower().split("/"):
+        if s == "..":
+            segs = segs[:-1]
+        elif s not in ("", "."):
+            segs.append(s)
+    return segs in (["graphql"], ["api", "graphql"])
+
+
+def _graphql_query_problem(field: str):
+    """Why a -f/-F field may carry a GraphQL query that is not a plain read, or
+    None. `field` is plain text: what bash expands was settled before."""
+    key, eq, value = field.partition("=")
+    if key.split("[", 1)[0] != "query" or not eq:
+        return None
+    if key != "query":
+        return f"passes its GraphQL query as '{key}'"
+    if "$" in value or "`" in value:
+        cut = min(i for i in (value.find("$"), value.find("`")) if i >= 0)
+        return (f"has a $ or backtick in its GraphQL query ('{value[cut:cut + 24]}'); write the values inline "
+                "instead of GraphQL variables")
+    if _GRAPHQL_MUTATION_RE.search(value):
+        return "runs a GraphQL mutation"
+    return None
+
+
+def _gh_api_write(args):
+    """Why this `gh api` call may change something on GitHub, or None for a
+    read. `args` are _gh_mark tokens; every one must be a literal word."""
+    from urllib.parse import unquote_plus
+    words = []
+    for a in args:
+        what = _gh_expands(a)
+        if what:
+            return (f"has {what} in an argument ('{_gh_plain(a)[:40]}'), which bash can turn into other or more "
+                    "arguments, such as -X DELETE; bash-guard reads only literal words in a gh api call")
+        words.append(_gh_plain(a))
+    seen, pos, unknown = _gh_api_parse(words)
+    if unknown:
+        return f"passes an option bash-guard does not know ('{unknown}'), so it cannot tell what the request does"
+    if seen["input"]:
+        return "sends a request body with --input"
+    for f in seen["field"]:
+        if f.partition("=")[2].startswith("@"):
+            return f"reads the field '{f.partition('=')[0]}' from a file or stdin (-F …=@), so bash-guard cannot see what it sends"
+    for h in seen["header"]:
+        if "method" in h.split(":", 1)[0].lower():
+            return f"sets the header '{h[:60]}', which can override the request method"
+    method = seen["method"][-1] if seen["method"] else None
+    if method is not None and method.upper() != "GET":
+        return f"sets the request method to '{method}'"
+    graphql = [p for p in pos if _graphql_endpoint(p)]
+    for p in graphql:
+        qs = p.partition("?")[2]
+        if "$" in qs or "`" in qs or _GRAPHQL_MUTATION_RE.search(unquote_plus(qs)):
+            return "puts a GraphQL query in the URL that bash-guard cannot read as a plain query"
+    fields = seen["field"] + seen["raw"]
+    if not fields:
+        return None
+    if method is None and not graphql:
+        return "sends -f/-F fields, which gh turns into a POST body unless --method GET is given"
+    for f in fields:
+        why = _graphql_query_problem(f)
+        if why:
+            return why
+    if method is None and not any(f.partition("=")[0] == "query" for f in fields):
+        return "posts fields to the GraphQL endpoint with no query written out"
+    return None
+
+
+def _gh_api_cmd(cmd, depth=0):
+    """(command, why) for a gh api call in `cmd`, or in a command it hands a
+    runner (xargs, find -exec, setsid …), that may not be a read; else None.
+    Only called for a command line that mentions gh api (_mentions_gh_api), so
+    a command whose name (or a wrapper's target) bash builds at run time
+    (`$G api …`, `` `echo gh` api ``, `/usr/bin/g? api`, `$HOME/bin/gh`)
+    asks: nothing here can tell it is not gh."""
+    shown = _gh_plain(" ".join(cmd))
+    inner = _strip_assignments(_strip_wrappers(_strip_assignments(cmd))[0]) or cmd
+    for name in dict.fromkeys((cmd[0], inner[0])):
+        what = _gh_expands(name)
+        if what:
+            return shown, (f"runs a command whose name has {what} ('{_gh_plain(name)[:30]}') in a command line that "
+                           "mentions gh api, so bash-guard cannot tell it is not gh api")
+    if _cmd_name(_gh_plain(inner[0])) == "gh":
+        args = _gh_api_args(inner)
+        why = _gh_api_write(args) if args is not None else None
+        return (shown, why) if why else None
+    # find ends an -exec at the word `;` however it was quoted (`\;`, ';'); _gh_mark marked it.
+    semi = _gh_lit(";")
+    for handed in _handed_commands([";" if t == semi else t for t in inner]) if depth < 6 else ():
+        hit = _gh_api_cmd(handed, depth + 1) if handed else None
+        if hit:
+            return hit
+    return None
+
+
+_GH_WORD_RE = re.compile(r"(?<![\w.-])gh(?![\w.-])")
+_API_WORD_RE = re.compile(r"(?<![\w.-])api(?![\w.-])")
+_IFS_RE = re.compile(r"(?<![A-Za-z0-9_])IFS(?![A-Za-z0-9_])")
+# Every expansion, so it can stand in for any text: `…`, $( … ), ${ … }, $'…', $NAME, $1, $@ …
+_GH_EXPANSION_RE = re.compile(r"`[^`]*`?|\$\([^()]*(?:\([^()]*\)[^()]*)*\)?|\$\{[^}]*\}?|\$'[^']*'?"
+                              r"|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]?")
+
+
+def _gh_skeleton(text: str) -> str:
+    """`text` with each expansion replaced by \\x01 and quotes and backslashes
+    removed: `g""h`, `g\\h` read as gh, `g$Xh` as g\\x01."""
+    return re.sub(r"[\"'\\]", "", _GH_EXPANSION_RE.sub("\x01", _gh_plain(text)))
+
+
+def _mentions_gh_api(text: str) -> bool:
+    """The word api appears, and before it the word gh or anything bash builds
+    at run time (an expansion, a glob) that could become gh; read once with
+    every expansion standing in for any text, and once with only the shell's
+    punctuation dropped, so code inside $( … ) and backticks counts too. The
+    fail-closed rules apply only to such a command."""
+    opened = re.sub(r"[\"'\\]", "", re.sub(r"[$`(){}]", " ", _gh_plain(text)))
+    for sk in (_gh_skeleton(text), opened):
+        apis = [m.start() for m in _API_WORD_RE.finditer(sk)]
+        if not apis:
+            continue
+        head = sk[:apis[-1]]
+        if _GH_WORD_RE.search(head.replace("\x01", "")) or "\x01" in head or re.search(r"[*?\[{]", head):
+            return True
+    return False
+
+
+def _gh_api_problem(prepped: str, depth=0):
+    """(command, why) for the first gh api call in the shell_prepass()ed
+    `prepped` that may not be a read, else None. Reads its own tokens
+    (_gh_mark), not the shared quote-stripped ones."""
+    if depth > 4:
+        return "(nested code)", "is nested too deeply for bash-guard to read"
+    marked, odd = _gh_mark(prepped)
+    if odd:
+        return prepped, f"uses {odd}, which bash-guard cannot split the way bash does"
+    if _IFS_RE.search(re.sub(r"[\"'\\]", "", _gh_plain(prepped))):
+        return prepped, "touches IFS, which changes how bash splits words into arguments"
+    tokens = tokenize(marked)
+    if tokens is None:
+        return prepped, "could not be parsed (unbalanced quotes)"
+    plain = _without_redirects(tokens)
+    why = _gh_stream_problem(plain)
+    if why:
+        return prepped, why
+    reads_code = False
+    for cmd, _cwd, _env in walk_commands(plain):
+        hit = _gh_api_cmd(cmd)
+        if hit:
+            return hit
+        reads_code = reads_code or _cmd_name(_gh_plain(cmd[0])) in _CODE_READERS
+    # Code bash runs that the walk reads as text: $( … ) and `…` inside a word,
+    # and, when the command runs a shell, eval, xargs, ssh …, any string.
+    nested = [a or b for a, b in _SUBST_RE.findall(" ".join(tokens))]
+    if reads_code:
+        nested += [t for t in tokens if not _is_op(t) and re.search(r"\s", t)]
+    for code in nested:
+        code = _gh_plain(code)
+        if not _mentions_gh_api(code):
+            continue
+        hit = _gh_api_problem(shell_prepass(code), depth + 1)
+        if hit:
+            return hit
+    return None
+
+
+def check_gh_api(prepped: str) -> None:
+    if not _mentions_gh_api(prepped):
+        return
+    hit = _gh_api_problem(prepped)
+    if hit:
+        shown, why = hit
+        shown = shown if len(shown) <= 80 else shown[:77] + "..."
+        ask(f"'{shown}' may change data on GitHub: it {why}", _GH_API_SUGGESTION)
+
+
 # ── Deletion guard: every deletion asks, except one literal scratch form ──────
-# cc_tool's rule for prompts: the agent asks before it installs something or
-# deletes something, and nowhere else. The deny tier above still refuses the
-# catastrophic forms (a root, home, the repo, .git, lockfiles, CI).
+# cc_tool's rule for prompts: the agent asks before it installs something,
+# deletes something, writes to GitHub's API or lands work on a protected
+# branch (above), and nowhere else. The
+# deny tier above still refuses the catastrophic forms (a root, home, the
+# repo, .git, lockfiles, CI).
 #
 # v0.0.23–v0.0.26 tried to exempt more (variables, cd, caches, find), deciding
 # from a parse of the command that a deletion was harmless. Five review rounds
@@ -2554,11 +3491,15 @@ def check_command(cmd: str) -> None:
         # can't guess at it — that half stays fail-open, as before — but the git
         # half still gets its regex fallback.
         check_git_unparseable(prepped)
+        check_landing_unparseable(prepped)
         check_cc_dash_launch_raw(cmd)
         check_project_rules(cmd)
         if _NPX_UNPARSEABLE_RE.search(prepped):
             ask("bash-guard could not parse this command (unbalanced quotes), so it cannot confirm the "
                 "'npx' in it runs an installed package rather than downloading one", _NPX_SUGGESTION)
+        if _GH_API_UNPARSEABLE_RE.search(prepped):
+            ask("bash-guard could not parse this command (unbalanced quotes), so it cannot tell whether the "
+                "'gh api' call in it changes data on GitHub", _GH_API_SUGGESTION)
         check_built_deleters(prepped)
         if _DELETE_UNPARSEABLE_RE.search(prepped):
             ask("bash-guard could not parse this command (unbalanced quotes), so it cannot tell what the "
@@ -2572,6 +3513,7 @@ def check_command(cmd: str) -> None:
     check_destructive(cmd, tokens)
     check_project_rules(cmd)
     check_npx(tokens)
+    check_gh_api(prepped)
     check_deletes(tokens)
     check_built_deleters(prepped)
     check_command_words(tokens)

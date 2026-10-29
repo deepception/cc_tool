@@ -17,6 +17,7 @@ attributed to the session in that repo whose tool calls are closest in time.
 import bisect
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -30,6 +31,77 @@ LIVE_SECS = 600          # a transcript written in the last 10 minutes is live
 WORKING_SECS = 90        # ...and "working" if the last write is this recent
 GUARD_MATCH_SECS = 120   # a guard event must sit this close to one of the session's tool calls
 MIN_REFRESH = 1.0
+DAYS_MAX = 30.0          # the widest window a request may ask for (or --days, when that is wider)
+DAYS_OPTIONS = (1.0, 3.0, 7.0, 14.0, 30.0)   # the page's window picker, plus the launch value
+# A widening parses without Store.lock but holds the interpreter (GIL) while it does, and a reader's
+# refresh gives the GIL up on every stat: at the 5 ms switch interval each one would wait up to 5 ms
+# to get it back. So the parse steps aside, every WIDEN_SLICE lines, while anyone holds or waits for
+# Store.lock, for at most WIDEN_YIELD seconds at a time (so busy readers slow it down, never stop it).
+WIDEN_SLICE = 64
+WIDEN_YIELD = 0.5
+
+
+class StoreLock:
+    """Store.lock: a re-entrant lock that also counts the acquisitions holding or waiting for it
+    (`wanted`), so a widening's parse can step aside for them (wait_idle). Used with `with`, or
+    acquire(blocking, timeout) and release() as threading.RLock."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(threading.Lock())
+        self.wanted = 0
+
+    def acquire(self, blocking=True, timeout=-1):
+        with self._cond:
+            self.wanted += 1
+        try:
+            ok = self._lock.acquire(blocking, timeout)
+        except BaseException:
+            self._settle()
+            raise
+        if not ok:
+            self._settle()
+        return ok
+
+    def release(self):
+        self._lock.release()
+        self._settle()
+
+    def _settle(self):
+        with self._cond:
+            self.wanted -= 1
+            if not self.wanted:
+                self._cond.notify_all()
+
+    __enter__ = acquire
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def wait_idle(self, timeout):
+        """Block (without the GIL) until nobody holds or waits for the lock, at most `timeout`
+        seconds; return at once on the thread that holds it."""
+        if self._lock._is_owned():
+            return
+        with self._cond:
+            self._cond.wait_for(lambda: not self.wanted, timeout)
+
+
+class _YieldingCache(FileCache):
+    """The widening's private FileCache: it parses in slices of WIDEN_SLICE lines and, between
+    slices, waits while Store.lock is wanted, so the launch window's readers run at full speed."""
+
+    def __init__(self, lock):
+        super().__init__()
+        self._store_lock = lock
+
+    def _lines(self, acc, data):
+        lines = data.split(b"\n")
+        lk = self._store_lock
+        for i in range(0, len(lines), WIDEN_SLICE):
+            if lk.wanted:
+                lk.wait_idle(WIDEN_YIELD)
+            FileCache._lines(acc, b"\n".join(lines[i:i + WIDEN_SLICE]))
 
 # Agent-level live state (the Live view's Agents board).
 LINGER_SECS = 120        # a finished or failed agent stays on the board this long, then drops
@@ -256,7 +328,8 @@ class Session:
         self.subs = []
         self.workflows = {}
         self.journals = {}
-        self.guard = []
+        self.guard = []             # guard events in the launch window (Store._guard_in for any other)
+        self.guard_pairs = []       # (event index, event) this session wins among every held session
         self.root, self.label, self.worktree = project_of(acc.cwd)
 
     @property
@@ -265,10 +338,29 @@ class Session:
 
 
 class Store:
+    """Every session within `span` days, parsed once and kept current by refresh().
+
+    Windows: --days is the launch window (`days`); `sessions` holds exactly the sessions in it,
+    and the live board, alerts and control read only that. Each windowed payload takes its own
+    `days` (clamp_days), so two pages on different windows are both right at once: a session is
+    in a window when its main transcript was written inside it, and every per-record filter
+    (hour buckets, timeline events, guard events, subagent starts) uses the same cutoff. The
+    holding (`held`) covers `span` days: it starts at `days`, only grows (ensure_window, up to
+    `days_max`), and is what refresh() scans, links, labels and evicts by.
+
+    Locks: `lock` (StoreLock) guards the holding and every accumulator; `_widen_lock` only makes
+    widenings one at a time. A widening parses holding only `_widen_lock`, takes `lock` just for
+    the merge, and between slices of its parse steps aside while anyone wants `lock`.
+    ensure_window() runs before `lock` (or any lock taken before it, as plans' and attention's
+    are) is taken, never under it."""
+
     def __init__(self, root=None, days=7.0, project="", clock=time.time):
         self.root = root or config_dir()
         self.projects_dir = os.path.join(self.root, "projects")
         self.days = float(days)
+        self.days_max = max(DAYS_MAX, self.days)
+        self.days_options = sorted(d for d in set(DAYS_OPTIONS) | {self.days} if d <= self.days_max)
+        self.span = self.days             # the widest window held so far: grows (ensure_window), never shrinks
         self.project = (project or "").lower()
         self.clock = clock
         self.cache = FileCache()
@@ -276,13 +368,140 @@ class Store:
         self._json_cache = {}             # path -> (mtime_ns, data) for meta and workflow json
         self._tree_cache = {}             # session id -> (key, tree.build() result)
         self._route_prof = {}             # (transcript path, role) -> (signature, routing.profile())
-        self._route_cache = {}            # project -> (key, payload)
-        self.sessions = {}
-        self.lock = threading.RLock()
+        self._route_cache = {}            # (project, days) -> (key, payload)
+        self.sessions = {}                # the launch window (--days): live board, alerts, control
+        self.held = {}                    # every session within `span` days; `sessions` is a subset
+        self._guard_alt = []              # contested guard events: (index, event, overall winner, candidates)
+        self.lock = StoreLock()
+        self._widen_lock = threading.Lock()
         self._last = 0.0
         self.last_scan = {"secs": 0.0, "files": 0, "parsed": 0, "bytes": 0}
+        self.last_widen = None
+
+    # ── windows ───────────────────────────────────────────────────────────
+    def clamp_days(self, raw=None):
+        """A request's window in days: `days` when raw is absent, empty, not a number, not finite or
+        not positive; at most `days_max`. Never raises: a bad value is coerced like other GET params."""
+        if raw is None or isinstance(raw, bool):
+            return self.days
+        try:
+            v = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return self.days
+        if not math.isfinite(v) or v <= 0:
+            return self.days
+        return min(v, self.days_max)
+
+    def window_sessions(self, days=None, now=None):
+        """The held sessions inside a `days` window (None: the launch window), in scan order.
+        Complete once ensure_window(days) has run; read it under `lock`."""
+        cutoff = (self.clock() if now is None else now) - self.clamp_days(days) * 86400
+        return [s for s in self.held.values() if s.mtime >= cutoff]
+
+    def _window_get(self, sid, days, now):
+        """One held session when it is inside the window, else None. `sid` is only a dict key."""
+        s = self.held.get(sid) if isinstance(sid, str) else None
+        return s if s is not None and s.mtime >= now - days * 86400 else None
+
+    def ensure_window(self, days=None):
+        """Hold every session of a `days` window; True when this call widened the holding.
+
+        Returns at once when the span covers it (no lock taken). Otherwise one widening at a time
+        (`_widen_lock`, never `lock`): the older transcripts are parsed into private caches with
+        no lock held, then `lock` is held only to merge them and rescan. A caller asking for an
+        even wider window waits for the running widening, then widens the rest."""
+        d = self.clamp_days(days)
+        if d <= self.span:
+            return False
+        with self._widen_lock:
+            if d <= self.span:
+                return False
+            self._widen(d)
+            return True
+
+    def _widen(self, days):
+        t0 = time.time()
+        old = self.span
+        cache, side, js, files, parsed = self._prescan(self.clock() - days * 86400)
+        nbytes = cache.bytes_read + side.bytes_read
+        t1 = time.time()
+        with self.lock:
+            for p, e in cache.entries.items():
+                self.cache.entries.setdefault(p, e)
+            for p, e in side.entries.items():
+                self.side_cache.entries.setdefault(p, e)
+            for p, v in js.items():
+                self._json_cache.setdefault(p, v)
+            self.cache.bytes_read += cache.bytes_read
+            self.side_cache.bytes_read += side.bytes_read
+            self.span = max(self.span, days)
+            self.refresh(force=True)
+            lock_secs = time.time() - t1
+        self.last_widen = {"from": old, "to": self.span, "secs": round(time.time() - t0, 3), "files": files,
+                           "parsed": parsed, "bytes": nbytes, "lock_secs": round(lock_secs, 3)}
+
+    def _prescan(self, cutoff):
+        """Parse what a window back to cutoff needs and the caches lack, into private caches, with no
+        lock held: main transcripts, their subagents (workflow ones too), journals, meta and run json,
+        and the guard logs of repos only those sessions worked in. (caches..., files, parsed)."""
+        cache, side, js = _YieldingCache(self.lock), _YieldingCache(self.lock), {}
+        have, have_side = self.cache.entries, self.side_cache.entries   # membership reads only
+        files = parsed = 0
+        cwds = set()
+        for sid, (st, path, projdir) in self._find(cutoff).items():
+            if path in have:
+                continue
+            files += 1
+            acc, changed = cache.get(path, lambda p=path: Acc(p, "main"), st)
+            parsed += changed
+            if acc is None or not self._wanted(acc, projdir):
+                continue
+            n, p = self._load_subs(Session(sid, path, projdir, acc, st.st_mtime), set(), cache, side, js)
+            files += n
+            parsed += p
+            if acc.cwd:
+                cwds.add(acc.cwd)
+        for cwd in cwds:                      # guard logs of repos that only the older sessions worked in
+            for p in activity_logs(cwd):
+                if p not in have_side:
+                    side.get(p, LineLog)
+        return cache, side, js, files, parsed
 
     # ── scanning ──────────────────────────────────────────────────────────
+    def _find(self, cutoff):
+        """{session id: (stat, path, project dir)} for main transcripts written at or after cutoff.
+        Reads the file system only, so it may run without the lock."""
+        found = {}
+        try:
+            projdirs = [e for e in os.scandir(self.projects_dir) if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            projdirs = []
+        for pd in projdirs:
+            try:
+                entries = list(os.scandir(pd.path))
+            except OSError:
+                continue
+            for e in entries:
+                if not e.name.endswith(".jsonl"):
+                    continue
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if st.st_mtime < cutoff:
+                    continue
+                sid = e.name[:-6]
+                prev = found.get(sid)
+                # The same session file copied into a second project dir is a copy: keep the newest.
+                if prev is None or st.st_mtime > prev[0].st_mtime:
+                    found[sid] = (st, e.path, pd.path)
+        return found
+
+    def _wanted(self, acc, projdir):
+        """The --project filter: the working directory or the project dir's name contains the text."""
+        return not self.project or self.project in (acc.cwd or "").lower() \
+            or self.project in os.path.basename(projdir).lower()
+
     def refresh(self, force=False):
         with self.lock:
             now = self.clock()
@@ -291,69 +510,48 @@ class Store:
             t0 = time.time()
             b0 = self.cache.bytes_read + self.side_cache.bytes_read
             self._last = now
-            cutoff = now - self.days * 86400
+            cutoff = now - self.span * 86400
+            launch = now - self.days * 86400
             seen_paths = set()
-            found = {}
-            try:
-                projdirs = [e for e in os.scandir(self.projects_dir) if e.is_dir(follow_symlinks=False)]
-            except OSError:
-                projdirs = []
             nfiles = parsed = 0
-            for pd in projdirs:
-                try:
-                    entries = list(os.scandir(pd.path))
-                except OSError:
-                    continue
-                for e in entries:
-                    if not e.name.endswith(".jsonl"):
-                        continue
-                    try:
-                        st = e.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    if st.st_mtime < cutoff:
-                        continue
-                    sid = e.name[:-6]
-                    prev = found.get(sid)
-                    # The same session file copied into a second project dir is a copy: keep the newest.
-                    if prev is None or st.st_mtime > prev[0].st_mtime:
-                        found[sid] = (st, e.path, pd.path)
             sessions = {}
-            for sid, (st, path, projdir) in found.items():
+            for sid, (st, path, projdir) in self._find(cutoff).items():
                 nfiles += 1
                 acc, changed = self.cache.get(path, lambda p=path: Acc(p, "main"), st)
                 parsed += changed
                 if acc is None:
                     continue
                 seen_paths.add(path)
-                if self.project and self.project not in (acc.cwd or "").lower() \
-                        and self.project not in os.path.basename(projdir).lower():
+                if not self._wanted(acc, projdir):
                     continue
                 s = Session(sid, path, projdir, acc, st.st_mtime)
                 n, p = self._load_subs(s, seen_paths)
                 nfiles += n
                 parsed += p
                 sessions[sid] = s
-            # Drop cache entries for files that left the window.
+            # Drop cache entries for files that left the span.
             for p in list(self.cache.entries):
                 if p not in seen_paths:
                     del self.cache.entries[p]
-            self.sessions = sessions
+            self.held = sessions
+            self.sessions = {sid: s for sid, s in sessions.items() if s.mtime >= launch}
+            # Labels over everything held, so a project keeps its name in every window.
             where, labels = resolve_projects({s.acc.cwd or "" for s in sessions.values()})
             for s in sessions.values():
                 s.root, s.worktree = where[s.acc.cwd or ""]
                 s.label = labels.get(s.root) or "unknown"
             self._link()
-            self._load_guard(cutoff)
+            self._load_guard(cutoff, launch)
             self.last_scan = {"secs": round(time.time() - t0, 3), "files": nfiles, "parsed": parsed,
                               "bytes": self.cache.bytes_read + self.side_cache.bytes_read - b0}
 
-    def _json(self, path):
+    def _json(self, path, cache=None):
+        cache = self._json_cache if cache is None else cache
         try:
             st = os.stat(path)
         except OSError:
             return None
-        c = self._json_cache.get(path)
+        c = cache.get(path)
         if c and c[0] == st.st_mtime_ns:
             return c[1]
         try:
@@ -361,10 +559,14 @@ class Store:
                 data = json.load(fh)
         except (OSError, ValueError):
             data = None
-        self._json_cache[path] = (st.st_mtime_ns, data)
+        cache[path] = (st.st_mtime_ns, data)
         return data
 
-    def _load_subs(self, s, seen_paths):
+    def _load_subs(self, s, seen_paths, cache=None, side=None, js=None):
+        """Subagents, journals and workflow runs of one session. `cache`, `side` and `js` stand in
+        for the store's own caches: ensure_window parses into private ones with no lock held."""
+        cache = self.cache if cache is None else cache
+        side = self.side_cache if side is None else side
         base = os.path.join(s.projdir, s.sid)
         sdir = os.path.join(base, "subagents")
         nfiles = parsed = 0
@@ -385,7 +587,7 @@ class Store:
             for e in entries:
                 n = e.name
                 if n == "journal.jsonl" and run_id:
-                    j, _ = self.side_cache.get(e.path, Journal)
+                    j, _ = side.get(e.path, Journal)
                     if j is not None:
                         s.journals[run_id] = j
                     seen_paths.add(e.path)
@@ -397,20 +599,20 @@ class Store:
                 except OSError:
                     continue
                 nfiles += 1
-                acc, changed = self.cache.get(e.path, lambda p=e.path: Acc(p, "sub"), st)
+                acc, changed = cache.get(e.path, lambda p=e.path: Acc(p, "sub"), st)
                 parsed += changed
                 if acc is None:
                     continue
                 seen_paths.add(e.path)
                 aid = n[len("agent-"):-len(".jsonl")]
-                meta = self._json(os.path.join(d, f"agent-{aid}.meta.json")) or {}
+                meta = self._json(os.path.join(d, f"agent-{aid}.meta.json"), js) or {}
                 s.subs.append(Sub(e.path, aid, meta if isinstance(meta, dict) else {}, acc, run_id, st.st_mtime))
         wf = os.path.join(base, "workflows")
         if os.path.isdir(wf):
             try:
                 for e in os.scandir(wf):
                     if e.name.endswith(".json"):
-                        data = self._json(e.path)
+                        data = self._json(e.path, js)
                         if isinstance(data, dict):
                             s.workflows[data.get("runId") or e.name[:-5]] = data
             except OSError:
@@ -420,7 +622,7 @@ class Store:
 
     def _link(self):
         now = self.clock()
-        for s in self.sessions.values():
+        for s in self.held.values():
             by_tool = {}
             by_agent = {}
             by_run = {}
@@ -460,12 +662,20 @@ class Store:
             return "running"
         return "stopped"
 
-    def _load_guard(self, cutoff):
+    def _load_guard(self, cutoff, launch):
+        """Give each guard event at or after cutoff (the span) to the held session in its repo whose
+        tool calls sit closest, within GUARD_MATCH_SECS (a tie goes to the later session).
+
+        A window must choose among its own sessions only, so an event that several sessions match
+        keeps its candidates (_guard_alt), and _guard_in() hands it to the best one inside a window
+        that leaves the overall winner out. s.guard is the launch window's list."""
         by_root = {}
-        for s in self.sessions.values():
-            s.guard = []
+        for s in self.held.values():
+            s.guard, s.guard_pairs = [], []
             if s.acc.cwd:
                 by_root.setdefault(s.acc.cwd, []).append(s)
+        alt = []
+        idx = 0
         for root, sess in by_root.items():
             events = []
             for p in activity_logs(root):
@@ -481,22 +691,58 @@ class Store:
                 hi = max([a.last_ts for a in [s.acc] + [x.acc for x in s.subs] if a.last_ts] or [0])
                 spans.append((s, ts, lo, hi))
             for ev in events:
-                if ev["t"] < cutoff:
+                t = ev["t"]
+                if t < cutoff:
                     continue
-                best, best_d = None, GUARD_MATCH_SECS
-                for s, ts, lo, hi in spans:
-                    if not (lo - GUARD_MATCH_SECS <= ev["t"] <= hi + GUARD_MATCH_SECS):
+                idx += 1
+                cands = []                    # (distance, -scan order, session): the smallest wins
+                for order, (s, ts, lo, hi) in enumerate(spans):
+                    if not (lo - GUARD_MATCH_SECS <= t <= hi + GUARD_MATCH_SECS):
                         continue
-                    i = bisect.bisect_left(ts, ev["t"])
-                    for j in (i - 1, i):
-                        if 0 <= j < len(ts):
-                            d = abs(ts[j] - ev["t"])
-                            if d <= best_d:
-                                best, best_d = s, d
-                if best is not None:
-                    best.guard.append(ev)
+                    i = bisect.bisect_left(ts, t)       # ts[i - 1] < t <= ts[i]
+                    d = t - ts[i - 1] if i else GUARD_MATCH_SECS + 1
+                    if i < len(ts) and ts[i] - t < d:
+                        d = ts[i] - t
+                    if d <= GUARD_MATCH_SECS:
+                        cands.append((d, -order, s))
+                if not cands:
+                    continue
+                best = (min(cands, key=lambda c: c[:2]) if len(cands) > 1 else cands[0])[2]
+                best.guard_pairs.append((idx, ev))
+                if len(cands) > 1:
+                    alt.append((idx, ev, best, cands))
+        self._guard_alt = alt
+        for s in self.held.values():
+            s.guard_pairs.sort(key=lambda p: (p[1]["t"], p[0]))
+        extras = self._guard_extras(launch)
         for s in self.sessions.values():
-            s.guard.sort(key=lambda e: e["t"])
+            s.guard = self._guard_in(s, launch, extras)
+
+    def _guard_extras(self, cutoff):
+        """{session id: [(index, event)]} for one window: contested events at or after cutoff whose
+        overall winner is outside the window, each given to its best match inside. Under `lock`."""
+        out = {}
+        for idx, ev, best, cands in self._guard_alt:
+            if ev["t"] < cutoff or best.mtime >= cutoff:
+                continue
+            inside = [c for c in cands if c[2].mtime >= cutoff]
+            if inside:
+                out.setdefault(min(inside, key=lambda c: c[:2])[2].sid, []).append((idx, ev))
+        return out
+
+    @staticmethod
+    def _guard_in(s, cutoff, extras):
+        """One session's guard events in a window (its cutoff and _guard_extras(cutoff)), oldest first."""
+        pairs = [p for p in s.guard_pairs if p[1]["t"] >= cutoff]
+        more = extras.get(s.sid)
+        if more:
+            pairs = sorted(pairs + more, key=lambda p: (p[1]["t"], p[0]))
+        return [ev for _, ev in pairs]
+
+    def _guards(self, sessions, cutoff):
+        """{session id: guard events in the window} for the given sessions. Under `lock`."""
+        extras = self._guard_extras(cutoff)
+        return {s.sid: self._guard_in(s, cutoff, extras) for s in sessions}
 
     # ── shaping ───────────────────────────────────────────────────────────
     def _state(self, s, now):
@@ -555,7 +801,8 @@ class Store:
     def _title(self, a):
         return a.custom_title or a.agent_name or a.ai_title or a.summary or a.first_prompt or "(no prompt)"
 
-    def _row(self, s, now):
+    def _row(self, s, now, guard=None):
+        """One session's row; `guard` is its guard events in the request's window (default: launch)."""
         a = s.acc
         accs = [a] + [x.acc for x in s.subs]
         usage = self._usage_rows(accs)
@@ -563,8 +810,9 @@ class Store:
         models = [r["name"] for r in usage if r["tokens"] > 0]
         start = min([x.first_ts for x in accs if x.first_ts] or [s.mtime])
         end = max([x.last_ts for x in accs if x.last_ts] or [s.mtime])
+        guard = s.guard if guard is None else guard
         guard_kinds = {"deny": 0, "ask": 0, "warn": 0}
-        for g in s.guard:
+        for g in guard:
             guard_kinds[g["kind"]] += 1
         workflows = sum(1 for sp in a.spawns if sp["kind"] == "workflow")
         return {
@@ -583,7 +831,7 @@ class Store:
             "tokens": tot["tokens"], "cost": tot["cost"], "unpriced_tokens": tot["unpriced_tokens"],
             "cache_read": tot["cache_read"], "input": tot["input"], "output": tot["output"], "cache_write": tot["cache_write"],
             "output_estimated": tot["output_estimated"], "est_msgs": tot["est_msgs"], "context": a.context,
-            "guard": len(s.guard), "guard_kinds": guard_kinds,
+            "guard": len(guard), "guard_kinds": guard_kinds,
             "state": self._state(s, now), "entrypoint": a.entrypoint, "version": a.version,
             "interrupts": a.interrupts, "compactions": a.compactions,
         }
@@ -993,18 +1241,29 @@ class Store:
     # ── payloads ──────────────────────────────────────────────────────────
     def meta(self):
         self.refresh()
-        return {"root": tilde(self.root), "days": self.days, "project": self.project,
-                "now": self.clock(), "live_secs": LIVE_SECS, "pricing": pricing.table(),
+        return {"root": tilde(self.root), "days": self.days, "days_max": self.days_max,
+                "days_options": list(self.days_options), "days_span": self.span, "widen": self.last_widen,
+                "project": self.project, "now": self.clock(), "live_secs": LIVE_SECS, "pricing": pricing.table(),
                 "scan": self.last_scan, "sessions": len(self.sessions)}
 
-    def sessions_payload(self):
+    def open_window(self, days):
+        """(days, now, cutoff) for a windowed payload: clamped, held (ensure_window), refreshed.
+        Called before `lock` is taken, never under it."""
+        d = self.clamp_days(days)
+        self.ensure_window(d)
         self.refresh()
         now = self.clock()
+        return d, now, now - d * 86400
+
+    def sessions_payload(self, days=None):
+        d, now, cutoff = self.open_window(days)
         with self.lock:
-            rows = [self._row(s, now) for s in self.sessions.values()]
-            projects = self._project_list(self.sessions.values())
+            win = self.window_sessions(d, now)
+            guards = self._guards(win, cutoff)
+            rows = [self._row(s, now, guards[s.sid]) for s in win]
+            projects = self._project_list(win)
         rows.sort(key=lambda r: -r["last_write"])
-        return {"now": now, "days": self.days, "sessions": rows, "projects": projects, "scan": self.last_scan}
+        return {"now": now, "days": d, "sessions": rows, "projects": projects, "scan": self.last_scan}
 
     @staticmethod
     def _project_list(sessions):
@@ -1056,15 +1315,17 @@ class Store:
                            "spark_mins": SPARK_MINS, "spark_top": SPARK_TOP, "rate_secs": RATE_SECS,
                            "feed_max": FEED_MAX}}
 
-    def scope_sessions(self, project):
-        """Sessions in one project (exact label match), or all of them for ''.
+    def scope_sessions(self, project, days=None, now=None):
+        """Sessions of a `days` window (None: the launch window) in one project (exact label
+        match), or all of them for ''.
 
         `project` comes from a query string: it is compared with labels and
         never used as a path, so any value is safe and an unknown one just
         matches nothing."""
+        win = self.window_sessions(days, now)
         if not project:
-            return list(self.sessions.values())
-        return [s for s in self.sessions.values() if s.label == project]
+            return win
+        return [s for s in win if s.label == project]
 
     @staticmethod
     def _blank_group(project, worktree):
@@ -1094,11 +1355,9 @@ class Store:
         g["error_rate"] = round(g["tool_errors"] / g["tool_calls"], 4) if g["tool_calls"] else 0.0
         return g
 
-    def overview_payload(self, project=""):
+    def overview_payload(self, project="", days=None):
         project = (project or "")[:200]
-        self.refresh()
-        now = self.clock()
-        cutoff = now - self.days * 86400
+        d, now, cutoff = self.open_window(days)
         hc = int(cutoff // 3600)
         hours = {}
         models = {}
@@ -1112,9 +1371,11 @@ class Store:
         guard = {"deny": 0, "ask": 0, "warn": 0}
         tools_main, tools_sub = [], []
         with self.lock:
+            win = self.window_sessions(d, now)
             project_list = [{"project": p["project"], "sessions": p["sessions"], "worktrees": len(p["worktrees"])}
-                            for p in self._project_list(self.sessions.values())]
-            scoped = self.scope_sessions(project)
+                            for p in self._project_list(win)]
+            scoped = win if not project else [s for s in win if s.label == project]
+            guards = self._guards(scoped, cutoff)
             for s in scoped:
                 g = self._blank_group(s.label, s.worktree)
                 g["sessions"] = 1
@@ -1132,10 +1393,10 @@ class Store:
                 g["subagents"] = len(win_subs)
                 tot["prompts"] += s.acc.prompts
                 g["prompts"] = s.acc.prompts
-                for ev in s.guard:
+                for ev in guards[s.sid]:
                     guard[ev["kind"]] += 1
                     g["guard_kinds"][ev["kind"]] += 1
-                g["guard"] = len(s.guard)
+                g["guard"] = len(guards[s.sid])
                 started = min([a.first_ts for a, _ in accs if a.first_ts] or [s.mtime])
                 hs = int(started // 3600)
                 if hs >= hc:
@@ -1222,7 +1483,7 @@ class Store:
         tot["active"] = round(tot["active"], 1)
         known = not project or any(p["project"] == project for p in project_list)
         return {
-            "now": now, "days": self.days, "cutoff": cutoff, "totals": tot, "guard": guard,
+            "now": now, "days": d, "cutoff": cutoff, "totals": tot, "guard": guard,
             "scope": {"project": project, "known": known},
             "project_list": project_list,
             "hours": [{"h": h, **v} for h, v in sorted(hours.items())],
@@ -1247,70 +1508,68 @@ class Store:
         self._tree_cache[s.sid] = (key, t)
         return t
 
-    def routing_payload(self, project=""):
-        """routing.build() for one scope, rebuilt when a transcript grew or every 15 s."""
+    def routing_payload(self, project="", days=None):
+        """routing.build() for one scope and window, rebuilt when a transcript grew or every 15 s."""
         project = (project or "")[:200]
-        self.refresh()
-        now = self.clock()
+        d, now, _cutoff = self.open_window(days)
         with self.lock:
-            key = (sum(s.acc.api_msgs + sum(x.acc.api_msgs for x in s.subs) for s in self.sessions.values()),
-                   len(self.sessions), int(now // 15))
-            hit = self._route_cache.get(project)
+            key = (sum(s.acc.api_msgs + sum(x.acc.api_msgs for x in s.subs) for s in self.held.values()),
+                   len(self.held), int(now // 15))
+            hit = self._route_cache.get((project, d))
             if hit and hit[0] == key:
                 return hit[1]
-            out = routing.build(self, project, now, self._route_prof)
+            out = routing.build(self, project, now, self._route_prof, d)
             if len(self._route_cache) > 32:
                 self._route_cache.clear()
-            self._route_cache[project] = (key, out)
+            self._route_cache[(project, d)] = (key, out)
             return out
 
-    def tree_payload(self, sid):
-        self.refresh()
-        now = self.clock()
+    def tree_payload(self, sid, days=None):
+        d, now, _cutoff = self.open_window(days)
         with self.lock:
-            s = self.sessions.get(sid)
+            s = self._window_get(sid, d, now)
             if s is None:
                 return None
             t = self.agent_tree(s, now)
-            return {**t, "now": now, "effort": agent_tree.session_effort(s, t["nodes"][0] if t["nodes"] else None)}
+            return {**t, "now": now, "days": d,
+                    "effort": agent_tree.session_effort(s, t["nodes"][0] if t["nodes"] else None)}
 
-    def session_payload(self, sid):
-        self.refresh()
-        now = self.clock()
+    def session_payload(self, sid, days=None):
+        d, now, cutoff = self.open_window(days)
         with self.lock:
-            s = self.sessions.get(sid)
+            s = self._window_get(sid, d, now)
             if s is None:
                 return None
-            row = self._row(s, now)
+            guard = self._guards([s], cutoff)[s.sid]
+            row = self._row(s, now, guard)
             tree, orphans = self._tree(s, now)
             usage_main = self._usage_rows([s.acc])
             usage_sub = self._usage_rows([x.acc for x in s.subs])
             at = self.agent_tree(s, now)
             return {
-                "now": now, "session": row, "events": s.acc.events, "dropped_events": s.acc.dropped_events,
+                "now": now, "days": d, "session": row, "events": s.acc.events, "dropped_events": s.acc.dropped_events,
                 "tree": tree, "orphans": orphans,
                 "agents": {k: v for k, v in at["summary"].items() if k not in ("matrix", "thinking", "levels", "efforts")},
                 "effort": agent_tree.session_effort(s, at["nodes"][0] if at["nodes"] else None),
                 "tools": self._tools([s.acc], [x.acc for x in s.subs]),
                 "usage": {"main": usage_main, "sub": usage_sub,
                           "all": self._usage_rows([s.acc] + [x.acc for x in s.subs])},
-                "guard": s.guard, "cost_state": s.acc.cost_state,
+                "guard": guard, "cost_state": s.acc.cost_state,
                 "bad_lines": s.acc.bad_lines + sum(x.acc.bad_lines for x in s.subs),
                 "path": tilde(s.path),
             }
 
-    def agent_payload(self, sid, agent_id):
-        self.refresh()
-        now = self.clock()
+    def agent_payload(self, sid, agent_id, days=None):
+        d, now, _cutoff = self.open_window(days)
         with self.lock:
-            s = self.sessions.get(sid)
+            s = self._window_get(sid, d, now)
             if s is None:
                 return None
             x = next((x for x in s.subs if x.agent_id == agent_id), None)
             if x is None:
                 return None
             node = next((n for n in self.agent_tree(s, now)["nodes"] if n["id"] == "a:" + agent_id), None) or {}
-            return {"now": now, "session_id": sid, "session_title": clip(self._title(s.acc), 200),
+            return {"now": now, "days": d, "session_id": sid, "session_title": clip(self._title(s.acc), 200),
                     "agent": self._sub_row(s, x, now), "events": x.acc.events,
                     "node": {k: node.get(k) for k in ("effort", "thinking", "sub", "level", "link", "fast_msgs", "models", "effort_log")},
                     "dropped_events": x.acc.dropped_events, "tools": self._tools([x.acc], []),

@@ -1,0 +1,2045 @@
+#!/usr/bin/env python3
+"""cc-docs-migrate: bring a project's Markdown docs in line with docs/guides/docs-standard.md.
+
+Reads (bounded, never following a symlink): every *.md under <project>/docs/ (with
+docs/superpowers/) and <project>/vault/, the root README.md, CLAUDE.md and AGENTS.md (as link
+sources only), factory/orders/FO-*.md (to find an order that already names a task), the
+project's tracked non-Markdown files (to find docs the code names; the check fails closed: past
+its caps --apply is refused), and read-only git: rev-parse, status, one `log` pass and one
+`ls-files` pass. Plans are parsed with lib/cc_dash/plans.py, the parser cc-dash's Plans view uses.
+PROJECT must be the top of its git work tree.
+
+Plans, per document: the keys it lacks among `type`, `title` (only when the body has no H1),
+`created` (the file name's date, else the commit that added it, never in a shallow clone) and,
+with --with-orders, `order`; existing keys and values are never changed. Link targets that do not
+resolve are rewritten when exactly one existing file fits, except on a checkbox or heading line
+and anywhere under vault/. Each doc is planned as a write, ok, or a skip with its reason. Notes it
+never acts on: broken links, orphans, ADR candidates, `Status:` lines and tasks that could be
+orders. A vault note that has frontmatter is never written.
+
+The dry run (the default) writes nothing anywhere. --apply writes only: the planned docs under
+docs/ and vault/notes/ (each atomically, through a fresh sibling file renamed over it, after
+checking the file still has the bytes it was planned from), their originals as
+docs/.migration-backup/<run>/<path>.orig (a folder that ignores itself in git), new orders
+through `cc-factory new` (then their body and `source`; only with --with-orders, from the top of
+the main checkout), and one JSON line per write appended to docs/.migration-log.jsonl. --undo puts
+one run back from that log, file by file, by hash. It never deletes, renames or moves a file,
+never touches code, vault/raw/, vault/inbox/, vault/daily/, vault/synthesis/ or the vault's index
+and log, never converts a wikilink, never runs a shell, never writes the factory ledger (only
+cc-factory does), and never writes a file whose plans.py parse (title, goal, spec, mode, tasks
+and their titles, steps with their text and ticks, milestones) would change. Python 3 standard
+library only.
+
+Usage:
+  cc-docs-migrate PROJECT [--apply] [--with-orders] [--only specs|plans|vault|docs] [--json] [--allow-dirty]
+  cc-docs-migrate PROJECT --undo LOG [--run RUN_ID] [--json]      (a relative LOG is read from PROJECT)
+
+Exit codes: 0 done (dry run, apply, undo, nothing to do), 1 usage error, 2 refused
+(BLOCKED: <reason>. Suggestion: <what to do>. on stderr; nothing written). --apply is refused
+outside git, on a dirty tree (unless --allow-dirty), and when the code check is incomplete.
+"""
+import os
+import sys
+
+# Run isolated, exactly as bin/cc-factory does: re-execute once as
+# `<python> -I <this script's real path> ...` without PYTHON* or LD_* variables, so no
+# PYTHONPATH, user site directory, current directory or preloaded library can put other
+# code into a tool that writes a project's docs.
+if not sys.flags.isolated:
+    exe = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "LD_"))}
+    os.execve(exe, [exe, "-I", os.path.realpath(__file__)] + sys.argv[1:], env)
+
+sys.dont_write_bytecode = True
+sys.pycache_prefix = os.path.join(os.devnull, "cc-docs-migrate-no-pycache")
+# The repo is this script's parent's parent (realpath so a symlinked script finds lib/).
+CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+import argparse  # noqa: E402
+import datetime  # noqa: E402
+import errno  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import posixpath  # noqa: E402
+import re  # noqa: E402
+import secrets  # noqa: E402
+import stat  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+import urllib.parse  # noqa: E402
+
+sys.path.insert(0, os.path.join(CC_TOOL_DIR, "lib"))
+try:
+    from cc_dash import plans  # noqa: E402
+except Exception as e:  # noqa: BLE001 - any failure to load the parser is one message
+    print("cc-docs-migrate: cannot load %s (%s: %s)" % (os.path.join(CC_TOOL_DIR, "lib", "cc_dash", "plans.py"),
+                                                       type(e).__name__, e), file=sys.stderr)
+    sys.exit(1)
+
+PROG = "cc-docs-migrate"
+FACTORY = os.path.join(CC_TOOL_DIR, "bin", "cc-factory")
+MAX_DOC_BYTES = 4 * 1024 * 1024        # a doc above this is skipped `too large`
+MAX_ORDER_BYTES = 1024 * 1024          # an order file above this is not looked at
+MAX_CODE_BYTES = 8 * 1024 * 1024       # a tracked file above this is not scanned (and named in a warning)
+MAX_CODE_TOTAL = 512 * 1024 * 1024     # all tracked files together; past it the check is incomplete
+MAX_CODE_FILES = 50000                 # tracked files to scan; past it the check is incomplete
+MAX_MD_FILES = 5000
+MAX_DEPTH = 10
+MAX_FM_LINES = 100                     # the closing `---` within lines 2..101 (lib/cc_dash/factory.py reads to it)
+MAX_LOG_BYTES = 64 * 1024 * 1024
+MAX_HASH_BYTES = 16 * 1024 * 1024      # a current file read for its hash (anything bigger cannot be ours)
+GIT_TIMEOUT = 30
+FACTORY_TIMEOUT = 60
+TREES = ("specs", "plans", "vault", "docs")
+SKIP_DIRS = {"node_modules", "venv", "__pycache__", "dist", "build", "vendor", "target", "worktrees", "Pods"}
+NOT_COVERED = {"readme.md", "changelog.md", "claude.md", "agents.md"}
+ROOT_SOURCES = ("README.md", "CLAUDE.md", "AGENTS.md")
+ENTRY_POINTS = {"readme.md", "index.md", "start-here.md", "glossary.md"}
+STATUS_TYPES = {"spec", "adr", "prd", "guide", "reference", "report", "note"}   # whose Status: line is noted
+KEY_ORDER = ("type", "title", "created", "order")   # the only keys the migration ever adds, in this order
+LOG_REL = "docs/.migration-log.jsonl"
+BACKUP_REL = "docs/.migration-backup"
+WRITABLE = ("docs/", "vault/notes/", "factory/orders/")   # the only places a log entry may restore
+_GIT_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+             "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_RFLAGS = os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC
+BOM = "\ufeff"
+
+
+class Refuse(Exception):
+    """A refusal: BLOCKED on stderr, exit 2."""
+
+    def __init__(self, reason, suggestion=""):
+        Exception.__init__(self, reason)
+        self.reason, self.suggestion = reason, suggestion
+
+
+class Usage(Exception):
+    """A usage error: message on stderr, exit 1."""
+
+
+def refuse(reason, suggestion=""):
+    raise Refuse(reason, suggestion)
+
+
+def block_message(reason, suggestion=""):
+    """`BLOCKED: <reason>. Suggestion: <what to do>.` (the shape every cc_tool guard uses)."""
+    reason = reason.strip()
+    if not reason.endswith((".", "!", "?")):
+        reason += "."
+    msg = "BLOCKED: " + reason
+    if suggestion:
+        suggestion = suggestion.strip()
+        if not suggestion.endswith((".", "!", "?")):
+            suggestion += "."
+        msg += " Suggestion: " + suggestion
+    return msg
+
+
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def one_line(s, n=300):
+    """Printable single-line text: control characters (escape sequences) gone, clipped with '...'."""
+    s = " ".join(_CTRL.sub(" ", s if isinstance(s, str) else ("" if s is None else str(s))).split())
+    return s if len(s) <= n else s[: max(0, n - 3)] + "..."
+
+
+def utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def new_run_id():
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3)
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def this_python():
+    return os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
+
+
+# ── Git (read-only commands, argument lists, no repository redirection) ───────
+def git(args, cwd):
+    """CompletedProcess (bytes) of a read-only git command, or None when git is missing or timed out.
+    GIT_OPTIONAL_LOCKS=0 keeps `git status` from refreshing the index, so even it writes nothing."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_VARS}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        return subprocess.run(["git"] + list(args), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def git_info(root):
+    """{inside, prefix, top, main, shallow}: whether PROJECT is in a git work tree, its path below
+    the top level ("" or "sub/"), the top level (realpath), whether PROJECT is the top of the main
+    checkout (where cc-factory writes), and whether the clone is shallow (or that is unknown)."""
+    info = {"inside": False, "prefix": "", "top": None, "main": False, "shallow": True}
+    r = git(["rev-parse", "--is-inside-work-tree", "--show-prefix", "--show-toplevel", "--git-dir",
+             "--git-common-dir"], root)
+    if r is None or r.returncode != 0:
+        return info
+    out = os.fsdecode(r.stdout).split("\n")
+    if len(out) < 5 or out[0].strip() != "true":
+        return info
+    info["inside"] = True
+    info["prefix"] = out[1]
+    info["top"] = os.path.realpath(out[2])
+    gd, cd = os.path.join(root, out[3]), os.path.join(root, out[4])
+    info["main"] = info["top"] == root and os.path.realpath(gd) == os.path.realpath(cd)
+    s = git(["rev-parse", "--is-shallow-repository"], root)
+    # Only a plain "false" counts as a full history: an old git that echoes the flag back, or a
+    # failure, keeps git dates out of `created`.
+    info["shallow"] = not (s is not None and s.returncode == 0 and os.fsdecode(s.stdout).strip() == "false")
+    return info
+
+
+def git_dirty(root, prefix):
+    """The `git status` entries that make the tree dirty (the migration's own log and backups
+    excluded), or None when status could not run."""
+    r = git(["status", "--porcelain=v1", "-z", "--untracked-files=normal"], root)
+    if r is None or r.returncode != 0:
+        return None
+    items = os.fsdecode(r.stdout).split("\0")
+    dirty, i = [], 0
+    while i < len(items):
+        entry = items[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        xy, path = entry[:2], entry[3:]
+        if "R" in xy or "C" in xy:
+            i += 1  # the original path of a rename or copy follows
+        if path == prefix + LOG_REL or path.startswith(prefix + BACKUP_REL + "/"):
+            continue
+        dirty.append(path)
+    return dirty
+
+
+def git_head(root):
+    r = git(["rev-parse", "--verify", "-q", "HEAD"], root)
+    if r is None or r.returncode != 0:
+        return None
+    return os.fsdecode(r.stdout).strip() or None
+
+
+def git_tracked(root):
+    """Every tracked path (relative to PROJECT), or None when ls-files failed (the code check is then
+    incomplete, never silently empty)."""
+    r = git(["ls-files", "-z"], root)
+    if r is None or r.returncode != 0:
+        return None
+    return [os.fsdecode(p) for p in r.stdout.split(b"\0") if p]
+
+
+def git_added(root, prefix):
+    """{root-relative path: YYYY-MM-DD it was added}, from one `git log` pass, newest first, so the
+    last date seen for a path is its oldest add."""
+    r = git(["-c", "core.quotePath=false", "-c", "log.showSignature=false", "log", "--diff-filter=A",
+             "--format=@@%as", "--name-only", "--", "docs", "vault"], root)
+    out = {}
+    if r is None or r.returncode != 0:
+        return out
+    date = None
+    for line in os.fsdecode(r.stdout).split("\n"):
+        if line.startswith("@@"):
+            date = line[2:].strip()
+            continue
+        if not line or date is None:
+            continue
+        if prefix:
+            if not line.startswith(prefix):
+                continue
+            line = line[len(prefix):]
+        out[line] = date
+    return out
+
+
+# ── Files ─────────────────────────────────────────────────────────────────────
+class NotRegular(OSError):
+    """The path is there but is not a regular file (a FIFO, a device, a directory)."""
+
+
+def read_regular(path, limit):
+    """(bytes, permission bits) of a regular file opened O_NOFOLLOW|O_NONBLOCK, at most limit+1 bytes
+    (so a caller can tell `too large`). OSError for a symlink (ELOOP) or a missing file, NotRegular
+    for anything that is not a regular file."""
+    fd = os.open(path, _RFLAGS)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise NotRegular(path)
+        chunks, n = [], 0
+        while n <= limit:
+            b = os.read(fd, min(1 << 20, limit + 1 - n))
+            if not b:
+                break
+            chunks.append(b)
+            n += len(b)
+        return b"".join(chunks), stat.S_IMODE(st.st_mode)
+    finally:
+        os.close(fd)
+
+
+def current_hash(path):
+    """sha256 of a regular file's bytes (O_NOFOLLOW), or None when it is missing, a symlink or other."""
+    try:
+        data, _ = read_regular(path, MAX_HASH_BYTES)
+    except OSError:
+        return None
+    return sha256(data)
+
+
+def real_dir(path):
+    """True for a real directory (a symlink to one does not count)."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def real_dirs_down(root, rel):
+    """True when every directory from root down to the file `rel` is a real directory."""
+    cur = root
+    for part in rel.split("/")[:-1]:
+        cur = os.path.join(cur, part)
+        if not real_dir(cur):
+            return False
+    return True
+
+
+def mkdir_real(path):
+    """mkdir (0755) unless it exists; True only when `path` is then a real directory."""
+    try:
+        os.mkdir(path, 0o755)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    return real_dir(path)
+
+
+def write_new(path, data, mode=0o644):
+    """Create `path` with O_EXCL|O_NOFOLLOW and exactly `mode` (FileExistsError when anything is there)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, mode)
+    try:
+        os.fchmod(fd, mode)
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+    finally:
+        os.close(fd)
+
+
+def unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def write_atomic(path, data, mode, expect):
+    """Replace `path` through a fresh sibling `.<name>.<pid>.<hex>.tmp`, but only when the target's
+    sha256 is still `expect` immediately before the rename. False (temp removed) when it is not."""
+    d, name = os.path.split(path)
+    tmp = os.path.join(d, ".%s.%d.%s.tmp" % (name, os.getpid(), secrets.token_hex(4)))
+    write_new(tmp, data, mode)
+    try:
+        if current_hash(path) != expect:
+            unlink_quiet(tmp)
+            return False
+        os.replace(tmp, path)
+    except OSError:
+        unlink_quiet(tmp)
+        raise
+    return True
+
+
+def append_line(path, obj):
+    """One JSON object as one line, one os.write, O_APPEND|O_CREAT|O_NOFOLLOW, 0644."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | _NOFOLLOW | _CLOEXEC, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            refuse("%s is not a regular file" % one_line(path), "remove whatever replaced the migration log")
+        os.write(fd, (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def inside(path, root):
+    return path == root or path.startswith(root + os.sep)
+
+
+# ── Text: lines, fences, frontmatter, values ──────────────────────────────────
+_FENCE = plans._FENCE
+_CB = plans._CB
+_ATX = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
+_KEY_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:")
+_YAML_START = set("-?:,[]{}#&*!|>'\"%@`")
+_YAML_WORDS = {"true", "false", "yes", "no", "on", "off", "null", "~", "y", "n"}
+_NUMLIKE = re.compile(r"^[-+]?(\d[\d_]*\.?\d*|\.\d+)([eE][-+]?\d+)?$|^0[xob][0-9a-fA-F_]+$")
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DECODER = json.JSONDecoder()
+_DQ_FALLBACK = re.compile(r'"(.*?)"\s*(?:\s#.*)?', re.DOTALL)   # lib/cc_dash/factory.py's _DQ_FALLBACK_RE
+_COMMENT = re.compile(r"(?:^|\s)#")                             # lib/cc_dash/factory.py's _COMMENT_RE
+
+
+def fenced_lines(lines, start):
+    """Indexes (>= start) of fence lines and the lines inside fenced code, by plans.py's rule:
+    ``` or ~~~ opens, the same character at least as long with nothing after it closes."""
+    out, fence = set(), None
+    for i in range(start, len(lines)):
+        s = lines[i].rstrip("\r")
+        fm = _FENCE.match(s)
+        if fence is not None:
+            out.add(i)
+            if fm and fm.group(1)[0] == fence[0] and len(fm.group(1)) >= fence[1] and not fm.group(2).strip():
+                fence = None
+            continue
+        if fm:
+            fence = (fm.group(1)[0], len(fm.group(1)))
+            out.add(i)
+    return out
+
+
+def parse_frontmatter(lines):
+    """None without frontmatter; a `malformed frontmatter: ...` string; else {close, keys} where
+    keys maps each lower-cased top-level key to its line index (the first one wins)."""
+    if not lines or lines[0].rstrip() != "---":
+        return None
+    close = next((i for i in range(1, min(len(lines), MAX_FM_LINES + 1)) if lines[i].rstrip() == "---"), None)
+    if close is None:
+        return "malformed frontmatter: no closing --- within %d lines" % MAX_FM_LINES
+    keys = {}
+    for i in range(1, close):
+        s = lines[i].rstrip("\r")
+        if not s.strip() or s[0] in "# \t":
+            continue
+        m = _KEY_LINE.match(s)
+        if not m:
+            return "malformed frontmatter: line %d is not key: value" % (i + 1)
+        keys.setdefault(m.group(1).lower(), i)
+    return {"close": close, "keys": keys}
+
+
+def scalar(v):
+    """A frontmatter value as text, by lib/cc_dash/factory.py's _scalar rule: JSON-decoded when
+    double-quoted (unparseable escapes fall back to the text between the quotes), '' unescaped when
+    single-quoted, else the text before a `#` that starts the value or follows whitespace."""
+    v = v.strip()
+    if v.startswith('"'):
+        try:
+            obj, _ = _DECODER.raw_decode(v)
+            if isinstance(obj, str):
+                return obj
+        except ValueError:
+            pass
+        m = _DQ_FALLBACK.fullmatch(v)
+        return m.group(1) if m else v[1:]
+    if v.startswith("'"):
+        out, i = [], 1
+        while i < len(v):
+            if v[i] == "'":
+                if v[i + 1:i + 2] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                break
+            out.append(v[i])
+            i += 1
+        return "".join(out)
+    m = _COMMENT.search(v)
+    return (v[:m.start()] if m else v).strip()
+
+
+def split_flow(inner):
+    """The raw items of a one-line flow list's inside (`a, "b, c"`), or None when it is not a plain
+    flow list (nested brackets or braces, an open quote)."""
+    items, cur, q, i = [], [], None, 0
+    while i < len(inner):
+        ch = inner[i]
+        if q:
+            cur.append(ch)
+            if q == '"' and ch == "\\" and i + 1 < len(inner):
+                cur.append(inner[i + 1])
+                i += 2
+                continue
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+            cur.append(ch)
+        elif ch == ",":
+            items.append("".join(cur).strip())
+            cur = []
+        elif ch in "[]{}":
+            return None
+        else:
+            cur.append(ch)
+        i += 1
+    if q:
+        return None
+    items.append("".join(cur).strip())
+    return [x for x in items if x]
+
+
+def yaml_value(v):
+    """A frontmatter value: JSON-quoted whenever a plain YAML scalar would be ambiguous (cc-factory's
+    yaml_title rule); a YYYY-MM-DD date stays plain."""
+    if _DATE.match(v):
+        return v
+    if (not v or v[0] in _YAML_START or ":" in v or "#" in v or v != v.strip() or v.lower() in _YAML_WORDS
+            or _NUMLIKE.match(v) or _CTRL.search(v)):
+        return json.dumps(v, ensure_ascii=False)
+    return v
+
+
+def rel_link(target_rel, from_dir_rel):
+    """The posix path from one root-relative directory to a root-relative path (no getcwd involved)."""
+    return posixpath.relpath("/" + target_rel, "/" + from_dir_rel)
+
+
+def norm_rel(p):
+    """A root-relative path as frontmatter writes it: no leading ./ or /, normalised."""
+    p = (p or "").strip()
+    while p.startswith("./") or p.startswith("/"):
+        p = p[2:] if p.startswith("./") else p[1:]
+    return posixpath.normpath(p) if p else ""
+
+
+def clean_heading(t):
+    """Heading text for a title: [text](url) -> text, ** __ ` removed, trailing #s gone, one line, <= 200."""
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = t.replace("**", "").replace("__", "").replace("`", "")
+    t = re.sub(r"(^|[ \t])#+[ \t]*$", "", t)
+    t = " ".join(_CTRL.sub(" ", t).split())
+    return t[:200].rstrip()
+
+
+# ── One document ──────────────────────────────────────────────────────────────
+class Doc:
+    """One walked Markdown file (or a root README/CLAUDE/AGENTS link source): what was read, what
+    the migration decided, and what it wrote."""
+
+    def __init__(self, rel, path, kind):
+        self.rel, self.path, self.kind = rel, path, kind      # kind: file | symlink | symdir | other | root
+        self.tree = tree_of(rel)
+        self.name = posixpath.basename(rel.rstrip("/"))
+        self.parts = [p.lower() for p in rel.split("/")[:-1]]
+        self.data = self.text = self.lines = self.fm = None
+        self.mode, self.bom, self.nl, self.body = 0o644, False, "\n", 0
+        self.read_skip = None     # too large | not UTF-8 | empty file | malformed frontmatter: ...
+        self.fence, self.heads, self._parsed = set(), [], None
+        self.skip = None
+        self.type, self.title = None, None
+        self.adds = {}            # key -> parsed value (formatted for YAML only when written)
+        self.fixes, self.broken, self.targets = [], [], []
+        self.order, self.candidate = None, False   # candidate: open work noted, no --with-orders
+        self.open_items, self.done_items = [], 0
+        self.new_bytes, self.plan, self.written, self.notes = None, "ok", False, []
+
+    # -- reading
+    def load(self):
+        """Read and split the file; False when it is not a regular file (then `kind` says what it is)."""
+        try:
+            data, self.mode = read_regular(self.path, MAX_DOC_BYTES)
+        except OSError:
+            self.kind = "symlink" if os.path.islink(self.path) else "other"
+            return False
+        self.data = data
+        if len(data) > MAX_DOC_BYTES:
+            self.read_skip = "too large"
+            return True
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            # Never written; decoded leniently only so that its links still count against orphans.
+            self.read_skip, text = "not UTF-8", data.decode("utf-8", "replace")
+        if text.startswith(BOM):
+            self.bom, text = True, text[1:]
+        self.text = text
+        self.lines = text.split("\n")
+        self.nl = "\r\n" if self.lines[0].endswith("\r") and len(self.lines) > 1 else "\n"
+        if not text.strip():
+            self.read_skip = self.read_skip or "empty file"
+            return True
+        fm = parse_frontmatter(self.lines)
+        if isinstance(fm, str):
+            self.read_skip = self.read_skip or fm
+        else:
+            self.fm = fm
+            self.body = fm["close"] + 1 if fm else 0
+        self.fence = fenced_lines(self.lines, self.body)
+        for i in range(self.body, len(self.lines)):
+            if i in self.fence:
+                continue
+            m = _ATX.match(self.lines[i].rstrip("\r"))
+            if m:
+                self.heads.append((i, len(m.group(1)), m.group(2)))
+        return True
+
+    @property
+    def scannable(self):
+        """Text whose links count for orphans: anything read, skipped or not (not a too-large file)."""
+        return self.text is not None
+
+    @property
+    def full(self):
+        return (BOM if self.bom else "") + self.text
+
+    @property
+    def parsed(self):
+        if self._parsed is None:
+            self._parsed = plans.parse_plan(self.full)
+        return self._parsed
+
+    # -- frontmatter access
+    def has_key(self, key):
+        return bool(self.fm) and key in self.fm["keys"]
+
+    def fm_raw(self, key):
+        """The raw text after `key:` on its line, or None."""
+        if not self.has_key(key):
+            return None
+        s = self.lines[self.fm["keys"][key]].rstrip("\r")
+        return s.split(":", 1)[1]
+
+    def fm_value(self, key):
+        raw = self.fm_raw(key)
+        return None if raw is None else scalar(raw)
+
+    def fm_list(self, key):
+        """A list value: a flow list, an indented block list below the key, or one scalar."""
+        raw = self.fm_raw(key)
+        if raw is None:
+            return []
+        v = raw.strip()
+        if v.startswith("["):
+            m = re.match(r"^\[(.*)\][ \t]*$", v)
+            items = split_flow(m.group(1)) if m else None
+            return [scalar(x) for x in items] if items else []
+        if v:
+            return [scalar(v)]
+        out = []
+        for i in range(self.fm["keys"][key] + 1, self.fm["close"]):
+            s = self.lines[i].rstrip("\r")
+            if not s[:1].isspace():
+                break
+            st = s.strip()
+            if st.startswith("- "):
+                out.append(scalar(st[2:]))
+        return out
+
+    def first_h1(self):
+        return next((t for (_, lvl, t) in self.heads if lvl == 1), "")
+
+
+def tree_of(rel):
+    if rel.startswith("docs/superpowers/specs/"):
+        return "specs"
+    if rel.startswith("docs/superpowers/plans/"):
+        return "plans"
+    if rel.startswith("vault/"):
+        return "vault"
+    return "docs"
+
+
+# ── Walk ──────────────────────────────────────────────────────────────────────
+def walk(root, warnings):
+    """Every *.md under docs/ and vault/ (no symlink followed, dot-dirs and build dirs skipped, depth
+    <= 10, at most 5000 files), plus one entry per symlinked directory."""
+    out, count, dropped = [], [0], [False]
+
+    def visit(rel, depth):
+        try:
+            with os.scandir(os.path.join(root, rel)) as it:
+                ents = sorted(it, key=lambda e: e.name)
+        except OSError:
+            return
+        for e in ents:
+            r = rel + "/" + e.name
+            is_md = e.name.lower().endswith(".md")
+            try:
+                link = e.is_symlink()
+                is_dir = (not link) and e.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if link:
+                if is_md:
+                    if count[0] >= MAX_MD_FILES:
+                        dropped[0] = True
+                        continue
+                    count[0] += 1
+                    out.append(Doc(r, os.path.join(root, r), "symlink"))
+                elif e.name[:1] != "." and e.name not in SKIP_DIRS and os.path.isdir(os.path.join(root, r)):
+                    out.append(Doc(r + "/", os.path.join(root, r), "symdir"))
+                continue
+            if is_dir:
+                if e.name[:1] != "." and e.name not in SKIP_DIRS and depth + 1 <= MAX_DEPTH:
+                    visit(r, depth + 1)
+                continue
+            if not is_md:
+                continue
+            if count[0] >= MAX_MD_FILES:
+                dropped[0] = True
+                continue
+            count[0] += 1
+            try:
+                regular = e.is_file(follow_symlinks=False)
+            except OSError:
+                regular = False
+            out.append(Doc(r, os.path.join(root, r), "file" if regular else "other"))
+
+    for top in ("docs", "vault"):
+        p = os.path.join(root, top)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            out.append(Doc(top + "/", p, "symdir"))
+        elif stat.S_ISDIR(st.st_mode):
+            visit(top, 0)
+        else:
+            warn(warnings, "is not a directory; nothing under it was looked at", top)
+    if dropped[0]:
+        warn(warnings, "walk stopped at %d Markdown files; the rest were not looked at" % MAX_MD_FILES)
+    return out
+
+
+# ── Code references ───────────────────────────────────────────────────────────
+_CODE_TOKEN = re.compile(rb"[A-Za-z0-9_./-]*[A-Za-z0-9_-]\.md\b")
+
+
+def code_tokens(root, tracked, warnings):
+    """({normalised .md token: (index, first tracked non-Markdown file that names it)}, complete).
+    Fails closed: past 50000 files or 512 MiB (or without ls-files) `complete` is False and --apply
+    is refused. A file over 8 MiB, or one that cannot be read, is not scanned and is named in one
+    warning, without refusing. Files are read whole. The migration's own log and backups are not
+    code, even when committed (the log names every doc it wrote)."""
+    tok = {}
+    if tracked is None:
+        warn(warnings, "code check incomplete: git ls-files failed; --apply refuses")
+        return tok, False
+    files = [r for r in tracked if not (r.lower().endswith((".md", ".markdown")) or r == LOG_REL
+                                        or r.startswith(BACKUP_REL + "/"))]
+    complete = True
+    if len(files) > MAX_CODE_FILES:
+        warn(warnings, "code check incomplete: %d tracked files, only the first %d scanned for doc names; "
+                       "--apply refuses" % (len(files), MAX_CODE_FILES))
+        files, complete = files[:MAX_CODE_FILES], False
+    total, unscanned = 0, []
+    for n, rel in enumerate(files, 1):
+        try:
+            fd = os.open(os.path.join(root, rel), _RFLAGS)
+        except OSError as e:
+            if e.errno not in (errno.ENOENT, errno.ELOOP):   # gone from the work tree, or a symlink
+                unscanned.append("%s (unreadable)" % rel)
+            continue
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                continue                                     # a submodule's directory, a FIFO
+            if st.st_size > MAX_CODE_BYTES:
+                unscanned.append("%s (%d MiB)" % (rel, st.st_size >> 20))
+                continue
+            if total + st.st_size > MAX_CODE_TOTAL:
+                warn(warnings, "code check incomplete: tracked files pass %d MiB at %s; --apply refuses"
+                     % (MAX_CODE_TOTAL >> 20, rel))
+                complete = False
+                break
+            chunks, size = [], 0
+            while size <= MAX_CODE_BYTES:
+                b = os.read(fd, 1 << 20)
+                if not b:
+                    break
+                chunks.append(b)
+                size += len(b)
+        except OSError:
+            unscanned.append("%s (unreadable)" % rel)
+            continue
+        finally:
+            os.close(fd)
+        if size > MAX_CODE_BYTES:
+            unscanned.append("%s (grew past 8 MiB)" % rel)
+            continue
+        total += size
+        data = b"".join(chunks)
+        if b".md" not in data or b"\0" in data[:8192]:
+            continue
+        for m in _CODE_TOKEN.finditer(data):
+            t = norm_token(m.group(0).decode("ascii"))
+            if t and t not in tok:
+                tok[t] = (n, rel)
+    if unscanned:
+        more = len(unscanned) - 20
+        warn(warnings, "not scanned for doc names: %s%s" % (", ".join(unscanned[:20]),
+                                                          " and %d more" % more if more > 0 else ""))
+    return tok, complete
+
+
+def norm_token(t):
+    while t.startswith("./") or t.startswith("/"):
+        t = t[2:] if t.startswith("./") else t[1:]
+    return t
+
+
+def referenced_by(rel, tok):
+    """The first tracked file naming `rel` (the whole path, or a tail of it after a /); a bare generic
+    name (README.md, PLAN.md, ...) counts only as the whole path."""
+    best = None
+    for t in [rel] + [rel[i + 1:] for i, ch in enumerate(rel) if ch == "/"]:
+        if "/" not in t and t.lower() in plans.GENERIC_NAMES and t != rel:
+            continue
+        hit = tok.get(t)
+        if hit and (best is None or hit[0] < best[0]):
+            best = hit
+    return best[1] if best else None
+
+
+# ── Links ─────────────────────────────────────────────────────────────────────
+_INLINE = re.compile(r'!?\[(?:[^\[\]\\]|\\.)*\]\((<[^<>\n]*>|[^()\s]+)(\s+"[^"]*")?\)')
+_REFDEF = re.compile(r'^\s{0,3}\[([^\]]+)\]:\s*(<[^<>\n]*>|\S+)')
+_SCHEME = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:')
+_TICKS = re.compile(r"`+")
+
+
+def mask_code_spans(s):
+    """`s` with every inline code span (a run of N backticks to the next run of exactly N) blanked."""
+    if "`" not in s:
+        return s
+    runs = [(m.start(), m.end()) for m in _TICKS.finditer(s)]
+    out, k = list(s), 0
+    while k < len(runs):
+        a, b = runs[k]
+        j = next((j for j in range(k + 1, len(runs)) if runs[j][1] - runs[j][0] == b - a), None)
+        if j is None:
+            k += 1
+            continue
+        for x in range(a, runs[j][1]):
+            out[x] = " "
+        k = j + 1
+    return "".join(out)
+
+
+def link_spans(s):
+    """[(start, end)] of the link targets on one (masked) line: inline links and images, and
+    reference definitions (footnotes `[^1]:` are not links)."""
+    spans = [(m.start(1), m.end(1)) for m in _INLINE.finditer(s)]
+    m = _REFDEF.match(s)
+    if m and not m.group(1).startswith("^"):
+        spans.append((m.start(2), m.end(2)))
+    spans.sort()
+    out, last = [], -1
+    for a, b in spans:
+        if a >= last:
+            out.append((a, b))
+            last = b
+    return out
+
+
+class Ctx:
+    """What every document is checked against: the project root and indexes over everything read."""
+
+    def __init__(self, root):
+        self.root = root
+        self.by_rel = {}          # rel -> Doc for every walked regular file and the root sources
+        self.by_name = {}         # basename -> {rel} of walked docs and tracked files
+        self.notes = {}           # wikilink key -> vault/notes rel
+        self._exists, self._isdir, self._cand = {}, {}, {}   # one stat per path, however many links name it
+
+    def exists(self, p):
+        r = self._exists.get(p)
+        if r is None:
+            r = self._exists[p] = os.path.exists(p)
+        return r
+
+    def isdir(self, p):
+        r = self._isdir.get(p)
+        if r is None:
+            r = self._isdir[p] = os.path.isdir(p)
+        return r
+
+    def rel_of(self, p):
+        if p.startswith(self.root + os.sep):
+            return p[len(self.root) + 1:].replace(os.sep, "/")
+        return os.path.relpath(p, self.root).replace(os.sep, "/")
+
+    def candidate(self, p):
+        """An existing path inside the project (lexically and after symlinks), or None."""
+        p = os.path.normpath(p)
+        if p not in self._cand:
+            ok = (inside(p, self.root) and p != self.root and self.exists(p)
+                  and inside(os.path.realpath(p), self.root))
+            self._cand[p] = p if ok else None
+        return self._cand[p]
+
+
+def resolve_link(raw, doc, ctx):
+    """('ignore',) | ('ok', abs) | ('fix', new target, abs) | ('broken', hint) for one link target."""
+    angle = len(raw) >= 2 and raw[0] == "<" and raw[-1] == ">"
+    t = raw[1:-1] if angle else raw
+    sm = _SCHEME.match(t)
+    if sm:
+        if sm.group(0).lower() != "file:":
+            return ("ignore",)
+        u = urllib.parse.urlsplit(t)
+        if u.netloc not in ("", "localhost"):
+            return ("ignore",)
+        path = urllib.parse.unquote(u.path)
+        suffix = ("?" + u.query if u.query else "") + ("#" + u.fragment if u.fragment else "")
+    else:
+        cut = min([i for i in (t.find("#"), t.find("?")) if i >= 0] or [len(t)])
+        path, suffix = urllib.parse.unquote(t[:cut]), t[cut:]
+    if not path:
+        return ("ignore",)
+    fdir = os.path.dirname(doc.path)
+    if not path.startswith("/"):
+        p = os.path.normpath(os.path.join(fdir, path))
+        if ctx.exists(p):
+            return ("ok", p)
+    cands = set()
+    if path.startswith("/"):
+        c = ctx.candidate(path)
+        if c:
+            cands.add(c)
+    stripped = path
+    while True:
+        for pre in ("/", "./", "../"):
+            if stripped.startswith(pre):
+                stripped = stripped[len(pre):]
+                break
+        else:
+            break
+    if stripped:
+        c = ctx.candidate(os.path.join(ctx.root, stripped))
+        if c:
+            cands.add(c)
+    if len(cands) == 1:
+        target = cands.pop()
+        new = rel_link(ctx.rel_of(target), posixpath.dirname(doc.rel))
+        if path.endswith("/") and not new.endswith("/"):
+            new += "/"
+        if not any(c in new for c in "<>\n"):
+            new += suffix
+            if angle or any(c in new for c in " ()"):
+                new = "<" + new + ">"
+            return ("fix", new, target)
+    return ("broken", broken_hint(path, ctx))
+
+
+def broken_hint(path, ctx):
+    name = posixpath.basename(path)
+    if name and len(ctx.by_name.get(name, ())) == 1:
+        return "a file named %s exists at %s" % (name, next(iter(ctx.by_name[name])))
+    if path.startswith("/"):
+        p = os.path.normpath(path)
+        first = norm_rel(path).split("/")[0]
+        if not inside(p, ctx.root) and not (first and ctx.exists(os.path.join(ctx.root, first))):
+            return "outside the project"
+    return None
+
+
+_CHECKBOX_LINE = re.compile(r"^\s*[-*+]\s+\[[ xX]\]")
+_HEADING_LINE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+HINT_LINE = "on a checkbox or heading line: fix it by hand"
+
+
+def scan_links(doc, ctx):
+    """Link fixes, broken links and resolved targets of the body (fenced and indented code, and
+    inline code spans, never looked at). A fixable link on a checkbox or heading line (plans.py
+    reads those), or anywhere under vault/ (the vault owns its notes), is reported, not rewritten."""
+    lines, prev_blank, prev_code = doc.lines, True, False
+    in_vault = doc.rel.startswith("vault/")
+    for i in range(doc.body, len(lines)):
+        if i in doc.fence:
+            prev_blank = prev_code = False
+            continue
+        s = lines[i].rstrip("\r")
+        blank = not s.strip()
+        if not blank and (s.startswith("\t") or s.startswith("    ")) and (prev_blank or prev_code):
+            prev_blank, prev_code = False, True
+            continue
+        prev_blank, prev_code = blank, False
+        if "[" not in s:
+            continue
+        masked = mask_code_spans(s)
+        locked = bool(_CHECKBOX_LINE.match(s) or _HEADING_LINE.match(s))
+        for a, b in link_spans(masked):
+            raw = s[a:b]
+            res = resolve_link(raw, doc, ctx)
+            if res[0] == "ok":
+                doc.targets.append(res[1])
+            elif res[0] == "fix" and locked:
+                doc.broken.append((i + 1, raw, HINT_LINE))
+            elif res[0] == "fix" and in_vault:
+                doc.broken.append((i + 1, raw, "under vault/: fix it by hand, to %s" % res[1]))
+            elif res[0] == "fix":
+                doc.fixes.append((i, a, b, raw, res[1]))
+                doc.targets.append(res[2])
+            elif res[0] == "broken":
+                doc.broken.append((i + 1, raw, res[1]))
+
+
+# ── Keys ──────────────────────────────────────────────────────────────────────
+_STATUS = re.compile(r"^\s*(?:[-*]\s*)?\**Status\**\s*:\s*\**\s*([A-Za-z][A-Za-z -]*)")
+_STATUS_HEAD = re.compile(r"^\s*(?:[-*]\s*)?\**Status\**\s*:")
+_TRACKER_NAMES = {"tasks.md", "todo.md", "backlog.md", "open-items.md"}
+_REPORT_NAMES = {"e2e-test-plan.md", "ui-ux-review.md", "frontend-review.md"}
+_SPEC_TOKEN = re.compile(r"[A-Za-z0-9_./-]+\.md")
+_GUIDE_NAME = re.compile(r"(?i)(^|[-_.])(guide|how-?to)([-_.]|$)")            # not GUIDELINES.md
+_REPORT_NAME = re.compile(r"(?i)(^|[-_.])(report|review|audit|assessment|findings)([-_.]|$)")
+
+
+def doc_type(doc):
+    """The folder first, then the name, then the shape (contract v2 order: spec, plan, adr, glossary,
+    start-here, task, tracker, plan by checkboxes, guide, reference, prd, log, report, plan by a
+    `plans` folder, note)."""
+    rel, name, parts = doc.rel, doc.name, set(doc.parts)
+    low = name.lower()
+    if rel.startswith("vault/notes/"):
+        return "note"
+    if rel.startswith("docs/superpowers/specs/"):
+        return "spec"
+    if rel.startswith("docs/superpowers/plans/") and plans.is_plan(doc.parsed, "plans"):
+        return "plan"
+    if parts & {"adr", "adrs", "decisions"}:
+        return "adr"
+    if low == "glossary.md":
+        return "glossary"
+    if rel == "docs/start-here.md":
+        return "start-here"
+    if "tasks" in parts:
+        return "task"
+    if low in _TRACKER_NAMES or re.search(r"(?i)[-_](tasks|todo|backlog)\.md$", name):
+        return "tracker"
+    if plans.is_plan(doc.parsed, "docs"):
+        return "plan"   # what cc-dash's Plans view tracks as one
+    if parts & {"guides", "how-to-guides", "how-to"} or _GUIDE_NAME.search(name):
+        return "guide"
+    if "reference" in parts or re.match(r"(?i)^(architecture|structure|api|quick-reference|reference)\b", name):
+        return "reference"
+    if re.search(r"(?i)(^|[-_])prd([-_.]|$)", name) or "product requirements" in doc.first_h1().lower():
+        return "prd"
+    if re.search(r"(?i)(^|[-_])(log|journal|history)\.md$", name) or low == "log.md":
+        return "log"
+    if low in _REPORT_NAMES or "reports" in parts or _REPORT_NAME.search(name):
+        return "report"
+    if "plans" in parts:
+        return "plan"   # a plan folder's prose plan (LOG.md, reviews and evidence beside it matched above)
+    return "note"
+
+
+def doc_title(doc, h1=True):
+    """The first H1 outside fences, else the first heading, else the file stem; cleaned. With
+    h1=False (the `title` key, which is only added to a body without an H1) the H1 step is moot."""
+    for want_h1 in ((True, False) if h1 else (False,)):
+        for (_, lvl, t) in doc.heads:
+            if want_h1 and lvl != 1:
+                continue
+            c = clean_heading(t)
+            if c:
+                return c
+    stem = doc.name[:-3] if doc.name.lower().endswith(".md") else doc.name
+    return clean_heading(stem) or stem
+
+
+def has_h1(doc):
+    return any(lvl == 1 for (_, lvl, _) in doc.heads)
+
+
+def doc_status_line(doc):
+    """(line number, the text after `Status:` cleaned and clipped to 120) of the first `Status:` line
+    in the first 30 body lines, or None. Reported only: the migration never writes `status`."""
+    for i in range(doc.body, min(len(doc.lines), doc.body + 30)):
+        line = doc.lines[i].rstrip("\r")
+        if _STATUS.match(line):
+            v = line[_STATUS_HEAD.match(line).end():]
+            v = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", v).replace("**", "").replace("__", "").replace("`", "")
+            v = " ".join(_CTRL.sub(" ", v).split())
+            return (i + 1, v[:120].rstrip())
+    return None
+
+
+def doc_created(doc, added):
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", doc.name)
+    if m:
+        try:
+            datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return m.group(0)
+        except ValueError:
+            pass
+    return added.get(doc.rel)
+
+
+def resolve_spec(spec, doc, ctx):
+    """The root-relative path of the existing regular file a `**Spec:**` value names, or None."""
+    m = _SPEC_TOKEN.search(spec or "")
+    if not m:
+        return None
+    token = m.group(0)
+    for cand in (norm_rel(token), posixpath.normpath(posixpath.join(posixpath.dirname(doc.rel), token))):
+        if not cand or cand == ".." or cand.startswith("../") or cand.startswith("/"):
+            continue
+        p = os.path.join(ctx.root, cand)
+        try:
+            if stat.S_ISREG(os.lstat(p).st_mode) and inside(os.path.realpath(p), ctx.root):
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def checkboxes(doc):
+    """(open item texts as written, number of done items), outside fences."""
+    open_items, done = [], 0
+    for i in range(doc.body, len(doc.lines)):
+        if i in doc.fence:
+            continue
+        m = _CB.match(doc.lines[i].rstrip("\r"))
+        if m:
+            if m.group(2) == " ":
+                open_items.append(m.group(3))
+            else:
+                done += 1
+    return open_items, done
+
+
+# ── Orders ────────────────────────────────────────────────────────────────────
+# lib/cc_dash/factory.py's _ORDER_FILE_RE: FO-<1-6 digits>, an optional -slug, .md (FO-007.md counts).
+_ORDER_NAME = re.compile("^(FO-[0-9]{1,6})(?:-[^/\x00-\x1f\x7f-\x9f]*)?\\.md$")
+_NEW_ORDER = re.compile(r"^(FO-\d+)\s+(factory/orders/[^\s]+\.md)$")
+_LIST_LINE = re.compile(r"^\s*(?:[-*+]|\d+[.)])(?:\s|$)")
+_OTHER_BLOCK = re.compile(r"^\s*(?:\||>|<)|^(?:\t| {4})|^\s*([-*_])(?:\s*\1){2,}\s*$")
+
+
+def orders_dir_real(root):
+    return real_dir(os.path.join(root, "factory")) and real_dir(os.path.join(root, "factory", "orders"))
+
+
+def existing_orders(root):
+    """{task rel: order id as in the file name} from every order file's `source` (lowest number wins)."""
+    out = {}
+    if not orders_dir_real(root):
+        return out
+    odir = os.path.join(root, "factory", "orders")
+    try:
+        names = [n for n in os.listdir(odir) if _ORDER_NAME.match(n)]
+    except OSError:
+        return out
+    for name in sorted(names, key=lambda n: (int(_ORDER_NAME.match(n).group(1)[3:]), n)):
+        try:
+            data, _ = read_regular(os.path.join(odir, name), MAX_ORDER_BYTES)
+        except OSError:
+            continue
+        if len(data) > MAX_ORDER_BYTES:
+            continue
+        d = Doc("factory/orders/" + name, os.path.join(odir, name), "order")
+        text = data.decode("utf-8", "replace")
+        d.lines = (text[1:] if text.startswith(BOM) else text).split("\n")
+        fm = parse_frontmatter(d.lines)
+        if not isinstance(fm, dict):
+            continue
+        d.fm = fm
+        src = norm_rel(d.fm_value("source") or "")
+        if src and src not in out:
+            out[src] = _ORDER_NAME.match(name).group(1)
+    return out
+
+
+def paragraph_from(doc, start, stop_at_heading):
+    """The first plain paragraph from line `start` (headings, lists, tables, quotes, code, HTML and
+    rules skipped), whitespace collapsed; None when there is none (or a heading comes first and
+    stop_at_heading)."""
+    lines, i = doc.lines, start
+    while i < len(lines):
+        if i in doc.fence:
+            i += 1
+            continue
+        s = lines[i].rstrip("\r")
+        if not s.strip():
+            i += 1
+            continue
+        if _ATX.match(s):
+            if stop_at_heading:
+                return None
+            i += 1
+            continue
+        if _LIST_LINE.match(s) or _OTHER_BLOCK.match(s) or _FENCE.match(s):
+            while i < len(lines) and i not in doc.fence and lines[i].strip() and not _ATX.match(lines[i].rstrip("\r")):
+                i += 1
+            continue
+        para = []
+        while i < len(lines) and i not in doc.fence:
+            s = lines[i].rstrip("\r")
+            if not s.strip() or _ATX.match(s) or _LIST_LINE.match(s) or _FENCE.match(s) or re.match(r"^\s*>", s):
+                break
+            para.append(s)
+            i += 1
+        text = " ".join(" ".join(para).split())
+        return text[:1000].rstrip() or None
+    return None
+
+
+def task_summary(doc):
+    for (i, _, t) in doc.heads:
+        if clean_heading(t).rstrip(":").strip().lower() == "summary":
+            p = paragraph_from(doc, i + 1, True)
+            if p:
+                return p
+            break
+    h1 = next((i for (i, lvl, _) in doc.heads if lvl == 1), None)
+    return paragraph_from(doc, doc.body if h1 is None else h1 + 1, False)
+
+
+def order_body(doc, today):
+    link = rel_link(doc.rel, "factory/orders")
+    if any(c in link for c in " ()"):
+        link = "<" + link + ">"
+    summary = task_summary(doc)
+    return ("## Intent\nFrom [%s](%s).%s\n\n## Acceptance criteria\n%s\n\n## Notes\n"
+            "Created by cc-docs-migrate from %s on %s. The task file stays where it is; its %d done items "
+            "are not repeated here.\n") % (doc.rel, link, (" " + summary) if summary else "",
+                                         "\n".join("- [ ] " + t for t in doc.open_items), doc.rel, today,
+                                         doc.done_items)
+
+
+def factory_new(root, priority, title):
+    """((id, rel path), None) from `cc-factory new`, or (None, why)."""
+    cmd = [this_python(), "-I", FACTORY, "-C", root, "new", "--priority", priority, "--", title]
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "LD_"))}
+    try:
+        r = subprocess.run(cmd, cwd=root, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, errors="replace", timeout=FACTORY_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, one_line(str(e), 240)
+    found = None
+    for line in r.stdout.split("\n"):
+        m = _NEW_ORDER.match(line.rstrip())
+        if m:
+            found = (m.group(1), m.group(2))
+    if r.returncode != 0 or not found:
+        return None, one_line(r.stderr.strip().split("\n")[-1] if r.stderr.strip() else
+                              (r.stdout.strip() or "cc-factory exited %d" % r.returncode), 240)
+    return found, None
+
+
+def fill_order(root, orel, task, today):
+    """Keep cc-factory's frontmatter of the order it just created, add `source: <task>` before the
+    closing `---`, replace the body with the task's intent and open items. The new bytes, or
+    OSError / ValueError saying why it was not written."""
+    if not re.match(r"^factory/orders/[^/]+\.md$", orel) or not orders_dir_real(root):
+        raise ValueError("%s is not a file in factory/orders/" % orel)
+    path = os.path.join(root, orel)
+    data, mode = read_regular(path, MAX_ORDER_BYTES)
+    text = data.decode("utf-8")
+    lines = text.split("\n")
+    fm = parse_frontmatter(lines)
+    if not isinstance(fm, dict):
+        raise ValueError("%s has no frontmatter cc-docs-migrate can read" % orel)
+    cr = "\r" if lines[0].endswith("\r") else ""
+    head = lines[:fm["close"]]
+    if "source" not in fm["keys"]:
+        head.append("source: %s%s" % (yaml_value(task.rel), cr))
+    new = "\n".join(head + [lines[fm["close"]]]) + "\n" + order_body(task, today)
+    nb = new.encode("utf-8")
+    if not write_atomic(path, nb, mode, sha256(data)):
+        raise ValueError("%s changed while migrating; not written" % orel)
+    return nb
+
+
+# ── Planning ──────────────────────────────────────────────────────────────────
+def plan_shape(p):
+    """What cc-dash's Plans view takes from a parsed file (plans.parse_plan): title, goal, spec, mode,
+    the counts, every task's id and title, every step's tick and text, the milestones. A write must
+    leave it equal."""
+    return (p["title"], p["goal"], p["mode"], p["checkboxes"], p["steps_total"], p["steps_done"], p["spec"],
+            [(t["id"], t["title"], len(t["steps"]), t["done_steps"], tuple(s["done"] for s in t["steps"]),
+              tuple(s["text"] for s in t["steps"])) for t in p["tasks"]],
+            len(p["milestones"]))
+
+
+def first_skip(doc, ctx):
+    """Skip reasons 1-8, first match wins (9, the plans.py guard, comes once the new text exists)."""
+    if doc.kind in ("symlink", "symdir"):
+        return "symlink"
+    if doc.kind != "file":
+        return "not a regular file"
+    if doc.rel.startswith("vault/") and not doc.rel.startswith("vault/notes/"):
+        return "vault-owned"
+    if doc.name.lower() in NOT_COVERED:
+        return "not covered: %s" % doc.name
+    if doc.read_skip:
+        return doc.read_skip
+    head = "\n".join(doc.lines[:5]).lower()
+    if any(k in head for k in ("do not edit", "<!-- generated", "auto-generated", "autogenerated")):
+        return "generated file"
+    ref = referenced_by(doc.rel, ctx.code_refs)
+    if ref:
+        return "referenced by code: %s" % ref
+    return None
+
+
+def base_adds(doc, ctx):
+    """The keys the migration adds, each only when absent, as parsed values: `type`; `title` only
+    for a body without an H1; `created` from the file name's date, else (outside a shallow clone)
+    the commit that added it. A vault note that already has frontmatter gets nothing."""
+    adds = {}
+    if doc.rel.startswith("vault/notes/") and doc.fm is not None:
+        return adds
+    if not doc.has_key("type"):
+        adds["type"] = doc.type
+    if not doc.has_key("title") and not has_h1(doc):
+        adds["title"] = doc_title(doc, h1=False)
+    if not doc.has_key("created") and not doc.has_key("date"):
+        c = doc_created(doc, ctx.added)
+        if c:
+            adds["created"] = c
+    return adds
+
+
+def build_new(doc):
+    """The new bytes: link targets swapped in place and the new key lines inserted (before the
+    closing `---`, or as a new block at the top); every other byte as it was."""
+    lines = list(doc.lines)
+    for (i, a, b, _, new) in sorted(doc.fixes, key=lambda f: (f[0], -f[1])):
+        lines[i] = lines[i][:a] + new + lines[i][b:]
+    cr = "\r" if doc.nl == "\r\n" else ""
+    keys = ["%s: %s%s" % (k, yaml_value(doc.adds[k]), cr) for k in KEY_ORDER if k in doc.adds]
+    if keys:
+        if doc.fm:
+            c = doc.fm["close"]
+            lines = lines[:c] + keys + lines[c:]
+        else:
+            lines = ["---" + cr] + keys + ["---" + cr] + lines
+    return ((BOM if doc.bom else "") + "\n".join(lines)).encode("utf-8")
+
+
+def settle(doc):
+    """Compute the new bytes and decide write / ok / skip (the 100-line frontmatter limit, then the
+    plans.py guard)."""
+    if doc.skip:
+        doc.plan, doc.new_bytes = "skip", None
+        return
+    if doc.fm and doc.adds and doc.fm["close"] + len(doc.adds) > MAX_FM_LINES:
+        doc.skip, doc.plan, doc.new_bytes = "frontmatter would exceed %d lines" % MAX_FM_LINES, "skip", None
+        return
+    nb = build_new(doc)
+    if nb == doc.data:
+        doc.plan, doc.new_bytes = "ok", None
+        return
+    if plan_shape(doc.parsed) != plan_shape(plans.parse_plan(nb.decode("utf-8"))):
+        doc.skip, doc.plan, doc.new_bytes = "would change plans.py parse", "skip", None
+        return
+    doc.plan, doc.new_bytes = "write", nb
+
+
+def project_git(root):
+    """A Ctx with what git says about the project: {inside, prefix, top, main, shallow} and the
+    dirty entries."""
+    ctx = Ctx(root)
+    ctx.git = git_info(root)
+    ctx.dirty = git_dirty(root, ctx.git["prefix"]) if ctx.git["inside"] else None
+    return ctx
+
+
+def require_top(ctx):
+    """Inside a git work tree, PROJECT must be its top (a linked worktree's own root is its top)."""
+    g = ctx.git
+    if g["inside"] and g["top"] != ctx.root:
+        refuse("%s is not the top of its git work tree" % one_line(ctx.root),
+               "run cc-docs-migrate on %s, the top of that work tree" % one_line(g["top"] or "?"))
+
+
+def plan_project(ctx, args, warnings):
+    """Everything the migration would do, read-only: the entries of the selected trees, sorted."""
+    root, g = ctx.root, ctx.git
+    then = "applied anyway (--allow-dirty)" if args.apply else "--apply refuses without --allow-dirty"
+    if not g["inside"]:
+        warn(warnings, "not a git repository: --apply refuses")
+        warn(warnings, "code check skipped: not a git repository")
+    elif ctx.dirty is None:
+        warn(warnings, "git status failed: " + then)
+    elif ctx.dirty:
+        warn(warnings, "git tree is dirty (%d entries, e.g. %s): %s" % (len(ctx.dirty), one_line(ctx.dirty[0], 120), then))
+    if g["inside"] and g["shallow"]:
+        warn(warnings, "shallow clone: `created` comes only from dates in file names")
+    docs = walk(root, warnings)
+    sources = [Doc(n, os.path.join(root, n), "root") for n in ROOT_SOURCES
+               if os.path.isfile(os.path.join(root, n)) and not os.path.islink(os.path.join(root, n))]
+    tracked = git_tracked(root) if g["inside"] else []
+    ctx.added = git_added(root, g["prefix"]) if g["inside"] and not g["shallow"] else {}
+    if g["inside"]:
+        ctx.code_refs, ctx.code_complete = code_tokens(root, tracked, warnings)
+    else:
+        ctx.code_refs, ctx.code_complete = {}, False
+    tracked = tracked or []
+    sources = [d for d in sources if d.load()]
+    for d in docs:
+        if d.kind == "file" and d.load():
+            ctx.by_rel[d.rel] = d
+            ctx.by_name.setdefault(d.name, set()).add(d.rel)
+            if d.rel.startswith("vault/notes/"):
+                key = d.rel[len("vault/notes/"):-3].lower()
+                ctx.notes.setdefault(key, d.rel)
+                ctx.notes.setdefault(posixpath.basename(key), d.rel)
+    for d in sources:
+        ctx.by_rel[d.rel] = d
+    for rel in tracked:
+        ctx.by_name.setdefault(posixpath.basename(rel), set()).add(rel)
+
+    for d in docs:
+        d.skip = first_skip(d, ctx)
+        if d.text is not None and not d.read_skip:
+            d.type = d.fm_value("type") if d.has_key("type") else doc_type(d)
+            d.title = doc_title(d)
+    for d in docs + sources:
+        if d.scannable:
+            scan_links(d, ctx)
+
+    selected = [d for d in docs if args.only in (None, d.tree)]
+    # Orders are opt-in: only with --with-orders, a real factory/orders/ and the main checkout's top
+    # (cc-factory -C writes there). Otherwise a task with open items is only noted.
+    want_orders = bool(args.with_orders) and args.only in (None, "docs")
+    orders_on = want_orders and orders_dir_real(root) and g["main"]
+    if args.with_orders and not orders_dir_real(root):
+        warn(warnings, "--with-orders: factory/orders/ does not exist; --apply refuses until cc-factory init")
+    elif want_orders and g["inside"] and not g["main"]:
+        warn(warnings, "--with-orders: PROJECT is not the top of its main git checkout, where cc-factory new "
+                       "writes; no order is created or linked")
+    have_orders = existing_orders(root)   # read even without orders: an order's `source` reaches its task
+    for d in docs:
+        if d.skip:
+            d.plan = "skip"
+            continue
+        d.adds = base_adds(d, ctx)
+        if order_candidate(d):
+            if orders_on:
+                plan_order(d, have_orders)
+            else:
+                d.candidate = True
+        settle(d)
+    from_orders = set(have_orders) | {d.rel for d in docs if d.order and d.plan == "write"}
+    graph_notes(docs, sources, ctx, from_orders)
+    selected.sort(key=lambda d: d.rel)
+    return selected
+
+
+def warn(warnings, msg, path="-"):
+    warnings.append((path, msg))
+
+
+def warning_strings(warnings):
+    return [m if p == "-" else "%s %s" % (p, m) for p, m in warnings]
+
+
+def order_candidate(doc):
+    """A task in docs/tasks/active/ or backlog/ (any depth) with an open checkbox outside fences and
+    no `order` key: one order's worth of open work (its items are kept on the doc)."""
+    if doc.type != "task" or doc.has_key("order"):
+        return False
+    if not (doc.rel.startswith("docs/tasks/active/") or doc.rel.startswith("docs/tasks/backlog/")):
+        return False
+    doc.open_items, doc.done_items = checkboxes(doc)
+    return bool(doc.open_items)
+
+
+def plan_order(doc, have_orders):
+    """With --with-orders, a candidate links to the order whose `source` names it, or gets a new one."""
+    priority = "p1" if doc.rel.startswith("docs/tasks/active/") else "p3"
+    oid = have_orders.get(doc.rel)
+    doc.order = {"new": oid is None, "id": oid, "title": doc.title, "priority": priority,
+                 "open": len(doc.open_items)}
+    doc.adds["order"] = oid if oid else "(new)"
+
+
+# ── Notes: broken links, orphans, ADR candidates ──────────────────────────────
+_AT_IMPORT = re.compile(r"(?<![\w@])@([A-Za-z0-9_.][^\s`'\"<>()\[\]]*)")
+_WIKI = re.compile(r"\[\[([^\[\]\n]+?)\]\]")
+
+
+def graph_notes(docs, sources, ctx, from_orders):
+    """Edges between docs (plus the tasks an order's `source` names, existing or planned), then the
+    notes of every doc that is written or ok."""
+    def to_doc(p):
+        rel = ctx.rel_of(p)
+        if rel in ctx.by_rel:
+            return [rel]
+        if ctx.isdir(p):
+            return [r for r in (rel + "/README.md", rel + "/index.md") if r in ctx.by_rel]
+        return []
+
+    inbound = set(from_orders)
+    for d in docs + sources:
+        if d.text is None:
+            continue
+        found = set()
+        for p in d.targets:
+            found.update(to_doc(p))
+        if d.fm:
+            for v in [d.fm_value("source") or ""] + d.fm_list("links"):
+                found.add(norm_rel(v))
+        s = resolve_spec(d.parsed["spec"], d, ctx) if d.parsed["spec"] else None
+        if s:
+            found.add(s)
+        if d.name.lower() in ("claude.md", "agents.md"):
+            for line in d.lines:
+                for m in _AT_IMPORT.finditer(line):
+                    t = m.group(1).rstrip(".,;:")
+                    if t.startswith("~"):
+                        continue
+                    found.update(to_doc(os.path.normpath(os.path.join(os.path.dirname(d.path), t))))
+        if d.rel.startswith("vault/"):
+            for m in _WIKI.finditer(d.text):
+                key = m.group(1).split("|")[0].split("#")[0].strip().lower()
+                if key.endswith(".md"):
+                    key = key[:-3]
+                for pre in ("vault/", "notes/"):
+                    if key.startswith(pre):
+                        key = key[len(pre):]
+                if key in ctx.notes:
+                    found.add(ctx.notes[key])
+        found.discard(d.rel)
+        inbound.update(found)
+
+    for d in docs:
+        if d.plan not in ("write", "ok"):
+            continue
+        d.notes = [{"kind": "broken", "line": ln, "target": t, "hint": h} for (ln, t, h) in d.broken]
+        if (d.type in STATUS_TYPES and not d.rel.startswith("vault/") and "archive" not in d.parts
+                and not d.has_key("status")):
+            st = doc_status_line(d)
+            if st:
+                d.notes.append({"kind": "status", "line": st[0], "value": st[1]})
+        if d.type != "adr" and not d.rel.startswith("vault/") and adr_candidate(d):
+            d.notes.append({"kind": "adr-candidate"})
+        if d.candidate:
+            d.notes.append({"kind": "order-candidate", "open": len(d.open_items)})
+        entry = d.name.lower() in ENTRY_POINTS or "archive" in d.parts
+        if not entry and d.rel not in inbound:
+            d.notes.append({"kind": "orphan"})
+
+
+def adr_candidate(doc):
+    names = set()
+    for (_, _, t) in doc.heads:
+        c = re.sub(r"^\d+[.)]\s*", "", clean_heading(t)).rstrip(":").strip().lower()
+        names.add(c)
+    return "context" in names and bool(names & {"decision", "decisions"})
+
+
+# ── Apply ─────────────────────────────────────────────────────────────────────
+def preflight(root, args, ctx):
+    """The --apply refusals that need no plan, before anything is written (the code check's comes
+    after planning, still before any write)."""
+    if not ctx.git["inside"]:
+        refuse("%s is not a git repository" % one_line(root),
+               "commit the project to git first: the dirty check, the code check and review rely on it")
+    if not args.allow_dirty:
+        if ctx.dirty is None:
+            refuse("git status failed in %s, so the dirty check could not run" % one_line(root),
+                   "check the repository, or pass --allow-dirty")
+        if ctx.dirty:
+            refuse("the git tree is dirty (%d entries, e.g. %s)" % (len(ctx.dirty), one_line(ctx.dirty[0], 120)),
+                   "commit or stash your changes first, or pass --allow-dirty")
+    for rel in ("docs", BACKUP_REL):
+        p = os.path.join(root, rel)
+        if os.path.lexists(p) and not real_dir(p):
+            refuse("%s/ is %s, not a real directory" % (rel, "a symlink" if os.path.islink(p) else "not a directory"),
+                   "replace it with a real directory (or move it away), then retry")
+    lp = os.path.join(root, LOG_REL)
+    if os.path.lexists(lp):
+        try:
+            ok = stat.S_ISREG(os.lstat(lp).st_mode)
+        except OSError:
+            ok = False
+        if not ok:
+            refuse("%s is not a regular file" % LOG_REL, "move it away, then retry")
+    if args.with_orders and not orders_dir_real(root):
+        refuse("--with-orders needs factory/orders/, and it is not a real directory",
+               "run cc-factory init %s and commit it first, or drop --with-orders" % one_line(root, 200))
+
+
+def require_code_check(ctx):
+    """The code check fails closed: an incomplete one (past its caps) refuses --apply."""
+    if not ctx.code_complete:
+        refuse("code check incomplete: not every tracked file was scanned for the doc names code reads "
+               "(the dry run's warn lines say where it stopped)",
+               "the check covers at most %d tracked files and %d MiB; edit the docs by hand instead of "
+               "applying" % (MAX_CODE_FILES, MAX_CODE_TOTAL >> 20))
+
+
+def apply_plan(root, args, ctx, entries, run, warnings):
+    """Write the plan: orders first, then the docs; one log line per write."""
+    writes = [d for d in entries if d.plan == "write"]
+    if not writes:
+        return
+    docs_dir = os.path.join(root, "docs")
+    bdir = os.path.join(root, BACKUP_REL)
+    if not mkdir_real(docs_dir) or not mkdir_real(bdir):
+        refuse("cannot create %s/ as a real directory" % BACKUP_REL, "check the permissions of docs/")
+    try:
+        write_new(os.path.join(bdir, ".gitignore"), b"*\n", 0o644)
+    except FileExistsError:
+        pass
+    try:
+        os.mkdir(os.path.join(bdir, run), 0o755)
+    except OSError as e:
+        refuse("cannot create %s/%s/ (%s)" % (BACKUP_REL, run, e.strerror or e), "retry")
+    log = os.path.join(root, LOG_REL)
+    # No absolute path in the log: it may be committed.
+    append_line(log, {"v": 1, "run": run, "event": "start", "at": utc_now(), "tool": PROG,
+                      "head": git_head(root) if ctx.git["inside"] else None,
+                      "args": {"only": args.only, "with_orders": bool(args.with_orders),
+                               "allow_dirty": bool(args.allow_dirty)}})
+    files = 0
+    today = time.strftime("%Y-%m-%d")
+    for d in writes:
+        if not (d.order and d.order["new"]):
+            continue
+        if ctx.git["main"]:
+            made, why = factory_new(root, d.order["priority"], d.order["title"])
+        else:  # cc-factory -C would pick the main checkout (or an ancestor repository), not PROJECT
+            made, why = None, ("PROJECT is not a git repository" if not ctx.git["inside"] else
+                               "PROJECT is not the top of its main git checkout")
+        if not made:
+            warn(warnings, "cc-factory new failed: %s" % why, d.rel)
+            d.adds.pop("order", None)
+            settle(d)
+            continue
+        oid, orel = made
+        d.order["id"] = oid
+        d.adds["order"] = oid
+        try:
+            nb = fill_order(root, orel, d, today)
+            append_line(log, {"v": 1, "run": run, "event": "write", "path": orel, "actions": ["order"],
+                              "before": None, "after": sha256(nb), "backup": None, "order": oid})
+            files += 1
+        except (OSError, ValueError, UnicodeDecodeError) as e:
+            warn(warnings, "%s created, but its body was not filled: %s" % (oid, one_line(str(e), 200)), orel)
+        settle(d)
+    for d in writes:
+        if d.plan != "write" or not d.new_bytes:
+            continue
+        if write_doc(root, run, d, log, warnings):
+            files += 1
+    append_line(log, {"v": 1, "run": run, "event": "end", "at": utc_now(), "files": files})
+
+
+def write_doc(root, run, d, log, warnings):
+    """Back up, then replace one doc; False (with a warning) when it changed or is not safe to write."""
+    before = sha256(d.data)
+    if not real_dirs_down(root, d.rel) or current_hash(d.path) != before:
+        warn(warnings, "changed while migrating; not written", d.rel)
+        return False
+    brel = "%s/%s/%s.orig" % (BACKUP_REL, run, d.rel)   # .orig: no *.md glob ever picks a backup up
+    cur = os.path.join(root, BACKUP_REL, run)
+    for part in d.rel.split("/")[:-1]:
+        cur = os.path.join(cur, part)
+        if not mkdir_real(cur):
+            warn(warnings, "backup folder could not be made; not written", d.rel)
+            return False
+    write_new(os.path.join(root, brel), d.data, d.mode)
+    if not write_atomic(d.path, d.new_bytes, d.mode, before):
+        warn(warnings, "changed while migrating; not written", d.rel)
+        return False
+    actions = []
+    if any(k != "order" for k in d.adds):
+        actions.append("frontmatter")
+    if d.fixes:
+        actions.append("links")
+    if "order" in d.adds:
+        actions.append("order")
+    rec = {"v": 1, "run": run, "event": "write", "path": d.rel, "actions": actions, "before": before,
+           "after": sha256(d.new_bytes), "backup": brel}
+    if "order" in d.adds:
+        rec["order"] = d.adds["order"]
+    append_line(log, rec)
+    d.written = True
+    return True
+
+
+# ── Undo ──────────────────────────────────────────────────────────────────────
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def safe_rel(p):
+    return (isinstance(p, str) and p and not p.startswith("/") and "\0" not in p and "\\" not in p
+            and ".." not in p.split("/") and "" not in p.split("/") and "." not in p.split("/"))
+
+
+def read_log(root, log_arg):
+    """The log's path and its parseable v1 events. A relative LOG is read from PROJECT (so
+    `--undo docs/.migration-log.jsonl` works from any directory); an absolute one must be inside it."""
+    path = os.path.normpath(log_arg if os.path.isabs(log_arg) else os.path.join(root, log_arg))
+    try:
+        st = os.lstat(path)
+    except OSError:
+        refuse("the log %s does not exist" % one_line(log_arg), "pass the docs/.migration-log.jsonl of a run")
+    if stat.S_ISLNK(st.st_mode):
+        refuse("the log %s is a symlink" % one_line(log_arg), "pass the real docs/.migration-log.jsonl")
+    if not stat.S_ISREG(st.st_mode):
+        refuse("the log %s is not a regular file" % one_line(log_arg), "pass the docs/.migration-log.jsonl of a run")
+    if not inside(os.path.realpath(path), root):
+        refuse("the log %s is not inside %s" % (one_line(log_arg), one_line(root)),
+               "pass the log of this project (PROJECT/docs/.migration-log.jsonl)")
+    try:
+        data, _ = read_regular(path, MAX_LOG_BYTES)
+    except OSError as e:
+        refuse("the log %s cannot be read (%s)" % (one_line(log_arg), e.strerror or e), "check it, then retry")
+    events = []
+    for line in data.decode("utf-8", "replace").split("\n"):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("v") == 1 and isinstance(ev.get("run"), str):
+            events.append(ev)
+    return path, events
+
+
+def undo(root, args):
+    log, events = read_log(root, args.undo)
+    order, writes, undone = [], {}, set()
+    for ev in events:
+        if ev["run"] not in order:
+            order.append(ev["run"])
+        if ev.get("event") == "write":
+            writes.setdefault(ev["run"], []).append(ev)
+        elif ev.get("event") == "undo" and isinstance(ev.get("of"), str):
+            undone.add(ev["of"])
+    cands = [r for r in order if writes.get(r) and r not in undone]
+    if args.run:
+        if args.run not in order:
+            refuse("run %s is not in %s" % (one_line(args.run, 80), one_line(args.undo)),
+                   "pick a run id from its start lines")
+        if not writes.get(args.run):
+            refuse("run %s wrote nothing" % one_line(args.run, 80), "pick a run with write lines")
+        if args.run in undone:
+            refuse("run %s was already undone" % one_line(args.run, 80), "nothing to do for it")
+        target = args.run
+    elif not cands:
+        return None
+    else:
+        target = cands[-1]
+    restored, already, kept = [], [], []
+    for ev in reversed(writes[target]):
+        path, why = ev.get("path"), undo_one(root, target, ev)
+        if why == "restored":
+            restored.append(path)
+        elif why == "already":
+            already.append(path)
+        else:
+            kept.append({"path": path if isinstance(path, str) else str(path), "why": why})
+    u = new_run_id()
+    restored.sort()
+    already.sort()
+    kept.sort(key=lambda k: k["path"])
+    append_line(log, {"v": 1, "run": u, "event": "undo", "of": target, "at": utc_now(),
+                      "restored": restored, "already": already, "kept": kept})
+    return {"run": u, "of": target, "restored": restored, "already": already, "kept": kept}
+
+
+def undo_one(root, run, ev):
+    """restored | already | the reason the file was kept."""
+    path, backup, before, after = ev.get("path"), ev.get("backup"), ev.get("before"), ev.get("after")
+    if (not safe_rel(path) or not path.startswith(WRITABLE) or path.startswith(BACKUP_REL + "/")
+            or path == LOG_REL or not isinstance(after, str) or not _HEX64.match(after)):
+        return "bad log entry"
+    if before is None:
+        why = "created by the migration"
+        oid = ev.get("order")
+        if isinstance(oid, str) and re.match(r"^FO-\d+$", oid):
+            why += "; %s stays in the factory ledger: retire it with cc-factory reject %s from your terminal" % (oid, oid)
+        return why
+    if (not isinstance(before, str) or not _HEX64.match(before) or not safe_rel(backup)
+            or not backup.startswith("%s/%s/" % (BACKUP_REL, run))):
+        return "bad log entry"
+    target = os.path.join(root, path)
+    if not os.path.lexists(target):
+        return "missing"
+    if not real_dirs_down(root, path):
+        return "changed since the migration"
+    try:
+        _, mode = read_regular(target, 0)
+    except OSError:
+        return "changed since the migration"
+    cur = current_hash(target)
+    if cur == before:
+        return "already"
+    if cur != after:
+        return "changed since the migration"
+    bpath = os.path.join(root, backup)
+    try:
+        if not real_dirs_down(root, backup):
+            raise OSError("not a real directory")
+        data, _ = read_regular(bpath, MAX_HASH_BYTES)
+    except OSError:
+        return "backup does not match its hash"
+    if sha256(data) != before:
+        return "backup does not match its hash"
+    if not write_atomic(target, data, mode, after):
+        return "changed since the migration"
+    return "restored"
+
+
+# ── Output ────────────────────────────────────────────────────────────────────
+def row(action, path, detail=""):
+    return "%-7s %s%s" % (action, one_line(path), ("  " + one_line(detail, 400)) if detail else "")
+
+
+def add_detail(d):
+    """`type=task title created=2026-10-05 order=(new)` (add) or `+type=note +created=...` (merge),
+    values in their written (YAML) form."""
+    merge, toks = bool(d.fm), []
+    for k in KEY_ORDER:
+        if k in d.adds:
+            t = k if k == "title" else "%s=%s" % (k, yaml_value(d.adds[k]))
+            toks.append(("+" + t) if merge else t)
+    return " ".join(toks)
+
+
+def fm_mode(d):
+    if d.plan != "write" and not d.written:
+        return None
+    if d.adds:
+        return "merge" if d.fm else "add"
+    return None
+
+
+def summarize(entries, applied):
+    done = [d for d in entries if (d.written if applied else d.plan == "write")]
+    notes = [n for d in entries for n in d.notes]
+    return {"docs": len(entries), "write": len(done),
+            "add": sum(1 for d in done if fm_mode(d) == "add"),
+            "merge": sum(1 for d in done if fm_mode(d) == "merge"),
+            "link_files": sum(1 for d in done if d.fixes),
+            "links_fixed": sum(len(d.fixes) for d in done),
+            "orders_new": sum(1 for d in entries if d.order and d.order["new"] and d.plan == "write"
+                              and (d.order["id"] if applied else True)),
+            "orders_linked": sum(1 for d in entries if d.order and not d.order["new"] and d.plan == "write"),
+            "skipped": sum(1 for d in entries if d.plan == "skip"),
+            "broken": sum(1 for n in notes if n["kind"] == "broken"),
+            "orphans": sum(1 for n in notes if n["kind"] == "orphan"),
+            "adr_candidates": sum(1 for n in notes if n["kind"] == "adr-candidate"),
+            "order_candidates": sum(1 for n in notes if n["kind"] == "order-candidate"),
+            "status_lines": sum(1 for n in notes if n["kind"] == "status")}
+
+
+LATE_SKIPS = ("generated file", "would change plans.py parse", "frontmatter would exceed %d lines" % MAX_FM_LINES)
+
+
+def json_type(d):
+    """The type a doc has or would get; null for what was never typed (symlinks, unreadable files,
+    malformed frontmatter, the vault's own files, README/CHANGELOG/CLAUDE/AGENTS)."""
+    late = d.skip is None or d.skip in LATE_SKIPS or d.skip.startswith("referenced by code: ")
+    return d.type if late else None
+
+
+def entry_json(d):
+    """One `docs` entry; `add` holds the parsed values (the file gets them in YAML form)."""
+    add = {k: d.adds[k] for k in KEY_ORDER if k in d.adds} if (d.plan == "write" or d.written) else {}
+    return {"path": d.rel, "tree": d.tree, "type": json_type(d),
+            "plan": d.plan, "reason": d.skip, "frontmatter": fm_mode(d), "add": add,
+            "links": [{"line": i + 1, "from": f, "to": t} for (i, _, _, f, t) in d.fixes] if d.plan == "write" else [],
+            "order": dict(d.order) if d.order and d.plan == "write" else None,
+            "notes": d.notes, "written": bool(d.written)}
+
+
+def text_report(root, entries, applied, run, warnings):
+    out = ["%s: %s  (%s)" % (PROG, one_line(root), ("apply: run %s" % run) if applied else
+                             "dry run: nothing written; --apply writes")]
+    groups = {}
+    for d in entries:
+        if d.skip == "vault-owned":
+            parts = d.rel.split("/")
+            groups.setdefault(parts[0] + "/" + parts[1] + "/" if len(parts) > 2 else "vault/*.md", []).append(d)
+    shown = set()
+    for d in entries:
+        if d.skip == "vault-owned":
+            parts = d.rel.split("/")
+            key = parts[0] + "/" + parts[1] + "/" if len(parts) > 2 else "vault/*.md"
+            if key not in shown:
+                shown.add(key)
+                n = len(groups[key])
+                out.append(row("skip", "%s (%d file%s)" % (key, n, "" if n == 1 else "s"), "vault-owned"))
+            continue
+        if d.plan == "skip":
+            out.append(row("skip", d.rel, d.skip))
+            continue
+        mode = fm_mode(d)
+        if mode:
+            out.append(row(mode, d.rel, add_detail(d)))
+        if d.plan == "write":
+            for (i, _, _, f, t) in d.fixes:
+                out.append(row("links", d.rel, "L%d %s -> %s" % (i + 1, f, t)))
+            if d.order:
+                o = d.order
+                if not o["new"]:
+                    detail = "linked to %s" % o["id"]
+                elif applied and o["id"]:
+                    detail = "%s created" % o["id"]
+                elif applied:
+                    detail = None
+                else:
+                    detail = 'new order "%s" (%s, %d open item%s)' % (o["title"], o["priority"], o["open"],
+                                                                     "" if o["open"] == 1 else "s")
+                if detail:
+                    out.append(row("order", d.rel, detail))
+        for n in d.notes:
+            if n["kind"] == "broken":
+                out.append(row("broken", d.rel, "L%d %s%s" % (n["line"], n["target"],
+                                                              " (%s)" % n["hint"] if n["hint"] else "")))
+            elif n["kind"] == "status":
+                out.append(row("status?", d.rel, "L%d %s" % (n["line"], n["value"])))
+            elif n["kind"] == "adr-candidate":
+                out.append(row("adr?", d.rel, "Context and Decision sections: an ADR candidate"))
+            elif n["kind"] == "order-candidate":
+                out.append(row("order?", d.rel, "%d open item%s: /factory intake or --with-orders"
+                               % (n["open"], "" if n["open"] == 1 else "s")))
+            else:
+                out.append(row("orphan", d.rel, "no inbound link"))
+    for path, msg in warnings:
+        out.append(row("warn", path, msg))
+    s = summarize(entries, applied)
+    out.append("summary: %d docs: %d %s (%d add, %d merge, %d with link fixes), %d new orders, %d skipped, "
+               "%d broken links, %d orphans, %d adr candidates, %d order candidates, %d status lines"
+               % (s["docs"], s["write"], "written" if applied else "to write", s["add"], s["merge"],
+                  s["link_files"], s["orders_new"], s["skipped"], s["broken"], s["orphans"], s["adr_candidates"],
+                  s["order_candidates"], s["status_lines"]))
+    return "\n".join(out)
+
+
+def print_json(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")   # compact: the C encoder, one line
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+USAGE = ("cc-docs-migrate PROJECT [--apply] [--with-orders] [--only specs|plans|vault|docs] [--json] [--allow-dirty]\n"
+         "       cc-docs-migrate PROJECT --undo LOG [--run RUN_ID] [--json]\n"
+         "       cc-docs-migrate -h | --help")
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Usage("%s (usage: cc-docs-migrate PROJECT [--apply] ...; see --help)" % message)
+
+
+def build_parser():
+    p = Parser(prog=PROG, usage=USAGE, formatter_class=argparse.RawDescriptionHelpFormatter,
+               description="Bring a project's Markdown docs in line with docs/guides/docs-standard.md:\n"
+                           "frontmatter, links that resolve, factory orders for open tasks.\n"
+                           "The dry run (the default) writes nothing; --apply logs every write and --undo puts\n"
+                           "a run back.",
+               epilog="Exit codes: 0 done, 1 usage error, 2 refused (BLOCKED: <reason>. Suggestion: <what to do>.).")
+    p.add_argument("project", metavar="PROJECT", help="the project directory")
+    p.add_argument("--apply", action="store_true",
+                   help="write the plan (refused outside git, on a dirty tree, or with an incomplete code check)")
+    p.add_argument("--with-orders", action="store_true",
+                   help="turn open tasks in docs/tasks/{active,backlog}/ into factory orders (needs cc-factory init "
+                        "and the main checkout); without it they are only noted")
+    p.add_argument("--only", action="append", choices=TREES, help="one tree: specs | plans | vault | docs")
+    p.add_argument("--json", action="store_true", help="one JSON object on stdout")
+    p.add_argument("--allow-dirty", action="store_true", help="apply on a dirty git tree")
+    p.add_argument("--undo", metavar="LOG",
+                   help="put back the last run of LOG (relative to PROJECT: docs/.migration-log.jsonl)")
+    p.add_argument("--run", metavar="RUN_ID", help="with --undo: the run to put back")
+    return p
+
+
+def parse_args(argv):
+    args = build_parser().parse_args(argv)
+    if args.only and len(args.only) > 1:
+        raise Usage("--only may be given once")
+    args.only = args.only[0] if args.only else None
+    if args.undo is not None:
+        bad = [f for f, on in (("--apply", args.apply), ("--with-orders", args.with_orders),
+                               ("--only", args.only), ("--allow-dirty", args.allow_dirty)) if on]
+        if bad:
+            raise Usage("--undo cannot be combined with %s" % ", ".join(bad))
+    elif args.run is not None:
+        raise Usage("--run needs --undo LOG")
+    if not os.path.isdir(args.project):
+        raise Usage("%s is not a directory" % one_line(args.project))
+    args.root = os.path.realpath(args.project)
+    return args
+
+
+def run_undo(args):
+    ctx = Ctx(args.root)
+    ctx.git = git_info(args.root)
+    require_top(ctx)
+    res = undo(args.root, args)
+    if args.json:
+        res = res or {"run": None, "of": None, "restored": [], "already": [], "kept": []}
+        print_json({"v": 1, "project": args.root, "mode": "undo", "run": res["run"], "of": res["of"],
+                    "restored": res["restored"], "already": res["already"], "kept": res["kept"]})
+        return 0
+    if res is None:
+        print("nothing to undo")
+        return 0
+    for p in res["restored"]:
+        print("%-8s %s" % ("restored", one_line(p)))
+    for p in res["already"]:
+        print("%-8s %s" % ("already", one_line(p)))
+    for k in res["kept"]:
+        print("%-8s %s  %s" % ("kept", one_line(k["path"]), one_line(k["why"], 400)))
+    print("summary: undo of run %s: %d restored, %d already, %d kept"
+          % (res["of"], len(res["restored"]), len(res["already"]), len(res["kept"])))
+    return 0
+
+
+def run_migrate(args):
+    root, warnings = args.root, []
+    ctx = project_git(root)
+    require_top(ctx)                 # dry run and apply alike
+    if args.apply:
+        preflight(root, args, ctx)   # the refusals that need no plan
+    entries = plan_project(ctx, args, warnings)
+    run = None
+    if args.apply:
+        require_code_check(ctx)      # still before any write
+        run = new_run_id()
+        apply_plan(root, args, ctx, entries, run, warnings)
+    if args.json:
+        print_json({"v": 1, "project": root, "mode": "apply" if args.apply else "dry-run", "run": run,
+                    "dirty": None if ctx.dirty is None else bool(ctx.dirty),
+                    "docs": [entry_json(d) for d in entries], "summary": summarize(entries, bool(args.apply)),
+                    "warnings": warning_strings(warnings)})
+    else:
+        print(text_report(root, entries, bool(args.apply), run, warnings))
+    return 0
+
+
+def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    try:
+        args = parse_args(sys.argv[1:] if argv is None else argv)
+        return run_undo(args) if args.undo is not None else run_migrate(args)
+    except Refuse as e:
+        print(block_message(e.reason, e.suggestion), file=sys.stderr)
+        return 2
+    except Usage as e:
+        print("%s: %s" % (PROG, e), file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

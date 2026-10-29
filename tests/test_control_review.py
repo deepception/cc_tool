@@ -3,7 +3,8 @@
 (after v0.2.2): one check per finding, each written from the reviewer's probe.
 
   F1  a Live row offered one-click Approve on a call its text (from
-      attention.jsonl, which an agent can append to) did not show
+      attention.jsonl, which an agent can append to) did not show; the rule
+      now holds for the Factory floor's Review button and its review dialog
   F2  "Allow for this session" rules were not covered by the card digest
   F3  incomplete cards (Write content clipped, MultiEdit edits and NotebookEdit
       source not shown) and Approve on an input the hook had shortened
@@ -30,6 +31,11 @@ The review of v0.2.4:
       then (review of that fix) attribution by /proc fd scan raced and failed open: the hook
       now talks over a Unix socket cc-dash makes, the kernel naming the peer
   P3  (MEDIUM) a process of yours whose fds cannot be read was skipped by the terminal scan
+
+The review of v0.3.0:
+  no /proc  (HIGH) without /proc (macOS) the hook trusted any lease and cc-dash turned its
+      hook check off, so an agent's own lease and socket could approve its prompts
+      (test_no_proc_review here; the hook side in test_control_hook.py)
 
 The web checks run lib/cc_dash/web/control.js in node against a small fake DOM
 (skipped without node). Run:  python3 tests/test_control_review.py
@@ -120,7 +126,7 @@ def hand_over(ctl, req):
     return code
 
 
-# ── F1: the Live row ───────────────────────────────────────────────────────
+# ── F1: the alert row, and the floor's Review button ───────────────────────
 def test_f1_liverow_text():
     """probe_liverow.py: an agent appends a forged PermissionRequest line ("npm test")
     ahead of the real one; the row must show the request's own command."""
@@ -149,11 +155,21 @@ def test_f1_inline_source():
     src = open(CONTROL_JS, encoding="utf-8").read()
     body = src[src.index("function inline("):]
     body = body[:body.index("\n  }\n")]
-    check("F1: inline() (Live rows) makes no Approve or Deny button", "'allow'" not in body and "'deny'" not in body
+    check("F1: inline() (the floor's Review button) makes no Approve or Deny button", "'allow'" not in body and "'deny'" not in body
           and "Approve" not in body, body[-400:])
     click = src[src.index("document.addEventListener('click'"):]
     click = click[:click.index("}, true);")]
-    check("F1: the Live rows' click handler never decides", "decide(" not in click, click[-300:])
+    check("F1: the Review buttons' click handler never decides; it opens the review dialog",
+          "decide(" not in click and "review(t.dataset.ctlReq" in click, click[-300:])
+    # The dialog only opens, shows and closes slot()'s full card: no decision path of its own.
+    for fn in ("function review(", "function reviewDialog(", "function closeSub(", "function closeReview("):
+        i = src.index(fn)
+        part = src[i:src.index("\n  }\n", i)]
+        check("F1: %s) never decides" % fn[len("function "):-1], not any(x in part for x in ("decide(", "post(", "act(", ".allow(", ".deny(", "'allow'", "'deny'")),
+              part[:300])
+    rv = src[src.index("function review("):]
+    rv = rv[:rv.index("\n  }\n")]
+    check("F1: Review opens the request's full card (slot() with no compact option)", "slot(id)" in rv and "compact" not in rv, rv[-400:])
 
 
 # ── the web card, in node against a fake DOM ───────────────────────────────
@@ -182,14 +198,22 @@ global.addEventListener = () => {};
 global.CustomEvent = class { constructor(t) { this.type = t; } };
 global.location = { hash: '' };
 global.innerHeight = 800;
-global.document = { createElement: (t) => new N(t.toUpperCase()), createTextNode: (s) => new N('#text', s), addEventListener() {},
+N.prototype.replaceChildren = function (...k) { this.children = []; this.append(...k); };
+N.prototype.showModal = function () { this.open = true; };
+N.prototype.close = function () { this.open = false; };
+const docL = {};
+const posts = [];
+global.document = { createElement: (t) => new N(t.toUpperCase()), createElementNS: (ns, t) => new N(t), createTextNode: (s) => new N('#text', s),
+  addEventListener(t, f) { (docL[t] = docL[t] || []).push(f); }, body: new N('BODY'),
   documentElement: new N('HTML'), dispatchEvent() {}, hidden: false, querySelectorAll() { return []; }, getElementById() { return null; },
   hasFocus() { return true; } };
 global.setInterval = () => 0;
+global.requestAnimationFrame = () => 0;
 global.ccDom = { reconcile() {} };
 global.ccAuth = { ready: Promise.resolve(), scope: () => 'control', unlock: async () => ({ ok: true }),
-  fetch: async (path) => ({ status: 200, json: async () => (path === '/api/meta' ? { control: { enabled: true, scope: 'control' } }
-    : path.startsWith('/api/control/state') ? { now: Date.now() / 1000, requests: data.requests, messages: [], audit: [], stops: [] } : {}) }) };
+  fetch: async (path, opts) => { if (opts && opts.method === 'POST') posts.push(path);
+    return { status: 200, json: async () => (path === '/api/meta' ? { control: { enabled: true, scope: 'control' } }
+      : path.startsWith('/api/control/state') ? { now: Date.now() / 1000, requests: data.requests, messages: [], audit: [], stops: [] } : {}) }; } };
 require(process.argv[2]);
 (async () => {
   for (let i = 0; i < 100 && !(window.ccControl && window.ccControl.ready() && window.ccControl.on()); i++) await new Promise((ok) => setTimeout(ok, 20));
@@ -204,7 +228,19 @@ require(process.argv[2]);
     walk(slot, (n) => { if ((n.className || '').includes('ctl-note') || (n.className || '').includes('ctl-more')) card.more.push(n.className); });
     const row = window.ccControl.inline(r.id, '#/s/x');
     card.inline = [];
-    if (row) walk(row, (n) => { if (n.tagName === 'BUTTON') card.inline.push({ label: n.textContent, act: n.dataset.ctlAct }); });
+    let rvBtn = null;
+    if (row) walk(row, (n) => { if (n.tagName === 'BUTTON') { card.inline.push({ label: n.textContent, act: n.dataset.ctlAct }); rvBtn = n; } });
+    // A click on Review, through control.js's delegated handler: the review dialog with the full card, and no POST.
+    if (rvBtn) {
+      const before = posts.length;
+      for (const f of docL.click || []) f({ target: { closest: (sel) => (sel === '[data-ctl-act]' ? rvBtn : null) }, stopPropagation() {}, preventDefault() {} });
+      let dlg = null;
+      walk(document.body, (n) => { if (n.tagName === 'DIALOG') dlg = n; });
+      const cards = [];
+      if (dlg) walk(dlg, (n) => { if ((n.className || '').split(' ').includes('ctl-card')) cards.push({ req: n.dataset.req, compact: n.className.includes('compact') }); });
+      card.review = { open: !!(dlg && dlg.open), cls: dlg ? dlg.className : null, cards, text: dlg ? dlg.textContent : '', posts: posts.length - before };
+      if (dlg) dlg.close();
+    }
     out[r.id] = card;
   }
   console.log(JSON.stringify(out));
@@ -253,8 +289,15 @@ def test_web_cards():
     if not out:
         return
     c = {k: out.get(r["id"], {}) for k, r in reqs.items()}
-    check("F1: a Live row offers only Review (it never approves or denies)",
+    check("F1: the floor's Review button offers only Review (it never approves or denies)",
           all([b["act"] for b in c[k].get("inline", [])] == ["open"] for k in reqs), {k: c[k].get("inline") for k in reqs})
+    rvs = {k: c[k].get("review") or {} for k in reqs}
+    check("F1: Review opens dialog.ctl-review holding the request's own full (not compact) card, and sends nothing",
+          all(v.get("open") and v.get("cls") == "ctl-review" and v.get("cards") == [{"req": reqs[k]["id"], "compact": False}] and v.get("posts") == 0
+              for k, v in rvs.items()), {k: {x: v.get(x) for x in ("open", "cls", "cards", "posts")} for k, v in rvs.items()})
+    check("F1/F3: the review dialog shows the whole input (a Write's last line, every MultiEdit edit)",
+          "LAST LINE: exfiltrate()" in rvs["write"].get("text", "") and all(("NEW-%d" % i) in rvs["multi"].get("text", "") for i in range(1, 4)),
+          rvs["write"].get("text", "")[-200:])
     check("F3: Write: the whole new content is on the card (behind Show all)", "LAST LINE: exfiltrate()" in c["write"].get("full", "")
           and "line 060 of the new file" in c["write"].get("full", ""), c["write"].get("full", "")[-200:])
     check("F3: MultiEdit: every edit's old and new text is on the card",
@@ -2168,16 +2211,135 @@ def test_markers_gone():
     check("M: bash-guard leaves no marker code behind", "guard_ask_mark" not in src and "guard_ask_key" not in src)
 
 
+def test_gh_api_guard_asked():
+    """`Bash(gh api *)` is allowlisted for reads. A gh api write is a prompt bash-guard
+    asked about, so through the control hook's classify() it needs the typed approve;
+    a gh api read is not flagged and a click is enough."""
+    hooks = pinned_hooks("gh-hooks")
+    dash, _store, state, _cfg = new_control("gh")
+    srv = serve(dash)
+    ctl = dash.dir
+    write_json(os.path.join(ctl, "lease"), {"v": 1, "pid": os.getpid(), "launch": "t", "port": srv.port, "key": dash.key, "sock": dash.hook_sock,
+                                            "expires": time.time() + 600, "wait": 30})
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+    env.update(XDG_STATE_HOME=state, HOME=os.path.join(BASE, "gh"), CC_DASH_LEASE_ANY_PROGRAM="1")
+    seen = {}
+    for cmd in ("gh api -X DELETE repos/o/r", "gh api repos/o/r --jq .name"):
+        payload = {"session_id": SID, "transcript_path": "/x", "cwd": BASE, "hook_event_name": "PermissionRequest",
+                   "permission_mode": "default", "tool_name": "Bash", "tool_input": {"command": cmd}}
+        p = subprocess.Popen([PY, os.path.join(hooks, "dash-control.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env)
+        p.stdin.write(json.dumps(payload).encode())
+        p.stdin.close()
+        p.stdin = None
+        end = time.time() + 8
+        while time.time() < end and cmd not in seen:
+            dash.scan()
+            req = next((dict(r) for r in dash.requests.values() if (r.get("input") or {}).get("command") == cmd), None)
+            if req is not None:
+                seen[cmd] = req
+            time.sleep(0.03)
+        p.terminate()
+        p.communicate(timeout=5)
+    srv.shutdown()
+    srv.server_close()
+    write, read = seen.get("gh api -X DELETE repos/o/r"), seen.get("gh api repos/o/r --jq .name")
+    check("GH: a gh api write is flagged with bash-guard's ask (typed approve)",
+          write is not None and (write.get("guard") or "").startswith("NEEDS APPROVAL") and "GitHub" in write.get("guard", ""),
+          (write or {}).get("guard"))
+    check("GH: a gh api read is not flagged", read is not None and (read.get("guard") or "") == "", (read or {}).get("guard"))
+    c, _store, _state, _cfg = new_control("gh-ctl")
+    for req, label, want_typed in ((write, "the gh api write needs the typed approve (a click is 428)", True),
+                                   (read, "the gh api read needs no typed approve (a click is not 428)", False)):
+        rid = (req or {}).get("id") or rid_now()
+        c.requests[rid] = dict(req or {}, status="open", id=rid)
+        code, out = c.decide("human", {"id": rid, "action": "allow", "hash": (req or {}).get("hash")})
+        check("GH: " + label, req is not None and (code == 428) == want_typed and code != 400, (code, out))
+
+
+def test_no_proc_review():
+    """The review of v0.3.0 (HIGH), cc-dash's side: without /proc, Control turned its
+    hook check off (hook_check and os.path.isdir("/proc/self")), so any request handed
+    over on the hook socket was shown, and control_refusal took any live lease pid for
+    cc-dash and started after checking the environment alone. Now a Control asked to
+    check hooks shows no request there, not even a real installed hook's (the hook gets
+    a refusal and leaves the prompt in the terminal), and control_refusal refuses, a
+    planted lease or not. Played by patching procs.have_proc."""
+    from cc_dash import procs
+    from cc_dash import server as server_mod
+    ctl, _store, state, _cfg = new_control("np", hook_check=True)
+    srv = serve(ctl)
+    installed = pinned_hooks("np-proj")
+    project = os.path.dirname(os.path.dirname(installed))
+    register(os.path.dirname(ctl.dir), project)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+    env.update(XDG_STATE_HOME=state, HOME=os.path.join(BASE, "np"), CC_DASH_LEASE_ANY_PROGRAM="1", CLAUDE_PROJECT_DIR=project)
+    real = procs.have_proc
+
+    def ask(cmd):
+        """Run the installed hook on a Bash prompt: (what cc-dash shows for it or None, new refusals, the hook's exit)."""
+        payload = {"session_id": SID, "transcript_path": "/x", "cwd": BASE, "hook_event_name": "PermissionRequest",
+                   "permission_mode": "default", "tool_name": "Bash", "tool_input": {"command": cmd}}
+        n0 = len([a for a in ctl.audit if a.get("kind") == "req"])
+        p = subprocess.Popen([PY, os.path.join(installed, "dash-control.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env)
+        p.stdin.write(json.dumps(payload).encode())
+        p.stdin.close()
+        p.stdin = None
+        seen, end = None, time.time() + 8
+        while time.time() < end and seen is None:
+            ctl.scan()
+            seen = next((dict(r) for r in ctl.requests.values() if (r.get("input") or {}).get("command") == cmd), None)
+            if len([a for a in ctl.audit if a.get("kind") == "req"]) > n0:
+                break
+            time.sleep(0.03)
+        try:
+            out, _err = p.communicate(timeout=3)  # refused: the hook exits by itself
+            gone = (p.returncode, out)
+        except subprocess.TimeoutExpired:
+            p.terminate()
+            p.communicate(timeout=5)
+            gone = None                             # still waiting on the dashboard
+        return seen, [a for a in ctl.audit if a.get("kind") == "req"][n0:], gone
+
+    try:
+        seen, _refused, _gone = ask("echo with-proc")
+        check("no /proc: (control) with /proc the installed hook's request is shown", seen is not None, seen)
+        procs.have_proc = lambda: False
+        seen, refused, gone = ask("echo without-proc")
+        check("no /proc: a Control that checks hooks shows no request, not even a real installed hook's", seen is None, seen)
+        check("no /proc: ... it audits the refusal, saying there is no /proc to tell who sent it",
+              len(refused) == 1 and "/proc" in (refused[0].get("result") or ""), refused)
+        check("no /proc: ... and the hook, refused, exits by itself without a decision (the prompt stays in the terminal)",
+              gone == (0, b""), gone)
+        check("no /proc: the Control still has its hook check on", ctl.hook_check is True)
+        d = os.path.join(BASE, "np-refusal", "control")
+        os.makedirs(d, mode=0o700)
+        write_json(os.path.join(d, "lease"), {"pid": 1, "expires": time.time() + 10 ** 9})
+        why = control_refusal(ctl_dir=d, env={}, ancestors=[], note=lambda s: None)
+        check("no /proc: control_refusal refuses, a planted lease (pid 1) not taken for a running cc-dash",
+              why == server_mod.NO_PROC, why)
+        os.unlink(os.path.join(d, "lease"))
+        why = control_refusal(ctl_dir=d, env={}, ancestors=[], note=lambda s: None)
+        check("no /proc: ... and with no lease and a clean environment, still refuses (no environment-only start)",
+              why == server_mod.NO_PROC, why)
+    finally:
+        procs.have_proc = real
+        srv.shutdown()
+        srv.server_close()
+
+
 def main():
     sys.path.insert(0, HOOKS)
     try:
         for fn in (test_f1_liverow_text, test_f1_inline_source, test_web_cards, test_f2_card_fields_equal_digest, test_f2_session_rules,
                    test_f3_truncated, test_f4a_code_in_text, test_f4b_planted_request, test_f5_planted_lease, test_f6_fake_checkout,
-                   test_f6_write_guard, test_f6_pin_setup, test_markers_gone, test_h1_no_checkout_code, test_h3_ld_env,
+                   test_f6_write_guard, test_f6_pin_setup, test_markers_gone, test_gh_api_guard_asked, test_h1_no_checkout_code, test_h3_ld_env,
                    test_r3_code_manifest, test_r4_no_lib_on_path, test_n1_interpreter_identity, test_n1_detached_rules,
                    test_n3_lineage_fail_closed, test_n2_rewrite_in_place, test_p2_hook_socket, test_p3_hidden_holder, test_n5_terminal_holder,
                    test_n7_appimage_full_hash, test_n8_recording, test_p1_recording_gate, test_n9_debug_holder, test_n10_union_read,
-                   test_n12_inherited_holders):
+                   test_n12_inherited_holders,
+                   test_no_proc_review):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001

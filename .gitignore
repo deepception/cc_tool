@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 docs/*
 !docs/guides/
+.claude/worktrees/

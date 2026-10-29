@@ -3,6 +3,12 @@ name: design-an-interface
 description: Generate multiple radically different interface designs for a code module (its API shape, not its visual UI) using parallel sub-agents. Use when user wants to design an API, explore module interface options, compare module shapes, or mentions "design it twice". Visual UI design goes to design-director.
 ---
 
+<!-- Adapted from https://github.com/mattpocock/skills (MIT, (c) 2026 Matt Pocock),
+     first taken byte-identical at 74dbf0d00c07cd0fb394cf02bd609e5bc9b42fad
+     (2026-02-03); cc_tool has edited it since. LICENSE ships alongside this
+     file. Upstream deprecated this skill on 2026-04-28 and deleted it on
+     2026-08-05 (c66bdee); its successor is codebase-design/DESIGN-IT-TWICE.md. -->
+
 # Design an Interface
 
 Based on "Design It Twice" from "A Philosophy of Software Design": your first idea is unlikely to be the best. Generate multiple radically different designs, then compare.

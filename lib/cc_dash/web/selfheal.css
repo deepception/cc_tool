@@ -1,0 +1,198 @@
+/* cc-dash self-heal: the header control, its popover and the proposals
+   drawer (selfheal.js). app.css tokens and components only:
+   - the button is the header's bordered 28px control (.icon-btn's frame with
+     a label; a square with the bandage glyph at 900 px and narrower, the way
+     the window picker becomes "7d"); the status beside it is the scope
+     text's quiet 12px; the count is a quiet text button like the picker's;
+   - the popover is the picker's (.picker-pop), its rows sunk wells, its code
+     field control.js's own (.ctl-lock, shown only under html.ctl-locked),
+     Run is control's .btn.primary;
+   - the drawer is the alerts drawer (.al-drawer, .al-scrim, .al-head,
+     .al-list, .al-foot), wider for diffs; a proposal is a raised panel, its
+     facts a two-column list, commands and the diff sit in the sunk box
+     control.css uses for an exact command (.ctl-box);
+   - states are app.css's status language (.g s-working, s-failed); severity
+     is a neutral .pill by weight, never a status colour; the diff's + and -
+     lines carry the one green and red wash (data, not decoration).
+   No inline styles anywhere (the CSP blocks them). */
+
+/* ── Header control ──────────────────────────────────────────────────── */
+.sh { position: relative; display: inline-flex; align-items: center; gap: var(--sp-1h); flex: none; margin-right: var(--sp-2);
+  white-space: nowrap; font-size: var(--fs-12); color: var(--ink-3); font-variant-numeric: tabular-nums; }
+html.unpaired .sh { visibility: hidden; }
+.sh-btn {
+  position: relative; flex: none; height: var(--h-ctl-s); display: inline-flex; align-items: center; justify-content: center; gap: var(--sp-1h);
+  padding: 0 var(--sp-2h); border: 1px solid var(--line); border-radius: var(--r-m); background: var(--surface); color: var(--ink-2);
+  font: 500 var(--fs-12)/1 var(--font); letter-spacing: -.003em; cursor: pointer;
+  transition: background-color var(--t-fast) ease, border-color var(--t-fast) ease, color var(--t-fast) ease;
+}
+.sh-btn:hover, .sh-btn[aria-expanded="true"] { border-color: var(--line-2); background: var(--raised); color: var(--ink); }
+.sh-btn:disabled { cursor: default; border-color: var(--line); background: transparent; color: var(--ink-4); }
+.sh-ico { display: none; width: 14px; height: 14px; flex: none; }
+.sh-badge { display: none; }
+/* Status text: plain inline text, so "last: " and the ticking time keep one space. */
+.sh-st { display: inline-block; line-height: var(--h-ctl-s); }
+.sh-st:empty { display: none; }
+.sh-st .g, .sh-row-t .g { vertical-align: 0; margin-right: var(--sp-1h); }
+.sh-st .g.s-failed, .sh-row-t .g.s-failed { vertical-align: -1px; }
+.sh-watch { color: var(--ink-2); border-radius: var(--r-s); text-decoration: underline; text-decoration-color: transparent; text-underline-offset: 3px;
+  transition: color var(--t-fast) ease, text-decoration-color var(--t-fast) ease; }
+.sh-watch:hover { color: var(--ink); text-decoration-color: var(--axis); }
+.sh-n {
+  flex: none; height: var(--h-ctl-s); padding: 0 var(--sp-2); margin-left: calc(-1 * var(--sp-0h)); border: 0; border-radius: var(--r-m); background: transparent;
+  color: var(--ink-2); font: 500 var(--fs-12)/1 var(--font); font-variant-numeric: tabular-nums; cursor: pointer;
+  transition: background-color var(--t-fast) ease, color var(--t-fast) ease;
+}
+.sh-n:hover, .sh-n[aria-expanded="true"] { background: var(--hover); color: var(--ink); }
+
+/* ── Popover ─────────────────────────────────────────────────────────── */
+.sh-pop { left: auto; right: 0; width: 360px; padding: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-3);
+  transform-origin: top right; white-space: normal; text-align: left; font-size: var(--fs-13); font-weight: 400; color: var(--ink); cursor: auto; }
+.sh-pop:focus { outline: none; }
+.sh-pop-h { font-size: var(--fs-14); }
+.sh-lede { margin: var(--sp-0h) 0 0; font-size: var(--fs-12); line-height: 1.45; color: var(--ink-3); }
+.sh-now { display: flex; flex-direction: column; gap: var(--sp-1h); }
+.sh-now:empty { display: none; }
+.sh-row {
+  margin: 0; display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); min-height: 36px;
+  padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-2h); border-radius: var(--r-m); background: var(--sunk); border: 1px solid var(--line);
+  font-size: var(--fs-12); line-height: 1.45; color: var(--ink-2);
+}
+.sh-row-t { min-width: 0; padding: var(--sp-0h) 0; overflow-wrap: anywhere; }
+.sh-row .btn { flex: none; height: 26px; padding: 0 var(--sp-2h); font-size: var(--fs-12); }
+.sh-row a.btn { display: inline-flex; align-items: center; }
+.sh-err { display: block; color: var(--ink-3); margin-top: var(--sp-0h); }
+.sh-kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: var(--sp-1h) var(--sp-4); margin: 0; font-size: var(--fs-12); line-height: 1.45; }
+.sh-kv:empty { display: none; }
+.sh-kv dt { color: var(--ink-3); }
+.sh-kv dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+/* Locked: control.js's code field in place of Run (it shows only under html.ctl-locked). */
+html:not(.ctl-locked) .sh-lock, .sh-lock:empty { display: none; }
+html.ctl-locked .sh-acts { display: none; }
+.sh-acts { display: flex; align-items: center; gap: var(--sp-2); }
+.sh-acts .btn { height: var(--h-ctl-s); }
+.sh-msg { margin: 0; font-size: var(--fs-12); line-height: 1.45; color: var(--ink-2); }
+.sh-msg.bad { color: var(--bad); }
+
+/* ── Drawer ──────────────────────────────────────────────────────────── */
+.sh-drawer { width: min(720px, 100vw); }
+html.sh-drawer-open .al-stack { visibility: hidden; }
+.sh-d-head { height: auto; min-height: var(--h-top); align-items: flex-start; padding: var(--sp-3) var(--sp-3) var(--sp-3) var(--sp-5); }
+.sh-d-id { min-width: 0; padding-top: var(--sp-1); }
+.sh-d-sub { margin: var(--sp-0h) 0 0; font-size: var(--fs-12); color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.sh-d-sub:empty { display: none; }
+.sh-list { gap: var(--sp-6); padding: var(--sp-4) var(--sp-5) var(--sp-6); }
+.al-foot:has(> .sh-d-foot:empty) { display: none; }
+.sh-d-foot { margin: 0; font-size: var(--fs-12); color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.sh-group { display: flex; flex-direction: column; gap: var(--sp-2h); min-width: 0; }
+.sh-g-head { display: flex; align-items: baseline; gap: var(--sp-2); min-width: 0; }
+.sh-g-h { flex: none; font-size: var(--fs-13); font-weight: 600; }
+.sh-g-head .count { flex: none; align-self: center; }
+.sh-g-sub { font-size: var(--fs-12); color: var(--ink-4); }
+
+/* A proposal: a raised panel, the same frame and padding as the decision card without its amber edge. */
+.sh-prop, .sh-sk-card { display: flex; flex-direction: column; gap: var(--sp-2h); min-width: 0; padding: var(--sp-3h) var(--sp-4) var(--sp-4);
+  border: 1px solid var(--line); border-radius: var(--r-l); background: var(--raised); }
+.sh-p-row1 { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; font-size: var(--fs-12); color: var(--ink-3); }
+.sh-sev { flex: none; }
+.pill.sh-sev.sev-high { color: var(--ink); border-color: var(--line-2); font-weight: 600; }
+.pill.sh-sev.sev-low { background: transparent; color: var(--ink-3); }
+.sh-target { flex: 0 1 auto; }
+.sh-verdict { flex: none; font-size: var(--fs-11); color: var(--ink-3); }
+.sh-p-title { margin: 0; font-size: var(--fs-14); font-weight: 600; line-height: 1.35; letter-spacing: -.008em; overflow-wrap: anywhere; }
+.sh-facts { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: var(--sp-1h) var(--sp-3); margin: 0; font-size: var(--fs-12); line-height: 1.5; }
+.sh-facts dt { color: var(--ink-3); }
+.sh-facts dd { margin: 0; min-width: 0; color: var(--ink-2); overflow-wrap: anywhere; }
+.sh-ev { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-1); }
+.sh-ev li { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--sp-2); min-width: 0; }
+.sh-ev-k { flex: none; color: var(--ink); font-weight: 500; font-variant-numeric: tabular-nums; }
+.sh-ev-s { flex: none; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.sh-ev-x { flex: 1 1 180px; min-width: 0; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The diff: one block span per line inside a box that scrolls both ways; the
+   inner code is as wide as the longest line, so every row's wash runs to it. */
+.sh-diff {
+  margin: 0; max-height: 300px; overflow: auto; overscroll-behavior: contain; padding: var(--sp-1h) 0;
+  background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-m); color: var(--ink); tab-size: 4;
+}
+.sh-diff:focus-visible { outline-offset: -2px; }
+.sh-diff-in { display: inline-block; min-width: 100%; font: var(--fs-12)/1.6 var(--mono); letter-spacing: 0; }
+.sh-l { display: block; padding: 0 var(--sp-3); white-space: pre; }
+.sh-l:empty::before { content: " "; }
+.sh-l.add { background: color-mix(in srgb, var(--good-dot) 11%, transparent); box-shadow: inset 2px 0 0 var(--good-dot); }
+.sh-l.del { background: color-mix(in srgb, var(--bad) 10%, transparent); box-shadow: inset 2px 0 0 var(--bad); }
+.sh-l.hunk { color: var(--ink-3); background: color-mix(in srgb, var(--ink) 4%, transparent); }
+.sh-l.hdr { color: var(--ink-3); }
+.sh-l.meta { color: var(--ink-4); }
+
+.sh-cmd { display: flex; align-items: flex-start; gap: var(--sp-2); min-width: 0; padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-2h);
+  background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-m); font-size: var(--fs-12); }
+.sh-cmd-l { flex: none; min-width: 36px; line-height: 22px; color: var(--ink-3); }
+.sh-cmd-t { flex: 1 1 auto; min-width: 0; padding: 3px 0; font: var(--fs-12)/1.4 var(--mono); letter-spacing: 0; color: var(--ink); overflow-wrap: anywhere; }
+.sh-cmd-copy { flex: none; height: 22px; }
+.sh-copy-ta {
+  width: 100%; min-height: 72px; resize: vertical; padding: var(--sp-1h) var(--sp-2); border-radius: var(--r-m); border: 1px solid var(--focus);
+  background: var(--surface); color: var(--ink); font: var(--fs-12)/1.5 var(--mono);
+}
+.sh-copy-ta:focus { outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 18%, transparent); }
+.sh-p-acts { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.sh-p-acts .btn { height: var(--h-ctl-s); font-size: var(--fs-12); }
+.sh-p-acts > .btn.quiet:first-child { margin-left: calc(-1 * var(--sp-3)); }   /* a quiet button alone keeps the card's text edge */
+.sh-copy { min-width: 92px; }
+.sh-order-btn[aria-expanded="true"] { background: var(--hover); border-color: var(--line); color: var(--ink); }
+.sh-order { display: flex; flex-direction: column; gap: var(--sp-1h); }
+.sh-note { margin: 0; font-size: var(--fs-12); color: var(--ink-3); }
+/* The server's caution above a diff: control.css's bash-guard note (.ctl-guard), one line. */
+.sh-caution {
+  margin: 0; padding: var(--sp-1h) var(--sp-3); border-radius: var(--r-m); font-size: var(--fs-12); line-height: 1.5; color: var(--ink); overflow-wrap: anywhere;
+  background: var(--needs-wash); border: 1px solid color-mix(in srgb, var(--warn-dot) 55%, var(--line));
+}
+.sh-caution b { color: var(--warn); font-weight: 600; }
+.sh-problem, .sh-problems {
+  margin: 0; display: flex; align-items: flex-start; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3); border-radius: var(--r-m);
+  background: var(--bad-wash); border: 1px solid color-mix(in srgb, var(--bad) 22%, transparent); font-size: var(--fs-12); line-height: 1.5; color: var(--ink-2); overflow-wrap: anywhere;
+}
+.sh-problem .g, .sh-problems .g { margin-top: 5px; }
+.sh-problem b, .sh-problems b { color: var(--bad); font-weight: 600; }
+.sh-problems { padding: var(--sp-3) var(--sp-4); border-radius: var(--r-l); }
+.sh-problems ul { margin: var(--sp-1) 0 0; padding-left: var(--sp-4); }
+
+.sh-drop-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); font-size: var(--fs-12); line-height: 1.45; }
+.sh-drop-list li { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
+.sh-drop-t { color: var(--ink-2); font-weight: 500; }
+.sh-drop-r { color: var(--ink-3); }
+.sh-notes { margin: 0; font-size: var(--fs-12); line-height: 1.5; color: var(--ink-3); }
+.sh-empty { margin: 32px var(--sp-2); }
+.sh-loading { display: flex; flex-direction: column; gap: var(--sp-3); }
+.sh-sk-a { width: 30%; margin: 0; }
+.sh-sk-b { width: 78%; height: 16px; margin: 0; }
+.sh-sk-c { height: 120px; margin-top: var(--sp-1); }
+
+/* ── Narrow: the button is a square, the status and count live in the popover ─ */
+@media (max-width: 900px) {
+  .sh-st, .sh-n { display: none; }
+  .sh-btn { width: var(--h-ctl-s); padding: 0; }
+  .sh-label { display: none; }
+  .sh-ico { display: block; }
+  .sh-badge:not([hidden]) { display: grid; place-items: center; position: absolute; top: -5px; right: -5px; width: 14px; height: 14px; border-radius: 50%; background: var(--bg); }
+}
+@media (max-width: 640px) {
+  .sh { margin-right: 0; }
+  .sh-btn { width: 32px; height: 32px; }
+  .sh-pop { position: fixed; top: calc(var(--h-top) + 6px); left: var(--sp-3); right: var(--sp-3); width: auto; max-width: none; }
+  .sh-d-head { padding: var(--sp-2h) var(--sp-2) var(--sp-2h) var(--sp-4); }
+  .sh-d-x { width: 40px; height: 40px; }   /* phone hit areas, as the review dialog's */
+  .sh-list { padding: var(--sp-3) var(--sp-3) var(--sp-5); gap: var(--sp-5); }
+  .sh-prop { padding: var(--sp-3); }
+  .sh-facts { grid-template-columns: minmax(0, 1fr); row-gap: 0; }
+  .sh-facts dd + dt { margin-top: var(--sp-2); }
+  /* A command takes the box's whole width under its label and Copy. */
+  .sh-cmd { flex-wrap: wrap; row-gap: 0; }
+  .sh-cmd-copy { margin-left: auto; }
+  .sh-cmd-t { order: 1; flex-basis: 100%; padding: 0 var(--sp-1) var(--sp-1) 0; }
+  .sh-g-sub { display: none; }
+}
+@media (max-width: 350px) {   /* with app.css's 28px squares */
+  .sh-btn { width: 28px; height: 28px; }
+}

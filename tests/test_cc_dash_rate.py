@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Tool-call rate checks for cc-dash's Live agent rows (store.py _spark, app.js sparkline).
+"""Tool-call rate checks for cc-dash's agent rows (store.py _spark, GET /api/live) and for the
+Factory floor's inspector, which draws the same figures from /api/graph (graph.py).
 
-Each agent row on the Live board carries the last 15 one-minute buckets of
+Each agent row on the board (/api/live) carries the last 15 one-minute buckets of
 tool calls as {n, err, tools} (calls started in the minute, how many failed,
 the top 3 tools by count), plus `rate` (calls started in the trailing 60
 seconds) and `peak` (the busiest bucket). This builds synthetic transcripts
@@ -11,14 +12,20 @@ window edges, the peak, the still-filling current minute, idle and silent
 rows, the payload-size bound on a busy board, and incremental updates after
 appending tool calls (only the new bytes are read). It also checks the burn
 rule beside the rate: $/min from cost_min, and new tokens per minute (never
-cache reads) only for an unpriced model, server side and in app.js rateText.
+cache reads) only for an unpriced model, server side and in factory.js rate()
+(extracted and run in node with app.js's money and compact).
 
-With headless Chrome and playwright-core present it opens the board on a busy
-fixture: the rate figures, the lighter running minute, the red failed
-segment, the hover and arrow-key tooltip (time range, calls, failed, top
-tools), and that three polls with unchanged data add, remove or rewrite
-nothing. Set CC_DASH_SHOTS=<dir> to save light and dark shots at 1440 and
-390 px plus a tooltip shot. Nothing outside the temp dir is touched.
+The floor shows a node's calls as a bare count per minute and no failed segment
+or tooltip, so with headless Chrome and playwright-core present it opens the
+floor on a busy fixture (frozen clock; /api/graph from the same store) and checks
+the inspector of a busy agent, an agent on an unpriced model, their sessions and
+an idle session: the sparkline (one bar per minute, the counts in its label, the
+running minute styled apart, bars ordered like the counts), the Burn row and the
+rate on a session's face as the payload's figure ($/min, else new tokens a minute),
+no Burn row for an idle session, light and dark, the phone's bottom sheet, and
+that three polls with unchanged data leave the open inspector's nodes alone.
+Set CC_DASH_SHOTS=<dir> to save light and dark shots at 1440 and 390 px.
+Nothing outside the temp dir is touched.
 
 Run:  python3 tests/test_cc_dash_rate.py
 """
@@ -36,11 +43,11 @@ from http.server import ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "lib"))
+from cc_dash import graph as graph_mod  # noqa: E402
 from cc_dash import store as store_mod  # noqa: E402
 from cc_dash.auth import Auth  # noqa: E402
 from cc_dash.server import Handler  # noqa: E402
 from cc_dash.store import Store  # noqa: E402
-from dash_pairing import auto_token  # noqa: E402
 
 RESULTS = []
 PLAYWRIGHT = os.environ.get("CC_DASH_PLAYWRIGHT", "/home/lukasz/Files/hobby/color-analyzer/webapp/node_modules/playwright-core")
@@ -58,6 +65,7 @@ def iso(t):
 
 BASE = tempfile.mkdtemp(prefix="cc-dash-rate-test-")
 CFG = os.path.join(BASE, "claude")
+os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "state")   # attention.py reads the hooks' log from here: no real one is ever read
 T = (int(time.time()) // 60) * 60 + 30            # "now": 30 s into a wall-clock minute
 NOW = [float(T)]
 M0 = T - 30                                        # start of the current minute
@@ -118,7 +126,7 @@ class World:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a" if append else "w") as fh:
             for r in records:
-                fh.write(json.dumps(r) + "\n")
+                fh.write(json.dumps(r, separators=(",", ":")) + "\n")      # compact, as Claude Code writes (the parser pre-filters api-request lines by prefix)
         last = max(datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")).timestamp() for r in records)
         os.utime(path, (last, last))
 
@@ -315,44 +323,113 @@ def test_burn(st):
     check("burn: tok_min (with cache reads) is far larger and kept only for the breakdown", bp["tok_min"] > 100 * bp["new_min"], bp)
     check("burn: a priced model has a cost per minute and no unpriced part", bp["cost_min"] > 0 and bp["unpriced_min"] == 0, bp)
     check("burn: an unpriced model has no cost and all its new tokens are unpriced", bu["cost_min"] == 0 and bu["unpriced_min"] == bu["new_min"] > 0, bu)
-    # app.js rateText: run the real functions in node
+    # factory.js rate(): run the real function in node, with the app's own money and compact
     if not shutil.which("node"):
         print("burn (js): skipped (no node)")
         return
-    src = open(os.path.join(REPO, "lib", "cc_dash", "web", "app.js")).read()
-
-    def fn(name):
-        m = re.search(r"\n  function " + name + r"\(", src)
-        i, depth = src.index("{", m.end()), 0
-        for j in range(i, len(src)):
-            depth += {"{": 1, "}": -1}.get(src[j], 0)
-            if depth == 0:
-                return src[m.start():j + 1]
-        raise ValueError(name)
-
-    js = "\n".join(fn(n) for n in ("money", "compact", "rateText", "burnTitle")) + """
+    web = os.path.join(REPO, "lib", "cc_dash", "web")
+    fx = open(os.path.join(web, "factory.js")).read()
+    app = open(os.path.join(web, "app.js")).read()
+    try:
+        # factory.js wraps its helpers around ctx (C.money, C.compact); here C is the app's own two formatters.
+        parts = [stmt(app, "money"), stmt(app, "compact"), stmt(fx, "num"), stmt(fx, "money"), stmt(fx, "compact"), stmt(fx, "rate")]
+    except ValueError as e:
+        check("burn (js): rate() and the helpers it calls found in factory.js", False, str(e))
+        return
+    # In the page, C is the app's context: C.money and C.compact are app.js's two functions (here inside their own scope,
+    # so factory.js's own money and compact consts, which call them through C, stay what they are).
+    js = ("const C = (() => {\n" + parts[0] + "\n" + parts[1] + "\nreturn { money, compact };\n})();\n"
+          + "\n".join(parts[2:]) + """
 const cases = JSON.parse(process.argv[2]);
-console.log(JSON.stringify(cases.map((b) => [rateText(b), burnTitle(b)])));
-"""
+console.log(JSON.stringify(cases.map((b) => rate(b))));
+""")
     path = os.path.join(BASE, "burn.js")
     with open(path, "w") as fh:
         fh.write(js)
     cases = [bp, bu, {"tok_min": 0, "new_min": 0, "out_min": 0, "unpriced_min": 0, "cost_min": 0},
-             {"tok_min": 1280000, "new_min": 9000, "out_min": 2000, "unpriced_min": 0, "cost_min": 0.4321}]
+             {"tok_min": 1280000, "new_min": 9000, "out_min": 2000, "unpriced_min": 0, "cost_min": 0.4321},
+             {"tok_min": 1280000, "new_min": 0, "out_min": 0, "unpriced_min": 0, "cost_min": 0},
+             {"tok_min": 0, "new_min": 0, "out_min": 0, "unpriced_min": 0, "cost_min": 0.004},
+             None]
     r = subprocess.run(["node", path, json.dumps(cases)], capture_output=True, text=True, timeout=30)
     out = json.loads(r.stdout) if r.returncode == 0 else None
-    check("burn (js): rateText ran", out is not None, r.stderr[-400:])
+    check("burn (js): factory.js rate() ran", out is not None, (r.stderr or r.stdout)[-400:])
     if out:
-        check("burn (js): a priced row shows $/min", out[0][0].endswith("/min") and out[0][0].startswith(("$", "<$")), out[0][0])
-        check("burn (js): an unpriced row falls back to 'new tok/min' from new_min", out[1][0] == f"{bu['new_min'] / 1000:.1f}K new tok/min".replace(".0K", "K"), out[1][0])
-        check("burn (js): no activity shows nothing", out[2][0] == "", out[2][0])
-        check("burn (js): a context-heavy row shows dollars, not the 1.28M cache-read figure", out[3][0] == "$0.43/min" and "1.3M" not in out[3][0], out[3][0])
-        check("burn (js): the tooltip breaks it down (new tokens, then cache reads on top)", "New tokens: 9K" in out[3][1] and "Cache reads come on top: 1.3M" in out[3][1], out[3][1])
+        check("burn (js): a priced agent shows $/min", out[0] == fmt_money(bp["cost_min"]) + "/min" and out[0].endswith("/min") and out[0].startswith(("$", "<$")), out[0])
+        check("burn (js): an unpriced agent falls back to 'new tok/min' from new_min", out[1] == fmt_compact(bu["new_min"]) + " new tok/min" == f"{bu['new_min'] / 1000:.1f}K new tok/min".replace(".0K", "K"), out[1])
+        check("burn (js): no activity shows nothing", out[2] == "", out[2])
+        check("burn (js): a context-heavy agent shows dollars, not the 1.28M cache-read figure", out[3] == "$0.43/min" and "1.3M" not in out[3], out[3])
+        check("burn (js): cache reads alone (tok_min, no new tokens, no cost) show nothing", out[4] == "", out[4])
+        check("burn (js): a cost under a cent reads '<$0.01/min'", out[5] == "<$0.01/min", out[5])
+        check("burn (js): no burn object shows nothing", out[6] == "", out[6])
+
+
+def stmt(text, name):
+    """The top-level (two-space indent) `function name(...) {...}` or `const name = ...;` of a script, found by
+    scanning brackets and strings to its end. Raises ValueError when it is not there."""
+    m = re.search(r"\n  (?:function %s\(|const %s =)" % (re.escape(name), re.escape(name)), text)
+    if not m:
+        raise ValueError("no top-level %s in the script" % name)
+    start = m.start() + 3                         # past the newline and the two spaces
+    fn = text.startswith("function", start)
+    depth, i, seen_body, quote = 0, start, False, None
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+            seen_body = seen_body or ch == "{"
+        elif ch in ")]}":
+            depth -= 1
+            if fn and depth == 0 and ch == "}" and seen_body:
+                return text[start:i + 1]
+        elif ch == ";" and depth == 0 and not fn:
+            return text[start:i + 1]
+        i += 1
+    raise ValueError("unterminated %s" % name)
+
+
+def fmt_money(v):
+    """app.js money(v)."""
+    if v == 0:
+        return "$0"
+    if v < 0.01:
+        return "<$0.01"
+    return "$%.2f" % v if v < 100 else "$%s" % format(round(v), ",")
+
+
+def fmt_compact(n):
+    """app.js compact(n) for the sizes a rate takes."""
+    if n < 1000:
+        return str(round(n))
+    if n < 1e6:
+        return (("%.1f" % (n / 1e3)) if n < 1e4 else ("%.0f" % (n / 1e3))).removesuffix(".0") + "K"
+    return (("%.1f" % (n / 1e6)) if n < 1e7 else ("%.0f" % (n / 1e6))).removesuffix(".0") + "M"
+
+
+def fmt_rate(b):
+    """factory.js rate(b): dollars a minute, else new tokens a minute, never tok_min."""
+    if not b:
+        return ""
+    if b["cost_min"] > 0:
+        return fmt_money(b["cost_min"]) + "/min"
+    return fmt_compact(b["new_min"]) + " new tok/min" if b["new_min"] > 0 else ""
 
 
 # ── browser ─────────────────────────────────────────────────────────────────
+UNPRICED = "acme-unknown-model-1"
+SHOP, DOCS, LAB = "44444444-0000-0000-0000-000000000001", "44444444-0000-0000-0000-000000000002", "44444444-0000-0000-0000-000000000003"
+
+
 def busy_fixture(root, t):
-    """A small board that reads well: a lead with three subagents at different paces, failures, an idle session."""
+    """A small floor that reads well: a lead with three subagents at different paces and failures (shop-api),
+    an idle session (docs-site) and a lead with one subagent on a model that has no price (lab-bench)."""
     def make(name, sid):
         w = World(name, sid)
         w.cwd = os.path.join(root, "work", name)
@@ -360,7 +437,7 @@ def busy_fixture(root, t):
         w.pdir = os.path.join(root, "claude", "projects", w.cwd.replace("/", "-"))
         w.main, w.subdir = os.path.join(w.pdir, w.sid + ".jsonl"), os.path.join(w.pdir, w.sid, "subagents")
         return w
-    w = make("shop-api", "44444444-0000-0000-0000-000000000001")
+    w = make("shop-api", SHOP)
     main = [w.prompt(t - 880, "Ship the checkout refactor")]
     for j, d in enumerate(["Port the payment client", "Write the integration tests", "Review the migration"]):
         main += [w.tool(t - 870 + j, f"sp{j}", "Agent", {"description": d, "run_in_background": True, "prompt": "p"}),
@@ -372,6 +449,9 @@ def busy_fixture(root, t):
     paces = {0: (4, ["Bash", "Read", "Edit", "Grep", "Bash", "Write"]), 1: (7, ["Bash", "Bash", "Read", "mcp__claude_ai_Claude_Docs__batch"]), 2: (19, ["Read", "Grep"])}
     for j, (step, names) in paces.items():
         r = [w.prompt(t - 868, "part", agent=f"x{j}")]
+        if j == 1:      # the effort this agent's requests carried (Claude Code writes an api-request record before them)
+            r.append({"type": "api-request", "sessionId": SHOP, "timestamp": iso(t - 867),
+                      "params": {"model": "claude-opus-5-5", "thinking": {"type": "adaptive", "display": "updates"}, "output_config": {"effort": "high"}}})
         k = 0
         tt = t - 860 + j * 2
         while tt < t - 3:
@@ -382,22 +462,28 @@ def busy_fixture(root, t):
             tt += step
         r.append(w.tool(t - 2, f"x{j}_run", "Bash", {"command": "pytest -q tests/"}, agent=f"x{j}"))
         w.write_sub(f"x{j}", r, {"agentType": "general-purpose", "description": ["Port the payment client", "Write the integration tests", "Review the migration"][j], "toolUseId": f"sp{j}"})
-    v = make("docs-site", "44444444-0000-0000-0000-000000000002")
+    v = make("docs-site", DOCS)
     rr = [v.prompt(t - 700, "Tidy the guides")]
     for k in range(12):
         rr += v.calls(t - 690 + k * 20, f"v{k}", ["Read", "Edit"][k % 2])
     rr.append(v.text(t - 300, "v-end", "Guides tidied."))
     v.write_main(rr)
+    # lab-bench: both threads on a model without a price, with big cache reads that must never show up as a rate
+    z = make("lab-bench", LAB)
+    big = {"input_tokens": 400, "output_tokens": 900, "cache_read_input_tokens": 200000, "cache_creation_input_tokens": 3000}
+    z.write_main([z.prompt(t - 400, "Calibrate the bench"),
+                  z.tool(t - 395, "lab_sp", "Agent", {"description": "Run the sweep", "prompt": "p"}, model=UNPRICED, usage=dict(big))])
+    ru = [z.prompt(t - 394, "sweep", agent="u1")]
+    for k in range(8):
+        ru += z.calls(t - 300 + k * 30, f"u{k}", "Read", agent="u1", model=UNPRICED, usage=dict(big))
+    ru.append(z.tool(t - 3, "u_run", "Bash", {"command": "make bench"}, agent="u1", model=UNPRICED, usage=dict(big)))
+    z.write_sub("u1", ru, {"agentType": "general-purpose", "description": "Run the sweep", "toolUseId": "lab_sp"})
 
 
 class StubHandler(Handler):
     def do_GET(self):  # noqa: N802
         if self.path == "/__test/code":     # test hook: a fresh one-time pairing code per browser context
             return self._json(200, {"code": self.server.auth.new_code()})
-        if self.path.startswith("/api/alerts"):
-            if self.server.auth.session(self.headers) is None:
-                return self._json(401, {"error": "Not paired."})
-            return self._json(200, {"alerts": [], "now": time.time()})
         return super().do_GET()
 
 
@@ -414,96 +500,140 @@ def _server(st):
 
 BROWSER_JS = r"""
 const { chromium } = require(process.env.PW);
+const first = (e) => String((e && e.message) || e).split('\n')[0].slice(0, 300);
+const IDS = JSON.parse(process.env.IDS);
+const out = {};
 (async () => {
-  const out = {};
   const browser = await chromium.launch({ executablePath: process.env.CHROME, headless: true });
   const port = process.env.PORT;
+  const S = process.env.SHOTS;
+  const HELPERS = () => {
+    const txt = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : null);
+    const q = (id) => document.querySelector('.gx-node[data-id=' + JSON.stringify(id) + ']');
+    window.__t = { txt, q };
+  };
   const open = async (w, h, scheme) => {
     const ctx = await browser.newContext({ viewport: { width: w, height: h }, colorScheme: scheme });
+    await ctx.addInitScript(HELPERS);
     const page = await ctx.newPage();
     page.errs = [];
-    page.on('pageerror', (e) => page.errs.push(String(e)));
+    page.on('pageerror', (e) => page.errs.push(first(e)));
     const { code } = await (await fetch(`http://127.0.0.1:${port}/__test/code`)).json();
-    await page.goto(`http://127.0.0.1:${port}/pair#code=${code}`, { waitUntil: 'load' });
-    try { await page.waitForSelector('.agroup:not(.loose) .arow[data-key] svg.spark', { timeout: 15000, state: 'attached' }); } catch (e) { throw new Error('no board: ' + page.errs.join(' / ') + ' / ' + (await page.evaluate(() => document.body.innerText.slice(0, 400)))); }
+    await page.goto(`http://127.0.0.1:${port}/pair#code=${code}`, { waitUntil: 'load' });   // pairing lands on #/factory
+    try { await page.waitForSelector('.gx-node[data-id]', { timeout: 15000 }); } catch (e) { throw new Error('no floor: ' + page.errs.join(' / ') + ' / ' + (await page.evaluate(() => document.body.innerText.slice(0, 300)))); }
     await page.waitForTimeout(800);
     return { ctx, page };
   };
-  const S = process.env.SHOTS;
-  {
-    const { ctx, page } = await open(1440, 900, 'light');
-    out.rows = await page.evaluate(() => [...document.querySelectorAll('.agroup:not(.loose) .arow[data-key]')].map((r) => {
-      const svg = r.querySelector('svg.spark');
-      return { key: r.dataset.key, rate: r.querySelector('.a-rate').textContent, faint: r.querySelector('.a-rate').classList.contains('faint'),
-        bars: svg.querySelectorAll('.sb').length, paths: svg.querySelectorAll('path').length,
-        now: svg.querySelectorAll('.sb')[14].getAttribute('class'), errs: [...svg.querySelectorAll('.sp-err')].filter((p) => p.getAttribute('d')).length,
-        nowFill: getComputedStyle(svg.querySelectorAll('.sb')[14]).fill, pastFill: (() => { const p = [...svg.querySelectorAll('.sb.sp')][0]; return p ? getComputedStyle(p).fill : ''; })(),
-        errFill: (() => { const p = [...svg.querySelectorAll('.sp-err')].find((x) => x.getAttribute('d')); return p ? getComputedStyle(p).fill : ''; })(),
-        label: svg.getAttribute('aria-label') };
-    }));
-    // Hover: the busiest subagent, a minute with failures if it has one.
-    const key = process.env.HOVER_KEY;
-    const box = await page.evaluate((k) => {
-      const svg = document.querySelector(`.arow[data-key="${k}"] svg.spark`);
-      const bars = [...svg.querySelectorAll('.sb')];
-      const errs = [...svg.querySelectorAll('.sp-err')];
-      let i = errs.findIndex((p, j) => p.getAttribute('d') && j < 14);
-      if (i < 0) i = 12;
-      const r = bars[i].getBoundingClientRect();
-      return { x: r.left + r.width / 2, y: r.top + 4, i };
-    }, key);
-    await page.mouse.move(box.x, box.y);
-    await page.waitForTimeout(250);
-    out.tip = await page.evaluate(() => { const t = document.querySelector('#tip'); return { hidden: t.hidden, title: t.querySelector('.tt') && t.querySelector('.tt').textContent, rows: [...t.querySelectorAll('.tr')].map((r) => r.textContent), text: t.textContent }; });
-    out.tip.i = box.i;
-    out.hov = await page.evaluate(() => document.querySelectorAll('svg.spark .sb.hov').length);
-    if (S) {
-      const r = await page.evaluate((k) => { const b = document.querySelector(`.arow[data-key="${k}"]`).closest('.agroup').getBoundingClientRect(); return { x: b.left, y: b.top, width: b.width, height: b.height }; }, key);
-      await page.screenshot({ path: S + '/tooltip-light.png', clip: { x: Math.max(0, r.x + r.width - 560), y: Math.max(0, r.y), width: 760, height: Math.min(420, r.height + 200) } });
+  // Open a node's inspector the way a user does: on a desktop, centre it and click it; on a phone, pick it in the list.
+  const pick = async (page, id, phone) => {
+    if (phone) {
+      await page.click('.fx-mode button[data-mode="list"]');
+      await page.waitForSelector('.fx-li[data-node=' + JSON.stringify(id) + ']', { timeout: 4000 });
+      await page.click('.fx-li[data-node=' + JSON.stringify(id) + ']');
+    } else {
+      const p = await page.evaluate((id) => {
+        const el = __t.q(id);
+        if (!el) return null;
+        try { window.ccFactory.graph().center(id, { animate: false }); } catch (e) { /* no engine */ }
+        return true;
+      }, id);
+      if (!p) throw new Error('no node ' + id);
+      await page.waitForTimeout(250);
+      const pt = await page.evaluate((id) => { const r = __t.q(id).getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }, id);
+      await page.mouse.click(pt.x, pt.y);
     }
-    await page.mouse.move(5, 5);
-    await page.waitForTimeout(150);
-    out.tipAfterLeave = await page.evaluate(() => document.querySelector('#tip').hidden);
-    // Keyboard: focus the row, arrow left twice from the running minute.
-    await page.focus(`.arow[data-key="${key}"]`);
-    await page.keyboard.press('ArrowLeft');
-    await page.keyboard.press('ArrowLeft');
-    await page.waitForTimeout(150);
-    out.key = await page.evaluate(() => { const t = document.querySelector('#tip'); const hov = document.querySelector('svg.spark .sb.hov'); return { hidden: t.hidden, title: t.querySelector('.tt') && t.querySelector('.tt').textContent, idx: hov ? [...hov.parentNode.querySelectorAll('.sb')].indexOf(hov) : -1 }; });
+    await page.waitForFunction(() => { const a = document.querySelector('aside.fx-inspector'); return a && !a.hidden; }, null, { timeout: 4000 });
+    await page.waitForTimeout(400);
+  };
+  const close = async (page) => {
     await page.keyboard.press('Escape');
-    await page.waitForTimeout(100);
-    out.keyEsc = await page.evaluate(() => document.querySelector('#tip').hidden && !document.querySelector('svg.spark .sb.hov'));
-    // No flicker: frozen data, three or more polls, nothing added, removed or rewritten.
-    await page.evaluate(() => document.activeElement.blur());
-    let polls = 0;
-    page.on('request', (rq) => { if (rq.url().includes('/api/live')) polls += 1; });
-    await page.waitForTimeout(3500);
-    await page.evaluate(() => {
-      window.__m = { childList: 0, attributes: {}, added: 0, removed: 0 };
-      new MutationObserver((ms) => { for (const m of ms) {
-        if (m.type === 'childList') { window.__m.childList += 1; window.__m.added += m.addedNodes.length; window.__m.removed += m.removedNodes.length; }
-        else if (m.type === 'attributes') window.__m.attributes[m.attributeName] = (window.__m.attributes[m.attributeName] || 0) + 1;
-      } }).observe(document.querySelector('#main'), { subtree: true, childList: true, attributes: true });
+    await page.waitForFunction(() => { const a = document.querySelector('aside.fx-inspector'); return !a || a.hidden; }, null, { timeout: 4000 });
+  };
+  // What the open inspector shows for the sparkline and the burn.
+  const read = (page) => page.evaluate(() => {
+    const a = document.querySelector('aside.fx-inspector'), svg = a.querySelector('svg.fx-spark');
+    const rects = svg ? [...svg.querySelectorAll('rect')] : [];
+    const fill = (el) => (el ? getComputedStyle(el).fill : null);
+    const burn = [...a.querySelectorAll('.fx-row')].find((r) => r.dataset.key === 'Burn');
+    const sr = svg ? svg.getBoundingClientRect() : null, ar = a.getBoundingClientRect(), br = burn ? burn.getBoundingClientRect() : null;
+    return { title: __t.txt(a.querySelector('.fx-insp-title')), head: __t.txt(a.querySelector('.fx-insp-kind')),
+      tags: [...a.querySelectorAll('.fx-insp-kind .tag')].map((x) => x.textContent.trim()),
+      burn: burn ? __t.txt(burn.querySelector('.fx-row-v')) : null,
+      spark: svg ? { n: rects.length, cls: rects.map((r) => r.getAttribute('class')), h: rects.map((r) => +r.getAttribute('height')), label: svg.getAttribute('aria-label'),
+        shown: svg.getClientRects().length > 0, fill: { sp: fill(rects.find((r) => r.classList.contains('sp'))), sp0: fill(rects.find((r) => r.classList.contains('sp0'))),
+          now: fill(rects.find((r) => r.classList.contains('sp-now'))) },
+        inside: sr.left >= ar.left - 1 && sr.right <= ar.right + 1 } : null,
+      burnInside: br ? br.left >= ar.left - 1 && br.right <= ar.right + 1 && br.height > 0 : null,
+      overflow: document.documentElement.scrollWidth > innerWidth };
+  });
+  const step = async (name, fn) => { const r = {}; try { await fn(r); } catch (e) { r.error = first(e); } out[name] = r; };
+
+  // The inspector of each kind of node, light, 1440 px.
+  await step('light', async (r) => {
+    const { ctx, page } = await open(1440, 900, 'light');
+    try {
+      r.faces = await page.evaluate((ids) => {
+        const o = {};
+        for (const k of ['busySess', 'unpSess', 'idleSess']) { const f = __t.q(ids[k]); o[k] = f ? { rate: f.querySelector('.fx-rate') ? f.querySelector('.fx-rate').textContent.trim() : null } : null; }
+        return o;
+      }, IDS);
+      for (const k of ['busy', 'unp', 'busySess', 'unpSess', 'idleSess']) {
+        await pick(page, IDS[k], false);
+        r[k] = await read(page);
+        if (S && k === 'busy') await page.screenshot({ path: S + '/inspector-1440-light.png' });
+        await close(page);
+      }
+      // The open inspector of a busy agent through three polls with unchanged data.
+      await pick(page, IDS.busy, false);
+      let polls = 0;
+      page.on('request', (rq) => { if (new URL(rq.url()).pathname === '/api/graph') polls += 1; });
+      await page.evaluate(() => {
+        window.__m = { childList: 0, added: 0, removed: 0, changed: [], same: 0 };
+        const insp = document.querySelector('aside.fx-inspector');
+        window.__rects = [...insp.querySelectorAll('svg.fx-spark rect')];
+        new MutationObserver((ms) => {
+          const last = new Map();
+          for (const m of ms) {
+            if (m.type === 'childList') { window.__m.childList += 1; window.__m.added += m.addedNodes.length; window.__m.removed += m.removedNodes.length; }
+            else if (m.type === 'attributes') {
+              let per = last.get(m.target);
+              if (!per) last.set(m.target, per = new Map());
+              const prev = per.get(m.attributeName);
+              if (prev) { if (prev.oldValue === m.oldValue) window.__m.same += 1; else window.__m.changed.push(prev.attributeName); }
+              per.set(m.attributeName, m);
+            }
+          }
+          for (const [el, per] of last) for (const [name, m] of per) { if (m.oldValue === el.getAttribute(name)) window.__m.same += 1; else window.__m.changed.push(name + ' on ' + el.tagName.toLowerCase()); }
+        }).observe(insp, { subtree: true, childList: true, attributes: true, attributeOldValue: true });
+      });
+      const p0 = polls;
+      await page.waitForTimeout(12500);
+      r.flicker = await page.evaluate(() => Object.assign({}, window.__m, { kept: [...document.querySelectorAll('aside.fx-inspector svg.fx-spark rect')].every((x, i) => x === window.__rects[i]) }));
+      r.flicker.polls = polls - p0;
+      r.errors = page.errs;
+    } finally { await ctx.close(); }
+  });
+  // The same bars in the dark theme.
+  await step('dark', async (r) => {
+    const { ctx, page } = await open(1440, 900, 'dark');
+    try {
+      await pick(page, IDS.busy, false);
+      r.busy = await read(page);
+      if (S) await page.screenshot({ path: S + '/inspector-1440-dark.png' });
+      r.errors = page.errs;
+    } finally { await ctx.close(); }
+  });
+  // A phone: the bottom sheet shows the bars and the burn without a horizontal scroll.
+  for (const scheme of ['light', 'dark']) {
+    await step('phone-' + scheme, async (r) => {
+      const { ctx, page } = await open(390, 844, scheme);
+      try {
+        await pick(page, IDS.busy, true);
+        r.busy = await read(page);
+        if (S) await page.screenshot({ path: S + '/inspector-390-' + scheme + '.png' });
+        r.errors = page.errs;
+      } finally { await ctx.close(); }
     });
-    const p0 = polls;
-    await page.waitForTimeout(10500);
-    out.flicker = await page.evaluate(() => window.__m);
-    out.flicker.polls = polls - p0;
-    if (S) await page.screenshot({ path: S + '/board-1440-light.png', fullPage: true });
-    out.errors = page.errs;
-    await ctx.close();
-  }
-  for (const [w, h, scheme] of [[1440, 900, 'dark'], [390, 844, 'light'], [390, 844, 'dark']]) {
-    const { ctx, page } = await open(w, h, scheme);
-    const info = await page.evaluate(() => {
-      const r = document.querySelector('.agroup:not(.loose) .arow[data-key]');
-      const rate = r.querySelector('.a-rate'), svg = r.querySelector('svg.spark');
-      return { rateShown: rate.getClientRects().length > 0, sparkShown: svg.getClientRects().length > 0, overflow: document.documentElement.scrollWidth > innerWidth,
-        rateRight: rate.getBoundingClientRect().right, rowRight: r.getBoundingClientRect().right };
-    });
-    if (S) await page.screenshot({ path: `${S}/board-${w}-${scheme}.png`, fullPage: true });
-    out[`v${w}${scheme}`] = { ...info, errors: page.errs };
-    await ctx.close();
   }
   await browser.close();
   console.log(JSON.stringify(out));
@@ -516,21 +646,21 @@ def test_browser():
         print("browser: skipped (no playwright-core, Chrome or node)")
         return
     root = tempfile.mkdtemp(prefix="busy-ui-", dir=BASE)
-    t = time.time()
+    t = (int(time.time()) // 60) * 60 - 30       # the middle of the previous minute: never ahead of the page's own clock
     busy_fixture(root, t)
-    frozen = t
-    st = Store(root=os.path.join(root, "claude"), days=1, clock=lambda: frozen)
+    st = Store(root=os.path.join(root, "claude"), days=1, clock=lambda: t)
+    pay = graph_mod.payload(st)
+    nodes = {n["id"]: n for n in pay["nodes"]}
+    ids = {"busy": "a:%s/x1" % SHOP, "unp": "a:%s/u1" % LAB, "busySess": "s:" + SHOP, "unpSess": "s:" + LAB, "idleSess": "s:" + DOCS}
     srv = _server(st)
-    auto_token(srv)
     js = os.path.join(BASE, "rate_browser.js")
     with open(js, "w") as fh:
         fh.write(BROWSER_JS)
     if SHOTS:
         os.makedirs(SHOTS, exist_ok=True)
-    hover = "44444444-0000-0000-0000-000000000001/x1"
-    env = dict(os.environ, PW=PLAYWRIGHT, CHROME=CHROME, PORT=str(srv.port), SHOTS=SHOTS, HOVER_KEY=hover)
+    env = dict(os.environ, PW=PLAYWRIGHT, CHROME=CHROME, PORT=str(srv.port), SHOTS=SHOTS, IDS=json.dumps(ids))
     try:
-        r = subprocess.run(["node", js], capture_output=True, text=True, timeout=180, env=env)
+        r = subprocess.run(["node", js], capture_output=True, text=True, timeout=240, env=env)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -538,39 +668,83 @@ def test_browser():
         check("browser: page check ran", False, r.stderr[-800:])
         return
     out = json.loads(r.stdout.strip().splitlines()[-1])
-    rows = {x["key"]: x for x in out["rows"]}
-    api = {a["key"]: a for a in st.live_payload()["agents"]}
-    check("browser: no page errors", not out["errors"] and not any(out[k]["errors"] for k in out if k.startswith("v")), out["errors"])
-    check("browser: every row has a 15-minute spark with two paths per minute", rows and all(x["bars"] == 15 and x["paths"] == 30 for x in rows.values()), [(x["bars"], x["paths"]) for x in rows.values()])
-    check("browser: the rate figure is the payload's rate as 'N calls/min'", all(x["rate"] == f"{api[k]['rate']} call{'' if api[k]['rate'] == 1 else 's'}/min" for k, x in rows.items()), [(x["rate"], api[k]["rate"]) for k, x in rows.items()])
-    busy = rows[hover]
-    check("browser: a working row's rate is in the secondary tone, an idle row's is faint",
-          not busy["faint"] and rows["44444444-0000-0000-0000-000000000002"]["faint"], (busy, rows["44444444-0000-0000-0000-000000000002"]["rate"]))
-    check("browser: the running minute is drawn lighter than the finished ones", "sp-now" in busy["now"] and busy["nowFill"] != busy["pastFill"] and busy["pastFill"], (busy["now"], busy["nowFill"], busy["pastFill"]))
-    check("browser: failed calls draw a red top segment", busy["errs"] > 0 and busy["errFill"] and busy["errFill"] != busy["pastFill"], (busy["errs"], busy["errFill"]))
-    check("browser: the spark's label reads the counts for screen readers", "Tool calls per minute" in busy["label"] and "failed" in busy["label"], busy["label"])
-    tip = out["tip"]
-    b = api[hover]["spark"][tip["i"]]
-    t0 = api[hover]["spark_end"] - (15 - tip["i"]) * 60
-    want_title = datetime.fromtimestamp(t0).strftime("%H:%M") + "–" + datetime.fromtimestamp(t0 + 60).strftime("%H:%M")
-    check("tooltip: shows on hover with the minute's time range", not tip["hidden"] and tip["title"] == want_title, (tip["title"], want_title))
-    check("tooltip: total calls and failed calls", tip["rows"][0] == f"Tool calls{b['n']}" and (not b["err"] or tip["rows"][1] == f"Failed{b['err']}"), tip["rows"])
-    check("tooltip: nothing but the title and rows (no stray text)", tip["text"] == tip["title"] + "".join(tip["rows"]), tip["text"])
-    named = [f"{k}{v}" for k, v in b["tools"].items()]
-    check("tooltip: the top tools of that minute with counts", all(n in tip["rows"] for n in named) and len(named) >= 2, (tip["rows"], named))
-    check("tooltip: the hovered minute is marked, and the tooltip goes when the pointer leaves", out["hov"] == 1 and out["tipAfterLeave"], (out["hov"], out["tipAfterLeave"]))
-    k = out["key"]
-    check("keyboard: arrow keys on a focused row walk the minutes with the same tooltip", not k["hidden"] and k["idx"] == 13 and k["title"], k)
-    check("keyboard: Escape closes it", out["keyEsc"])
-    f = out["flicker"]
-    print(f"flicker: {f['polls']} polls, childList={f['childList']} (+{f['added']} -{f['removed']}), attributes={f['attributes']}")
-    check("flicker: 3+ polls with unchanged data add or remove no node", f["polls"] >= 3 and f["added"] == 0 and f["removed"] == 0, f)
-    check("flicker: and rewrite no attribute", not f["attributes"], f["attributes"])
-    d = out["v1440dark"]
-    check("dark 1440: spark and rate shown", d["sparkShown"] and d["rateShown"], d)
-    for name in ("v390light", "v390dark"):
-        p = out[name]
-        check(f"phone ({name[4:]}): only the rate figure, no horizontal scroll", p["rateShown"] and not p["sparkShown"] and not p["overflow"], p)
+    for name, step in out.items():
+        if step.get("error"):
+            check("browser: step %s ran to the end" % name, False, step["error"])
+    if os.environ.get("CC_DASH_DEBUG"):
+        print(json.dumps(out, indent=1)[:9000])
+    li = out["light"]
+    check("browser: no page errors", not any(s.get("errors") for s in out.values()), [s.get("errors") for s in out.values() if s.get("errors")])
+    if "busy" not in li:
+        return
+    bn, un = nodes[ids["busy"]], nodes[ids["unp"]]
+    check("fixture: the busy agent is priced and running, the other has no price and still burns new tokens",
+          bn["state"] == "tool" and bn["burn"]["cost_min"] > 0 and un["state"] == "tool" and un["burn"]["cost_min"] == 0 and un["burn"]["new_min"] > 0
+          and un["burn"]["tok_min"] > 20 * un["burn"]["new_min"], (bn["burn"], un["burn"]))
+
+    def spark_ok(k, who):
+        """The sparkline of a node as the inspector draws it, against the payload's counts: a bar a minute, the
+        empty minutes flat and apart from the rest, more calls never a shorter bar, the counts in the label."""
+        sp, arr = who["spark"], nodes[ids[k]]["spark"]
+        h, cls = sp["h"], [c.split() for c in sp["cls"]]
+        zero, some = [i for i, v in enumerate(arr) if v == 0], [i for i, v in enumerate(arr) if v > 0]
+        why = (arr, h, sp["cls"], sp["label"])
+        if not (sp["n"] == len(arr) == 15 and len(cls) == 15):
+            return False, why
+        if not all(("sp0" in cls[i]) == (arr[i] == 0) for i in range(14)):                       # finished minutes: sp or sp0
+            return False, why
+        if not (("sp0" in cls[14]) if arr[14] == 0 else ("sp-now" in cls[14])):                  # the running one: sp-now when it has calls
+            return False, why
+        if not (", ".join(str(v) for v in arr) in sp["label"] and "Tool calls per minute" in sp["label"]):
+            return False, why
+        if zero and some and not max(h[i] for i in zero) < min(h[i] for i in some):
+            return False, why
+        if any(arr[i] < arr[j] and h[i] > h[j] for i in range(15) for j in range(15)):
+            return False, why
+        return True, why
+    busy = li["busy"]
+    ok, why = spark_ok("busy", busy)
+    check("floor: the busy agent's sparkline has a bar per minute, empty minutes flat, taller bars for more calls, the counts in its label",
+          ok and len(set(busy["spark"]["h"])) > 3 and nodes[ids["busy"]]["spark"][-1] > 0, why)
+    f = busy["spark"]["fill"]
+    check("floor: the running minute is drawn apart from the finished ones", "sp-now" in busy["spark"]["cls"][-1] and f["now"] and f["sp"] and f["now"] != f["sp"], f)
+    d = out["dark"]["busy"]["spark"]["fill"] if "busy" in out["dark"] else {}
+    check("floor (dark): the running minute is still drawn apart, and the finished bars differ from light", d.get("now") and d.get("now") != d.get("sp") and d.get("sp") != f["sp"], (d, f))
+    check("floor: the inspector head names the kind, the model and the recorded effort (a chip)",
+          bn["effort"] == "high" and all(w in (busy["head"] or "") for w in ("Agent", "Opus", "effort high")), (bn["effort"], busy["head"]))
+    want = fmt_rate(bn["burn"])
+    check("floor: the busy agent's Burn row starts with its $/min", want.endswith("/min") and want.startswith(("$", "<$")) and (busy["burn"] or "").startswith(want), (want, busy["burn"]))
+    ub = li["unp"]
+    uwant = fmt_rate(un["burn"])
+    check("floor: an agent on an unpriced model shows new tokens a minute, from new_min",
+          uwant.endswith(" new tok/min") and (ub["burn"] or "").startswith(uwant), (uwant, ub["burn"]))
+    check("floor: cache reads never count: the unpriced agent's rate is not its tok_min", fmt_compact(un["burn"]["tok_min"]) not in (ub["burn"] or "").split(" · ")[0], (ub["burn"], un["burn"]))
+    ok, why = spark_ok("unp", ub)
+    check("floor: the unpriced agent's sparkline reads like the busy one's", ok, why)
+    fc = li["faces"]
+    sess = nodes[ids["busySess"]]
+    check("floor: a running session's face shows the payload's rate: $/min when priced",
+          fc["busySess"]["rate"] == fmt_rate(sess["burn"]) and fc["busySess"]["rate"].endswith("/min"), (fc["busySess"], sess["burn"]))
+    usess = nodes[ids["unpSess"]]
+    check("floor: ...and new tokens a minute when the model has no price",
+          fc["unpSess"]["rate"] == fmt_rate(usess["burn"]) and fc["unpSess"]["rate"].endswith(" new tok/min"), (fc["unpSess"], usess["burn"]))
+    check("floor: a session's inspector has the same Burn row", (li["busySess"]["burn"] or "").startswith(fmt_rate(sess["burn"])) and (li["unpSess"]["burn"] or "").startswith(fmt_rate(usess["burn"])),
+          (li["busySess"]["burn"], li["unpSess"]["burn"]))
+    idle = nodes[ids["idleSess"]]
+    check("floor: an idle session has no rate on its face and no Burn row", idle["state"] == "idle" and fc["idleSess"]["rate"] is None and li["idleSess"]["burn"] is None,
+          (idle["state"], fc["idleSess"], li["idleSess"]["burn"]))
+    ok, why = spark_ok("idleSess", li["idleSess"])
+    check("floor: an idle session's sparkline keeps its earlier calls", ok and sum(idle["spark"]) > 0, why)
+    fl = li["flicker"]
+    print(f"flicker: {fl['polls']} polls with the inspector open, childList={fl['childList']} (+{fl['added']} -{fl['removed']}), changed attributes={fl['changed']}, same-value rewrites={fl['same']}")
+    check("flicker: 3+ polls with unchanged data add or remove no node in the open inspector and the bars stay the same elements",
+          fl["polls"] >= 3 and fl["added"] == 0 and fl["removed"] == 0 and fl["kept"], fl)
+    check("flicker: and no attribute takes a new value", not fl["changed"], fl["changed"])
+    for name in ("phone-light", "phone-dark"):
+        p = out[name].get("busy")
+        if p:
+            check(f"phone ({name[6:]}): the bottom sheet shows the bars and the burn row inside the sheet, no horizontal scroll",
+                  p["spark"]["shown"] and p["spark"]["inside"] and p["burnInside"] and not p["overflow"] and (p["burn"] or "").startswith(want), p)
 
 
 def main():

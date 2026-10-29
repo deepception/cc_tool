@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "lines": {
+    "default": {
+      "stations": [
+        {"name": "plan", "title": "Plan", "model": "opus"},
+        {"name": "build", "title": "Build", "model": "sonnet", "effort": "medium"},
+        {"name": "test", "title": "Test", "model": "sonnet"},
+        {"name": "verify", "title": "Verify", "model": "opus", "holdout": true},
+        {"name": "review", "title": "Review", "model": "opus"}
+      ],
+      "gates": {"spec": "human", "merge": "human"},
+      "retries": 1
+    }
+  }
+}

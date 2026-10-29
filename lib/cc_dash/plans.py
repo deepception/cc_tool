@@ -75,6 +75,7 @@ PAUSE_SECS = 2 * 3600              # an unfinished plan with no activity this lo
 LIVE_SECS = 600                    # store.LIVE_SECS: a session written this recently is live
 MAX_SEGMENTS = 40                  # the progress bar draws one segment per milestone up to this many
 GIT_TIMEOUT = 5
+EV_MAX = 8192                      # cached session evidence entries (per session and plan set) before a reset
 SKIP_DIRS = {"node_modules", ".git", ".venv", "venv", "__pycache__", "dist", "build", "vendor", ".next",
              ".dart_tool", ".gradle", "Pods", "target", ".cache", "worktrees"}
 GENERIC_NAMES = {"readme.md", "plan.md", "tasks.md", "todo.md", "log.md", "spec.md", "index.md", "notes.md",
@@ -353,7 +354,7 @@ class Plans:
         self._ledgers = {}     # checkout -> (time, {plan rel: ledger path})
         self._ledger_parse = {}
         self._git = {}         # args tuple + reflog stamp -> commits
-        self._ev = {}          # session id -> (signature, plans signature, evidence)
+        self._ev = {}          # (session id, plans signature) -> (signature, evidence); one per window's plan set
 
     # discovery ------------------------------------------------------------
     @staticmethod
@@ -561,9 +562,9 @@ class Plans:
         accs = [(s.acc, None)] + [(x.acc, x) for x in s.subs]
         sig = (len(s.subs), tuple((len(getattr(a, "plan_sigs", ())), len(a.spawns), a.last_ts) for a, _ in accs),
                tuple(x.status for x in s.subs))
-        c = self._ev.get(s.sid)
-        if c and c[0] == sig and c[1] == plans_sig:
-            return c[2]
+        c = self._ev.get((s.sid, plans_sig))
+        if c and c[0] == sig:
+            return c[1]
         match, stems = self._matcher(recs)
         refs = []          # (t, rel, acc index)
         ev = {}
@@ -740,7 +741,9 @@ class Plans:
                 E(rel)["accs"].add(ai)
         for e in ev.values():
             e["refs"].sort()
-        self._ev[s.sid] = (sig, plans_sig, ev)
+        if len(self._ev) > EV_MAX:
+            self._ev.clear()
+        self._ev[(s.sid, plans_sig)] = (sig, ev)
         return ev
 
     @staticmethod
@@ -1109,11 +1112,11 @@ class Plans:
         return sorted(seen.values(), key=lambda c: -c["t"])[:200]
 
     # payloads -------------------------------------------------------------------
-    def _gather(self, project_filter):
-        """[(project, root, sessions)] from the store, under its lock."""
+    def _gather(self, project_filter, days=None, now=None):
+        """[(project, root, sessions)] of a `days` window (None: the launch window), under the store's lock."""
         st = self.store
         groups = {}
-        for s in st.sessions.values():
+        for s in st.window_sessions(days, now):
             if not s.root:
                 continue
             if project_filter and s.label != project_filter:
@@ -1121,19 +1124,23 @@ class Plans:
             groups.setdefault((s.label, s.root), []).append(s)
         return [(lbl, root, sess) for (lbl, root), sess in sorted(groups.items())]
 
-    def _evaluate(self, project_filter, alerts, detail_key=None):
+    def _evaluate(self, project_filter, alerts, detail_key=None, days=None):
         st = self.store
+        days = st.clamp_days(days)
+        st.ensure_window(days)        # before any lock: it may take the store's to merge a widening
         st.refresh()
         now = st.clock()
         out = []
         with self.lock, st.lock:
-            groups = self._gather(project_filter)
+            groups = self._gather(project_filter, days, now)
             self._cur_ev = {}
             for label, root, sess in groups:
                 recs = self.project_plans(label, root, sess)
                 if not recs:
                     continue
-                psig = tuple(sorted((k, v["abs"]) for k, v in recs.items()))
+                # Every copy's path: a window that holds more sessions can find more checkouts, and the
+                # evidence matcher reads every copy, so one window's evidence never answers another's.
+                psig = tuple(sorted((k, v["abs"], tuple(sorted(c["abs"] for c in v["copies"]))) for k, v in recs.items()))
                 for s in sess:
                     ev = self._session_evidence(s, recs, psig)
                     if ev:
@@ -1146,10 +1153,11 @@ class Plans:
             self._cur_ev = {}
         return out, now
 
-    def payload(self, project="", alerts=None, everything=False):
+    def payload(self, project="", alerts=None, everything=False, days=None):
         project = (project or "")[:200]
-        plans, now = self._evaluate(project, alerts)
-        cutoff = now - self.store.days * 86400
+        days = self.store.clamp_days(days)
+        plans, now = self._evaluate(project, alerts, days=days)
+        cutoff = now - days * 86400
         for p in plans:
             # git checkouts touch every file's mtime, so a recent mtime alone is not activity
             p["recent"] = bool(p["sessions"]) or p["status"] in ("live", "blocked", "active") \
@@ -1177,11 +1185,11 @@ class Plans:
             d["plans"] += 1
             d["recent"] += p["recent"]
             d["active"] += p["status"] in ("live", "active", "blocked")
-        return {"now": now, "plans": shown, "older": len(plans) - len([p for p in plans if p["recent"]]),
+        return {"now": now, "days": days, "plans": shown, "older": len(plans) - len([p for p in plans if p["recent"]]),
                 "total": len(plans), "chips": chips, "projects": sorted(projects.values(), key=lambda x: x["project"].lower()),
                 "scope": {"project": project}, "pause_secs": PAUSE_SECS}
 
-    def resolve(self, project, path):
+    def resolve(self, project, path, days=None):
         """The plan key for (project, path) when it is safe, else None.
 
         project must be a resolved project label; path a relative path ending
@@ -1195,7 +1203,7 @@ class Plans:
             return None
         st = self.store
         with st.lock:
-            groups = self._gather(project)
+            groups = self._gather(project, days)
         groups = [g for g in groups if g[0] == project]
         if not project or not groups:
             return None
@@ -1219,14 +1227,16 @@ class Plans:
                 return None
         return r["rel"]
 
-    def detail(self, project, path, alerts=None):
-        key = self.resolve(project, path)
+    def detail(self, project, path, alerts=None, days=None):
+        days = self.store.clamp_days(days)
+        self.store.ensure_window(days)    # resolve() reads the window's sessions
+        key = self.resolve(project, path, days)
         if key is None:
             return None
-        plans, now = self._evaluate(project, alerts, detail_key=key)
+        plans, now = self._evaluate(project, alerts, detail_key=key, days=days)
         if not plans:
             return None
-        return {"now": now, "plan": plans[0], "pause_secs": PAUSE_SECS}
+        return {"now": now, "days": days, "plan": plans[0], "pause_secs": PAUSE_SECS}
 
 
 _SRC_NAME = {"checkboxes": "plan checkboxes", "ledger": "SDD ledger", "todo": "todo list", "agent": "subagent finished"}

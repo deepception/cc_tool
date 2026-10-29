@@ -30,6 +30,18 @@ WHAT IT DOES
   still persist incremental progress in target/, so repeated attempts converge
   on their own.
 
+SCOPE
+  A checker runs only for a file whose real path (symlinks resolved) lies
+  inside the session's project (CLAUDE_PROJECT_DIR), and the root it runs in is
+  found by walking up from that file no further than the project. An edit
+  elsewhere runs nothing: a Cargo.toml and build.rs an agent writes into /tmp
+  must not turn a file edit, which a workflow run approves on its own, into
+  code execution with no Bash prompt. Inside the project the checker is the
+  project's own toolchain (cargo runs build scripts and proc macros; tsc can
+  be the project's node_modules/.bin/tsc), so an edit there can run the
+  project's code, as running its build would. For an agent you do not trust,
+  use cc-devcontainer or remove this hook.
+
 OPT-IN / REMOVABLE
   This hook is deliberately lightweight and safe to remove. To disable it,
   delete the matching PostToolUse entry from .claude/settings.json (and,
@@ -59,19 +71,27 @@ def _silent_exit():
     sys.exit(0)
 
 
-def _find_repo_root(start: str) -> str:
-    """Walk up from `start` to the first dir containing a .git (dir or worktree file), else CLAUDE_PROJECT_DIR."""
-    d = os.path.abspath(start)
-    if os.path.isfile(d):
-        d = os.path.dirname(d)
-    while True:
-        if os.path.exists(os.path.join(d, ".git")):  # dir, or the file a worktree carries
+def _project_root() -> str:
+    """realpath of the session's project: CLAUDE_PROJECT_DIR, else the repo around the cwd."""
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env and os.path.isdir(env):
+        return os.path.realpath(env)
+    return os.path.realpath(lib.repo_root() if lib else os.getcwd())
+
+
+def _inside(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _find_repo_root(real: str, project: str) -> str:
+    """Walk up from the edited file (`real`, already inside `project`) to the first
+    dir containing a .git (dir or worktree file), stopping at the project itself."""
+    d = real if os.path.isdir(real) else os.path.dirname(real)
+    while _inside(d, project):
+        if d == project or os.path.exists(os.path.join(d, ".git")):
             return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
-    return os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+        d = os.path.dirname(d)
+    return project
 
 
 def _skip_marker(root: str, tool: str) -> str:
@@ -239,7 +259,12 @@ def main():
     _SESSION = str(data.get("session_id") or "")
 
     ext = os.path.splitext(path)[1].lower()
-    root = _find_repo_root(path)
+    # SCOPE (module docstring): never run a toolchain found outside the session's project.
+    project = _project_root()
+    real = os.path.realpath(path if os.path.isabs(path) else os.path.join(os.getcwd(), path))
+    if not _inside(real, project):
+        _silent_exit()
+    root = _find_repo_root(real, project)
 
     # ── TypeScript ────────────────────────────────────────────────────────────
     if ext in (".ts", ".tsx", ".mts", ".cts") and os.path.isfile(

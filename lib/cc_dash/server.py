@@ -22,6 +22,12 @@ over the request it waits on; the kernel names the connecting process
 (SO_PEERCRED, and SO_PEERPIDFD against pid reuse), which must be your user and,
 for a request, the hook process the request names.
 Without --control those paths are 404 and every POST but /api/pair is 405.
+
+The POSTs, all through auth.check_write: /api/control/decide, message, cancel,
+stop, and /api/control/selfheal, which starts one self-heal run (selfheal.py:
+a headless `claude -p` that proposes harness patches and applies none; its
+body only gives a number of days). GET /api/selfheal and /api/selfheal/run
+show its state and a run's validated proposals to any paired token.
 """
 import argparse
 import errno
@@ -37,8 +43,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import attention
+from . import graph     # the Factory floor (/api/graph)
 from . import procs
 from . import plans   # plan progress (/api/plans)
+from . import selfheal  # self-heal runs (/api/selfheal, POST /api/control/selfheal)
 from .auth import Auth, local_pairing_supported
 from .control import MAX_BODY, MAX_REQUEST_BODY, Control
 from .docs import Docs, DocsError
@@ -73,6 +81,13 @@ ASSETS = {
     # Overview's Routing panel (routing.py): who picked each agent's model and effort
     "/routing.js": ("routing.js", "text/javascript; charset=utf-8"),
     "/routing.css": ("routing.css", "text/css; charset=utf-8"),
+    # Factory floor (graph.py, /api/graph): the graph renderer, the floor view and its stage
+    "/graph.js": ("graph.js", "text/javascript; charset=utf-8"),
+    "/factory.js": ("factory.js", "text/javascript; charset=utf-8"),
+    "/factory.css": ("factory.css", "text/css; charset=utf-8"),
+    # self-heal (selfheal.py): the header control and its results drawer
+    "/selfheal.js": ("selfheal.js", "text/javascript; charset=utf-8"),
+    "/selfheal.css": ("selfheal.css", "text/css; charset=utf-8"),
 }
 # img-src blob: is for Docs images (fetched with the token, shown as object URLs);
 # frame-src 'self' is for the sandboxed HTML preview at /docs-frame/<ticket>, whose
@@ -164,24 +179,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._docs(path, q)
             if path == "/api/live":
                 return self._json(200, store.live_payload())
+            # A server object without a SelfHeal (a test harness's own) answers as one that never ran.
+            sh = getattr(self.server, "selfheal", None)
+            if path == "/api/selfheal":         # selfheal.py: the trigger's state, the last runs
+                return self._json(200, sh.status() if sh is not None else {
+                    "enabled": False, "budget_usd": selfheal.DEFAULT_BUDGET, "timeout_secs": selfheal.TIMEOUT_SECS,
+                    "now": time.time(), "running": None, "last": None, "last_completed": None, "next_since": None})
+            if path == "/api/selfheal/run":     # one run's validated proposals; the id is checked before any path
+                return self._json(*(sh.run_view(q.get("id", "")[:64]) if sh is not None else
+                                    (404, {"error": "No self-heal run with that id."})))
+            # The windowed endpoints below take ?days= (Store.clamp_days: a bad value means the launch
+            # window, never a 400); every other endpoint ignores it.
+            days = q.get("days", "")[:16]
+            if path == "/api/graph":            # graph.py: the Factory floor, one graph of everything live
+                # A filter value compared with project labels, never a path.
+                return self._json(200, graph.payload(store, q.get("project", "")[:200], all_projects=q.get("all") == "1",
+                                                     days=days))
             if path == "/api/sessions":
-                return self._json(200, store.sessions_payload())
+                return self._json(200, store.sessions_payload(days))
             if path == "/api/overview":
                 # A filter value compared with project labels, never a path.
-                return self._json(200, store.overview_payload(q.get("project", "")))
+                return self._json(200, store.overview_payload(q.get("project", ""), days))
             if path == "/api/routing":          # routing.py: who chose each agent's model and effort
-                return self._json(200, store.routing_payload(q.get("project", "")))
+                return self._json(200, store.routing_payload(q.get("project", ""), days))
             if path == "/api/session":
-                p = store.session_payload(q.get("id", ""))
+                p = store.session_payload(q.get("id", ""), days)
                 return self._json(200, p) if p else self._json(404, {"error": "No session with that id in the lookback window."})
             if path == "/api/session/tree":     # the recursive agent tree (tree.py)
-                p = store.tree_payload(q.get("id", ""))
+                p = store.tree_payload(q.get("id", ""), days)
                 return self._json(200, p) if p else self._json(404, {"error": "No session with that id in the lookback window."})
             if path == "/api/agent":
-                p = store.agent_payload(q.get("session", ""), q.get("id", ""))
+                p = store.agent_payload(q.get("session", ""), q.get("id", ""), days)
                 return self._json(200, p) if p else self._json(404, {"error": "No subagent with that id in this session."})
             if path in ("/api/plans", "/api/plans/detail"):   # plans.py: plan progress and milestones
-                return self._plans(path, q, store)
+                return self._plans(path, q, store, days)
         except BrokenPipeError:
             return None
         except Exception as e:  # noqa: BLE001 - one bad transcript must not take the server down
@@ -225,13 +256,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(e.status, e.msg + "\n", "text/plain; charset=utf-8",
                               csp="default-src 'none'; frame-ancestors 'self'; sandbox")
         return self._send(200, body, "text/html; charset=utf-8", csp=csp)
-    def _plans(self, path, q, store):
-        """GET /api/plans?project=[&all=1] and /api/plans/detail?project=&path= (plans.py checks the path)."""
+    def _plans(self, path, q, store, days=""):
+        """GET /api/plans?project=[&all=1][&days=] and /api/plans/detail?project=&path=[&days=]
+        (plans.py checks the path)."""
         al = attention.alerts_payload(store)["alerts"]
         eng = plans.for_store(store)
         if path == "/api/plans":
-            return self._json(200, eng.payload(q.get("project", ""), al, everything=q.get("all") == "1"))
-        p = eng.detail(q.get("project", "")[:200], q.get("path", "")[:1024], al)
+            return self._json(200, eng.payload(q.get("project", ""), al, everything=q.get("all") == "1", days=days))
+        p = eng.detail(q.get("project", "")[:200], q.get("path", "")[:1024], al, days=days)
         return self._json(200, p) if p else self._json(404, {"error": "No plan at that path in that project."})
 
     def _read_body(self, limit=MAX_BODY):
@@ -357,7 +389,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._deny(404, "Not found.")
         self._deny(405, "cc-dash is read-only.")
 
-    POSTS = ("/api/control/decide", "/api/control/message", "/api/control/cancel", "/api/control/stop")
+    POSTS = ("/api/control/decide", "/api/control/message", "/api/control/cancel", "/api/control/stop",
+             "/api/control/selfheal")
 
     def do_POST(self):
         if getattr(self.server, "hook_channel", False):
@@ -400,6 +433,9 @@ class Handler(BaseHTTPRequestHandler):
                 code, out = ctl.message(client, body)
             elif path == "/api/control/stop":
                 code, out = ctl.stop_turn(client, body)
+            elif path == "/api/control/selfheal":
+                sh = getattr(self.server, "selfheal", None)
+                code, out = sh.trigger(client, body) if sh is not None else (404, {"error": "Self-heal is not available."})
             else:
                 code, out = ctl.cancel(client, body)
         except Exception as e:  # noqa: BLE001 - report, never take the server down
@@ -423,16 +459,28 @@ class DashServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port, store, verbose=False):
+    def __init__(self, port, store, verbose=False, budget=selfheal.DEFAULT_BUDGET):
         super().__init__(("127.0.0.1", port), Handler)
         self.store = store
         self.verbose = verbose
+        self.selfheal = selfheal.SelfHeal(store, budget=budget, writable=False)
         self.control = None
         real = self.server_address[1]
         self.port = real
         self.allowed_hosts = {f"127.0.0.1:{real}", f"localhost:{real}"}
         self.auth = Auth(real)
         self.docs = Docs(store)
+
+    @property
+    def control(self):
+        return self._control
+
+    @control.setter
+    def control(self, ctl):
+        # Self-heal writes its state only in control mode, where its trigger exists, and audits there.
+        self._control = ctl
+        self.selfheal.writable = ctl is not None
+        self.selfheal.control = ctl
 
 
 HOOK_HOST = "cc-dash-hook"
@@ -475,14 +523,14 @@ def start_hook_channel(ctl):
     return hs
 
 
-def make_server(port, store, verbose=False, fallback=True):
+def make_server(port, store, verbose=False, fallback=True, budget=selfheal.DEFAULT_BUDGET):
     """Bind 127.0.0.1:port; when it is taken and fallback is on, take any free port."""
     try:
-        return DashServer(port, store, verbose)
+        return DashServer(port, store, verbose, budget)
     except OSError as e:
         if not fallback or e.errno not in (errno.EADDRINUSE, errno.EACCES):
             raise
-        return DashServer(0, store, verbose)
+        return DashServer(0, store, verbose, budget)
 
 
 def parse_args(argv):
@@ -495,7 +543,8 @@ def parse_args(argv):
     p.add_argument("--port", type=int, default=DEFAULT_PORT,
                    help=f"port to listen on (default {DEFAULT_PORT}; a free port is used if it is taken)")
     p.add_argument("--no-open", action="store_true", help="do not open the browser")
-    p.add_argument("--days", type=float, default=7, help="lookback window in days (default 7)")
+    p.add_argument("--days", type=float, default=7,
+                   help="starting lookback window in days (default 7); the page can switch to 1, 3, 7, 14 or 30")
     p.add_argument("--project", default="", help="only sessions whose working directory contains this text")
     p.add_argument("--verbose", action="store_true", help="log each request to stderr")
     p.add_argument("--control", action="store_true",
@@ -504,12 +553,17 @@ def parse_args(argv):
                         "printed link)")
     p.add_argument("--control-wait", type=float, default=300, metavar="SECS",
                    help="control mode: how long a waiting permission hook waits for the dashboard (default 300)")
+    p.add_argument("--selfheal-budget", type=float, default=selfheal.DEFAULT_BUDGET, metavar="USD",
+                   help="control mode: the spending cap of one self-heal run (default %g, %g-%g)"
+                        % (selfheal.DEFAULT_BUDGET, selfheal.BUDGET_MIN, selfheal.BUDGET_MAX))
     p.add_argument("--ready-fd", type=int, default=None, metavar="FD", help=argparse.SUPPRESS)
     a = p.parse_args(argv)
     if not (5 <= a.control_wait <= 590):
         p.error("--control-wait must be 5-590 seconds")
-    if a.days <= 0:
-        p.error("--days must be positive")
+    if not (selfheal.BUDGET_MIN <= a.selfheal_budget <= selfheal.BUDGET_MAX):     # NaN and inf fail it too
+        p.error("--selfheal-budget must be %g-%g dollars" % (selfheal.BUDGET_MIN, selfheal.BUDGET_MAX))
+    if not 0 < a.days < float("inf"):       # NaN fails every comparison: no NaN or infinite cutoff
+        p.error("--days must be a positive number")
     if not (0 <= a.port <= 65535):
         p.error("--port must be 0-65535")
     if a.ready_fd is not None and a.ready_fd < 3:
@@ -532,6 +586,8 @@ def _ready(a):
 # cc-setup copies beside the control hook, so both judge a launch the same way.
 CLAUDE_ENV_SIGNALS = procs.CLAUDE_ENV_SIGNALS
 INSIDE_CLAUDE = "cc-dash --control must be started from your own terminal, not from inside a Claude Code session"
+NO_PROC = ("--control needs /proc to identify the dashboard and its hooks, so control mode works on Linux only. "
+           "Run cc-dash without --control for the read-only dashboard; permission prompts stay in the terminal.")
 _proc_stat = procs.proc_stat
 _ancestors = procs.ancestors
 _is_claude = procs.is_claude
@@ -611,8 +667,15 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
     cc-dash launches itself, from outside Claude Code); any other lease is
     removed, with a note (`note`, a callable, gets the text). Both are raised
     bars, not walls: a program running as you can unset the variable and
-    detach. See docs/guides/commands.md (Control mode, Security)."""
+    detach. See docs/guides/commands.md (Control mode, Security).
+
+    Before either, it refuses where there is no /proc (procs.have_proc; NO_PROC):
+    nothing could then tell this process, a lease's pid or a hook from any
+    other program of yours, so control mode is Linux-only. `proc` fakes the
+    process entries for tests, not that check."""
     from .control import read_json, unlink
+    if not procs.have_proc():
+        return NO_PROC
     env = os.environ if env is None else env
     d = ctl_dir or os.path.join(attention.state_dir(), "control")
     # The terminals the holder of this process's terminal may be (procs.terminal_problem).
@@ -631,8 +694,7 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
             except OSError:
                 alive = False
         if alive:
-            why = procs.dashboard_problem(pid, root or CC_TOOL_DIR, proc, terminals=terminals) \
-                if (proc != "/proc" or os.path.isdir("/proc/self")) else ""
+            why = procs.dashboard_problem(pid, root or CC_TOOL_DIR, proc, terminals=terminals)
             if not why:
                 return ("another cc-dash --control (pid %d) is running and holds the control lease. Stop it first "
                         "(Ctrl-C in its terminal; `ccdash --control` does this for you)." % pid)
@@ -642,10 +704,13 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
                      "Something running as you wrote it; see the audit log once control mode is on." % (pid, why))
     me = os.getpid() if me is None else me
     st = _proc_stat(me, proc)
-    if st is None:                             # no /proc: only the environment (and given parents) can be checked
+    if st is None:
+        # Its own process cannot be inspected, so nothing shows how it was started: refused. The
+        # environment and the given parents still pick the plainer message when they already tell.
         why = procs.claude_env(env) or next(("process %d, %s, is among its parents" % (p, comm)
                                              for p, comm, exe, argv in ancestors or [] if _is_claude(comm, exe, argv)), "")
-        return (INSIDE_CLAUDE + " (%s)." % why) if why else ""
+        return (INSIDE_CLAUDE + " (%s)." % why) if why else \
+            "cc-dash --control must be started from your own terminal: its own process (%d) cannot be inspected." % me
     if ancestors is None:
         ancestors, complete = procs.chain(st["ppid"], proc=proc)
         if not complete:
@@ -764,7 +829,7 @@ def main(argv=None):
     store = Store(root=root, days=a.days, project=a.project)
     hook_srv = None
     try:
-        srv = make_server(a.port, store, a.verbose)
+        srv = make_server(a.port, store, a.verbose, budget=a.selfheal_budget)
     except OSError as e:
         print(f"cc-dash: cannot listen on 127.0.0.1:{a.port}: {e.strerror}", file=sys.stderr)
         return 1
@@ -803,6 +868,11 @@ def main(argv=None):
         print("cc-dash: control mode is on: approvals, answers, plans and messages from the dashboard, after the "
               "control code shown on the terminal is typed into it.")
         print(f"cc-dash: audit log {tilde(srv.control.audit_path)}")
+        try:
+            srv.selfheal.status()     # now writable: settle a run a previous launch left (gone, or overdue)
+        except OSError as e:
+            print(f"cc-dash: self-heal state at {tilde(srv.selfheal.base)} is unusable ({e}); self-heal will not run "
+                  "until that is fixed.", file=sys.stderr)
         note = launch_note()
         if note:
             print(note, file=sys.stderr)

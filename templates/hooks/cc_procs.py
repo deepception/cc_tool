@@ -7,9 +7,17 @@ protected path in Claude Code): the hook never runs code from the cc_tool
 checkout, which lies outside the project and which an agent could edit.
 Standard library only, no package imports.
 
-Everything here reads /proc (Linux). Where there is no /proc the process checks
-cannot run; callers say what they do then.
+Everything here reads /proc (Linux). Where there is no /proc (have_proc) the
+process checks cannot run, and nothing can tell cc-dash or a hook from any other
+program of yours, so control mode does not run there: `cc-dash --control`
+refuses to start, cc-dash shows no request, the hook leaves every prompt in the
+terminal, and cc-setup records no terminal. The rules that decide also fail
+closed on their own when what they read cannot be read (python_problem,
+claude_lineage, terminal_problem, hook_problem, peer_holder_problem,
+code_after_start, recording_problem).
 
+  have_proc()                   whether there is a /proc to read (tests patch
+                                it to play a system without one)
   dashboard_problem(pid, root, python)
                                 why pid is not the cc-dash of the checkout at
                                 root, run by the recorded Python interpreter,
@@ -52,6 +60,15 @@ import stat
 CLAUDE_ENV_SIGNALS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID",
                       "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_CHILD_SESSION")
 PIN_NAME = "cc_tool_root"
+
+
+def have_proc():
+    """True where /proc can tell processes apart (Linux). Without it the
+    dashboard's lease and socket could be any program of yours (one an agent
+    started), so control mode refuses rather than trusting them: callers treat
+    False as "no", never as "nothing to check". dash-control.py has its own
+    copy of this check."""
+    return os.path.isdir("/proc/self")
 
 
 def proc_stat(pid, proc="/proc"):
@@ -982,7 +999,9 @@ SO_PEERPIDFD = 77           # Linux >= 6.5 (asm-generic/socket.h)
 def peer_cred(sock):
     """(pid, uid) of the process at the other end of a connected Unix socket, as
     the kernel recorded it when the connection was made (SO_PEERCRED on Linux;
-    LOCAL_PEERPID and LOCAL_PEERCRED on macOS), or (None, None)."""
+    LOCAL_PEERPID and LOCAL_PEERCRED on macOS), or (None, None). A pid alone
+    says nothing about which program it is: control mode also needs /proc
+    (have_proc) and refuses without it."""
     import socket
     import struct
     try:

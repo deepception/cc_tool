@@ -13,22 +13,24 @@
 <link rel="stylesheet" href="/docs.css"><!-- Docs view: tree, reader, Markdown -->
 <link rel="stylesheet" href="/plans.css"><!-- plans: progress bars, plan cards, plan page -->
 <link rel="stylesheet" href="/routing.css"><!-- Overview: the Routing panel -->
+<link rel="stylesheet" href="/factory.css"><!-- Factory floor: the lit stage, glass nodes, HUD, inspector -->
+<link rel="stylesheet" href="/selfheal.css"><!-- Self-heal: the header control, its popover, the proposals drawer -->
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="top">
   <div class="top-in">
-    <a class="brand" href="#/live" aria-label="cc-dash home">
+    <a class="brand" href="#/factory" aria-label="cc-dash home">
       <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="1" y="1" width="14" height="14" rx="3.5" class="brand-bg"/><rect x="4" y="9" width="2" height="3" rx=".6" class="brand-fg"/><rect x="7" y="6" width="2" height="6" rx=".6" class="brand-fg"/><rect x="10" y="4" width="2" height="8" rx=".6" class="brand-fg"/></svg>
       <span>cc-dash</span>
     </a>
     <nav class="tabs" aria-label="Views">
-      <a href="#/live" data-view="live">Live <span class="count" id="live-count" hidden></span></a>
-      <a href="#/sessions" data-view="sessions">Sessions</a>
+      <a href="#/factory" data-view="factory">Factory</a>
       <a href="#/overview" data-view="projects">Projects</a>
     </nav>
     <div class="top-right">
       <span class="scope" id="scope"></span>
+      <span class="sh" id="selfheal"></span>
       <span class="sync" id="sync"><span class="sync-txt"><span class="g s-failed" aria-hidden="true"></span><span class="sync-msg"></span></span><span class="sync-bar" aria-hidden="true"><span class="sync-fill"></span></span></span>
       <span class="vh" id="sync-live" role="status" aria-live="polite"></span>
       <button class="icon-btn" id="theme" type="button" aria-label="Theme: follow system" title="Theme (t)"></button>
@@ -41,11 +43,12 @@
 <dialog class="help" id="help">
   <h2>Keyboard</h2>
   <dl>
-    <dt><kbd>l</kbd> <kbd>s</kbd></dt><dd>Live, Sessions</dd>
-    <dt><kbd>o</kbd> <kbd>p</kbd> <kbd>d</kbd></dt><dd>Projects: Overview, Plans, Docs (for the project you picked)</dd>
-    <dt><kbd>v</kbd></dt><dd>Live: switch between agents and sessions</dd>
+    <dt><kbd>f</kbd></dt><dd>Factory</dd>
+    <dt><kbd>←</kbd> <kbd>↑</kbd> <kbd>↓</kbd> <kbd>→</kbd> <kbd>Enter</kbd></dt><dd>Factory: move between nodes, open one (Esc closes it)</dd>
+    <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Factory: zoom in, zoom out, fit everything</dd>
+    <dt><kbd>o</kbd> <kbd>s</kbd> <kbd>p</kbd> <kbd>d</kbd></dt><dd>Projects: Overview, Sessions, Plans, Docs (for the project you picked)</dd>
     <dt><kbd>/</kbd></dt><dd>Search sessions, or the project's docs</dd>
-    <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Move down and up a list</dd>
+    <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Move down and up a list (the Factory: in tree order)</dd>
     <dt><kbd>Enter</kbd></dt><dd>Open the selected row</dd>
     <dt><kbd>Esc</kbd></dt><dd>Back, or clear the search</dd>
     <dt><kbd>1</kbd> to <kbd>5</kbd></dt><dd>Session tabs</dd>
@@ -64,7 +67,10 @@
 <script src="/plans.js"></script><!-- plans: list, plan page, chips (app.js calls ccPlans.init) -->
 <script src="/agents.js"></script><!-- session Agents tab and the effort chip (app.js calls ccAgents.init) -->
 <script src="/routing.js"></script><!-- Overview: the Routing panel (app.js calls ccRouting.init) -->
+<script src="/graph.js"></script><!-- Factory: the graph engine, layout and canvas (factory.js calls ccGraph.create) -->
+<script src="/factory.js"></script><!-- Factory floor view (app.js calls ccFactory.init) -->
 <script src="/app.js"></script>
+<script src="/selfheal.js"></script><!-- Self-heal: the header control and proposals drawer (needs app.js and control.js; before alerts.js, so its keys go first) -->
 <script src="/markdown.js"></script><!-- Docs: the Markdown renderer (pure, no DOM) -->
 <script src="/docs.js"></script><!-- Docs view: per-project Markdown and HTML -->
 <script src="/alerts.js"></script><!-- alerts: polls /api/alerts -->

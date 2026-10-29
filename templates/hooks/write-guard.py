@@ -17,6 +17,11 @@ Blocks (deny):
     files there are how the dashboard talks to the dash-control hook, and an
     agent must not forge them (the hook also checks the dashboard process and
     cc-dash verifies every file; this is defence in depth).
+  - writes into cc-dash's self-heal state
+    (${XDG_STATE_HOME:-~/.local/state}/cc_tool/selfheal/), judged the same
+    way: its run records, the evidence of a run and the patch copies
+    cc-dash shows are cc-dash's alone (cc-dash also pins what a run wrote
+    by sha256; Bash stays the documented same-user limit).
   - writes anywhere in the cc_tool checkout this project was set up from (the
     path in cc_tool_root beside this hook): it holds the code cc-dash and the
     hooks run, so an agent must not change it from another project. Unless the
@@ -35,9 +40,9 @@ Warns (additionalContext, never blocks):
     Claude scratchpad, ~/.claude/), e.g. a sibling repository the user asked
     the session to work on. The repository's other git worktrees (`git
     worktree list`) count as the project, wherever they sit on disk, and get
-    no note at all. cc_tool asks only before installs and deletions, and the
-    denials above already cover the system paths and dotfiles that matter, so
-    the default is a note, not a prompt. Set "write_outside_repo": "ask" in
+    no note at all. cc_tool asks only before installs, deletions, GitHub
+    API writes and merges into a protected branch, and the denials above already cover the system paths and
+    dotfiles that matter, so the default is a note, not a prompt. Set "write_outside_repo": "ask" in
     .claude/guard-rules.json to be asked per file again, or "off" for silence.
   - stale read: the target file changed on disk after Claude last read or
     wrote it this session (a formatter, a shell write, another agent). The
@@ -178,6 +183,10 @@ def check_cc_dash(root: str, path: str) -> None:
             deny(root, path, f"writing '{real}' forges cc-dash's control channel (approvals, messages and stops "
                              "between the dashboard and its hook)",
                  "ask the user to approve or answer in their terminal or in the dashboard")
+        if _under(real, os.path.join(spot, "selfheal")):
+            deny(root, path, f"writing '{real}' forges cc-dash's self-heal state (run records, evidence and the "
+                             "patches the dashboard shows)",
+                 "self-heal runs are started from the dashboard or with cc-selfheal, and only cc-dash writes there")
 
 
 def _pinned_root() -> str:

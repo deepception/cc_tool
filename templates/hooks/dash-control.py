@@ -108,6 +108,9 @@ restart it"). The checks are
 cc_procs.py beside this hook (cc-setup copies it here; never code from the
 checkout, which an agent could edit), the same code cc-dash runs on itself,
 run when the lease is read and again before every verify.
+Linux only: without /proc none of this can be checked, and a lease, a socket
+and a key are all that an agent's own program would need to show, so the hook
+then trusts no lease and every prompt stays in the terminal (dashboard_problem).
 Limit: a process running as you that rewrites its own memory (argv,
 environment) can still pass; see docs/guides/commands.md (Control mode,
 Security).
@@ -303,13 +306,23 @@ def _procs():
     return _PROCS[0]
 
 
+NO_PROC = "control mode needs /proc to identify the dashboard (Linux only); prompts stay in the terminal"
+
+
+def have_proc():
+    """True where /proc can tell processes apart (Linux); = cc_procs.have_proc."""
+    return os.path.isdir("/proc/self")
+
+
 def dashboard_problem(pid):
     """'' when the lease's pid is the cc-dash this hook trusts (the module
     docstring, "Which dashboard"), else why not."""
     if os.environ.get("CC_DASH_LEASE_ANY_PROGRAM") == "1":
         return ""                          # the hook's tests: their fake dashboard is the test process
-    if not os.path.isdir("/proc/self"):
-        return ""                          # no /proc: the dashboard's keyed, socket-checked answer carries the trust
+    if not have_proc():
+        # Without /proc a lease, a socket and a key are all an agent's own program can show: it writes
+        # the lease with its pid and key and listens on hook.sock. Nothing here can tell it from cc-dash.
+        return NO_PROC
     root = pinned_root()
     if not root:
         return "no cc_tool_root beside this hook (run cc-update-project)"
@@ -1184,10 +1197,20 @@ def permission_request(d, ctl, ls):
     if not send_request(ls, req):
         return
     # req/<id>.json is only a doorbell (the id): cc-dash shows it while this file is here.
-    held = write_private(req_path, {"v": 2, "id": rid}, keep=True)
     res = {"v": 1, "id": rid, "session": req["session"], "agent_id": req["agent_id"], "outcome": "terminal"}
     watch = Resolution(d, started)
+    # From the moment the request file exists, a kill must land inside the try below, whose
+    # finally removes it and writes the outcome: hold the signals across the write and let
+    # a pending one fire only once inside the try.
+    stops = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+    signal.pthread_sigmask(signal.SIG_BLOCK, stops)
     try:
+        held = write_private(req_path, {"v": 2, "id": rid}, keep=True)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
+        raise
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stops)
         last_lease = started
         while True:
             now = time.time()

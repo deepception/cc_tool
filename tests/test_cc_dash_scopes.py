@@ -418,11 +418,16 @@ def test_launch_refusals():
             ok = True
         check("argparse rejects the abbreviation %s (allow_abbrev=False)" % abbrev, ok)
     d = os.path.join(BASE, "refuse", "control")
-    NOPROC = os.path.join(BASE, "noproc")      # no /proc entries: only the given env and ancestors count
+    NOPROC = os.path.join(BASE, "noproc")      # no /proc entries: only the given env and ancestors can be read
     os.makedirs(d, mode=0o700)
-    check("no lease, not under Claude Code: allowed", server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=[]) == "")
+    # Its own process cannot be inspected: refused whatever the environment and parents say (fail closed);
+    # they only pick the plainer message when they already show Claude Code.
+    uninspected = "must be started from your own terminal: its own process (%d) cannot be inspected" % os.getpid()
+    why = server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=[])
+    check("no lease, its own process cannot be inspected: refused (not allowed on the environment alone)", uninspected in why, why)
     shell = [(50, "zsh", "/usr/bin/zsh", ["zsh"]), (40, "gnome-terminal-", "/usr/libexec/gnome-terminal-server", ["gnome-terminal-server"])]
-    check("a plain terminal parent chain: allowed", server_mod.control_refusal(d, proc=NOPROC, env={"HOME": "/h"}, ancestors=shell) == "")
+    why = server_mod.control_refusal(d, proc=NOPROC, env={"HOME": "/h"}, ancestors=shell)
+    check("a plain terminal parent chain, its own process not inspectable: refused", uninspected in why, why)
     def plant_lease(pid):
         p = os.path.join(d, "lease")
         if os.path.lexists(p):
@@ -468,7 +473,8 @@ def test_launch_refusals():
     finally:
         sleeper.kill()
         sleeper.wait()
-    check("the holder gone: allowed again", server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=[]) == "")
+    why = server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=[])
+    check("the holder gone: the lease no longer blocks", "holds the control lease" not in why and uninspected in why, why)
     if os.path.exists(os.path.join(d, "lease")):
         os.unlink(os.path.join(d, "lease"))
     for var in server_mod.CLAUDE_ENV_SIGNALS:
@@ -480,8 +486,8 @@ def test_launch_refusals():
                          ("node running a `claude` shim", [(9, "node", "/usr/bin/node", ["node", "/home/u/.npm/bin/claude", "--model", "x"])])):
         why = server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=shell[:1] + chain + shell[1:])
         check("an ancestor that is %s, several levels up: refused" % label, "not from inside a Claude Code session" in why, why)
-    check("node running something else is not mistaken for Claude Code", server_mod.control_refusal(
-        d, proc=NOPROC, env={}, ancestors=[(9, "node", "/usr/bin/node", ["node", "/srv/app/server.js"])]) == "")
+    why = server_mod.control_refusal(d, proc=NOPROC, env={}, ancestors=[(9, "node", "/usr/bin/node", ["node", "/srv/app/server.js"])])
+    check("node running something else is not mistaken for Claude Code", "inside a Claude Code session" not in why and uninspected in why, why)
 
     # A fake /proc: the parent chain is clean (double-forked, re-parented to the user
     # manager), but the session or process-group leader still descends from claude.

@@ -258,12 +258,13 @@ class Docs:
 
     # ── projects ──────────────────────────────────────────────────────────
     def projects(self):
-        """[{project, root, sessions, last_active}] for every resolved project root on disk."""
+        """[{project, root, sessions, last_active}] for every resolved project root on disk, over every
+        held session (the store's span), so a project picked in a wider window opens here too."""
         st = self.store
         st.refresh()
         out = {}
         with st.lock:
-            for s in st.sessions.values():
+            for s in st.held.values():
                 root = getattr(s, "root", "") or ""
                 label = getattr(s, "label", "") or ""
                 if not root or not label or label == "unknown":

@@ -17,7 +17,12 @@ Then it checks how sessions are grouped, the /api/sessions project list,
 sessions), that the query value is only a filter (traversal-looking values
 match nothing and never fail), the per-project numbers, and the timeline
 order (newest first, runs of tool calls reversed inside, the handed-back
-report on top). Nothing outside the temp dir is touched.
+report on top). With headless Chrome and playwright-core present it also
+drives the Sessions tab of the Projects area over the same tree: the area's
+four tabs, the key s, the rows, the title picker (projects and, under a
+project, worktrees) setting #/sessions?p=&wt=, the key /, a row opening
+#/s/<sid> with a "← Sessions" crumb back, #/live bouncing to the floor, and the
+10 s poll. Nothing outside the temp dir is touched.
 
 Run:  python3 tests/test_cc_dash_projects.py
       python3 tests/test_cc_dash_projects.py --fixture DIR   (only write the tree, for a browser check)
@@ -161,6 +166,264 @@ def get(port, path):
     return r.status, body
 
 
+BROWSER_JS = r"""
+const { chromium } = require(process.env.PW);
+const first = (e) => String((e && e.message) || e).split('\n')[0].slice(0, 300);
+const out = {};
+(async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHROME, headless: true });
+  const base = 'http://127.0.0.1:' + process.env.PORT;
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 1000 }, colorScheme: 'light' });
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on('pageerror', (e) => errs.push(first(e)));
+  let sessionReqs = 0;
+  page.on('request', (rq) => { if (new URL(rq.url()).pathname === '/api/sessions') sessionReqs += 1; });
+  const rows = () => page.$$eval('tr.link[data-key]', (r) => r.map((x) => x.dataset.key));
+  const waitRows = (n) => page.waitForFunction((n) => document.querySelectorAll('tr.link[data-key]').length === n, n, { timeout: 8000 }).catch(() => {});
+  const label = () => page.evaluate(() => { const b = document.querySelector('.area-title .picker-btn'); return b ? b.querySelector('.picker-label').textContent.trim() : null; });
+  const hash = () => page.evaluate(() => location.hash);
+  const tabs = () => page.$$eval('nav.area-tabs a', (a) => a.map((x) => ({ key: x.dataset.key, text: x.firstChild ? x.firstChild.textContent.trim() : '', cur: x.getAttribute('aria-current'), href: x.getAttribute('href') })));
+  const goto = async (h) => { await page.evaluate((h) => { location.hash = h; }, h); await page.waitForTimeout(500); };
+  // The title picker, driven with the mouse. An option's key may hold a NUL (worktrees), so options are found by key, not by selector.
+  const openPicker = async () => {
+    await page.click('.area-title .picker-btn');
+    await page.waitForSelector('.area-title .picker-pop:not([hidden])', { timeout: 4000 });
+  };
+  const clickOpt = async (key, inner) => {
+    const pt = await page.evaluate(([key, inner]) => {
+      const li = [...document.querySelectorAll('.area-title .picker-list li')].find((x) => x.dataset.key === key);
+      const el = li && (inner ? li.querySelector(inner) : li);
+      if (!el) return null;
+      el.scrollIntoView({ block: 'nearest' });
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }, [key, inner || null]);
+    if (!pt) throw new Error('no picker option ' + JSON.stringify(key) + (inner ? ' ' + inner : ''));
+    await page.mouse.click(pt.x, pt.y);
+  };
+  const step = async (name, fn) => { const r = {}; try { await fn(r); } catch (e) { r.error = first(e); } out[name] = r; };
+
+  const code = process.env.CODE;
+  await page.goto(base + '/pair#code=' + code, { waitUntil: 'load' });
+  out.landed = await hash();
+  await page.waitForSelector('section.fx', { timeout: 15000 });
+
+  // The key s opens the tab; the area has four tabs.
+  await step('keys', async (r) => {
+    await page.keyboard.press('s');
+    await page.waitForSelector('nav.area-tabs', { timeout: 8000 });
+    await waitRows(10);
+    r.hash = await hash(); r.tabs = await tabs(); r.rows = await rows(); r.label = await label();
+    r.sub = await page.evaluate(() => document.querySelector('.area-head .sub').textContent.trim());
+    r.summary = await page.evaluate(() => document.querySelector('.summary').textContent.replace(/\s+/g, ' ').trim());
+    r.topTab = await page.$$eval('.tabs a[aria-current="page"]', (a) => a.map((x) => x.dataset.view));
+    r.header = await page.evaluate(() => [...document.querySelectorAll('thead th')].map((x) => x.textContent.replace(/[↑↓]/g, '').trim()).filter(Boolean));
+    r.filters = await page.evaluate(() => ({ q: !!document.querySelector('input#q'), seg: [...document.querySelectorAll('.filters .seg button')].map((b) => b.textContent.trim()) }));
+    r.firstRow = await page.evaluate(() => { const t = document.querySelector('tr.link[data-key]'); return t ? { project: t.querySelector('.t-meta span').textContent, title: t.querySelector('.t-title').textContent } : null; });
+  });
+
+  // Picking a project in the title narrows the rows and sets ?p=.
+  await step('pick', async (r) => {
+    await openPicker();
+    await clickOpt('p:beta');
+    await page.waitForFunction(() => location.hash === '#/sessions?p=beta', null, { timeout: 4000 }).catch(() => {});
+    await waitRows(2);
+    r.hash = await hash(); r.rows = await rows(); r.label = await label(); r.tabs = await tabs();
+    // ...and a worktree, from the same picker: alpha folds its worktrees under it.
+    await openPicker();
+    await clickOpt('p:alpha', '.picker-exp');
+    await page.waitForTimeout(200);
+    await clickOpt('w:alpha\u0000s4-wt/web');
+    await page.waitForFunction(() => location.hash.startsWith('#/sessions?p=alpha&wt='), null, { timeout: 4000 }).catch(() => {});
+    await waitRows(1);
+    r.wtHash = decodeURIComponent(await hash()); r.wtRows = await rows(); r.wtLabel = await label();
+  });
+
+  // ?p=X&wt=Y keeps both filters, also through a reload.
+  await step('worktree', async (r) => {
+    await goto('#/sessions?p=alpha&wt=wt1');
+    await waitRows(1);
+    r.hash = await hash(); r.rows = await rows(); r.label = await label(); r.tabs = await tabs();
+    await page.reload({ waitUntil: 'load' });
+    await page.waitForSelector('nav.area-tabs', { timeout: 8000 });
+    await waitRows(1);
+    r.reHash = await hash(); r.reRows = await rows(); r.reLabel = await label();
+    await goto('#/sessions?p=alpha');
+    await waitRows(4);
+    r.alphaRows = await rows(); r.alphaLabel = await label();
+    r.sub = await page.evaluate(() => document.querySelector('.area-head .sub').textContent.trim());
+  });
+
+  // Unknown project: an empty state that offers all projects.
+  await step('unknown', async (r) => {
+    await goto('#/sessions?p=nope');
+    await page.waitForSelector('.empty[data-key="noscope"]', { timeout: 8000 });
+    r.empty = await page.evaluate(() => document.querySelector('.empty[data-key="noscope"]').textContent.replace(/\s+/g, ' ').trim());
+    r.label = await label();
+  });
+
+  // The other tabs of the area carry the project, and the key / goes to the search.
+  await step('area', async (r) => {
+    await goto('#/overview?p=alpha');
+    await page.waitForSelector('nav.area-tabs', { timeout: 8000 });
+    r.tabsOverview = await tabs();
+    await page.click('nav.area-tabs a[data-key="sessions"]');
+    await page.waitForFunction(() => location.hash === '#/sessions?p=alpha', null, { timeout: 4000 }).catch(() => {});
+    await waitRows(4);
+    r.hash = await hash(); r.rows = await rows();
+    await goto('#/sessions');
+    await waitRows(10);
+    await page.evaluate(() => { if (document.activeElement) document.activeElement.blur(); });
+    await page.keyboard.press('/');
+    await page.waitForFunction(() => document.activeElement && document.activeElement.id === 'q', null, { timeout: 3000 }).catch(() => {});
+    r.slash = await page.evaluate(() => (document.activeElement && document.activeElement.id) || null);
+    await page.keyboard.type('linked');
+    await waitRows(1);
+    r.found = await rows();
+    r.hashAfterType = await hash();
+    await page.keyboard.press('Escape');
+    await waitRows(10);
+    r.cleared = (await rows()).length;
+  });
+
+  // A row opens the session; its crumb leads back to the tab, filters and all.
+  await step('open', async (r) => {
+    await goto('#/sessions?p=beta');
+    await waitRows(2);
+    const sid = process.env.OPEN;
+    await page.click('tr.link[data-key="' + sid + '"]');
+    await page.waitForFunction((sid) => location.hash === '#/s/' + sid, sid, { timeout: 4000 }).catch(() => {});
+    await page.waitForFunction(() => { const c = document.querySelector('a.crumb'); return c && c.textContent.trim(); }, null, { timeout: 8000 });
+    r.hash = await hash();
+    r.crumb = await page.evaluate(() => ({ text: document.querySelector('a.crumb').textContent.trim(), href: document.querySelector('a.crumb').getAttribute('href') }));
+    r.topTab = await page.$$eval('.tabs a[aria-current="page"]', (a) => a.map((x) => x.dataset.view));
+    await page.click('a.crumb');
+    await page.waitForSelector('nav.area-tabs', { timeout: 8000 });
+    await waitRows(2);
+    r.back = await hash(); r.backRows = await rows(); r.backLabel = await label();
+  });
+
+  // Clear filters drops the search, model and errors-only, never the project or worktree; ?wt= needs a p; an empty worktree offers its project.
+  await step('clear', async (r) => {
+    await goto('#/sessions?p=alpha&wt=wt1');
+    await waitRows(1);
+    await page.fill('#q', 'zzzz-no-such-session');
+    await page.waitForSelector('.empty[data-key="nomatch"]', { timeout: 4000 });
+    await page.click('.empty[data-key="nomatch"] button');
+    await waitRows(1);
+    r.hash = await hash(); r.rows = await rows(); r.label = await label();
+    r.q = await page.inputValue('#q');
+    await goto('#/sessions?wt=wt1');
+    await waitRows(10);
+    r.noP = { rows: (await rows()).length, label: await label() };
+    await goto('#/sessions?p=alpha&wt=nope');
+    await page.waitForSelector('.empty[data-key="noscope"]', { timeout: 4000 });
+    r.empty = await page.evaluate(() => document.querySelector('.empty[data-key="noscope"]').textContent.replace(/\s+/g, ' ').trim());
+  });
+
+  // The old Live link bounces to the floor.
+  await step('live', async (r) => {
+    await goto('#/live');
+    await page.waitForSelector('section.fx', { timeout: 8000 });
+    r.hash = await hash();
+  });
+
+  // The tab polls /api/sessions about every 10 s.
+  await step('poll', async (r) => {
+    await goto('#/sessions');
+    await waitRows(10);
+    await page.waitForTimeout(500);
+    const n0 = sessionReqs;
+    await page.waitForTimeout(12500);
+    r.polls = sessionReqs - n0;
+  });
+
+  out.errors = errs;
+  await browser.close();
+  console.log(JSON.stringify(out));
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+
+
+def browser_sessions(cfg, ids):
+    """Sessions is a tab of the Projects area: Overview · Sessions · Plans · Docs, the title picker (worktree-aware) is its
+    project filter, #/sessions?p=&wt= its address, and a row opens the session with a crumb back to it."""
+    playwright = os.environ.get("CC_DASH_PLAYWRIGHT", "/home/lukasz/Files/hobby/color-analyzer/webapp/node_modules/playwright-core")
+    chrome = os.environ.get("CC_DASH_CHROME", "/usr/bin/google-chrome")
+    if not (os.path.isdir(playwright) and os.path.exists(chrome) and shutil.which("node")):
+        print("browser: skipped (no playwright-core, Chrome or node)")
+        return
+    os.environ.setdefault("XDG_STATE_HOME", os.path.join(os.path.dirname(cfg), "state"))   # attention.py's log: none, never the real one
+    srv = make_server(0, Store(root=cfg, days=7), fallback=False)
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
+    js = os.path.join(os.path.dirname(cfg), "projects_browser.js")
+    with open(js, "w") as fh:
+        fh.write(BROWSER_JS)
+    env = dict(os.environ, PW=playwright, CHROME=chrome, PORT=str(srv.port), CODE=srv.auth.new_code(), OPEN=ids["beta"][0])
+    try:
+        r = subprocess.run(["node", js], capture_output=True, text=True, timeout=240, env=env)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    if r.returncode != 0:
+        check("browser: page check ran", False, r.stderr[-800:])
+        return
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    for name, step in out.items():
+        if isinstance(step, dict) and step.get("error"):
+            check("browser: step %s ran to the end" % name, False, step["error"])
+    every = sorted(i for v in ids.values() for i in v)
+    beta, alpha = sorted(ids["beta"]), ids["alpha"]
+    wt1 = [i for i in alpha if i.endswith("3")]
+    sib = [i for i in alpha if i.endswith("4")]
+    ks, pk, wk = out.get("keys", {}), out.get("pick", {}), out.get("worktree", {})
+    check("sessions tab: no page errors", not out.get("errors"), out.get("errors"))
+    check("sessions tab: the key s from the floor lands on #/sessions and shows the area's four tabs, Sessions current",
+          ks.get("hash") == "#/sessions" and [t["key"] for t in ks.get("tabs", [])] == ["overview", "sessions", "plans", "docs"]
+          and [t["text"] for t in ks.get("tabs", [])] == ["Overview", "Sessions", "Plans", "Docs"]
+          and [t["key"] for t in ks.get("tabs", []) if t["cur"] == "page"] == ["sessions"], (ks.get("hash"), ks.get("tabs")))
+    check("sessions tab: it sits under the Projects tab of the nav (there is no Sessions tab up there)", ks.get("topTab") == ["projects"], ks.get("topTab"))
+    check("sessions tab: every session in the window is a row, the title picker reads 'All projects'",
+          sorted(ks.get("rows", [])) == every and ks.get("label") == "All projects", (len(ks.get("rows", [])), ks.get("label")))
+    check("sessions tab: the filter row has the search, the model segment and 'Errors or guard catches'",
+          ks.get("filters", {}).get("q") and "All models" in ks.get("filters", {}).get("seg", []) and "Errors or guard catches" in ks.get("filters", {}).get("seg", []), ks.get("filters"))
+    check("sessions tab: the summary counts the rows and the table keeps its columns",
+          ks.get("summary", "").startswith("10 sessions") and ks.get("header", [])[:3] == ["Session", "Last active", "Active"] and "Guard" in ks.get("header", []), (ks.get("summary"), ks.get("header")))
+    check("sessions tab: a row names its project and carries the session's title", ks.get("firstRow") and ks["firstRow"]["project"] and ks["firstRow"]["title"].startswith("Work in"), ks.get("firstRow"))
+    check("sessions tab: picking a project narrows the rows and sets #/sessions?p=beta",
+          pk.get("hash") == "#/sessions?p=beta" and sorted(pk.get("rows", [])) == beta and pk.get("label") == "beta", (pk.get("hash"), pk.get("rows"), pk.get("label")))
+    check("sessions tab: the other tabs follow the pick (Overview, Plans and Docs carry p=beta)",
+          all("p=beta" in t["href"] for t in pk.get("tabs", []) if t["key"] in ("overview", "sessions", "plans", "docs")), pk.get("tabs"))
+    check("sessions tab: the picker is worktree-aware: a worktree under alpha sets &wt= and reads 'alpha › s4-wt/web'",
+          pk.get("wtHash") == "#/sessions?p=alpha&wt=s4-wt/web" and pk.get("wtRows") == sib and pk.get("wtLabel") == "alpha › s4-wt/web", (pk.get("wtHash"), pk.get("wtRows"), pk.get("wtLabel")))
+    check("sessions tab: #/sessions?p=alpha&wt=wt1 keeps both filters (rows, picker 'alpha › wt1', tab links)",
+          wk.get("hash") == "#/sessions?p=alpha&wt=wt1" and wk.get("rows") == wt1 and wk.get("label") == "alpha › wt1"
+          and any("wt=wt1" in t["href"] for t in wk.get("tabs", []) if t["key"] == "sessions"), (wk.get("hash"), wk.get("rows"), wk.get("label"), wk.get("tabs")))
+    check("sessions tab: and through a reload", wk.get("reHash") == "#/sessions?p=alpha&wt=wt1" and wk.get("reRows") == wt1 and wk.get("reLabel") == "alpha › wt1", (wk.get("reHash"), wk.get("reRows"), wk.get("reLabel")))
+    check("sessions tab: ?p=alpha alone is the whole project, worktrees included, and the line under the title says so",
+          sorted(wk.get("alphaRows", [])) == sorted(alpha) and wk.get("alphaLabel") == "alpha" and wk.get("sub", "").startswith("4 sessions in alpha"), (wk.get("alphaRows"), wk.get("alphaLabel"), wk.get("sub")))
+    un = out.get("unknown", {})
+    check("sessions tab: a project with no sessions says so and offers all projects", "No sessions in nope" in un.get("empty", "") and "Show all projects" in un.get("empty", "") and un.get("label") == "nope", un)
+    ar = out.get("area", {})
+    check("sessions tab: the Sessions tab from Overview keeps the project (#/sessions?p=alpha, its four sessions)",
+          ar.get("hash") == "#/sessions?p=alpha" and sorted(ar.get("rows", [])) == sorted(alpha), (ar.get("hash"), ar.get("rows")))
+    check("sessions tab: the key / focuses the search, typing narrows the rows, Escape clears it",
+          ar.get("slash") == "q" and ar.get("found") == [i for i in ids["beta"] if i.endswith("2")] and ar.get("cleared") == 10, (ar.get("slash"), ar.get("found"), ar.get("cleared")))
+    op = out.get("open", {})
+    check("sessions tab: a row opens #/s/<sid>; its crumb reads '← Sessions'", op.get("hash") == "#/s/" + ids["beta"][0] and op.get("crumb", {}).get("text") == "← Sessions", (op.get("hash"), op.get("crumb")))
+    check("sessions tab: that crumb leads back to the tab with the project still picked, and the page sat under Projects",
+          op.get("crumb", {}).get("href") == "#/sessions?p=beta" and op.get("back") == "#/sessions?p=beta" and sorted(op.get("backRows", [])) == beta and op.get("backLabel") == "beta"
+          and op.get("topTab") == ["projects"], op)
+    cl = out.get("clear", {})
+    check("sessions tab: 'Clear filters' clears the search but keeps the project and worktree in the title",
+          cl.get("hash") == "#/sessions?p=alpha&wt=wt1" and cl.get("rows") == wt1 and cl.get("label") == "alpha › wt1" and cl.get("q") == "", cl)
+    check("sessions tab: ?wt= without a project is ignored (all projects, every session)", cl.get("noP", {}).get("rows") == 10 and cl.get("noP", {}).get("label") == "All projects", cl.get("noP"))
+    check("sessions tab: an empty worktree says so and offers 'Show all of alpha'", "No sessions in alpha › nope" in cl.get("empty", "") and "Show all of alpha" in cl.get("empty", ""), cl.get("empty"))
+    check("redirect: #/live bounces to the floor (#/factory)", out.get("live", {}).get("hash") == "#/factory", out.get("live"))
+    check("sessions tab: it polls /api/sessions about every 10 s (1 or 2 polls in 12.5 s)", 1 <= out.get("poll", {}).get("polls", 0) <= 2, out.get("poll"))
+
+
 def main():
     base = tempfile.mkdtemp(prefix="cc-dash-proj-")
     try:
@@ -169,7 +432,7 @@ def main():
         shutil.rmtree(base, ignore_errors=True)
     fails = [r for r in RESULTS if not r[1]]
     for name, ok, detail in RESULTS:
-        print(("PASS " if ok else "FAIL ") + name + ("" if ok or not detail else "  -- " + detail))
+        print(("PASS " if ok else "FAIL ") + name + ("" if ok or not detail else "  -- " + str(detail)[:400]))
     print(f"total={len(RESULTS)}  pass={len(RESULTS) - len(fails)}  fail={len(fails)}")
     return 1 if fails else 0
 
@@ -283,6 +546,9 @@ def run(base):
     finally:
         srv.shutdown()
         srv.server_close()
+
+    # ── the Projects area's Sessions tab, in a browser ────────────────────
+    browser_sessions(cfg, ids)
 
     # ── the DOM gets text only ────────────────────────────────────────────
     web = os.path.join(REPO, "lib", "cc_dash", "web")

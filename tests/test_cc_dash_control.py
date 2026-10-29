@@ -606,6 +606,118 @@ def test_refusal_on_terminal():
           told == b"refused" and a.ready_fd is None, told)
 
 
+def test_no_proc_refused():
+    """Without /proc (macOS) nothing can tell cc-dash, a lease's pid or a hook from
+    any program of yours (an agent can write a lease naming its own pid and key and
+    listen on hook.sock), so control mode fails closed: control_refusal refuses,
+    with or without a live lease (it used to take any live lease pid for cc-dash,
+    and to start after checking the environment alone), `cc-dash --control` exits
+    with the reason on its terminal, and a Control asked to check hooks shows no
+    request. The read-only dashboard still works. The system without /proc is
+    played by patching procs.have_proc."""
+    import io
+    from cc_dash import procs
+    from cc_dash import server as server_mod
+    from cc_dash import control as control_mod
+    d = os.path.join(BASE, "noproc", "control")
+    os.makedirs(d, mode=0o700)
+    real = procs.have_proc
+    sleeper = subprocess.Popen([PY, "-c", "import time; time.sleep(30)"])
+    try:
+        check("no /proc: here, on Linux, there is one (so the patch below is what plays its absence)", real() is True)
+        procs.have_proc = lambda: False
+        check("no /proc: lib/cc_dash sees the patched check (one seam: procs.have_proc)",
+              server_mod.procs.have_proc() is False and control_mod.procs.have_proc() is False)
+        why = server_mod.control_refusal(d, env={}, ancestors=[], note=lambda _t: None)
+        check("no /proc: control_refusal refuses to start (no lease, a clean environment)", why == server_mod.NO_PROC, why)
+        check("no /proc: the refusal names /proc, Linux, and the read-only way to run", "/proc" in why and "Linux" in why
+              and "without --control" in why and "prompts stay in the terminal" in why, why)
+        why = server_mod.control_refusal(d, env={}, ancestors=[], proc=os.path.join(BASE, "noproc", "fakeproc"), me=400,
+                                         note=lambda _t: None)
+        check("no /proc: a fake process tree passed as `proc` does not stand in for /proc", why == server_mod.NO_PROC, why)
+        lease = os.path.join(d, "lease")
+        fd = os.open(lease, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, json.dumps({"pid": sleeper.pid, "expires": time.time() + 600, "port": 1}).encode())
+        os.close(fd)
+        notes = []
+        why = server_mod.control_refusal(d, env={}, ancestors=[], note=notes.append)
+        check("no /proc: a live lease gets the same refusal, not taken for a running cc-dash",
+              why == server_mod.NO_PROC and "holds the control lease" not in why, why)
+        check("no /proc: ... and that lease is left alone (nothing could judge it)", os.path.exists(lease) and notes == [], notes)
+
+        # `cc-dash --control` itself: refused on its terminal and in the log, exit 1, nothing started.
+        shown, err, old_err = [], io.StringIO(), sys.stderr
+        saved = (server_mod.tty_write, server_mod.own_process_group)
+        old_env = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "XDG_STATE_HOME")}
+        root = os.path.join(BASE, "noproc", "main")
+        os.makedirs(os.path.join(root, "claude", "projects"), exist_ok=True)
+        os.makedirs(os.path.join(root, "state"), mode=0o700, exist_ok=True)
+        server_mod.tty_write = lambda text, tty="/dev/tty": shown.append(text) or True
+        server_mod.own_process_group = lambda: None          # leave this test process's group alone
+        os.environ.update(CLAUDE_CONFIG_DIR=os.path.join(root, "claude"), XDG_STATE_HOME=os.path.join(root, "state"))
+        sys.stderr = err
+        try:
+            rc = server_mod.main(["--control", "--no-open", "--port", "0"])
+        finally:
+            sys.stderr = old_err
+            server_mod.tty_write, server_mod.own_process_group = saved
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        check("no /proc: cc-dash --control exits 1", rc == 1, rc)
+        check("no /proc: ... with the reason on its terminal, where the control code would have been",
+              any("cc-dash: " + server_mod.NO_PROC in t for t in shown), shown)
+        check("no /proc: ... and in the log (stderr)", "cc-dash: " + server_mod.NO_PROC in err.getvalue(), err.getvalue())
+        check("no /proc: ... and no control code, lease or hook socket", not any("control code:" in t for t in shown)
+              and not os.path.lexists(os.path.join(root, "state", "cc_tool", "control", "lease"))
+              and not os.path.lexists(os.path.join(root, "state", "cc_tool", "control", "hook.sock")), shown)
+
+        # A Control asked to check hooks: keeps the check, and shows nothing (403, audited).
+        s = Srv(hook_check=True)
+        try:
+            check("no /proc: Control(hook_check=True) keeps the hook check (not silently off)", s.ctl.hook_check is True)
+            ti = {"command": "make deploy"}
+            rid = "%x-%s" % (int(time.time() * 1000), os.urandom(6).hex())
+            req = {"v": 1, "id": rid, "ts": time.time(), "pid": os.getpid(), "session": SID, "cwd": s.cwd, "tool": "Bash",
+                   "kind": "permission", "sig": "make deploy", "hash": os.urandom(32).hex(), "input": ti,
+                   "deadline": time.time() + 300}
+            st, _out, _h = hook_call(s.ctl.dir, s.ctl.key, "POST", "/api/control/request", req)
+            fd = os.open(s.path("req", rid + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, json.dumps({"v": 2, "id": rid}).encode())
+            os.close(fd)
+            s.ctl.scan()
+            check("no /proc: a request handed over on the hook socket is refused (403)", st == 403, st)
+            check("no /proc: ... and not shown, also after its doorbell rings",
+                  rid not in s.ctl.requests and s.ctl.state()["requests"] == [], s.ctl.state()["requests"])
+            audit = [a for a in audit_lines(s) if a.get("item") == rid and a.get("action") == "refused"]
+            check("no /proc: ... and audited once, saying why", len(audit) == 1 and "/proc" in audit[0].get("result", "")
+                  and "Linux" in audit[0].get("result", ""), audit)
+            code, _ = s.ctl.decide("human", {"id": rid, "action": "allow", "hash": req["hash"]})
+            check("no /proc: ... and it cannot be approved", code == 404, code)
+        finally:
+            s.close()
+        s = Srv(hook_check=False)          # requests written by hand (tests): still taken
+        try:
+            r = s.fake_request()
+            check("no /proc: hook_check=False still takes requests (the hand-written test setup)", r["id"] in s.ctl.requests)
+        finally:
+            s.close()
+        s = Srv(control=False)
+        try:
+            s.pair(control=False)
+            st, _, body = s.req("GET", "/api/sessions")
+            check("no /proc: the read-only dashboard still pairs and serves", st == 200 and isinstance(json.loads(body), (list, dict)),
+                  (st, body[:80]))
+        finally:
+            s.close()
+    finally:
+        procs.have_proc = real
+        sleeper.kill()
+        sleeper.wait()
+
+
 def test_stop_cleans_lease():
     s = Srv()
     s.close()
@@ -616,7 +728,8 @@ def test_stop_cleans_lease():
 def main():
     try:
         for fn in (test_pairing, test_write_checks, test_decide, test_messages_and_stop, test_socket_transport,
-                   test_agents_release_and_annotate, test_round_trip_with_hook, test_refusal_on_terminal, test_stop_cleans_lease):
+                   test_agents_release_and_annotate, test_round_trip_with_hook, test_refusal_on_terminal, test_no_proc_refused,
+                   test_stop_cleans_lease):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001

@@ -97,6 +97,8 @@ CC_STATE = os.path.join(_XDG if os.path.isabs(_XDG) else os.path.join(HOME, ".lo
 
 CTL_LINK = os.path.join(ROOT, "src", "ctl-link")      # a symlink to cc-dash's control directory
 os.symlink(os.path.join(CC_STATE, "control"), CTL_LINK)
+SH_LINK = os.path.join(ROOT, "src", "sh-link")        # a symlink to cc-dash's self-heal state
+os.symlink(os.path.join(CC_STATE, "selfheal"), SH_LINK)
 
 FAKE_GH = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 FAKE_ANT = "sk-ant-api03-" + "qwertyuiopasdfghjklzxcvbnm1234"
@@ -169,6 +171,15 @@ CASES = [
     ("C14", "ccdash", ROOT, "NotebookEdit", {"notebook_path": "/etc/x.ipynb", "new_source": "x"}, "s", D),
     ("C05", "ccdash", ROOT, "Write", {"file_path": os.path.join(ROOT, "src", "control", "x.ts"), "content": "x"}, "s", A),
     ("C06", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "notes.txt"), "content": "x"}, "s", W),  # outside the repo: a note, not a block
+    # ── self-heal: its state (records, run dirs, patch copies) is cc-dash's alone ─
+    ("C16", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "selfheal", "state.json"), "content": "{}"}, "s", D),
+    ("C17", "ccdash", ROOT, "Edit", {"file_path": os.path.join(CC_STATE, "selfheal", "runs", "self-heal-20260101-000000-abcd", "proposals.json"),
+                                     "old_string": "a", "new_string": "b"}, "s", D),
+    ("C18", "ccdash", ROOT, "MultiEdit", {"file_path": os.path.join(CC_STATE, "selfheal", "patches", "x", "a", "01-x.patch"), "edits": []}, "s", D),
+    ("C19", "ccdash", ROOT, "NotebookEdit", {"notebook_path": os.path.join(CC_STATE, "selfheal", "records", "x.json"), "new_source": "x"}, "s", D),
+    ("C20", "ccdash", ROOT, "Write", {"file_path": os.path.join(SH_LINK, "state.json"), "content": "{}"}, "s", D),  # a symlink into it
+    ("C21", "ccdash", ROOT, "Write", {"file_path": A_TS, "path": os.path.join(CC_STATE, "selfheal", "lock"), "content": "x"}, "s", D),  # a decoy field
+    ("C22", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "selfheal-notes.txt"), "content": "x"}, "s", W),  # a sibling name: a note
 ]
 
 

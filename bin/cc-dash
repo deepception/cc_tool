@@ -9,6 +9,7 @@ browser, and runs until Ctrl-C. Read-only and writes nothing, unless --control
 ${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/). Python 3 standard library only.
 
 Usage: cc-dash [--port 7878] [--no-open] [--days 7] [--project <text>] [--control [--control-wait 300]]
+  --days is the starting window; the page can switch to 1, 3, 7, 14 or 30 days.
 """
 import os
 import sys

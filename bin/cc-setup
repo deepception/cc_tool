@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cc-setup: Configure Claude Code tools (hooks + settings + skills + CLAUDE.md) in a project.
-# Usage: cc-setup [project_path] [--vault] [--reset-terminals] [--devcontainer [--cloud aws|gcp|none] [--firewall on|off]]
+# Usage: cc-setup [project_path] [--vault] [--factory] [--reset-terminals] [--devcontainer [--cloud aws|gcp|none] [--firewall on|off]]
 #   --reset-terminals  replace the recorded terminal hosts (control mode) with this terminal's, instead of adding it
 set -euo pipefail
 
@@ -9,12 +9,14 @@ CC_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_DIR=""
 WITH_DEVCONTAINER=0
 WITH_VAULT=0
+WITH_FACTORY=0
 RESET_TERMINALS=0
 DEVCONTAINER_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --vault) WITH_VAULT=1; shift ;;
+        --factory) WITH_FACTORY=1; shift ;;
         --reset-terminals) RESET_TERMINALS=1; shift ;;
         --devcontainer) WITH_DEVCONTAINER=1; shift ;;
         --cloud|--cloud=*|--firewall|--firewall=*|--force)
@@ -651,6 +653,13 @@ if (( WITH_VAULT )); then
     echo ""
     echo "── Vault ───────────────────────────────────────────────────────────"
     "$CC_TOOL_DIR/bin/cc-vault" "$PROJECT_DIR"
+fi
+
+# ── 5b. Optional software factory ────────────────────────────────────────────
+if (( WITH_FACTORY )); then
+    echo ""
+    echo "── Factory ─────────────────────────────────────────────────────────"
+    "$CC_TOOL_DIR/bin/cc-factory" init "$PROJECT_DIR"
 fi
 
 # ── 6. Optional devcontainer setup ──────────────────────────────────────────

@@ -5,6 +5,11 @@ user-invocable: true
 disable-model-invocation: true
 ---
 
+<!-- Adapted from https://github.com/mattpocock/skills (MIT, (c) 2026 Matt Pocock),
+     first taken byte-identical at d1beb4fe61574b3325ed96cd0d9a31966d31a02a
+     (2026-03-13); cc_tool has edited it since. LICENSE ships alongside this
+     file and REFERENCE.md. -->
+
 # Improve Codebase Architecture
 
 Explore a codebase like an AI would, surface architectural friction, discover opportunities for improving testability, and propose module-deepening refactors as GitHub issue RFCs.

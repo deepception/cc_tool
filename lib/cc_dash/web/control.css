@@ -1,8 +1,10 @@
-/* cc-dash control mode: the decision card, inline Live buttons, the message
-   composer, Stop, and the "Re-pair" screen. app.css tokens and components
-   only: statuses are app.css pills (s-decide, s-turn, ...), the card is the
-   one decision card (alerts.css wraps it in toasts and the drawer), buttons
-   are .btn with the variants below. No inline styles (the CSP blocks them). */
+/* cc-dash control mode: the decision card, the Review button and the review
+   dialog that holds the card, the message composer, Stop, and the "Re-pair"
+   screen. app.css tokens and components only: statuses are app.css pills
+   (s-decide, s-turn, ...), the card is the one decision card (alerts.css
+   wraps it in toasts and the drawer), the dialog is the help dialog's frame,
+   buttons are .btn with the variants below. No inline styles (the CSP blocks
+   them). factory.css seats the Review button on the floor's glass. */
 
 /* ── Button variants (control is the only place that writes) ─────────── */
 .btn.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); }
@@ -13,13 +15,12 @@
 .btn.danger { color: var(--bad); }
 .btn.warn-solid { background: var(--warn-dot); color: var(--on-warn); border-color: var(--warn-dot); }
 .btn.warn-solid:hover { background: color-mix(in srgb, var(--warn-dot) 85%, var(--ink)); }
+.btn.warn-solid:disabled { background: var(--sunk); color: var(--ink-4); border-color: var(--line); }   /* "Run it" until approve is typed */
 .btn.opt { height: auto; min-height: var(--h-ctl-s); padding: var(--sp-1) var(--sp-2h); white-space: normal; text-align: left; }
 .btn.opt[aria-checked="true"] { border-color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink); background: var(--raised); }
 .btn.ctl-mini { height: 24px; padding: 0 var(--sp-2); font-size: var(--fs-12); }
-.btn.ctl-mini.failed { border-color: var(--bad); color: var(--bad); }
 .ctl-x { border: 0; background: transparent; color: var(--ink-3); font: 500 var(--fs-12)/1 var(--font); padding: var(--sp-1) var(--sp-1h); border-radius: var(--r-s); cursor: pointer; transition: color var(--t-fast) ease, background-color var(--t-fast) ease; }
 .ctl-x:hover { color: var(--ink); background: var(--select); }
-.arow.c-turn .a-state .st { color: var(--ink-2); font-weight: 500; }
 
 /* ── The decision card: control's parts (the frame is in app.css) ──── */
 .ctl-where { font-size: var(--fs-11); color: var(--ink-3); margin-top: calc(-1 * var(--sp-1)); }
@@ -79,12 +80,37 @@
 .ctl-card.compact .ctl-acts .btn { height: 26px; padding: 0 var(--sp-2h); font-size: var(--fs-12); }
 .ctl-card.compact .ctl-plan-text { max-height: 140px; }
 
-/* ── Inline buttons on a Live row ────────────────────────────────────── */
+/* ── The Review button (inline()) ────────────────────────────────────── */
 .ctl-inline { display: inline-flex; gap: var(--sp-1h); flex: none; }
-.ctl-msg-btn { opacity: 0; transition: opacity var(--t-fast) ease; }
-.arow:hover .ctl-msg-btn, .arow:focus-within .ctl-msg-btn, .arow.sel .ctl-msg-btn, .arow.c-turn .ctl-msg-btn, .ctl-msg-btn:focus-visible { opacity: 1; }
-@media (hover: none) { .ctl-msg-btn { opacity: 1; } }
-html:not(.ctl-paired) .ctl-msg-btn, html:not(.ctl-paired) .ctl-inline { display: none; }
+html:not(.ctl-paired) .ctl-inline { display: none; }
+
+/* ── The review dialog: a Review button's full card, in the help dialog's frame ─
+   The head names what and who, so the card's own copies of those two lines are
+   hidden in here (as in a toast); everything else on the card stays. */
+.ctl-review {
+  width: min(560px, calc(100vw - 32px)); max-width: none; max-height: calc(100dvh - 48px); margin: auto; padding: 0; overflow: hidden;
+  border: 1px solid var(--line-2); border-radius: var(--r-l); background: var(--raised); color: var(--ink); box-shadow: var(--shadow-pop);
+}
+.ctl-review[open] { display: flex; flex-direction: column; }
+.ctl-review::backdrop { background: var(--scrim); }
+@media (prefers-reduced-motion: no-preference) {
+  .ctl-review[open] { animation: pop var(--t-pop) var(--ease) both; }
+  .ctl-review[open]::backdrop { animation: fade var(--t-pop) ease both; }
+}
+@media (prefers-reduced-motion: reduce) { .ctl-review[open], .ctl-review[open]::backdrop { animation: fade var(--t-pop) ease both; } }
+.ctl-rv-head { flex: none; display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-4) var(--sp-3) var(--sp-3) var(--sp-5); border-bottom: 1px solid var(--line); }
+.ctl-rv-id { flex: 1; min-width: 0; }
+.ctl-rv-what { margin: 0; font-size: var(--fs-16); font-weight: 600; line-height: 1.3; letter-spacing: -.012em; }
+.ctl-rv-who { margin: var(--sp-0h) 0 0; font-size: var(--fs-12); font-weight: 500; color: var(--ink-2); overflow-wrap: anywhere; }
+.ctl-rv-x { background: transparent; border-color: transparent; }
+.ctl-rv-x:hover { background: var(--hover); border-color: var(--line); }
+.ctl-rv-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: var(--sp-4) var(--sp-5); }
+.ctl-rv-body .ctl-card .ctl-what, .ctl-rv-body .ctl-card .ctl-who { display: none; }
+.ctl-rv-body .ctl-box { max-height: 320px; }
+.ctl-rv-foot { flex: none; display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); min-height: 49px; padding: var(--sp-2h) var(--sp-5); border-top: 1px solid var(--line); }
+.ctl-rv-open { display: inline-flex; align-items: center; height: var(--h-ctl-s); margin-left: calc(-1 * var(--sp-3)); font-size: var(--fs-12); }
+.ctl-rv-foot .ctl-keys { margin-left: auto; gap: var(--sp-3); }
+html.ctl-locked .ctl-rv-foot .ctl-keys { display: none; }   /* locked, y and n only focus the code field */
 
 /* ── Session and subagent page: open decisions, Stop, history ────────── */
 .ctl-panel { display: flex; flex-direction: column; gap: var(--sp-3); margin: 0 0 var(--sp-5); }
@@ -131,7 +157,7 @@ html.ctl-paired .al-stack { bottom: calc(var(--sp-5) + var(--ctl-comp-h, 0px)); 
 .ctl-mtext { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
 .ctl-msg .ctl-x[hidden] { display: none; }
 
-/* ── Quick-send popover (Live rows, the drawer) ──────────────────────── */
+/* ── Quick-send popover (the drawer's and toasts' "Message…") ────────── */
 .ctl-pop {
   position: fixed; z-index: 38; padding: var(--sp-3); border-radius: var(--r-l);
   background: var(--raised); border: 1px solid var(--line-2); box-shadow: var(--shadow-pop); display: flex; flex-direction: column; gap: var(--sp-2);
@@ -141,6 +167,11 @@ html.ctl-paired .al-stack { bottom: calc(var(--sp-5) + var(--ctl-comp-h, 0px)); 
 
 @media (max-width: 900px) { .ctl-composer { margin-left: calc(-1 * var(--sp-4)); margin-right: calc(-1 * var(--sp-4)); padding-left: var(--sp-4); padding-right: var(--sp-4); } }
 @media (max-width: 640px) {
+  .ctl-rv-head { padding: var(--sp-3) var(--sp-2) var(--sp-2h) var(--sp-4); }
+  .ctl-rv-body { padding: var(--sp-3); }
+  .ctl-rv-foot { padding: var(--sp-2) var(--sp-4); min-height: 0; }
+  .ctl-rv-x { width: 40px; height: 40px; }   /* phone hit areas, as the inspector's */
+  .ctl-rv-open { height: 40px; }
   .ctl-hist { grid-template-columns: 56px minmax(0, 1fr); }
   .ctl-hist-detail, .ctl-hist-res { grid-column: 2; }
   .ctl-keys { display: none; }

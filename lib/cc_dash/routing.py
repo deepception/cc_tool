@@ -282,18 +282,18 @@ def _share(a, b):
     return round(a / b, 4) if b else 0.0
 
 
-def build(store, project, now, cache):
-    """The routing payload for one scope ('' = every project). `cache` is the Store's profile cache."""
-    cutoff = now - store.days * 86400
-    sessions = store.scope_sessions(project)
+def build(store, project, now, cache, days=None):
+    """The routing payload for one scope ('' = every project) over a `days` window (None: the
+    store's launch window). `cache` is the Store's profile cache. Called under store.lock."""
+    days = store.days if days is None else days
+    cutoff = now - days * 86400
+    sessions = store.scope_sessions(project, days, now)
     agents = []
     main = {"count": 0, "cost": 0.0, "spend": 0.0, "other_count": 0, "other_cost": 0.0}
-    live_keys = set()
 
     def prof(acc, role):
         key = (acc.path, role)
         sig = (acc.api_msgs, len(acc.msg_usage), acc.last_ts, acc.effort)
-        live_keys.add(key)
         hit = cache.get(key)
         if hit and hit[0] == sig:
             return hit[1]
@@ -385,11 +385,16 @@ def build(store, project, now, cache):
             "family": a["family"], "model": a["model"], "source": a["source"], "effort": a["effort"],
             "effort_named": a["effort_named"], "flags": a["flags"], "cost": r4(a["w"]["cost"]), "save": a["save"],
             "max_ctx": a["w"]["max_ctx"]} for a in flagged[:TOP]]
-    if not project:                  # a scoped build sees only its own transcripts; the full one prunes
-        for k in [k for k in cache if k not in live_keys]:
-            del cache[k]
+    # Prune only the profiles of transcripts the store no longer holds at all: a profile outside this
+    # request's window or scope may be another page's, on another window.
+    keep = set()
+    for s in store.held.values():
+        keep.add((s.acc.path, "main"))
+        keep.update((x.acc.path, "sub") for x in s.subs)
+    for k in [k for k in cache if k not in keep]:
+        del cache[k]
     return {
-        "now": now, "days": store.days, "cutoff": cutoff, "scope": {"project": project},
+        "now": now, "days": days, "cutoff": cutoff, "scope": {"project": project},
         "agents": len(agents), "cost": r4(total_cost),
         "new_tokens": sum(a["w"]["new_tokens"] for a in agents), "cache_read": sum(a["w"]["cache_read"] for a in agents),
         "cache_read_cost": r4(sum(a["w"]["cread_cost"] for a in agents)),

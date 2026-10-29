@@ -334,9 +334,10 @@ class Control:
         self._stop = threading.Event()
         self._thread = None
         self.audit_path = os.path.join(self.dir, "audit.jsonl")
-        # Requests are shown only from a real hook process (procs.hook_problem). Off
+        # Requests are shown only from a real hook process (procs.hook_problem); where
+        # there is no /proc to tell (procs.have_proc), none is (receive_request). Off
         # only for tests that write request files by hand.
-        self.hook_check = hook_check and os.path.isdir("/proc/self")
+        self.hook_check = hook_check
         self.root = root or CC_TOOL_DIR
         self.planted = {}          # request id -> why it was not shown (audited once)
         self.hook_sock = None      # <dir>/hook.sock once server.start_hook_channel made it; named in the lease
@@ -469,12 +470,13 @@ class Control:
         """(http status, response) for POST /api/control/request: the hook hands over
         the request it waits on. The only way a request reaches a card: req/ files
         are doorbells, and their content is never read, so rewriting one changes
-        nothing shown. With the hook check on (Linux), `peer_pid` (the process
+        nothing shown. With the hook check on, `peer_pid` (the process
         that connected to the hook socket, from SO_PEERCRED; `peer_why` says why
         there is none) must be the pid the request names, and that process a
         dash-control.py hook installed from this
         checkout for a registered project (procs.hook_problem); anything else is
-        refused and audited. `still` (from SO_PEERPIDFD, where the kernel has it)
+        refused and audited, and so is every request where there is no /proc to
+        tell (procs.have_proc). `still` (from SO_PEERPIDFD, where the kernel has it)
         says the process that connected is still the one with that pid, after
         the check. Each request id is taken once."""
         rid = body.get("id")
@@ -484,16 +486,22 @@ class Control:
         now = self.clock()
         if self.hook_check:
             pid = body.get("pid")
-            why = (peer_why or "the connecting process is not process %s, which the request names" % pid) \
-                if peer_pid is None or peer_pid != pid else procs.hook_problem(pid, self.root, projects=self.projects())
+            result = "a request no dash-control hook sent was not shown (%s)"
+            if not procs.have_proc():
+                # Nothing can tell a hook from any other program of yours: shown from nobody (fail closed).
+                why = "there is no /proc to tell which program sent it; control mode works on Linux only"
+                result = "a request was not shown (%s)"
+            elif peer_pid is None or peer_pid != pid:
+                why = peer_why or "the connecting process is not process %s, which the request names" % pid
+            else:
+                why = procs.hook_problem(pid, self.root, projects=self.projects())
             if not why and still is not None and not still():
                 why = "process %s exited during the check, so its pid may now name another process" % pid
             if why:
                 with self.lock:
                     self.planted[rid] = now
                 self.log(None, "refused", kind="req", item=rid, session=body["session"][:100] or None,
-                         tool=_str(body.get("tool"), 100) or None,
-                         result="a request no dash-control hook sent was not shown (%s)" % why)
+                         tool=_str(body.get("tool"), 100) or None, result=result % why)
                 return 403, {"ok": False}
         d = {k: body[k] for k in self.REQUEST_KEYS if k in body}
         d["session"] = d["session"][:100]

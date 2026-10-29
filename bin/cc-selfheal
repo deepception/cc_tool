@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""cc-selfheal: run cc_tool's self-heal from a terminal.
+
+Builds the evidence bundle of every session since the last completed self-heal run
+(the errors, guard denials, stalls, corrections and reworks they hit), starts ONE
+headless `claude -p` run of the self-heal workflow on it, waits, then prints the
+proposed harness changes (CLAUDE.md, guard rules, settings, skills, factory lines,
+cc_tool's templates) as patch files, grouped by project and severity, and the cost.
+Proposals only: nothing is applied and nothing it prints is run. The same run as the
+Self-heal button of `cc-dash --control`; both go through lib/cc_dash/selfheal.py and
+share its state under ${XDG_STATE_HOME:-~/.local/state}/cc_tool/selfheal/ (one run
+at a time). Reads ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/ like cc-dash.
+
+Usage: cc-selfheal [--project P] [--since ISO] [--days N] [--budget USD] [--timeout MIN] [--dry-run]
+  --dry-run only builds the bundle (evidence.json, evidence/, harness/, args.json in a
+  new run directory) and prints where it is and its size: no claude, no state change.
+
+Exit codes: 0 done, 1 refused or failed, 2 usage error, 130 interrupted (Ctrl-C stops
+the run: its process group is killed and the run is recorded as interrupted).
+Python 3 standard library only.
+"""
+import os
+import sys
+
+# Run isolated, like bin/cc-dash: re-execute once as `<python> -I <this script's real
+# path> ...` without PYTHON* or LD_* variables, so no PYTHONPATH, PYTHONSTARTUP, user
+# site directory, current directory or preloaded library can put other code into a
+# process that spawns claude with the user's credentials. <python> is the interpreter
+# already running this, by the kernel's /proc/self/exe, never one named in a file or
+# a variable.
+if not sys.flags.isolated:
+    exe = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTHON", "LD_"))}
+    os.execve(exe, [exe, "-I", os.path.realpath(__file__)] + sys.argv[1:], env)
+
+sys.dont_write_bytecode = True   # write no __pycache__ next to lib/ ...
+sys.pycache_prefix = os.path.join(os.devnull, "cc-selfheal-no-pycache")   # ... and read none
+# The repo is this script's parent's parent (realpath, so a symlinked cc-selfheal still finds lib/).
+CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+import argparse  # noqa: E402
+import datetime  # noqa: E402
+import math  # noqa: E402
+import re  # noqa: E402
+import signal  # noqa: E402
+import time  # noqa: E402
+
+# The contract's defaults (lib/cc_dash/selfheal.py DEFAULT_BUDGET, BUDGET_MIN, BUDGET_MAX,
+# TIMEOUT_SECS), spelled out here so --help and usage errors work without loading it.
+DEFAULT_BUDGET, BUDGET_MIN, BUDGET_MAX = 5.0, 0.5, 100.0
+DEFAULT_TIMEOUT_MIN, TIMEOUT_MIN_MAX = 60.0, 24 * 60.0
+SELFHEAL_PY = os.path.join(CC_TOOL_DIR, "lib", "cc_dash", "selfheal.py")
+SEV_ORDER = ("high", "medium", "low")
+
+# Everything printed from a record or a proposal went through a model at some point:
+# one line, no control, bidi or zero-width characters (no terminal escapes), clipped.
+_BAD = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ud800-\udfff]")
+
+
+def safe(v, n=200):
+    s = " ".join(_BAD.sub(" ", "" if v is None else str(v)).split())
+    return s if len(s) <= n else s[:n - 1] + "..."
+
+
+def tilde(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if home not in ("", "/") and (p == home or p.startswith(home + os.sep)) else p
+
+
+def parse_since(text):
+    """An epoch from an ISO date or time (naive means local time), or None."""
+    try:
+        d = datetime.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    t = d.timestamp()
+    return t if math.isfinite(t) else None
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="cc-selfheal",
+        description="Analyze the errors of recent Claude Code sessions (since the last completed self-heal run) "
+                    "with one headless claude run and print proposed harness changes as patch files. Proposals "
+                    "only: nothing is applied.",
+        epilog="Exit codes: 0 done, 1 refused or failed, 2 usage error, 130 interrupted.",
+        allow_abbrev=False)
+    p.add_argument("--project", default="", metavar="P",
+                   help="only sessions whose working directory contains this text (like cc-dash --project)")
+    p.add_argument("--since", default=None, metavar="ISO",
+                   help="start the window here (e.g. 2026-10-20 or 2026-10-20T09:00; naive means local time) "
+                        "instead of where the last completed run ended")
+    p.add_argument("--days", type=float, default=None, metavar="N",
+                   help="window of a first run, when no run has completed yet (default 7)")
+    p.add_argument("--budget", type=float, default=DEFAULT_BUDGET, metavar="USD",
+                   help=f"spending cap of the headless run in USD (default {DEFAULT_BUDGET:g}, "
+                        f"{BUDGET_MIN:g}-{BUDGET_MAX:g})")
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_MIN, metavar="MIN",
+                   help=f"minutes before the run is killed (default {DEFAULT_TIMEOUT_MIN:g})")
+    p.add_argument("--dry-run", action="store_true",
+                   help="only build the evidence bundle and print where it is and its size; starts no claude "
+                        "and changes no state")
+    a = p.parse_args(argv)
+    if a.days is not None and not 0 < a.days < float("inf"):     # NaN fails every comparison
+        p.error("--days must be a positive number")
+    if not BUDGET_MIN <= a.budget <= BUDGET_MAX:
+        p.error(f"--budget must be {BUDGET_MIN:g}-{BUDGET_MAX:g} USD")
+    if not 1 <= a.timeout <= TIMEOUT_MIN_MAX:
+        p.error(f"--timeout must be 1-{TIMEOUT_MIN_MAX:g} minutes")
+    a.since_at = None
+    if a.since is not None:
+        a.since_at = parse_since(a.since)
+        if a.since_at is None:
+            p.error("--since must be an ISO date or time, e.g. 2026-10-20 or 2026-10-20T09:00")
+        if a.since_at >= time.time():
+            p.error("--since is in the future")
+    return a
+
+
+def load_cc_dash():
+    """Load lib/cc_dash by its path, like bin/cc-dash: lib/ never goes on sys.path."""
+    import importlib.util
+    pkg = os.path.join(CC_TOOL_DIR, "lib", "cc_dash")
+    spec = importlib.util.spec_from_file_location("cc_dash", os.path.join(pkg, "__init__.py"),
+                                                  submodule_search_locations=[pkg])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["cc_dash"] = mod
+    spec.loader.exec_module(mod)
+    from cc_dash import selfheal
+    from cc_dash.store import Store, config_dir
+    return selfheal, Store, config_dir
+
+
+def when(t):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(t)))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def window_text(w):
+    if not isinstance(w, dict):
+        return "?"
+    notes = []
+    if w.get("first"):
+        notes.append(f"first run, {w['days']:g} days" if isinstance(w.get("days"), (int, float)) else "first run")
+    if w.get("clamped"):
+        notes.append("clamped to the store's widest window")
+    return f"{when(w.get('since'))} to {when(w.get('until'))}" + (f" ({', '.join(notes)})" if notes else "")
+
+
+def money(v):
+    return f"${v:.2f}" if isinstance(v, (int, float)) and math.isfinite(v) else "unknown"
+
+
+def tree_size(root):
+    """(files, bytes) of the regular files under root, never following a symlink."""
+    files = size = 0
+    for d, dirs, names in os.walk(root, followlinks=False):
+        for n in names:
+            try:
+                st = os.lstat(os.path.join(d, n))
+            except OSError:
+                continue
+            if os.path.isfile(os.path.join(d, n)) and not os.path.islink(os.path.join(d, n)):
+                files += 1
+                size += st.st_size
+    return files, size
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
+def print_report(sh, rec):
+    """The finished run: status, the proposals grouped by project and severity, the cost."""
+    rid = rec.get("id")
+    status = rec.get("status")
+    by = rec.get("by_severity") if isinstance(rec.get("by_severity"), dict) else {}
+    head = f"cc-selfheal: {rid} {safe(status, 20)}"
+    if status == "done":
+        n = rec.get("proposals") or 0
+        sev = ", ".join(f"{k} {by.get(k, 0)}" for k in SEV_ORDER)
+        print(f"{head}: {n} proposal(s) ({sev}), cost {money(rec.get('cost_usd'))}")
+    else:
+        print(f"{head}: {safe(rec.get('error'), 300) or 'no reason recorded'}; cost {money(rec.get('cost_usd'))}",
+              file=sys.stderr)
+    code, view = sh.run_view(rid)
+    if code != 200 or not isinstance(view, dict):
+        return
+    for prob in view.get("problems") or []:
+        print(f"  problem: {safe(prob, 300)}")
+    props = [p for p in view.get("proposals") or [] if isinstance(p, dict)]
+    project = None
+    for p in props:          # run_view's order: by project (_cc_tool last), then severity
+        if p.get("project") != project:
+            project = p.get("project")
+            root = safe(p.get("project_root"), 200)
+            print(f"\n{safe(project, 64)}" + (f"  ({root})" if root else ""))
+        print(f"  {safe(p.get('severity'), 6):<6}  {safe(p.get('id'), 5):<4} {safe(p.get('title'), 120)}  "
+              f"[{safe(p.get('target'), 120)}]")
+        if p.get("patch_ok"):
+            print(f"          patch  {safe(p.get('patch_path'), 300)}")
+            if p.get("apply_cmd"):
+                print(f"          apply  {safe(p.get('apply_cmd'), 600)}")
+        else:
+            print(f"          patch withheld: {safe(p.get('patch_problem'), 300)}")
+    dropped = [d for d in view.get("dropped") or [] if isinstance(d, dict)]
+    if dropped:
+        print(f"\ndropped: {len(dropped)}")
+        for d in dropped:
+            print(f"  - {safe(d.get('title'), 120)}: {safe(d.get('reason'), 300)}")
+    if props or dropped:
+        print(f"\nreport: {safe(view.get('markdown_path'), 300)}")
+    if status == "done" and not props:
+        print("no proposals: nothing in the window called for a harness change.")
+    print(f"cost: {money(rec.get('cost_usd'))}")
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def main(argv=None):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    a = parse_args(sys.argv[1:] if argv is None else argv)
+    if not os.path.isfile(SELFHEAL_PY):
+        print(f"cc-selfheal: {tilde(SELFHEAL_PY)} is missing in this checkout; update cc_tool.", file=sys.stderr)
+        return 1
+    selfheal, Store, config_dir = load_cc_dash()
+    # A closed terminal or a kill stops the run the same way Ctrl-C does.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _interrupt)
+    root = config_dir()
+    days = a.days if a.days is not None else 7.0
+    try:
+        store = Store(root=root, days=days, project=a.project)
+        print(f"cc-selfheal: reading transcripts from {tilde(os.path.join(root, 'projects'))}"
+              + (f" matching '{safe(a.project, 80)}'" if a.project else "") + " ...")
+        store.refresh(force=True)
+        sh = selfheal.SelfHeal(store, budget=a.budget, timeout=int(round(a.timeout * 60)), writable=True)
+        code, body = sh.start(days=a.days, since=a.since_at, origin="cli", dry_run=a.dry_run, background=False)
+    except KeyboardInterrupt:
+        print("cc-selfheal: interrupted before claude started; nothing is running.", file=sys.stderr)
+        return 130
+    if not isinstance(body, dict) or code >= 300 or not body.get("ok") or not isinstance(body.get("run"), dict):
+        err = safe(body.get("error") if isinstance(body, dict) else "", 300) or f"refused ({code})"
+        print(f"cc-selfheal: {err}", file=sys.stderr)
+        running = body.get("running") if isinstance(body, dict) else None
+        if isinstance(running, dict):
+            print(f"  running   {safe(running.get('id'), 64)} ({safe(running.get('origin'), 12)}), "
+                  f"session {safe(running.get('session_id'), 64)}", file=sys.stderr)
+        return 1
+    rec = body["run"]
+    rid = rec.get("id")
+    run_dir = os.path.expanduser(str(rec.get("run_dir") or ""))
+    projects = [safe(p, 64) for p in rec.get("projects") or []]
+    if a.dry_run:
+        bundle = os.path.join(run_dir, "evidence.json")
+        try:
+            bsize = human(os.lstat(bundle).st_size)
+        except OSError:
+            bsize = "not written"
+        files, total = tree_size(run_dir) if os.path.isdir(run_dir) else (0, 0)
+        print(f"cc-selfheal: dry run {rid}: bundle built; no claude started, no state changed.")
+        print(f"  bundle    {tilde(bundle)}  ({bsize})")
+        print(f"  run dir   {tilde(run_dir)}  ({files} file(s), {human(total)}: evidence.json, evidence/, harness/, args.json)")
+        print(f"  window    {window_text(rec.get('window'))}")
+        print(f"  evidence  {rec.get('signals') or 0} item(s) from {len(projects)} project(s)"
+              + (f": {', '.join(projects)}" if projects else ""))
+        return 0
+    print(f"cc-selfheal: {rid} started: {rec.get('signals') or 0} item(s) from {len(projects)} project(s), "
+          f"budget {money(rec.get('budget_usd'))}, timeout {a.timeout:g} min")
+    print(f"  window    {window_text(rec.get('window'))}")
+    print(f"  run dir   {tilde(run_dir)}")
+    if rec.get("status") == "running":
+        sid = safe(rec.get("session_id"), 64)
+        print(f"  session   {sid}")
+        print(f"  watch     cc-dash, Factory floor: s:{sid}; claude's stderr: {tilde(os.path.join(run_dir, 'claude.err'))}")
+        print("  waiting ... (Ctrl-C stops the run)")
+    try:
+        final = sh.wait(rid)
+    except KeyboardInterrupt:
+        print("\ncc-selfheal: stopping the run ...", file=sys.stderr)
+        try:
+            sh.stop(rid)
+        except KeyboardInterrupt:
+            pass
+        print(f"cc-selfheal: {rid} interrupted.", file=sys.stderr)
+        return 130
+    if not isinstance(final, dict):
+        print(f"cc-selfheal: {rid}: the run's record is gone.", file=sys.stderr)
+        return 1
+    print_report(sh, final)
+    return 0 if final.get("status") == "done" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
