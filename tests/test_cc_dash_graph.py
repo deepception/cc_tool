@@ -460,7 +460,7 @@ ORDER_STATES = ("queued", "spec", "approved", "building", "verifying", "review",
 STATES = {"project": ("working", "needs", "idle"), "session": BOARD, "agent": BOARD,
           "workflow": ("running", "done", "failed"), "order": ORDER_STATES}
 PREFIX = {"project": "p:", "session": "s:", "agent": "a:", "workflow": "w:", "order": "o:"}
-TOP = {"now", "window_days", "scope", "sig", "kpis", "nodes", "edges", "alerts", "feed", "series", "limits"}
+TOP = {"now", "window_days", "scope", "sig", "kpis", "nodes", "edges", "alerts", "feed", "series", "limits", "usage_limits"}
 KPIS = {"sessions_live": is_int, "agents": is_int, "working": is_int, "needs": is_int, "stalled": is_int, "failed": is_int,
         "done": is_int, "burn_cost_min": is_num, "burn_tok_min": is_int, "cost_live": is_num, "cost_window": is_num,
         "guard": sub(GUARD), "errors": is_int,
@@ -1662,6 +1662,41 @@ def run(fn, *a):
         return None
 
 
+def test_usage_limits():
+    """usage_limits: what bin/cc-statusline last recorded (limits.py), null without it, the same in every
+    scope, judged against the store's clock, and in the sig."""
+    st = fresh_store()
+    udir = os.path.join(STATE, "cc_tool", "usage")
+    p0 = poll(st)
+    check("usage_limits: null with no reading", p0["usage_limits"] is None, p0["usage_limits"])
+    os.makedirs(udir, mode=0o700, exist_ok=True)
+    rec = os.path.join(udir, "sess-1.json")
+    try:
+        with open(rec, "w") as fh:
+            json.dump({"session_id": "sess-1", "changed_at": T - 30, "five_hour": {"used_percentage": 38.5, "resets_at": T + 100},
+                       "seven_day": {"used_percentage": 41, "resets_at": T + 86400}}, fh)
+        os.chmod(rec, 0o600)
+        p1 = poll(st)
+        u = p1["usage_limits"] or {}
+        check("usage_limits: both windows with used_percentage, resets_at, as_of and expired",
+              set(u) == {"five_hour", "seven_day"} and all(set(w) == {"used_percentage", "resets_at", "as_of", "expired"} for w in u.values())
+              and u["five_hour"]["used_percentage"] == 38.5 and u["five_hour"]["as_of"] == T - 30 and u["five_hour"]["expired"] is False, u)
+        check("usage_limits: a new reading moves the sig", p1["sig"] != p0["sig"], (p0["sig"], p1["sig"]))
+        check("usage_limits: the same for a project scope and with dormant hubs",
+              poll(st, project=ALPHA)["usage_limits"] == u and poll(st, all_projects=True)["usage_limits"] == u)
+        set_clock(st, T + 200)
+        p2 = poll(st)
+        set_clock(st, T)
+        u2 = p2["usage_limits"] or {}
+        check("usage_limits: past resets_at (by the store's clock) a window is expired, the other not",
+              (u2.get("five_hour") or {}).get("expired") is True and (u2.get("seven_day") or {}).get("expired") is False, u2)
+        os.chmod(rec, 0o666)
+        check("usage_limits: a record others can write is ignored", poll(st)["usage_limits"] is None)
+        json.dumps(p1, allow_nan=False)
+    finally:
+        shutil.rmtree(udir, ignore_errors=True)
+
+
 def main():
     try:
         graph.PLANS_TTL = graph.ORDERS_TTL = 0
@@ -1685,6 +1720,7 @@ def main():
         run(test_rerun_link)
         run(test_series)
         run(test_series_memory)
+        run(test_usage_limits)
         run(test_latency)
         run(test_real_factory)
     finally:

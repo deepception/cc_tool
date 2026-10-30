@@ -241,6 +241,28 @@ main:has(> .fx) { padding-bottom: var(--sp-4); }
 .fx-side-btn:hover { background: var(--hover); color: var(--ink); }
 .fx-side-btn[aria-pressed="true"] { background: var(--select); color: var(--ink); }
 
+/* Usage limits (factory.js limits()): the subscription's 5-hour and weekly windows, quiet text
+   just before the Activity toggle, split by the panel's hairline. The track is the order
+   stepper's (5px, 3px radius, the done-step fill); amber from 75% and red at 100% are the status colours'
+   "decide soon" and "stopped", and a reading too old to trust, or a window that has reset since,
+   goes to the muted ink. Below 1100px the time left goes first; on a phone it is not shown. */
+.fx-lim { flex: none; margin-left: auto; display: inline-flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-1h);
+  color: var(--ink-3); font-size: var(--fs-12); white-space: nowrap; font-variant-numeric: tabular-nums; cursor: default; }
+.fx-lim[hidden] { display: none; }
+.fx-lim:not([hidden]) + .fx-side-btn { margin-left: 0; }
+.fx-lim-w { display: inline-flex; align-items: center; gap: var(--sp-1h); }
+.fx-lim-w + .fx-lim-w { padding-left: var(--sp-3); box-shadow: -1px 0 0 var(--fx-panel-edge); }
+.fx-lim-bar { flex: none; width: 32px; height: 5px; border-radius: 3px; background: var(--fx-track); overflow: hidden; }
+.fx-lim-bar i { display: block; height: 100%; border-radius: inherit; background: var(--series-main); }
+.fx-lim-w b { color: var(--ink); font-weight: 600; }
+.fx-lim-w.high .fx-lim-bar i { background: var(--warn-dot); }
+.fx-lim-w.high b { color: var(--warn); }
+.fx-lim-w.full .fx-lim-bar i { background: var(--bad); }
+.fx-lim-w.full b { color: var(--bad); }
+.fx-lim-w.dim .fx-lim-bar i { background: var(--ink-4); }
+.fx-lim-w.dim b { color: var(--ink-3); font-weight: 500; }
+@media (max-width: 1100px) { .fx-lim-left { display: none; } }
+
 /* ── Zoom: + - fit, bottom right, left of the column or inspector ───── */
 .fx-zoom { position: absolute; z-index: 3; bottom: var(--gap); right: var(--gap); display: flex; flex-direction: column; gap: var(--sp-0h); padding: var(--sp-0h);
   transform: translateX(calc(-1 * max(0px, var(--fx-right, 0px) - var(--gap)))); transition: transform var(--t-drawer) var(--ease-drawer); }
@@ -623,6 +645,7 @@ main:has(> .fx) { padding-bottom: var(--sp-4); }
   .fx-kpi[data-k="stalled"], .fx-kpi[data-k="cost"], .fx-kpi[data-k="guard"], .fx-kpi[data-k="orders"] { display: none; }
   .fx-kpi { padding: var(--sp-1h) var(--sp-3); }
   .fx-band { height: 44px; }
+  .fx-lim { display: none; }
   .fx-alert, .fx-alert-w > .ctl-inline .btn.ctl-mini, .fx-side-btn { height: 36px; }
   .fx-now-act .btn.ctl-mini { height: 40px; }
   .fx-zoom { flex-direction: row; }   /* a row costs a wide floor less room than a column */

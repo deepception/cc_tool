@@ -149,5 +149,33 @@ if yaml is not None:
             if isinstance(fm, dict) and key in fm:
                 check(f"{key} is a string in {rel}", isinstance(fm[key], str), type(fm[key]).__name__)
 
+# A skill's `allowed-tools` pre-approves those tools (no permission prompt) for the
+# turn that invokes it, and the model can invoke most skills on its own; it restricts
+# nothing. So a shipped skill may list only read-only tools bare, and anything else
+# scoped to a pattern that is not a bare wildcard (PR #3 dropped scroll-world's
+# `Bash, Read, Write, Edit, ...`). Read from the text, so this runs without PyYAML.
+import re  # noqa: E402
+
+READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "AskUserQuestion"}
+for path in sorted(os.listdir(SKILLS)):
+    rel = os.path.join("templates", "skills", path, "SKILL.md")
+    if not os.path.isfile(os.path.join(REPO, rel)):
+        continue
+    text = read(rel)
+    fm = text[4:].split("\n---", 1)[0] if text.startswith("---\n") else ""
+    m = re.search(r"""^[ \t]*(["']?)allowed-tools\1[ \t]*:[ \t]*(.*(?:\n[ \t]+-.*)*)""", fm, re.M | re.I)
+    check(f"allowed-tools in {rel} is a plain top-level key",
+          not m or m.group(0)[:1] not in " \t\"'" and "allowed-tools" in m.group(0),
+          m.group(0)[:60] if m else "")
+    if not m:
+        continue
+    raw = m.group(2).strip()
+    items = re.findall(r"^[ \t]*-[ \t]*(.+)$", raw, re.M) if raw.startswith("-") or "\n" in raw \
+        else re.findall(r"[^,\s(]+(?:\([^)]*\))?", raw.strip("[]"))
+    broad = [t.strip().strip("'\"") for t in items
+             if not re.fullmatch(r"[A-Za-z_]\w*\((?![\s*:]*\))[^)]+\)", t.strip().strip("'\""))
+             and t.strip().strip("'\"") not in READ_ONLY_TOOLS]
+    check(f"allowed-tools in {rel} pre-approves only read-only tools or narrow patterns", not broad, str(broad))
+
 print(f"{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

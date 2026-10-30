@@ -26,7 +26,9 @@ Without --control those paths are 404 and every POST but /api/pair is 405.
 The POSTs, all through auth.check_write: /api/control/decide, message, cancel,
 stop, and /api/control/selfheal, which starts one self-heal run (selfheal.py:
 a headless `claude -p` that proposes harness patches and applies none; its
-body only gives a number of days). GET /api/selfheal and /api/selfheal/run
+body only gives a number of days), and /api/control/selfheal/apply, which applies
+one finished run's proposal and commits it after a typed confirm (SelfHeal.apply
+re-checks everything). GET /api/selfheal and /api/selfheal/run
 show its state and a run's validated proposals to any paired token.
 """
 import argparse
@@ -390,7 +392,7 @@ class Handler(BaseHTTPRequestHandler):
         self._deny(405, "cc-dash is read-only.")
 
     POSTS = ("/api/control/decide", "/api/control/message", "/api/control/cancel", "/api/control/stop",
-             "/api/control/selfheal")
+             "/api/control/selfheal", "/api/control/selfheal/apply")
 
     def do_POST(self):
         if getattr(self.server, "hook_channel", False):
@@ -436,6 +438,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/control/selfheal":
                 sh = getattr(self.server, "selfheal", None)
                 code, out = sh.trigger(client, body) if sh is not None else (404, {"error": "Self-heal is not available."})
+            elif path == "/api/control/selfheal/apply":     # one proposal's checked patch, applied and committed
+                sh = getattr(self.server, "selfheal", None)
+                code, out = sh.apply(client, body) if sh is not None else (404, {"error": "Self-heal is not available."})
             else:
                 code, out = ctl.cancel(client, body)
         except Exception as e:  # noqa: BLE001 - report, never take the server down

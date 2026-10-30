@@ -32,7 +32,9 @@ about.
 
 Asks (hands the decision to the user; in an unattended run that is a refusal).
 The rule is: ask before an install, a deletion, a GitHub API write or landing
-work on a protected branch, nowhere else.
+work on a protected branch, nowhere else; plus the ways an allowlisted command
+(`gh api`, `git diff/log/fetch …`) sends data elsewhere, runs a command or
+writes a file, and a command the guard could not finish checking.
   - landing on a protected branch (the merge gate), by allowlist: with HEAD
     on main/master/production/release (or moved to one, or to an unknown
     branch such as `-` / @{-1}, earlier in the command), a git command runs
@@ -92,10 +94,26 @@ work on a protected branch, nowhere else.
     could turn into other arguments: any `$`/backtick in a word (no variable
     is resolved), an unquoted glob or brace expansion, process substitution,
     `$'…'`, IFS; and a command name bash builds (`$G api`, `/usr/bin/g? api`).
+    Also a request to another host, a way out for data under the same allow
+    rule: --hostname, an endpoint with `://` (a full URL) other than
+    https://api.github.com/…, and any mention of GH_HOST, GH_CONFIG_DIR,
+    XDG_CONFIG_HOME or HOME other than a plain $HOME / ${HOME} read, or of a
+    builtin or loop that sets a variable by a name bash may build (declare,
+    typeset, local, export, readonly, read, mapfile, readarray, unset, eval,
+    source / `.`, let, getopts, for, select, printf -v).
     Reads pass: `gh api repos/o/r`, `--paginate`, `--jq`, `-X GET … -f q=…`
     (a query string), `gh api graphql -f query='{ viewer { login } }'`.
     `gh api *` is allowlisted, so unlike the rest of this file this check
     fails closed on shell expansion (see check_gh_api, _gh_mark).
+  - git options that turn an allowlisted read into running a command or
+    writing a file, on any branch: `--exec`, `--upload-pack`,
+    `--receive-pack` (and git's abbreviations of them, `--upload-p`), `clone
+    -u`, `clone -c/--config`, and `--output` (`git diff --output=~/.zshrc`);
+    anywhere in the arguments, past a `--` too, since parse-options takes a
+    `--` as an option's value.
+  - a command bash-guard cannot finish checking within HOOK_BUDGET_SECONDS
+    (2.4 s of its registered 3 s timeout): a hook that times out lets the
+    command run unchecked.
   - Deletions follow nothing: no variables, no `cd`, no caches (see
     check_deletes). npx follows variables, `cd` and subshells (see
     walk_commands), since a wrong guess there costs a download, not files; a
@@ -159,6 +177,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -172,6 +191,11 @@ PROTECTED = {"main", "master", "production", "release"}
 # Longest command we tokenize. Beyond this we cannot analyse safely, so we warn
 # loudly and defer to the user rather than silently allowing (see main()).
 MAX_COMMAND_CHARS = 400_000
+# Wall-clock budget for one run of the hook. settings.json registers it with a
+# 3 s timeout, and a hook that times out lets the command run unchecked (under
+# the allow rules: `gh api *`, `git rebase *` …), so past this budget the hook
+# asks instead (see _arm_budget, main()).
+HOOK_BUDGET_SECONDS = 2.4
 
 _CMD_FOR_LOG = ""      # set by main() so deny/ask can log what they refused
 _PAYLOAD_CWD = ""      # the Bash tool's working directory, from the hook payload
@@ -210,6 +234,7 @@ def deny(reason: str, suggestion: str = "") -> None:
     msg = _fmt(reason, suggestion)
     if _CAPTURE:
         raise _Verdict("deny", msg)
+    _disarm_budget()
     _log("deny", msg)
     print(json.dumps({
         "hookSpecificOutput": {
@@ -227,6 +252,7 @@ def ask(reason: str, suggestion: str = "") -> None:
     msg = _fmt(reason, suggestion).replace("BLOCKED:", "NEEDS APPROVAL:", 1)
     if _CAPTURE:
         raise _Verdict("ask", msg)
+    _disarm_budget()
     _log("ask", msg)
     print(json.dumps({
         "hookSpecificOutput": {
@@ -236,6 +262,26 @@ def ask(reason: str, suggestion: str = "") -> None:
         }
     }))
     sys.exit(0)
+
+
+def _out_of_budget(_signum, _frame) -> None:
+    ask(f"bash-guard ran out of time ({HOOK_BUDGET_SECONDS} s) before it finished checking this command, "
+        "and a hook that times out lets the command run unchecked. Approve only if you have read it",
+        "split it into shorter commands")
+
+
+def _arm_budget() -> None:
+    """Ask, rather than time out, once HOOK_BUDGET_SECONDS have passed. Only the
+    hook itself arms it (main()); classify() runs inside other hooks and never does."""
+    if hasattr(signal, "setitimer"):
+        signal.signal(signal.SIGALRM, _out_of_budget)
+        signal.setitimer(signal.ITIMER_REAL, HOOK_BUDGET_SECONDS)
+
+
+def _disarm_budget() -> None:
+    """Called before a decision is printed, so the timer cannot print a second one."""
+    if hasattr(signal, "setitimer"):
+        signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 def warn(note: str) -> None:
@@ -918,6 +964,43 @@ def check_git(tokens) -> None:
     #    so `git merge --squash x && git commit` is still refused).
     _check_protected_landing(tokens, invocations)
 
+    # 5) options that turn an allow-listed git read into running a command or
+    #    writing a file, on any branch (templates/settings.json allows `git
+    #    diff/log/stash/fetch/rebase *` with no prompt). rebase --exec / -x are
+    #    asked by (4) already.
+    #    The whole argument list is scanned, `--` or not: git's parse-options
+    #    takes a `--` as the value of an option that wants one (`git fetch -o --
+    #    --upload-pack=…`, `git push --repo -- --exec=…` run it), and no
+    #    subcommand is trusted to stop there. A path named like an option after
+    #    `--` (`git diff -- --output`) costs a prompt.
+    for sub, _gopts, args, _repo in invocations:
+        for a in args:
+            if a.startswith("--") and len(a) > 3:
+                name = a.split("=", 1)[0]
+                # git takes any unique prefix of a long option (`--upload-p`, `--exe`)
+                hit = next((opt for opt in _GIT_EXEC_LONG if opt.startswith(name)), None)
+                if hit:
+                    ask(f"'git {sub} {name}' {_GIT_EXEC_LONG[hit]}",
+                        "run the command or write the file as its own step, where it is visible")
+                if sub == "clone" and "--config".startswith(name) and len(name) > 4:
+                    ask(f"'git clone {name}' {_GIT_CLONE_CONFIG}", "clone without it, then set the configuration")
+            elif sub == "clone" and "u" in _short_flags(a):
+                ask(f"'git clone -u' {_GIT_EXEC_LONG['--upload-pack']}", "clone without -u")
+            elif sub == "clone" and "c" in _short_flags(a):
+                ask(f"'git clone -c' {_GIT_CLONE_CONFIG}", "clone without it, then set the configuration")
+
+
+# Long options that run a command or write a file, and what they do. Matched by
+# prefix, since git's option parser takes any unique abbreviation (the diff
+# options take none, so `git diff --out=f` only fails; it asks all the same).
+_GIT_EXEC_LONG = {
+    "--output": "writes its output to any file, outside write-guard",
+    "--exec": "runs a shell command (push, archive: as the remote helper; rebase: after each commit)",
+    "--upload-pack": "runs a shell command as the remote helper",
+    "--receive-pack": "runs a shell command as the remote helper",
+}
+_GIT_CLONE_CONFIG = ("sets configuration the clone itself uses, which can name a command to run "
+                     "(core.sshCommand, a credential helper)")
 
 # ── landing work on a protected branch (merge gate) ───────────────────────────
 # Commit and push to main/master/production/release are denied, but a merge into
@@ -1592,19 +1675,28 @@ def _check_pipelines(tokens) -> None:
             groups.setdefault(gid, []).append(cmd)
     for stages in groups.values():
         names = [_cmd_name(s[0]) for s in stages]
+        # What runs after each stage, and whether a secret was named up to it, in
+        # one pass each way: rescanning the rest of the pipeline from every stage
+        # was quadratic, and a long enough `a | a | … ; git reset --hard` ran
+        # past the hook's timeout, which lets the command through unchecked.
+        interp_after = [False] * len(names)
+        sink_after = [False] * len(names)
+        for i in range(len(names) - 2, -1, -1):
+            interp_after[i] = interp_after[i + 1] or names[i + 1] in _INTERPRETERS
+            sink_after[i] = sink_after[i + 1] or names[i + 1] in _NET_SINKS
+        secret_so_far = False
         for i, nm in enumerate(names):
-            later = names[i + 1:]
-            if nm in _FETCHERS and any(x in _INTERPRETERS for x in later):
+            secret_so_far = secret_so_far or any(_is_secret_token(t) for t in stages[i][1:])
+            if nm in _FETCHERS and interp_after[i]:
                 deny("downloading a script and piping it straight into a shell or interpreter runs "
                      "unreviewed remote code",
                      "download to a file, read it, then run it deliberately; or install through the package manager")
-            if nm in _ENV_DUMPERS and any(x in _NET_SINKS for x in later):
+            if nm in _ENV_DUMPERS and sink_after[i]:
                 deny("piping the environment (which holds every secret this shell can see) into a network tool "
                      "is exfiltration", "print the one variable you need, never the whole environment")
-            if nm in ("cat", "grep", "awk", "base64", "xxd") and any(x in _NET_SINKS for x in later):
-                if any(_is_secret_token(t) for s in stages[:i + 1] for t in s[1:]):
-                    deny("sending secret material to a network tool is exfiltration",
-                         "never transmit credential files")
+            if nm in ("cat", "grep", "awk", "base64", "xxd") and sink_after[i] and secret_so_far:
+                deny("sending secret material to a network tool is exfiltration",
+                     "never transmit credential files")
 
 
 def _check_infra(seg, wrappers) -> None:
@@ -2243,7 +2335,7 @@ def check_npx(tokens) -> None:
 _GH_API_SHORT = {"X": "method", "F": "field", "f": "raw", "H": "header", "q": "", "t": "", "p": ""}
 _GH_API_SHORT_BOOL = {"i", "h"}
 _GH_API_LONG = {"method": "method", "field": "field", "raw-field": "raw", "header": "header", "input": "input",
-                "jq": "", "template": "", "preview": "", "cache": "", "hostname": ""}
+                "jq": "", "template": "", "preview": "", "cache": "", "hostname": "hostname"}
 _GH_API_LONG_BOOL = {"include", "paginate", "slurp", "silent", "verbose", "help"}
 _GH_ROOT_BOOLS = {"-h", "--help", "--version"}
 _GRAPHQL_MUTATION_RE = re.compile(r"(?<![_0-9A-Za-z])mutation(?![_0-9A-Za-z])")
@@ -2443,7 +2535,7 @@ def _gh_api_args(cmd):
 def _gh_api_parse(words):
     """({kind: [values]}, positionals, first option gh does not have or None),
     reading `words` as pflag does (see the comment above)."""
-    seen = {"method": [], "field": [], "raw": [], "header": [], "input": []}
+    seen = {"method": [], "field": [], "raw": [], "header": [], "input": [], "hostname": []}
     pos, k = [], 0
     while k < len(words):
         a = words[k]
@@ -2534,6 +2626,12 @@ def _gh_api_write(args):
     seen, pos, unknown = _gh_api_parse(words)
     if unknown:
         return f"passes an option bash-guard does not know ('{unknown}'), so it cannot tell what the request does"
+    if seen["hostname"]:
+        return f"sends the request to another host (--hostname {seen['hostname'][-1][:40]}), not github.com"
+    # gh takes an endpoint with :// anywhere in it as the whole URL, whatever its host
+    url = next((p for p in pos if "://" in p and not p.startswith("https://api.github.com/")), None)
+    if url:
+        return f"sends the request to a full URL ('{url[:40]}'), which can name any host"
     if seen["input"]:
         return "sends a request body with --input"
     for f in seen["field"]:
@@ -2594,6 +2692,22 @@ def _gh_api_cmd(cmd, depth=0):
 _GH_WORD_RE = re.compile(r"(?<![\w.-])gh(?![\w.-])")
 _API_WORD_RE = re.compile(r"(?<![\w.-])api(?![\w.-])")
 _IFS_RE = re.compile(r"(?<![A-Za-z0-9_])IFS(?![A-Za-z0-9_])")
+# What picks gh's host or its config (hosts.yml names the default host and its token):
+# any mention of GH_HOST, GH_CONFIG_DIR or XDG_CONFIG_HOME, and of HOME except a
+# plain read ($HOME, ${HOME}): HOME=, HOME+=, export/read/declare/printf -v HOME,
+# `for HOME in`, ${HOME:=…} all count, since no assignment form is modelled.
+# Builtins and loops that assign a variable whose name may be built at run time
+# (`n=HOME; declare "$n=/x"`, `read "$v"`, `for "$v" in`): in a command line that
+# mentions gh api, any of them asks (printf only with -v).
+_GH_NAME_SETTERS = {"declare", "typeset", "local", "export", "readonly", "read", "mapfile", "readarray", "unset",
+                    "eval", "source", ".", "let", "getopts", "for", "select"}
+_GH_HOST_ENV_RE = re.compile(r"(?<![A-Za-z0-9_])(?:GH_HOST|GH_CONFIG_DIR|XDG_CONFIG_HOME)(?![A-Za-z0-9_])"
+                             r"|(?<![A-Za-z0-9_$])(?<!\$\{)HOME(?![A-Za-z0-9_])|\$\{HOME(?!\})")
+# Variables gh (Go's HTTP stack) reads to pick a proxy or trust store, matched in any case: a line that
+# names one may route the request, token and all, through someone else's server.
+_GH_PROXY_ENV_RE = re.compile(r"(?<![A-Za-z0-9_])(?:HTTPS?_PROXY|ALL_PROXY|NO_PROXY|SSL_CERT_(?:FILE|DIR))(?![A-Za-z0-9_])",
+                              re.IGNORECASE)
+_GH_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
 # Every expansion, so it can stand in for any text: `…`, $( … ), ${ … }, $'…', $NAME, $1, $@ …
 _GH_EXPANSION_RE = re.compile(r"`[^`]*`?|\$\([^()]*(?:\([^()]*\)[^()]*)*\)?|\$\{[^}]*\}?|\$'[^']*'?"
                               r"|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]?")
@@ -2622,6 +2736,22 @@ def _mentions_gh_api(text: str) -> bool:
     return False
 
 
+def _gh_api_around(plain, k):
+    """True when gh api is mentioned in `plain` outside the assignment at k and its value: the value's
+    command substitution, which the tokens split (`X=$`, `(`, …, `)`), is skipped to its closing paren."""
+    j = k + 1
+    if _gh_plain(plain[k]).endswith("$") and j < len(plain) and _gh_plain(plain[j]).startswith("("):
+        depth = 0
+        while j < len(plain):
+            text = _gh_plain(plain[j])
+            depth += text.count("(") - text.count(")")
+            j += 1
+            if depth <= 0:
+                break
+    join = lambda ts: " ".join(_gh_plain(x) for x in ts)
+    return _mentions_gh_api(join(plain[:k])) or _mentions_gh_api(join(plain[j:]))
+
+
 def _gh_api_problem(prepped: str, depth=0):
     """(command, why) for the first gh api call in the shell_prepass()ed
     `prepped` that may not be a read, else None. Reads its own tokens
@@ -2633,13 +2763,46 @@ def _gh_api_problem(prepped: str, depth=0):
         return prepped, f"uses {odd}, which bash-guard cannot split the way bash does"
     if _IFS_RE.search(re.sub(r"[\"'\\]", "", _gh_plain(prepped))):
         return prepped, "touches IFS, which changes how bash splits words into arguments"
+    host_env = _GH_HOST_ENV_RE.search(re.sub(r"[\"'\\]", "", _gh_plain(prepped)))
+    if host_env:
+        return prepped, (f"touches {host_env.group(0).rstrip('=')}, which can make gh send the request to "
+                         "another host")
+    proxy_env = _GH_PROXY_ENV_RE.search(re.sub(r"[\"'\\]", "", _gh_plain(prepped)))
+    if proxy_env:
+        return prepped, (f"touches {proxy_env.group(0)}, which can route gh's request (and its token) through "
+                         "another server")
     tokens = tokenize(marked)
     if tokens is None:
         return prepped, "could not be parsed (unbalanced quotes)"
     plain = _without_redirects(tokens)
+    # Any variable set where a command starts (`X=1 gh api …`, `X=1; gh api …`, `env X=1 gh api …`): gh
+    # reads more of its environment than any list here can keep up with, so none of it is trusted.
+    # The one exception: an assignment that only captures gh's output (`X=$(gh api user)`), where gh api
+    # appears nowhere else in the line, so X is set after gh ran.
+    start = True
+    for k, t in enumerate(plain):
+        if _is_op(t):
+            start = True
+            continue
+        w = _gh_plain(t)
+        captures = bool(_GH_ASSIGN_RE.match(w)) and not _gh_api_around(plain, k)
+        if start and (w == "env" or (_GH_ASSIGN_RE.match(w) and not captures)):
+            return prepped, (f"sets a variable ({w.split('=', 1)[0] if w != 'env' else 'env'}) in the same command "
+                             "line, and gh reads its environment to pick the host, proxy and credentials")
+        start = w in _GH_RESERVED or bool(start and _GH_ASSIGN_RE.match(w))
     why = _gh_stream_problem(plain)
     if why:
         return prepped, why
+    words = [_gh_plain(t) for t in plain if not _is_op(t)]
+    # anywhere (`builtin read "$v"`, `command declare …`), but `.` only where a command starts:
+    # `gh api x --jq .` is a jq filter
+    sourced = any(_gh_plain(t) == "." and (k == 0 or _is_op(plain[k - 1]) or _gh_plain(plain[k - 1]) in _GH_RESERVED)
+                  for k, t in enumerate(plain))
+    setter = next((w for w in words if w in _GH_NAME_SETTERS - {"."}), None) or ("." if sourced else None) or (
+        "printf -v" if "printf" in words and any(w.startswith("-v") for w in words) else None)
+    if setter:
+        return prepped, (f"runs '{setter}', which can set any variable, HOME or GH_HOST among them, through a "
+                         "name bash builds (`declare \"$n=…\"`), so gh may send the request to another host")
     reads_code = False
     for cmd, _cwd, _env in walk_commands(plain):
         hit = _gh_api_cmd(cmd)
@@ -2668,7 +2831,7 @@ def check_gh_api(prepped: str) -> None:
     if hit:
         shown, why = hit
         shown = shown if len(shown) <= 80 else shown[:77] + "..."
-        ask(f"'{shown}' may change data on GitHub: it {why}", _GH_API_SUGGESTION)
+        ask(f"'{shown}' may change data on GitHub or send it elsewhere: it {why}", _GH_API_SUGGESTION)
 
 
 # ── Deletion guard: every deletion asks, except one literal scratch form ──────
@@ -3543,10 +3706,12 @@ def classify(command: str, cwd: str = ""):
 
 
 def main() -> None:
+    _arm_budget()
     cmd = read_command()
     if not cmd.strip():
         sys.exit(0)
     check_command(cmd)
+    _disarm_budget()
     flush_warnings()
     sys.exit(0)
 

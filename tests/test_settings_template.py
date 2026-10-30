@@ -77,5 +77,19 @@ for section, rs in template.items():
     dupes = sorted({r for r in rs if rs.count(r) > 1})
     check("no duplicate %s rules" % section, not dupes, str(dupes))
 
+# 5. This repo's own .claude/settings.json (what a session working on cc_tool runs under)
+#    pre-approves nothing that dumps the environment, runs as root, installs plugins or
+#    names one machine's home directory, and nothing the template denies.
+OWN = os.path.join(REPO, ".claude", "settings.json")
+if os.path.isfile(OWN):
+    own = rules_of(OWN)
+    risky = re.compile(r"^Bash\((?:env|printenv|set|export -p|sudo\b|claude plugin\b|claude mcp\b)")
+    bad = [r for r in own["allow"] if risky.match(r)]
+    check(".claude/settings.json allows no env dump, sudo or plugin/MCP install", not bad, str(bad))
+    home = [r for r in own["allow"] if "/home/" in r or "/Users/" in r]
+    check(".claude/settings.json names no machine's home directory", not home, str(home))
+    denied = sorted(set(own["allow"]) & set(template["deny"]))
+    check(".claude/settings.json allows nothing the template denies", not denied, str(denied))
+
 print("%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

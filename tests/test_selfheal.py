@@ -30,17 +30,29 @@ Covered, by name prefix:
               state, kills only for a pid whose argv names the run, the audit lines, never-loadable snapshot
               names, CLAUDE_CODE_DISABLE_CLAUDE_MDS, the agents.json / self-heal.js gate, patch copies under
               S/patches and stragglers killed, absolute PATH only, $HOME projects left out, `caution`.
+  apply:      POST /api/control/selfheal/apply and SelfHeal.apply over real temp git repos: the control checks
+              (401, 403 unlock, Origin / Sec-Fetch-Site / Content-Type, 421, 404 without --control, 403 read-only),
+              the typed confirm (428), the happy path (one-path commit, message, other work untouched, the record,
+              run_view's applied state, audit), double apply, and each refusal: sha mismatch, not cc-dash's copy,
+              dirty target (staged or not), stale patch, wrong or missing root, no git repo, mid-merge / rebase,
+              untracked target, unknown ids, a cautioned patch without the acknowledgement, a filter attribute;
+              a new rule file committed; the repo's hooks never run.
+  targets:    .claude/rules/<name>.md as a target kind (accepted, traversal and other names rejected, snapshotted
+              and redacted as _claude/rules/<name>.md.txt, in the workflow) and project roots under temp dirs
+              left out by real path.
   ui:         headless Chrome (skipped cleanly without playwright-core / Chrome / node): the header control in
               each state, the confirm, the drawer (a patch with <script> shown as text), copy patch, the
-              factory-order command only revealed, Escape and focus, 390 px fit. The UI's selectors are all in
+              factory-order command only revealed, the Apply confirm (code field while locked, typed apply,
+              Escape, the server's refusal shown), Escape and focus, 390 px fit. The UI's selectors are all in
               the SEL dict near the top of this file.
 
 Run:  python3 tests/test_selfheal.py
 Env:  CC_DASH_PLAYWRIGHT  playwright-core directory     CC_DASH_CHROME  Chrome binary
       CC_DASH_SHOTS       directory for screenshots: header-off, header-on, header-running, header-done and
                           drawer, each at 1440x900 and 390x844, light and dark
-      SELFHEAL_ONLY       comma list of sections to run (evidence,state,endpoint,spawn,gate,proposals,workflow,review,ui)
+      SELFHEAL_ONLY       comma list of sections to run (evidence,state,endpoint,spawn,gate,proposals,workflow,review,apply,targets,ui)
 """
+import difflib
 import hashlib
 import http.client
 import json
@@ -79,6 +91,11 @@ try:
     IMPORT_ERROR = ""
 except Exception as _e:  # noqa: BLE001  (the module may not exist yet: reported once, dependent sections skip)
     sh, IMPORT_ERROR = None, "%s: %s" % (type(_e).__name__, _e)
+# Every world here lives under BASE, a temp dir, and the evidence leaves out projects under temp dirs. So the
+# check sees no temp dirs, except in the targets section, which tests that exclusion with the real list.
+REAL_TEMP_DIRS = getattr(sh, "_temp_dirs", None)
+if sh is not None:
+    sh._temp_dirs = lambda: set()
 
 RESULTS = []
 ONLY = [x for x in os.environ.get("SELFHEAL_ONLY", "").split(",") if x]
@@ -1659,6 +1676,43 @@ async function shot(page, name, o) {
     await ob.click();
     const oc = await loc(page, 'order_cmd', dr, 3000);
     ck('ui drawer: "File as factory order" only reveals the command (no POST, no run)', page.rec.posts.length === before && /cc-factory\s+-C/.test(await oc.textContent()), await oc.textContent());
+    // Apply: a typed confirm in the card; Escape closes the confirm first, and what was typed is forgotten.
+    const ab = dr.getByRole('button', { name: /^apply$/i }).first();
+    const abShown = await ab.isVisible().catch(() => false);
+    ck('ui apply: a checked patch has an Apply button in control mode', abShown, '');
+    if (abShown) {
+      await ab.click();
+      const word = dr.locator('.sh-apply-word').first(), go = dr.locator('.sh-apply-go').first();
+      const codeF = dr.locator('.sh-apply-confirm .ctl-code').first();
+      // This page is a fresh, locked tab: the confirm asks for the control code first.
+      const st0 = { open: await dr.locator('.sh-apply-confirm:not([hidden])').count(), dis: await go.isDisabled(), wordDis: await word.isDisabled(),
+                    code: await codeF.isVisible().catch(() => false), focus: await codeF.evaluate((el) => el === document.activeElement).catch(() => false) };
+      ck('ui apply: Apply opens the confirm; locked, it asks for the control code (focused) and "Apply and commit" is disabled',
+         st0.open === 1 && st0.dis && st0.wordDis && st0.code && st0.focus, JSON.stringify(st0));
+      const { code } = await getJSON(URLS.on, '/__test/ctlcode');
+      await codeF.fill(code); await codeF.press('Enter');
+      await page.waitForFunction(() => { const w = document.querySelector('#selfheal-drawer .sh-apply-word'); return w && !w.disabled; }, null, { timeout: 5000 }).catch(() => null);
+      const st0b = { code: await codeF.isVisible().catch(() => false), focus: await word.evaluate((el) => el === document.activeElement), dis: await go.isDisabled() };
+      ck('ui apply: the code typed, the field gives way to "type apply" (focused), still disabled', !st0b.code && st0b.focus && st0b.dis, JSON.stringify(st0b));
+      await word.type('apply');
+      ck('ui apply: typing apply enables it', !(await go.isDisabled()), '');
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(200);
+      const st1 = { open: await dr.locator('.sh-apply-confirm:not([hidden])').count(), drawer: await has(page, 'drawer', null, 600), focus: await ab.evaluate((el) => el === document.activeElement) };
+      ck('ui apply: Escape closes the confirm, not the drawer, and focus goes back to Apply', st1.open === 0 && st1.drawer && st1.focus, JSON.stringify(st1));
+      await ab.click();
+      ck('ui apply: opened again, the confirm has forgotten what was typed', (await word.inputValue()) === '' && (await go.isDisabled()), '');
+      await word.type('apply');
+      const n0 = page.rec.posts.length;
+      await go.click();
+      const err = dr.locator('.sh-apply-err').first();
+      await err.waitFor({ state: 'visible', timeout: 5000 }).catch(() => null);
+      const msg = (await err.textContent().catch(() => '')) || '';
+      // This world's project is no git repo, so the server refuses and the card says why.
+      ck('ui apply: confirming POSTs /api/control/selfheal/apply once and shows the server\'s refusal', page.rec.posts.slice(n0).filter((p) => p === '/api/control/selfheal/apply').length === 1 && /git work tree/.test(msg), msg + ' ' + page.rec.posts.slice(n0).join(','));
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(200);
+    }
     // On a phone the header keeps only the button: the results open from its popover's View.
     await shotAll(URLS.on, 'drawer', async (p) => {
       const rr = await root(p);
@@ -2024,21 +2078,63 @@ def test_review():
     # 12. caution
     C = sh.caution
 
-    def sp(body, target=".claude/settings.json"):
-        return "--- a/%s\n+++ b/%s\n@@ -1,3 +1,4 @@\n%s" % (target, target, body)
     check("review 12: run_view gives every proposal a caution field ('' for a CLAUDE.md patch)", p9.get("caution") == "", p9.get("caution"))
+    # settings: judged on the parsed file before and after the patch, against a live file under a root
+    sroot = os.path.join(BASE, "caution-settings")
+    os.makedirs(os.path.join(sroot, ".claude"), exist_ok=True)
+    os.makedirs(os.path.join(sroot, "templates"), exist_ok=True)
+    live = {"permissions": {"allow": ["Read(*)"], "deny": ["Read(.env)"], "defaultMode": "default"}}
+    live_text = json.dumps(live, indent=2) + "\n"
+    for rel in (".claude/settings.json", "templates/settings.json"):
+        with open(os.path.join(sroot, rel), "w") as fh:
+            fh.write(live_text)
+
+    def sdiff(new_text, target=".claude/settings.json", old_text=None):
+        old = live_text if old_text is None else old_text
+        a = "/dev/null" if old_text == "" else "a/" + target
+        return "\n".join(difflib.unified_diff(old.splitlines(), new_text.splitlines(), a, "b/" + target, n=2, lineterm="")) + "\n"
+
+    def SC(obj_or_text, target=".claude/settings.json", kind="settings", root=sroot, old_text=None):
+        text = obj_or_text if isinstance(obj_or_text, str) else json.dumps(obj_or_text, indent=2) + "\n"
+        return C(sdiff(text, target, old_text), target, kind, root)
+
+    def edit(fn):
+        d = json.loads(live_text)
+        fn(d)
+        return d
     check("review 12: an allow rule added -> the settings caution",
-          C(sp(' {\n   "permissions": {\n     "allow": [\n+      "Bash(*)",\n'), ".claude/settings.json", "settings") == sh.CAUTION_SETTINGS)
-    check("review 12: hooks, env, apiKeyHelper, defaultMode, bypassPermissions, additionalDirectories added -> the settings caution",
-          all(C(sp(' {\n+  "%s": %s,\n' % (k, v)), ".claude/settings.json", "settings") == sh.CAUTION_SETTINGS
-              for k, v in (("hooks", "{}"), ("env", "{}"), ("apiKeyHelper", '"x"'), ("defaultMode", '"acceptEdits"'), ("bypassPermissions", "true"),
-                           ("additionalDirectories", "[]"))))
-    check("review 12: a deny entry removed -> the settings caution",
-          C(sp('     "deny": [\n-      "Bash(rm:*)",\n       "Read(.env)"\n+\n'), ".claude/settings.json", "settings") == sh.CAUTION_SETTINGS)
-    check("review 12: templates/settings.json gets the same caution",
-          C(sp(' {\n+  "env": {},\n', "templates/settings.json"), "templates/settings.json", "cc_tool_template") == sh.CAUTION_SETTINGS)
-    check("review 12: a deny rule added is no caution",
-          C(sp('     "deny": [\n+      "Bash(curl:*)",\n       "Read(.env)"\n'), ".claude/settings.json", "settings") == "")
+          SC(edit(lambda d: d["permissions"]["allow"].append("Bash(*)"))) == sh.CAUTION_SETTINGS)
+    check("review 12: a deny rule added is no caution", SC(edit(lambda d: d["permissions"]["deny"].append("Bash(curl:*)"))) == "")
+    check("review 12: a new ask list is no caution", SC(edit(lambda d: d["permissions"].update(ask=["Bash(git push:*)"]))) == "")
+    check("review 12: an allow rule removed is no caution", SC(edit(lambda d: d["permissions"]["allow"].clear())) == "")
+    check("review 12: a deny rule removed -> the settings caution", SC(edit(lambda d: d["permissions"]["deny"].clear())) == sh.CAUTION_SETTINGS)
+    check("review 12: a deny rule moved to ask -> the settings caution",
+          SC(edit(lambda d: (d["permissions"]["deny"].clear(), d["permissions"].update(ask=["Read(.env)"])))) == sh.CAUTION_SETTINGS)
+    check("review 12: defaultMode changed -> the settings caution",
+          SC(edit(lambda d: d["permissions"].update(defaultMode="acceptEdits"))) == sh.CAUTION_SETTINGS)
+    check("review 12: every other settings key added -> the settings caution (an allowlist, not a list of risky keys)",
+          all(SC(edit(lambda d, k=k, v=v: d.update({k: v}))) == sh.CAUTION_SETTINGS
+              for k, v in (("hooks", {}), ("env", {}), ("apiKeyHelper", "x"), ("statusLine", {"type": "command", "command": "x"}),
+                           ("awsAuthRefresh", "x"), ("awsCredentialExport", "x"), ("otelHeadersHelper", "x"),
+                           ("enableAllProjectMcpServers", True), ("enabledMcpjsonServers", ["x"]), ("enabledPlugins", {}),
+                           ("extraKnownMarketplaces", {}), ("sandbox", {}), ("disableAllHooks", True), ("mcpServers", {}),
+                           ("fileSuggestion", {}), ("someFutureKey", "x"))))
+    check("review 12: a key added inside permissions -> the settings caution",
+          SC(edit(lambda d: d["permissions"].update(additionalDirectories=["/"]))) == sh.CAUTION_SETTINGS)
+    dup = live_text.rstrip("\n")[:-1].rstrip() + ',\n  "permissions": {"allow": ["Bash(*)"]}\n}\n'
+    check("review 12: a duplicate key in the result (the last one wins in a parser) -> the settings caution", SC(dup) == sh.CAUTION_SETTINGS)
+    check("review 12: a result that is not JSON -> the settings caution", SC(live_text + "}\n") == sh.CAUTION_SETTINGS)
+    check("review 12: no root to read the live file -> the settings caution",
+          SC(edit(lambda d: d["permissions"]["deny"].append("Bash(x)")), root=None) == sh.CAUTION_SETTINGS)
+    check("review 12: a patch that does not match the live file -> the settings caution",
+          C(sdiff(json.dumps({"x": 1}, indent=2) + "\n", old_text='{\n  "other": 1\n}\n'), ".claude/settings.json", "settings", sroot) == sh.CAUTION_SETTINGS)
+    check("review 12: a new settings file holding only deny rules is no caution",
+          SC({"permissions": {"deny": ["Read(.env)"]}}, target=".claude/settings.local.json", old_text="") == "")
+    check("review 12: a new settings file with an allow rule -> the settings caution",
+          SC({"permissions": {"allow": ["Bash(*)"]}}, target=".claude/settings.local.json", old_text="") == sh.CAUTION_SETTINGS)
+    check("review 12: templates/settings.json is judged the same way",
+          SC(edit(lambda d: d.update(env={})), "templates/settings.json", "cc_tool_template") == sh.CAUTION_SETTINGS
+          and SC(edit(lambda d: d["permissions"]["deny"].append("Bash(x)")), "templates/settings.json", "cc_tool_template") == "")
 
     def gp(body):
         return "--- a/.claude/guard-rules.json\n+++ b/.claude/guard-rules.json\n@@ -1,2 +1,2 @@\n" + body
@@ -2049,10 +2145,477 @@ def test_review():
     check("review 12: a guard rule added is no caution",
           C(gp(' [\n+  {"pattern": "y", "level": "deny"},\n'), ".claude/guard-rules.json", "guard_rules") == "")
 
+    # A skill's frontmatter holds allowed-tools (pre-approves tools for the turn that invokes it, PR #3)
+    # and hooks (run commands). Judged by line numbers in the live file, never by reading YAML keys:
+    # any change inside the frontmatter before or after the patch, or unclear boundaries, cautions.
+    SK = ".claude/skills/demo/SKILL.md"
+    sk_root = tempfile.mkdtemp(prefix="sh-skill-")
+
+    def skc(live, patch_lines, target=SK, kind="skill", root=sk_root):
+        """caution() for a patch against `live` (the file's lines; None for a new file) under `root`,
+        the hunk built from patch_lines: (old start line, [' ctx', '-old', '+new' …]). Nothing is
+        written outside the temp root; root "" means no project root."""
+        if root:
+            path = os.path.join(root, target)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if live is None and os.path.lexists(path):
+                os.unlink(path)
+            elif live is not None:
+                with open(path, "w") as fh:
+                    fh.write("\n".join(live) + "\n")
+        hdr = ("--- /dev/null\n+++ b/%s\n" % target) if live is None else ("--- a/%s\n+++ b/%s\n" % (target, target))
+        start, body = patch_lines
+        old = sum(1 for x in body if x[:1] in " -")
+        new = sum(1 for x in body if x[:1] in " +")
+        return C(hdr + "@@ -%d,%d +%d,%d @@\n" % (start, old, max(start, 1), new) + "\n".join(body) + "\n",
+                 target, kind, root)
+    base = ["---", "name: demo", "description: x", "allowed-tools:", "  - Read", "  - Grep", "---", "",
+            "# Demo", "", "Intro.", "", "- step one", "  - nested", "", "Body.", "-- a line", "End."]
+    plain = ["---", "name: demo", "description: x", "---", "", "Intro.", "", "# Steps", "", "- item", "Body."]
+    CS = sh.CAUTION_SKILL
+    check("review 12: a frontmatter line added (allowed-tools) -> the skill caution",
+          skc(plain, (2, [" name: demo", "+allowed-tools: Bash, Write", " description: x"])) == CS)
+    check("review 12: a frontmatter line removed -> the skill caution",
+          skc(base, (4, ["-allowed-tools:", "-  - Read", "-  - Grep", " ---"])) == CS)
+    check("review 12: frontmatter lines reordered -> the skill caution",
+          skc(base, (5, ["-  - Read", "   - Grep", "+  - Read", " ---"])) == CS)
+    check("review 12: a quoted \"allowed-tools\" key added -> the skill caution",
+          skc(plain, (2, [" name: demo", '+"allowed-tools": Bash', " description: x"])) == CS)
+    check("review 12: an indented key added -> the skill caution",
+          skc(plain, (2, [" name: demo", "+  allowed-tools: Bash", " description: x"])) == CS)
+    check("review 12: a hunk that starts above the closing fence, even with a body change -> the skill caution",
+          skc(plain, (3, [" description: x", " ---", " ", "+More.", " Intro."])) == CS)
+    check("review 12: a second `---` block added in the body is body text (only the first block is frontmatter)",
+          skc(plain, (9, [" ", "+---", "+allowed-tools: Bash", "+---", " - item"])) == "")
+    check("review 12: an ambiguous fence (indented, trailing space, `...`) -> the skill caution",
+          all(skc(lv, (10, [" - item", "+- two", " Body."])) == CS for lv in (
+              ["---", "name: demo", "  ---", "x: y", "---", "", "", "", "", "- item", "Body."],
+              ["---", "name: demo", "--- ", "x: y", "---", "", "", "", "", "- item", "Body."],
+              ["---", "name: demo", "...", "x: y", "---", "", "", "", "", "- item", "Body."])))
+    check("review 12: no `---` on line 1 (a blank line, a BOM, no frontmatter) -> the skill caution",
+          all(skc(lv, (5, [" - a", "+- b", " Body."])) == CS for lv in (
+              ["", "---", "name: d", "---", "- a", "Body."], ["﻿---", "name: d", "---", "", "- a", "Body."],
+              ["# Demo", "", "", "", "- a", "Body."])))
+    check("review 12: no closing fence -> the skill caution",
+          skc(["---", "name: d", "", "", "- a", "Body."], (5, [" - a", "+- b", " Body."])) == CS)
+    check("review 12: a new skill file -> the skill caution",
+          skc(None, (0, ["+---", "+name: n", "+---", "+Body."])) == CS)
+    check("review 12: no project root, or an unreadable live file -> the skill caution",
+          skc(plain, (10, [" - item", "+- two", " Body."]), root="") == CS
+          and C("--- a/x\n+++ b/x\n@@ -10,2 +10,3 @@\n - item\n+- two\n Body.\n", ".claude/skills/gone/SKILL.md",
+                "skill", sk_root) == CS)
+    check("review 12: a patch that does not fit the live file -> the skill caution",
+          skc(plain, (10, [" Not there.", "+- two"])) == CS)
+    check("review 12: a cc_tool skill template gets the same caution",
+          skc(plain, (2, [" name: demo", "+allowed-tools: Bash"]), target="templates/skills/demo/SKILL.md",
+              kind="cc_tool_template") == CS)
+    check("review 12: a body-only edit is no caution",
+          skc(base, (13, [" - step one", "+- step two", "   - nested"])) == ""
+          and skc(plain, (10, [" - item", "+- two", " Body."])) == "")
+    check("review 12: a removed body line that starts '-- ' is a body edit, no caution",
+          skc(base, (16, [" Body.", "--- a line", " End."])) == "")
+    check("review 12: a body-only edit of a cc_tool skill template is no caution",
+          skc(plain, (10, [" - item", "+- two", " Body."]), target="templates/skills/demo/SKILL.md",
+              kind="cc_tool_template") == "")
+    shutil.rmtree(sk_root, ignore_errors=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# 9. apply: POST /api/control/selfheal/apply and SelfHeal.apply over a real temp git repo
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+def git(root, *args, check_rc=True):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
+    r = subprocess.run(["git", "-C", root] + list(args), env=env, capture_output=True, text=True)
+    if check_rc and r.returncode:
+        raise RuntimeError("git %s: %s" % (" ".join(args), r.stderr))
+    return r.stdout.strip()
+
+
+SETTINGS_ALLOW_PATCH = ('--- a/.claude/settings.json\n+++ b/.claude/settings.json\n@@ -5,3 +5,3 @@\n  "permissions": {\n'
+                        '-  "allow": []\n+  "allow": ["Bash(curl:*)"]\n  }\n')
+# A hunk with trailing context: git apply anchors one that ends in a + line at the end of the file.
+APPLY_PATCH = "--- a/CLAUDE.md\n+++ b/CLAUDE.md\n@@ -1,3 +1,4 @@\n # Demo\n Rule one.\n+Rule two: run the tests before committing.\n \n"
+RULE_NEW = "--- /dev/null\n+++ b/.claude/rules/testing.md\n@@ -0,0 +1,2 @@\n+# Testing\n+Run the tests before committing.\n"
+APPLY_RUN = "self-heal-20261029-120000-%04x"
+
+
+class ApplyWorld:
+    """A World whose project alpha is a real git repo, and a finished run of one proposal written the way
+    finalize writes it: runs/<id>/proposals.json, its sha256 in records/<id>.json, cc-dash's checked copy in
+    patches/<id>/alpha/01-x.patch, roots and markers in the record."""
+    n = 0
+
+    def __init__(self, name, patch=APPLY_PATCH, target="CLAUDE.md", kind="claude_md", title="Run the tests before committing",
+                 commit=True, make=True):
+        ApplyWorld.n += 1
+        self.w = World(name, ("alpha",))
+        self.root = root = self.w.dirs["alpha"]
+        shutil.rmtree(os.path.join(root, ".git"))
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "user.name", "Self Heal Test")
+        git(root, "config", "user.email", "selfheal@example.invalid")
+        if commit:
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "init")
+        self.rid = APPLY_RUN % ApplyWorld.n
+        self.patch, self.target, self.kind, self.title = patch, target, kind, title
+        base = self.w.base
+        for d in (base, os.path.join(base, "records"), os.path.join(base, "runs"), os.path.join(base, "runs", self.rid),
+                  os.path.join(base, "patches"), os.path.join(base, "patches", self.rid), os.path.join(base, "patches", self.rid, "alpha")):
+            control_mod.ensure_private_dir(d)
+        doc = {"version": 1, "run_id": self.rid, "proposals": [{
+            "id": "P1", "project": "alpha", "severity": "high", "title": title, "target": target, "target_kind": kind,
+            "failure_mode": "f", "evidence": [], "risk": "r", "check": "c", "verdict": "keep", "patch": patch,
+            "patch_file": "proposals/alpha/01-x.patch"}], "dropped": [], "notes": ""}
+        raw = json.dumps(doc).encode()
+        self.pj = os.path.join(base, "runs", self.rid, "proposals.json")
+        self.put(self.pj, raw)
+        self.copy = os.path.join(base, "patches", self.rid, "alpha", "01-x.patch")
+        self.put(self.copy, patch.encode())
+        self.rec = mk_rec("done", rid=self.rid, projects=["alpha"], roots={"alpha": root}, markers={"alpha": 4},
+                          proposals_sha256=hashlib.sha256(raw).hexdigest(), proposals=1)
+        control_mod.write_json(os.path.join(base, "records", self.rid + ".json"), self.rec)
+        if make:
+            self.w.make()
+
+    @staticmethod
+    def put(path, data):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+
+    def body(self, **kw):
+        b = {"run": self.rid, "proposal": "P1", "root": self.root, "confirm": "apply"}
+        b.update(kw)
+        return b
+
+    def head(self):
+        return git(self.root, "rev-parse", "HEAD", check_rc=False)
+
+    def read(self, rel="CLAUDE.md"):
+        try:
+            with open(os.path.join(self.root, rel)) as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+
+def test_apply():
+    P = "apply"
+    if not need_module(P):
+        return
+    if not shutil.which("git"):
+        note("apply: git is not installed, section skipped")
+        return
+    # ── the happy path over HTTP, with the control checks first ──
+    aw = ApplyWorld("ap", make=False)
+    # Unrelated work in the same repo stays as it was: an untracked file and a staged change elsewhere.
+    with open(os.path.join(aw.root, "notes.txt"), "w") as fh:
+        fh.write("mine\n")
+    with open(os.path.join(aw.root, "factory", "line.json"), "w") as fh:
+        fh.write('{"lines": {"default": {}, "other": {}}}\n')
+    git(aw.root, "add", "factory/line.json")
+    head0 = aw.head()
+    s = Srv(aw.w, control=True)
+    try:
+        st, out = s.post("/api/control/selfheal/apply", aw.body(), token=False)
+        check("apply: no token -> 401", st == 401, (st, out))
+        s.pair(unlock=False)
+        st, out = s.post("/api/control/selfheal/apply", aw.body())
+        check("apply: a paired token without the control code -> 403 unlock", st == 403 and out.get("unlock") is True, (st, out))
+        s.pair(unlock=True)
+        for label, hdr, want in (("no Origin", {"Origin": None}, 403), ("another site's Origin", {"Origin": "http://evil.example"}, 403),
+                                 ("Sec-Fetch-Site cross-site", {"Sec-Fetch-Site": "cross-site"}, 403),
+                                 ("Content-Type text/plain", {"Content-Type": "text/plain"}, 403)):
+            st, out = s.post("/api/control/selfheal/apply", aw.body(), headers=hdr)
+            check("apply: refused: %s -> %d" % (label, want), st == want, (st, out))
+        st, out = s.post("/api/control/selfheal/apply", aw.body(), host="evil.example:%d" % s.port)
+        check("apply: refused: foreign Host -> 421", st == 421, (st, out))
+        st, out = s.post("/api/control/selfheal/apply", aw.body(confirm=None))
+        check("apply: no typed confirm -> 428", st == 428 and "type apply" in str(out.get("error", "")).lower(), (st, out))
+        st, out = s.post("/api/control/selfheal/apply", aw.body(text=s.control_code))
+        check("apply: a body carrying the control code is refused (400) and nothing applied", st == 400 and out.get("code_in_text") is True, (st, out))
+        for label, b in (("a run id with ../", aw.body(run="../../x")), ("a bad proposal id", aw.body(proposal="P1; rm")),
+                         ("a non-string run", aw.body(run=1))):
+            st, out = s.post("/api/control/selfheal/apply", b)
+            check("apply: %s -> 400" % label, st == 400, (st, out))
+        check("apply: nothing was committed by any refused request", aw.head() == head0 and "Rule two" not in aw.read())
+        code, view = aw.w.sh.run_view(aw.rid)
+        p = (view.get("proposals") or [{}])[0]
+        check("apply: run_view offers Apply (can_apply, not applied) for a checked patch in control mode",
+              code == 200 and p.get("can_apply") is True and p.get("applied") is None and p.get("project_root") == aw.root, (code, {k: p.get(k) for k in ("can_apply", "applied", "patch_problem")}))
+        st, out = s.post("/api/control/selfheal/apply", aw.body(root=p.get("project_root")))
+        sha = aw.head()
+        check("apply: the happy path answers 200 with the commit", st == 200 and out.get("ok") is True and (out.get("applied") or {}).get("sha") == sha
+              and out["applied"]["short"] == sha[:7] and sha != head0, (st, out))
+        check("apply: the commit holds only the target", git(aw.root, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").split() == ["CLAUDE.md"])
+        msg = git(aw.root, "log", "-1", "--format=%B")
+        check("apply: the commit message is 'self-heal: <title>' with the run and proposal ids",
+              msg.splitlines()[0] == "self-heal: Run the tests before committing" and aw.rid in msg and "P1" in msg, msg)
+        check("apply: the commit's parent is the old HEAD and the file has the change",
+              git(aw.root, "rev-parse", "HEAD~1") == head0 and "Rule two: run the tests before committing." in aw.read())
+        stat_ = git(aw.root, "status", "--porcelain")
+        check("apply: the unrelated staged change and untracked file are left as they were",
+              "M  factory/line.json" in stat_ and "?? notes.txt" in stat_ and "CLAUDE.md" not in stat_, stat_)
+        rec = read_json(os.path.join(aw.w.base, "records", aw.rid + ".json")) or {}
+        check("apply: the record keeps the applied commit (sha, root, target)",
+              (rec.get("applied") or {}).get("P1", {}).get("sha") == sha and rec["applied"]["P1"].get("target") == "CLAUDE.md", rec.get("applied"))
+        code, view = aw.w.sh.run_view(aw.rid)
+        p = (view.get("proposals") or [{}])[0]
+        check("apply: run_view then shows it applied, with no Apply and no apply command, the diff kept",
+              (p.get("applied") or {}).get("short") == sha[:7] and p.get("can_apply") is False and p.get("apply_cmd") == "" and p.get("patch") == APPLY_PATCH,
+              {k: p.get(k) for k in ("applied", "can_apply", "apply_cmd", "patch_problem")})
+        st, out = s.post("/api/control/selfheal/apply", aw.body())
+        check("apply: a second apply of the same proposal -> 409 already applied, with the commit",
+              st == 409 and "already applied" in str(out.get("error")) and (out.get("applied") or {}).get("sha") == sha and aw.head() == sha, (st, out))
+        lines = [a for a in s.audit() if a.get("action") == "selfheal" and "apply" in str(a.get("result"))]
+        check("apply: every apply and refusal is audited (committed, refused 428, 409)",
+              any("committed CLAUDE.md" in str(a["result"]) and sha[:7] in str(a["result"]) for a in lines)
+              and any("refused (428)" in str(a["result"]) for a in lines) and any("refused (409)" in str(a["result"]) for a in lines),
+              [a.get("result") for a in lines])
+    finally:
+        s.close()
+
+    # ── without --control: the route is not served; a read-only SelfHeal refuses ──
+    a0 = ApplyWorld("ap0", make=False)
+    s0 = Srv(a0.w, control=False, writable=False)
+    try:
+        s0.pair(unlock=False)
+        st, out = s0.post("/api/control/selfheal/apply", a0.body())
+        check("apply: POST /api/control/selfheal/apply is 404 without --control", st == 404, (st, out))
+        code, out = a0.w.sh.apply(None, a0.body())
+        check("apply: a read-only SelfHeal (no control mode) refuses with 403", code == 403 and "--control" in out.get("error", ""), (code, out))
+        code, view = a0.w.sh.run_view(a0.rid)
+        check("apply: run_view offers no Apply without control mode", ((view.get("proposals") or [{}])[0]).get("can_apply") is False)
+        check("apply: nothing applied without control mode", "Rule two" not in a0.read())
+    finally:
+        s0.close()
+
+    def refused(label, aw, want, needle, body=None, **kw):
+        h0, f0 = aw.head(), aw.read(kw.get("rel", "CLAUDE.md"))
+        code, out = aw.w.sh.apply(None, body or aw.body())
+        check("apply: %s -> %d (%s)" % (label, want, needle), code == want and needle in str(out.get("error", "")).lower()
+              and aw.head() == h0 and aw.read(kw.get("rel", "CLAUDE.md")) == f0, (code, out))
+        return out
+
+    # proposals.json changed after the run
+    a1 = ApplyWorld("ap1")
+    with open(a1.pj, "rb") as fh:
+        raw = fh.read()
+    ApplyWorld.put(a1.pj, raw.replace(b"Run the tests", b"Run the TESTS"))
+    refused("proposals.json sha256 no longer matches", a1, 409, "proposals.json changed")
+    # cc-dash's copy differs from proposals.json (or is gone)
+    a2 = ApplyWorld("ap2")
+    ApplyWorld.put(a2.copy, APPLY_PATCH.replace("Rule two", "Rule 2").encode())
+    refused("the patch is not cc-dash's checked copy", a2, 409, "copy of the patch")
+    # the target has uncommitted changes (unstaged, then staged)
+    a3 = ApplyWorld("ap3")
+    with open(os.path.join(a3.root, "CLAUDE.md"), "a") as fh:
+        fh.write("local edit\n")
+    refused("the target has an unstaged change", a3, 409, "uncommitted changes")
+    git(a3.root, "add", "CLAUDE.md")
+    refused("the target has a staged change", a3, 409, "uncommitted changes")
+    # the patch no longer applies: the file moved on in a commit
+    a4 = ApplyWorld("ap4")
+    with open(os.path.join(a4.root, "CLAUDE.md"), "w") as fh:
+        fh.write("# Demo\nRule one, reworded.\n\n%s\nmanaged\n" % MARKER)
+    git(a4.root, "commit", "-q", "-am", "reword")
+    refused("a stale patch (the file changed since the run)", a4, 409, "does not match")
+    # the root: the body names another, the record's is not a git work tree
+    a5 = ApplyWorld("ap5")
+    refused("a body naming another root", a5, 409, "not the project root", body=a5.body(root=os.path.join(BASE, "elsewhere")))
+    refused("a body naming no root", a5, 409, "not the project root", body=a5.body(root=None))
+    a6 = ApplyWorld("ap6", make=False)
+    shutil.rmtree(os.path.join(a6.root, ".git"))
+    a6.w.make()
+    refused("a recorded root that is not a git work tree", a6, 409, "not a git work tree")
+    a6b = ApplyWorld("ap6b", make=False)
+    rec = dict(a6b.rec, roots={})
+    control_mod.write_json(os.path.join(a6b.w.base, "records", a6b.rid + ".json"), rec)
+    a6b.w.make()
+    refused("a run with no root recorded for the project", a6b, 409, "no project root")
+    # mid-merge / mid-rebase
+    a7 = ApplyWorld("ap7")
+    gd = git(a7.root, "rev-parse", "--absolute-git-dir")
+    with open(os.path.join(gd, "MERGE_HEAD"), "w") as fh:
+        fh.write(a7.head() + "\n")
+    refused("a repo in the middle of a merge", a7, 409, "middle of a merge")
+    os.unlink(os.path.join(gd, "MERGE_HEAD"))
+    os.makedirs(os.path.join(gd, "rebase-merge"))
+    refused("a repo in the middle of a rebase", a7, 409, "middle of a rebase")
+    # an untracked target
+    a8 = ApplyWorld("ap8", commit=False)
+    refused("a target git does not track", a8, 409, "not tracked")
+    # a run that is not finished, a proposal that is not there
+    a9 = ApplyWorld("ap9")
+    refused("an unknown proposal id", a9, 404, "no proposal p7", body=a9.body(proposal="P7"))
+    refused("an unknown run", a9, 404, "no self-heal run", body=a9.body(run="self-heal-20261029-120000-ffff"))
+    # a cautioned patch (it widens permissions) needs the explicit acknowledgement
+    a10 = ApplyWorld("ap10", patch=SETTINGS_ALLOW_PATCH, target=".claude/settings.json", kind="settings", title="Allow curl")
+    out = refused("a permission-widening patch without the acknowledgement", a10, 428, "acknowledgement", rel=".claude/settings.json")
+    check("apply: the 428 says an acknowledgement is needed", out.get("acknowledge") is True, out)
+    code, view = a10.w.sh.run_view(a10.rid)
+    check("apply: run_view keeps the caution line for it", ((view.get("proposals") or [{}])[0]).get("caution") == sh.CAUTION_SETTINGS, view.get("proposals"))
+    code, out = a10.w.sh.apply(None, a10.body(acknowledge=True))
+    check("apply: with acknowledge true it applies and commits", code == 200 and '"Bash(curl:*)"' in (a10.read(".claude/settings.json") or ""), (code, out))
+    # a new rule file: created, added and committed alone
+    a11 = ApplyWorld("ap11", patch=RULE_NEW, target=".claude/rules/testing.md", kind="rules", title="Testing rule")
+    code, out = a11.w.sh.apply(None, a11.body())
+    check("apply: a new .claude/rules file is created and committed alone",
+          code == 200 and (a11.read(".claude/rules/testing.md") or "").startswith("# Testing")
+          and git(a11.root, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").split() == [".claude/rules/testing.md"], (code, out))
+    # a filter attribute on the target would run a program on git add: refused
+    a12 = ApplyWorld("ap12")
+    gd = git(a12.root, "rev-parse", "--absolute-git-dir")
+    os.makedirs(os.path.join(gd, "info"), exist_ok=True)
+    with open(os.path.join(gd, "info", "attributes"), "w") as fh:
+        fh.write("CLAUDE.md filter=evil\n")
+    git(a12.root, "config", "filter.evil.clean", "touch %s; cat" % os.path.join(BASE, "filter-ran"))
+    refused("a target with a git filter attribute", a12, 409, "filter attribute")
+    check("apply: the filter never ran", not os.path.exists(os.path.join(BASE, "filter-ran")))
+    # repo config cannot run a hook on commit
+    a13 = ApplyWorld("ap13")
+    hook = os.path.join(a13.root, ".git", "hooks", "pre-commit")
+    os.makedirs(os.path.dirname(hook), exist_ok=True)
+    with open(hook, "w") as fh:
+        fh.write("#!/bin/sh\ntouch %s\n" % os.path.join(BASE, "hook-ran"))
+    os.chmod(hook, 0o755)
+    code, out = a13.w.sh.apply(None, a13.body())
+    check("apply: the repo's own hooks do not run (core.hooksPath=/dev/null)", code == 200 and not os.path.exists(os.path.join(BASE, "hook-ran")), (code, out))
+    # a target git ignores (a deployed cc_tool skill under an ignored .claude/): changed in place, backed up, not committed
+    skill = "---\nname: x\ndescription: d\n---\n# X\nStep one.\n"
+    skill_patch = ("--- a/.claude/skills/x/SKILL.md\n+++ b/.claude/skills/x/SKILL.md\n@@ -5,2 +5,3 @@\n # X\n Step one.\n+Step two.\n")
+    a14 = ApplyWorld("ap14", patch=skill_patch, target=".claude/skills/x/SKILL.md", kind="skill", title="Step two", commit=False, make=False)
+    with open(os.path.join(a14.root, ".gitignore"), "w") as fh:
+        fh.write(".claude\n")
+    os.makedirs(os.path.join(a14.root, ".claude", "skills", "x"), exist_ok=True)
+    with open(os.path.join(a14.root, ".claude", "skills", "x", "SKILL.md"), "w") as fh:
+        fh.write(skill)
+    git(a14.root, "add", "-A")
+    git(a14.root, "commit", "-q", "-m", "init")
+    a14.w.make()
+    head0 = a14.head()
+    code, view = a14.w.sh.run_view(a14.rid)
+    p0 = (view.get("proposals") or [{}])[0]
+    check("apply: run_view marks a git-ignored target as applied without a commit",
+          p0.get("can_apply") is True and p0.get("apply_commits") is False, p0)
+    code, out = a14.w.sh.apply(None, a14.body())
+    a = out.get("applied") or {}
+    bak = os.path.join(a14.w.base, "backups", a14.rid, "P1.orig")
+    check("apply: a git-ignored target is changed in place", code == 200 and (a14.read(".claude/skills/x/SKILL.md") or "").endswith("Step two.\n"), (code, out))
+    check("apply: nothing is committed for a git-ignored target", a14.head() == head0 and a.get("committed") is False, (a14.head(), head0, a))
+    check("apply: the old file is backed up 0600 and named in the result",
+          os.path.exists(bak) and open(bak).read() == skill and stat.S_IMODE(os.stat(bak).st_mode) == 0o600
+          and a.get("backup", "").endswith("P1.orig"), (bak, a))
+    code, out = a14.w.sh.apply(None, a14.body())
+    check("apply: a second apply of the git-ignored change is refused", code == 409 and "already applied" in out.get("error", ""), (code, out))
+    # a new file under an ignored directory: created, not committed, no backup
+    a15 = ApplyWorld("ap15", patch=RULE_NEW, target=".claude/rules/testing.md", kind="rules", title="Testing rule", commit=False, make=False)
+    with open(os.path.join(a15.root, ".gitignore"), "w") as fh:
+        fh.write(".claude\n")
+    git(a15.root, "add", "-A")
+    git(a15.root, "commit", "-q", "-m", "init")
+    a15.w.make()
+    head0 = a15.head()
+    code, out = a15.w.sh.apply(None, a15.body())
+    a = out.get("applied") or {}
+    check("apply: a new file in a git-ignored directory is created, not committed, with no backup",
+          code == 200 and (a15.read(".claude/rules/testing.md") or "").startswith("# Testing") and a15.head() == head0
+          and a.get("committed") is False and a.get("backup") == "", (code, out))
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# 10. targets: .claude/rules/*.md as a target kind, and project roots under temp dirs left out
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+def test_targets():
+    P = "targets"
+    if not need_module(P):
+        return
+    vp = sh.validate_patch
+    edit = "--- a/.claude/rules/testing.md\n+++ b/.claude/rules/testing.md\n@@ -1,2 +1,3 @@\n # Testing\n Run them.\n+Always.\n"
+    check("targets: rules is a target kind", "rules" in sh.TARGET_KINDS)
+    check("targets: an edit of .claude/rules/<name>.md is accepted", vp(edit, ".claude/rules/testing.md", "rules") == "", vp(edit, ".claude/rules/testing.md", "rules"))
+    check("targets: a new rule file (--- /dev/null) is accepted", vp(RULE_NEW, ".claude/rules/testing.md", "rules") == "", vp(RULE_NEW, ".claude/rules/testing.md", "rules"))
+    check("targets: an underscore in a rule name is accepted", vp(RULE_NEW.replace("testing", "code_style"), ".claude/rules/code_style.md", "rules") == "")
+    for label, t in (("../ traversal", ".claude/rules/../settings.json"), ("../ out of the project", ".claude/rules/../../x.md"),
+                     ("a subdirectory", ".claude/rules/sub/x.md"), ("not .md", ".claude/rules/x.txt"), ("an uppercase name", ".claude/rules/X.md"),
+                     ("a dot name", ".claude/rules/.hidden.md"), ("an absolute path", "/etc/rules/x.md"), ("a skill path", ".claude/skills/x/SKILL.md"),
+                     ("a trailing newline", ".claude/rules/x.md\n"), ("the rules dir itself", ".claude/rules/.md")):
+        patch = RULE_NEW.replace(".claude/rules/testing.md", t.rstrip("\n"))
+        check("targets: a rules target with %s is rejected" % label, vp(patch, t, "rules") != "", vp(patch, t, "rules"))
+    check("targets: a rules kind cannot target CLAUDE.md", vp(GOOD_PATCH, "CLAUDE.md", "rules") != "")
+    clean, _ = sh.validate_proposals({"version": 1, "proposals": [{"id": "P1", "project": "alpha", "severity": "low", "target": ".claude/rules/testing.md",
+                                                                  "target_kind": "rules", "verdict": "keep", "patch": RULE_NEW,
+                                                                  "patch_file": "proposals/alpha/01-rule.patch"}]}, ["alpha"], {})
+    check("targets: validate_proposals keeps a rules proposal with its patch", len(clean) == 1 and clean[0]["patch_ok"] is True, clean)
+    # the evidence builder snapshots .claude/rules/*.md under _claude/rules/<name>.md.txt, redacted
+    w = error_world("tg")
+    root = w.dirs["alpha"]
+    os.makedirs(os.path.join(root, ".claude", "rules", "sub"), exist_ok=True)
+    with open(os.path.join(root, ".claude", "rules", "testing.md"), "w") as fh:
+        fh.write("# Testing\nThe token is %s\n" % GH)
+    with open(os.path.join(root, ".claude", "rules", "notes.txt"), "w") as fh:
+        fh.write("not a rule\n")
+    with open(os.path.join(root, ".claude", "rules", "sub", "deep.md"), "w") as fh:
+        fh.write("nested\n")
+    os.symlink(os.path.join(root, "CLAUDE.md"), os.path.join(root, ".claude", "rules", "linked.md"))
+    out = w.sh.start(days=1, origin="cli", dry_run=True, background=False)
+    d, ev = load_evidence(w, out)
+    alpha = find_project(ev, "alpha") or {}
+    harness = alpha.get("harness") or {}
+    snap = os.path.join(d or "", "harness", alpha.get("slug", "alpha"), "_claude", "rules", "testing.md.txt")
+    text = open(snap).read() if os.path.exists(snap) else ""
+    check("targets: a rule file is snapshotted as _claude/rules/<name>.md.txt and listed in harness.rules and files",
+          text.startswith("# Testing") and harness.get("rules") == ["testing"] and ".claude/rules/testing.md" in harness.get("files", []), (snap, harness))
+    check("targets: the rule snapshot is redacted", GH not in text and "[redacted:" in text, text)
+    check("targets: a non-.md file, a subdirectory's file and a symlinked rule are not snapshotted",
+          not any(n in json.dumps(harness) for n in ("notes", "deep", "linked")), harness)
+    wf = open(WF_JS).read()
+    check("targets: the workflow lists rules among its TARGET_KINDS and explains rules vs CLAUDE.md",
+          re.search(r"TARGET_KINDS = \[[^\]]*'rules'", wf) and "_claude/rules/<name>.md.txt" in wf and "use CLAUDE.md for a short, project-wide instruction" in wf)
+
+    # project roots under temp dirs: left out by real path, like home-dir roots
+    real = REAL_TEMP_DIRS
+    dirs = real()
+    check("targets: the temp dirs are /tmp, $TMPDIR and tempfile.gettempdir(), by real path",
+          os.path.realpath("/tmp") in dirs and os.path.realpath(tempfile.gettempdir()) in dirs, dirs)
+    wt = error_world("tgtmp")
+    saved = sh._temp_dirs
+    sh._temp_dirs = real
+    try:
+        out = wt.sh.start(days=1, origin="cli", dry_run=True, background=False)
+    finally:
+        sh._temp_dirs = saved
+    _d, evt = load_evidence(wt, out)
+    check("targets: a session whose project root is under /tmp is left out, in dropped_projects with the reason",
+          evt and find_project(evt, "alpha") is None and any("alpha" in x and "temp directory" in x for x in evt["scope"]["dropped_projects"]),
+          (evt or {}).get("scope"))
+    # $TMPDIR given as a symlink: compared by real path, so a root reached either way counts; a sibling prefix does not
+    link = os.path.join(BASE, "tmpdir-link")
+    os.symlink(wt.work, link)
+    saved_env = os.environ.get("TMPDIR")
+    os.environ["TMPDIR"] = link
+    try:
+        listed = os.path.realpath(link) in real() and link not in real()
+        sh._temp_dirs = lambda: {os.path.realpath(link)}
+        inside = sh._is_temp(os.path.join(link, "alpha")) and sh._is_temp(wt.dirs["alpha"]) and sh._is_temp(wt.work)
+        sibling = sh._is_temp(wt.work + "2")
+    finally:
+        sh._temp_dirs = saved
+        if saved_env is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = saved_env
+    check("targets: $TMPDIR given as a symlink is listed by its real path", listed)
+    check("targets: roots under a temp dir count whether reached by the symlink or the real path", inside)
+    check("targets: a directory that only shares the temp dir's name prefix does not count", not sibling)
+    check("targets: / is never a temp dir (TMPDIR=/ would drop everything)", "/" not in real())
+
 
 def main():
     sections = (("evidence", test_evidence), ("state", test_state), ("endpoint", test_endpoint), ("spawn", test_spawn), ("proposals", test_proposals),
-                ("workflow", test_workflow), ("review", test_review), ("ui", test_ui))
+                ("workflow", test_workflow), ("review", test_review), ("apply", test_apply), ("targets", test_targets), ("ui", test_ui))
     try:
         for name, fn in sections:
             if not ran(name) and not (name in ("spawn", "proposals") and ran("gate")):

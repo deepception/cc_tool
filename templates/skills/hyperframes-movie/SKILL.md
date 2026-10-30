@@ -39,7 +39,13 @@ The working method behind those numbers: one `scripts/schedule.py` owns every ti
 
 Run the rhythm snapshots into a fresh directory each round: `rhythm.py` reuses frames it finds.
 Gate 7 needs `puppeteer-core` next to the script (Node resolves imports from the script's own
-folder): `mkdir -p <scratch>/pb && cp $SKILL/scripts/playback.mjs <scratch>/pb/ && (cd <scratch>/pb && npm init -y >/dev/null && npm i puppeteer-core@25)`.
+folder). `npm i` always asks for approval, so do this once, in the foreground, before any subagent
+starts, into one shared directory written as a literal path:
+`mkdir -p <scratch>/pb && cp $SKILL/scripts/playback.mjs <scratch>/pb/ && cd <scratch>/pb && npm init -y >/dev/null && npm i puppeteer-core@25`.
+Every film then runs `node <scratch>/pb/playback.mjs ...` from that one directory; a subagent never
+runs `npm i` (if `pb` is missing, it reports back). In subagent Bash, write every path and command
+out literally: no `S=...; cd $S`, no `$f` or `$D/...` as a command, no `$((i*4+1))` loops. bash-guard
+asks before each of them, and in an unattended run nobody answers, so the agent stalls for hours.
 On an unattended run, gate 6 goes to a fresh reviewer subagent given the sheets and the defect list,
 because the worker is a lenient judge of its own frames.
 

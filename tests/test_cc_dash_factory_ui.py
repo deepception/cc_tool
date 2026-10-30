@@ -53,7 +53,10 @@ count cache reads; the new IA (Factory and Projects, #/live landing on the Facto
 extra visuals: at far zoom a failed node's red ring, a stalled node's dashed amber one and the wider
 needs-you halo (none of them up close), each node's time in its state and each order's rework count,
 read from their fields, changed in place by a poll without a relayout, the time counting on between
-polls without a repaint, and nothing of it moving under reduced motion. Every
+polls without a repaint, and nothing of it moving under reduced motion; and the usage limits in the band
+(payload.usage_limits, stubbed per GET /__test/limits?mode=ok|high|old|gone|none|junk): what each window says,
+the tooltip and accessible name, amber and red, dimmed when old or reset, hidden without a reading, changed in
+place, the time left dropped at 1000 px, nothing at phone width, the Activity toggle kept at the right end. Every
 browser step runs in its own context and is wrapped in try/catch, so one failing step never hides
 the others.
 
@@ -63,6 +66,7 @@ Env:  CC_DASH_PLAYWRIGHT  playwright-core directory     CC_DASH_CHROME  Chrome b
                           the edge node opened, and in control mode with Review in the strip (and its
                           toast), the inspector with Review, and the review dialog's typed confirm; the
                           300-node floor and long hub names up close in both themes; the empty floor
+                          (and, from the limits step, limits-*.png: the instrument panel in each limits state)
       CC_DASH_FX_ONLY     comma list of browser steps to run (development)
 """
 import copy
@@ -390,6 +394,33 @@ def ctl_alerts(now):
              "worktree": "", "notified": False, "request": REQ_B3}]
 
 
+# The subscription's usage limits in every /api/graph answer (GET /__test/limits?mode=...): ok (38% and
+# 41%, read 20 s ago), high (5h at 82%, week at 100%), old (read 2 hours ago), gone (the 5-hour window
+# reset a minute ago), edge (74.6% and 99.6%: shown as 75% amber and 100% red), none (null: no cc-statusline),
+# junk (wrong types).
+LIM = {"mode": "ok"}
+LIM_MODES = ("ok", "high", "edge", "old", "gone", "none", "junk")
+
+
+def usage_limits(now):
+    m = LIM["mode"]
+    if m == "none":
+        return None
+    if m == "junk":
+        return {"five_hour": {"used_percentage": "lots", "resets_at": now + 600}, "seven_day": [1, 2]}
+    five = {"used_percentage": 38.4, "resets_at": now + 9600 + 30, "as_of": now - 20, "expired": False}
+    week = {"used_percentage": 41.0, "resets_at": now + 4 * 86400 + 6 * 3600 + 30, "as_of": now - 20, "expired": False}
+    if m == "high":
+        five["used_percentage"], week["used_percentage"] = 82.0, 100.0
+    elif m == "edge":
+        five["used_percentage"], week["used_percentage"] = 74.6, 99.6
+    elif m == "old":
+        five["as_of"] = week["as_of"] = now - 7200
+    elif m == "gone":
+        five.update(resets_at=now - 60, expired=True)
+    return {"five_hour": five, "seven_day": week}
+
+
 def variant(n):
     return {"1": lambda: copy.deepcopy(POLL1), "2": lambda: copy.deepcopy(POLL2), "states": states_variant,
             "big": big_variant, "empty": empty_variant, "long": long_variant, "cycles": cycles_variant,
@@ -444,6 +475,11 @@ class FxHandler(server_mod.Handler):
                 return self._json(400, {"error": "unknown variant " + n})
             STATE["n"] = n
             return self._json(200, {"n": n})
+        if parts.path == "/__test/limits":
+            if q.get("mode") not in LIM_MODES:
+                return self._json(400, {"error": "unknown limits mode"})
+            LIM["mode"] = q["mode"]
+            return self._json(200, {"mode": LIM["mode"]})
         if parts.path == "/__test/ctl":                   # control mode on / off / read-only, and whether the toast's alert is open
             if q.get("mode") in ("off", "on", "read"):
                 CTL.update(mode=q["mode"], posts=[], status={})
@@ -475,6 +511,8 @@ class FxHandler(server_mod.Handler):
             d = variant(STATE["n"])
             d = shift(d, time.time() - d["now"])
             d = scoped(d, q.get("project", ""), q.get("all") == "1")
+            if isinstance(d, dict):
+                d["usage_limits"] = usage_limits(time.time())
             return self._json(200, d)
         return super().do_GET()
 
@@ -673,6 +711,7 @@ const HELPERS = `(() => {
 async function getJSON(p) { return (await fetch(BASE + p)).json(); }
 const setPoll = (n) => getJSON('/__test/poll?n=' + n);
 const setCtl = (mode, alerts) => getJSON('/__test/ctl?' + (mode ? 'mode=' + mode + '&' : '') + (alerts == null ? '' : 'alerts=' + (alerts ? '1' : '0')));
+const setLim = (m) => getJSON('/__test/limits?mode=' + m);
 const ctlPosts = async () => (await getJSON('/__test/ctl')).posts;
 const first = (e) => String((e && e.message) || e).split('\n')[0].slice(0, 300);
 
@@ -689,8 +728,9 @@ async function step(name, fn) {
 
 // A fresh paired browser context + page. Page errors and console errors are collected into r.
 async function withPage(opts, r, fn) {
-  const o = Object.assign({ w: 1440, h: 900, scheme: 'light', reduced: false, poll: '1', hash: '#/factory', url: null, ctl: 'off', alerts: true }, opts);
+  const o = Object.assign({ w: 1440, h: 900, scheme: 'light', reduced: false, poll: '1', hash: '#/factory', url: null, ctl: 'off', alerts: true, lim: 'ok' }, opts);
   await setPoll(o.poll);
+  await setLim(o.lim);
   await setCtl(o.ctl, o.alerts);                 // control mode off unless the step asks (a fresh decide log either way)
   const ctx = await browser.newContext({ viewport: { width: o.w, height: o.h }, colorScheme: o.scheme,
     reducedMotion: o.reduced ? 'reduce' : 'no-preference', deviceScaleFactor: 1, locale: 'en-US' });
@@ -2093,6 +2133,74 @@ async function clickInPlace(page, id) {
     });
   });
 
+  // 13d. Usage limits in the band (payload.usage_limits): what it says for each window, the tooltip and the
+  // accessible name, amber and red, dimmed when old or reset, hidden without a reading (or a junk one), changed
+  // in place by a poll, the time left giving way below 1100 px, nothing at phone width, the Activity toggle kept
+  // at the band's right end whatever it shows.
+  const limRead = (page) => page.evaluate(() => {
+    const R = (e) => e.getBoundingClientRect();
+    const el = document.querySelector('.fx-lim'), band = document.querySelector('.fx-band'), btn = document.querySelector('.fx-side-btn');
+    const al = document.querySelector('.fx-alert');
+    const ws = el ? [...el.querySelectorAll('.fx-lim-w')].map((w) => {
+      const bar = w.querySelector('.fx-lim-bar'), fill = bar && bar.querySelector('i'), b = w.querySelector('b'), lf = w.querySelector('.fx-lim-left');
+      return { key: w.dataset.key, cls: w.className, k: (w.querySelector('.fx-lim-k') || {}).textContent, pct: b && b.textContent, left: lf && lf.textContent,
+        leftShown: !!lf && __t.vis(lf), fill: bar && fill ? Math.round(100 * R(fill).width / R(bar).width) : null,
+        pctColor: b && getComputedStyle(b).color, fillColor: fill && getComputedStyle(fill).backgroundColor, tag: w.__limTag || null };
+    }) : [];
+    return { exists: !!el, shown: !!el && __t.vis(el), hidden: el ? el.hidden : null, role: el && el.getAttribute('role'), aria: el && el.getAttribute('aria-label'), title: el && el.getAttribute('title'), ws,
+      lim: el && __t.vis(el) ? R(el).toJSON() : null, band: R(band).toJSON(), btn: R(btn).toJSON(), alertW: al ? R(al).width : null,
+      tok: Object.fromEntries(['--warn', '--bad', '--warn-dot', '--ink'].map((v) => { const x = document.createElement('span'); x.style.color = 'var(' + v + ')'; document.body.append(x); const c = getComputedStyle(x).color; x.remove(); return [v, c]; })),
+      scrollW: document.documentElement.scrollWidth, iw: innerWidth };
+  });
+  // With CC_DASH_SHOTS, the instrument panel in each state too (limits-*.png; not among the twenty-nine).
+  const limShot = async (page, name) => {
+    if (!SHOTS) return;
+    const b = await page.evaluate(() => document.querySelector('.fx-top').getBoundingClientRect().toJSON());
+    await page.screenshot({ path: SHOTS + '/limits-' + name + '.png', clip: { x: b.x, y: b.y, width: b.width, height: b.height } });
+  };
+  const limWait = (page, fn) => page.waitForFunction(fn, null, { timeout: 9000 }).then(() => true).catch(() => false);
+  await step('limits', async (r) => {
+    await withPage({}, r, async (page) => {
+      await waitFx(page, 32); await settle(page, 4000);
+      await limWait(page, () => document.querySelectorAll('.fx-lim .fx-lim-w').length === 2);
+      r.ok = await limRead(page);
+      await limShot(page, 'ok-light');
+      await page.evaluate(() => { for (const w of document.querySelectorAll('.fx-lim-w')) w.__limTag = w.dataset.key; });
+      for (const m of ['high', 'edge', 'old', 'gone']) {
+        await setLim(m);
+        const want = { high: () => /\bhigh\b/.test((document.querySelector('.fx-lim-w[data-key="five_hour"]') || {}).className || ''),
+          edge: () => ((document.querySelector('.fx-lim-w[data-key="five_hour"] b') || {}).textContent === '75%'),
+          old: () => [...document.querySelectorAll('.fx-lim-w')].every((w) => /\bdim\b/.test(w.className)) && /2h ago/.test(document.querySelector('.fx-lim').title),
+          gone: () => ((document.querySelector('.fx-lim-w[data-key="five_hour"] b') || {}).textContent === '–') }[m];
+        r[m + 'Waited'] = await limWait(page, want);
+        r[m] = await limRead(page);
+        await limShot(page, m + '-light');
+      }
+      for (const m of ['none', 'junk']) {
+        await setLim(m);
+        r[m + 'Waited'] = await limWait(page, () => document.querySelector('.fx-lim').hidden);
+        r[m] = await limRead(page);
+      }
+    });
+    await withPage({ w: 1000, h: 800 }, r, async (page) => {
+      await waitFx(page, 32); await settle(page, 4000);
+      await limWait(page, () => document.querySelectorAll('.fx-lim .fx-lim-w').length === 2);
+      r.mid = await limRead(page);
+      await limShot(page, '1000-light');
+    });
+    await withPage({ w: 390, h: 844 }, r, async (page) => {
+      await waitFx(page, 32); await settle(page, 4000); await page.waitForTimeout(3500);
+      r.phone = await limRead(page);
+      await limShot(page, 'phone-light');
+    });
+    await withPage({ scheme: 'dark', lim: 'high' }, r, async (page) => {
+      await waitFx(page, 32); await settle(page, 4000);
+      await limWait(page, () => document.querySelectorAll('.fx-lim .fx-lim-w').length === 2);
+      r.dark = await limRead(page);
+      await limShot(page, 'high-dark');
+    });
+  });
+
   // 14. Screenshots (CC_DASH_SHOTS) -----------------------------------------------------------------------------------
   // The selected shots open the floor's edge node in place (the inspector re-frames it); then the 300-node
   // floor in both themes, long hub names up close, and the empty floor.
@@ -3199,6 +3307,54 @@ def evaluate(steps, exp):
         stat = [g for g in list((rn.get("since") or {}).values()) + list((rn.get("rework") or {}).values()) if g.get("trans") not in ("0s", None)]
         check("visuals: the time and the rework never transition; the ring is not in the face's transitions",
               not stat and (rn.get("since") or rn.get("rework")) and "outline" not in (ring(rf, "failed").get("trans") or "outline"), why(r) or (stat, ring(rf, "failed")))
+
+    if ran("limits"):
+        r = S("limits")
+        no_errors("limits", r)
+        ok, hi, edge, old, gone, none, junk, mid, ph, dk = (r.get(k) or {} for k in ("ok", "high", "edge", "old", "gone", "none", "junk", "mid", "phone", "dark"))
+        ws = {w.get("key"): w for w in ok.get("ws") or []}
+        f5, wk = ws.get("five_hour") or {}, ws.get("seven_day") or {}
+        note("limits: %s | %s | title %r" % (f5, wk, ok.get("title")))
+        check("limits: shown in the band with both windows, 5h first", ok.get("shown") and [w.get("key") for w in ok.get("ws") or []] == ["five_hour", "seven_day"], why(r) or ok)
+        check("limits: each window says its label, use and time left (5h 38% 2h40m left, Week 41% 4d06h left)",
+              (f5.get("k"), f5.get("pct"), f5.get("left"), wk.get("k"), wk.get("pct"), wk.get("left")) == ("5h", "38%", "2h40m left", "Week", "41%", "4d06h left"), (f5, wk))
+        check("limits: the track fills to the use", abs((f5.get("fill") or 0) - 38) <= 3 and abs((wk.get("fill") or 0) - 41) <= 3, (f5.get("fill"), wk.get("fill")))
+        t = ok.get("title") or ""
+        check("limits: the tooltip names each window with its use, reset time and age",
+              t.count("\n") == 1 and "5-hour window: 38% used, resets in 2h 40m" in t and "Weekly window: 41% used, resets " in t and "as of " in t, t)
+        check("limits: an accessible name says the same (role img)", ok.get("role") == "img" and (ok.get("aria") or "").startswith("Usage limits. 5-hour window: 38% used"), ok.get("aria"))
+        lim, btn, band = ok.get("lim") or {}, ok.get("btn") or {}, ok.get("band") or {}
+        check("limits: sits before the Activity toggle, which keeps the band's right end, alerts still readable",
+              lim and lim.get("right", 1e9) <= btn.get("left", 0) + 0.5 and abs(band.get("right", 0) - btn.get("right", 0)) < 12 and (ok.get("alertW") or 0) > 200,
+              (lim, btn, band, ok.get("alertW")))
+        h5 = {w.get("key"): w for w in hi.get("ws") or []}
+        tok = hi.get("tok") or {}
+        check("limits: amber from 75%, red at 100%, in the status tokens (ink below)", r.get("highWaited") and "high" in (h5.get("five_hour") or {}).get("cls", "") and "full" in (h5.get("seven_day") or {}).get("cls", "")
+              and (h5.get("five_hour") or {}).get("pctColor") == tok.get("--warn") and (h5.get("seven_day") or {}).get("pctColor") == tok.get("--bad")
+              and (h5.get("five_hour") or {}).get("fillColor") == tok.get("--warn-dot") and f5.get("pctColor") == (ok.get("tok") or {}).get("--ink"), (r.get("highWaited"), h5, tok))
+        e5 = {w.get("key"): w for w in edge.get("ws") or []}
+        check("limits: the colour follows the shown figure (74.6% shows 75% amber, 99.6% shows 100% red)",
+              r.get("edgeWaited") and (e5.get("five_hour") or {}).get("pct") == "75%" and "high" in (e5.get("five_hour") or {}).get("cls", "")
+              and (e5.get("seven_day") or {}).get("pct") == "100%" and "full" in (e5.get("seven_day") or {}).get("cls", ""), (r.get("edgeWaited"), e5))
+        check("limits: a poll changes them in place (same elements)", all((w.get("tag") == w.get("key")) for w in hi.get("ws") or []) and len(hi.get("ws") or []) == 2, hi.get("ws"))
+        check("limits: a reading over an hour old is dimmed and the tooltip says what it misses",
+              r.get("oldWaited") and all("dim" in w.get("cls", "") for w in old.get("ws") or []) and "is not in it" in (old.get("title") or ""), (r.get("oldWaited"), old.get("ws"), old.get("title")))
+        g5 = {w.get("key"): w for w in gone.get("ws") or []}.get("five_hour") or {}
+        check("limits: a window past its reset shows no figure, an empty track and 'reset'; the tooltip says it waits for a reading",
+              r.get("goneWaited") and g5.get("pct") == "\u2013" and g5.get("left") == "reset" and g5.get("fill") == 0 and "dim" in g5.get("cls", "") and "no reading since" in (gone.get("title") or ""), (r.get("goneWaited"), g5, gone.get("title")))
+        check("limits: no reading (null) hides it, with no tooltip left behind, and Activity keeps the right end",
+              r.get("noneWaited") and none.get("hidden") and not none.get("shown") and none.get("title") is None and abs((none.get("band") or {}).get("right", 0) - (none.get("btn") or {}).get("right", 0)) < 12,
+              (r.get("noneWaited"), none.get("hidden"), none.get("title"), none.get("btn"), none.get("band")))
+        check("limits: a junk reading hides it without an error", r.get("junkWaited") and junk.get("hidden") and not junk.get("shown"), (r.get("junkWaited"), junk))
+        check("limits: at 1000 px the time left gives way, the rest stays inside the band", mid.get("shown") and all(not w.get("leftShown") for w in mid.get("ws") or [])
+              and (mid.get("lim") or {}).get("right", 1e9) <= (mid.get("btn") or {}).get("left", 0) + 0.5, (mid.get("ws"), mid.get("lim"), mid.get("btn")))
+        check("limits: not shown at phone width, and no horizontal scroll", ph.get("exists") and not ph.get("shown") and ph.get("scrollW") <= ph.get("iw"),
+              (ph.get("shown"), ph.get("scrollW"), ph.get("iw")))
+        d5 = {w.get("key"): w for w in dk.get("ws") or []}
+        dt = dk.get("tok") or {}
+        check("limits: dark theme draws them in its own amber and red", dk.get("shown") and "high" in (d5.get("five_hour") or {}).get("cls", "") and "full" in (d5.get("seven_day") or {}).get("cls", "")
+              and (d5.get("five_hour") or {}).get("pctColor") == dt.get("--warn") and (d5.get("seven_day") or {}).get("pctColor") == dt.get("--bad") and dt.get("--warn") != tok.get("--warn"),
+              dk.get("ws"))
 
     if ran("shots") and SHOTS:
         r = S("shots")

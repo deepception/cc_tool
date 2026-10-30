@@ -9,6 +9,9 @@ Joined from what the other views already compute, never re-derived:
   factory.project_orders()    work orders per project root (cached ORDERS_TTL); a missing module or one
                               that raises means no orders, never a failed graph
   transcript hour buckets     project cost, tokens, model mix and errors over the window (Overview's rule)
+  limits.payload()            usage_limits: the subscription's 5-hour and weekly windows as bin/cc-statusline
+                              last recorded them (or null), read from files each poll; account-wide, so the
+                              same whatever the scope; in the sig, and its `expired` flips with the clock
 
 Node ids are stable across polls (they key the client's layout):
   p:<project label>   s:<session>   a:<session>/<agent>   w:<session>/<run>   o:<project label>/<order>
@@ -57,6 +60,7 @@ import re
 import time
 
 from . import attention
+from . import limits as limits_mod   # the subscription's usage limits bin/cc-statusline recorded
 from . import plans as plans_mod
 from . import pricing
 from .parser import M_ACTIVE, M_ERRORS, M_TOOLS, SERIES_FAMILIES, clip, tilde
@@ -470,13 +474,23 @@ def payload(store, project="", all_projects=False, days=None):
         heads = [w for w in board["workflows"] if w["session"] in snodes]
     # Orders: factory.py reads files only, outside the store's lock.
     fac = _factory()
+    usage = _usage_limits(now)     # files only, outside the store's lock
     orders = {}
     if fac is not None:
         for label, st in sorted(stats.items()):
             if st["root"] and label != "unknown":
                 orders[label] = _project_orders(store, fac, st["root"], now)
     return _assemble(days, project, all_projects, now, board, stats, snodes, label_of, seen_at, rows_of,
-                     agent_ref, run_refs, heads, orders, alerts, plan_view, series)
+                     agent_ref, run_refs, heads, orders, alerts, plan_view, series, usage)
+
+
+def _usage_limits(now):
+    """limits.payload() or None: a reading that cannot be had (no cc-statusline, an API key, a
+    bad file) only leaves the floor without it, never fails the graph."""
+    try:
+        return limits_mod.payload(now=now)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _rank(kind):
@@ -491,7 +505,7 @@ def _copy_order(o):
 
 
 def _assemble(days, project, all_projects, now, board, stats, snodes, label_of, seen_at, rows_of,
-              agent_ref, run_refs, heads, orders, alerts, plan_view, series=None):
+              agent_ref, run_refs, heads, orders, alerts, plan_view, series=None, usage=None):
     """The payload from plain data gathered under the store's lock (no Session or Acc is touched here)."""
     nodes, edges, stamps, proj = {}, {}, {}, {}      # proj: node id -> project label
 
@@ -677,7 +691,8 @@ def _assemble(days, project, all_projects, now, board, stats, snodes, label_of, 
 
     out = {"now": now, "window_days": days, "scope": {"project": project}, "sig": "", "kpis": kp,
            "nodes": list(nodes.values()), "edges": list(edges.values()), "alerts": out_alerts, "feed": feed,
-           "series": _series_view(series, now), "limits": {"live_secs": LIVE_SECS, "linger": LINGER_SECS}}
+           "series": _series_view(series, now), "limits": {"live_secs": LIVE_SECS, "linger": LINGER_SECS},
+           "usage_limits": usage}
     out["sig"] = _sig(out, stamps)
     for a in out_alerts:
         del a["_t"]
@@ -695,6 +710,7 @@ def _sig(out, stamps):
         nodes.append(n)
     view = {"window_days": out["window_days"], "scope": out["scope"], "kpis": out["kpis"], "nodes": nodes,
             "edges": out["edges"], "feed": out["feed"], "series": out["series"], "limits": out["limits"],
+            "usage_limits": out["usage_limits"],
             "alerts": [dict(a, age=a["_t"]) for a in out["alerts"]]}
     raw = json.dumps(view, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:20]

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""cc-statusline: Claude Code status line that records your usage limits for cc-dash.
+
+Claude Code runs the status line command with a JSON description of the
+session on stdin and shows its first line of output under the prompt. For a
+Claude subscription that JSON carries `rate_limits`: the 5-hour session window
+and the 7-day window, each with used_percentage and resets_at. Claude Code
+writes those numbers nowhere else, so this is where cc-dash gets them.
+
+Prints:  Opus 5.5 · ctx 34% · 5h 42% (resets 14:05) · week 61% (resets Mon 09:00)
+
+Saves each session's latest reading to
+${XDG_STATE_HOME:-~/.local/state}/cc_tool/usage/<session id>.json (directory
+0700, file 0600, no symlinks followed), moving changed_at only when the numbers
+change: an idle session redrawing its line must not pass an old reading off as
+new. seen_at moves when a fresh API reply confirmed the reading (the session's
+cost.total_api_duration_ms changed, kept as `reply`), so an unchanged figure
+that replies keep confirming is not taken for an old one. Readings older than
+a week are pruned. Only the two windows, the session id, those two times and
+the reply mark are stored, nothing about the conversation.
+lib/cc_dash/limits.py reads them. install.sh sets this as the user-level
+statusLine.
+
+Never fails the status line: on any error it still prints what it can and
+exits 0. Python 3 standard library only.
+
+`cc-statusline --install [settings.json]` sets it as the status line there
+(default: the user-level settings), unless another one is already set.
+"""
+import json
+import math
+import os
+import re
+import shlex
+import stat
+import sys
+import time
+
+KEEP_SECS = 7 * 86400
+MAX_AHEAD = 30 * 86400      # a reset time further out than this is not a 5-hour or weekly window
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
+WINDOWS = ("five_hour", "seven_day")
+
+
+def usage_dir():
+    """Where lib/cc_dash/limits.py reads. Keep the two in step."""
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "cc_tool", "usage")
+
+
+def num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def reply_mark(data):
+    """cost.total_api_duration_ms: it grows with every API reply of the session, so a change says
+    a fresh reply confirmed the reading, even when the percentages stayed the same."""
+    cost = data.get("cost")
+    v = cost.get("total_api_duration_ms") if isinstance(cost, dict) else None
+    return v if num(v) else None
+
+
+def windows(data, now=None):
+    """{window: {used_percentage, resets_at}} for each well-formed window."""
+    rl = data.get("rate_limits")
+    out = {}
+    if not isinstance(rl, dict):
+        return out
+    for name in WINDOWS:
+        w = rl.get(name)
+        if isinstance(w, dict) and num(w.get("used_percentage")) and 0 <= w["used_percentage"] <= 100 \
+                and num(w.get("resets_at")) and 0 < w["resets_at"] <= (now or time.time()) + MAX_AHEAD:
+            out[name] = {"used_percentage": w["used_percentage"], "resets_at": w["resets_at"]}
+    return out
+
+
+def private_dir(d):
+    """Make d (0700) if missing; True only when it is a real directory of ours
+    that nobody else can write."""
+    try:
+        os.makedirs(os.path.dirname(d), mode=0o700, exist_ok=True)
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022   # as limits.py reads
+
+
+def read_record(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            return None
+        try:
+            rec = json.loads(fh.read(4096))
+        except ValueError:
+            return None
+    return rec if isinstance(rec, dict) else None
+
+
+def prune(d, now):
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for name in names:
+        p = os.path.join(d, name)
+        try:
+            st = os.lstat(p)
+            if now - st.st_mtime > KEEP_SECS and (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+                os.unlink(p)
+        except OSError:
+            pass
+
+
+def save(sid, wins, now, mark=None):
+    d = usage_dir()
+    if not SESSION_RE.match(sid) or not private_dir(d):
+        return
+    path = os.path.join(d, sid + ".json")
+    old = read_record(path)
+    if old and all(old.get(w) == wins.get(w) for w in WINDOWS):
+        # Same reading. An idle session redrawing its line must not pass it off as new, so
+        # changed_at stays; a fresh reply (the mark moved) confirms it, so seen_at moves.
+        if mark is None or old.get("reply") == mark or not num(old.get("changed_at")):
+            return
+        rec = dict(wins, session_id=sid, changed_at=old["changed_at"], seen_at=now, reply=mark)
+    else:
+        rec = dict(wins, session_id=sid, changed_at=now, seen_at=now)
+        if mark is not None:
+            rec["reply"] = mark
+    tmp = os.path.join(d, ".%s.%d.tmp" % (sid, os.getpid()))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(rec, fh, allow_nan=False)
+        os.replace(tmp, path)                     # replaces a planted symlink, never follows it
+    except (OSError, ValueError):
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return
+    prune(d, now)
+
+
+def resets(ts, now):
+    t = time.localtime(ts)
+    return time.strftime("%H:%M" if ts - now < 86400 else "%a %H:%M", t)
+
+
+def line(data, wins, now):
+    parts = []
+    model = data.get("model")
+    if isinstance(model, dict) and isinstance(model.get("display_name"), str):
+        parts.append("".join(c for c in model["display_name"][:40] if c.isprintable()))
+    ctx = data.get("context_window")
+    if isinstance(ctx, dict) and num(ctx.get("used_percentage")):
+        parts.append("ctx %d%%" % round(ctx["used_percentage"]))
+    for name, label in (("five_hour", "5h"), ("seven_day", "week")):
+        w = wins.get(name)
+        if w:
+            parts.append("%s %d%% (resets %s)" % (label, round(w["used_percentage"]), resets(w["resets_at"], now)))
+    return " · ".join(parts)
+
+
+def install(settings):
+    """Make this script the status line in `settings` (install.sh passes the
+    user-level ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json), so every session
+    in every project records its limits. A status line that is already set to
+    something else is left alone. Returns the exit status."""
+    me = os.path.realpath(__file__)
+    command = shlex.quote(me)
+    # A settings.json that is a symlink (a dotfiles checkout) is written through, never replaced by a file.
+    settings = os.path.realpath(settings)
+    data = {}
+    if os.path.exists(settings):
+        try:
+            with open(settings, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            print("✗ %s is not readable JSON (%s); status line not set. Add it yourself:\n"
+                  '  "statusLine": {"type": "command", "command": %s}' % (settings, e, json.dumps(command)))
+            return 1
+        if not isinstance(data, dict):
+            print("✗ %s is not a JSON object; status line not set." % settings)
+            return 1
+    current = data.get("statusLine")
+    if isinstance(current, dict) and any(x in str(current.get("command", "")) for x in (me, command)):
+        print("✓ cc-statusline already set as your status line (%s)" % settings)
+        return 0
+    if current:
+        print("• %s already has a status line, left as it is. cc-dash shows usage limits only from cc-statusline;\n"
+              "  to use it, set: \"statusLine\": {\"type\": \"command\", \"command\": %s}" % (settings, json.dumps(command)))
+        return 0
+    data["statusLine"] = {"type": "command", "command": command}
+    d = os.path.dirname(settings) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    mode = stat.S_IMODE(os.stat(settings).st_mode) if os.path.exists(settings) else 0o600
+    tmp = os.path.join(d, ".settings.json.cc-statusline.%d" % os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, settings)
+    print("✓ Set cc-statusline as your status line in %s (it records usage limits for cc-dash)" % settings)
+    return 0
+
+
+def main():
+    now = time.time()
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    wins = windows(data, now)
+    sid = data.get("session_id")
+    if wins and isinstance(sid, str):
+        try:
+            save(sid, wins, now, reply_mark(data))
+        except Exception:  # noqa: BLE001 - recording must never break the status line
+            pass
+    print(line(data, wins, now))
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--install"]:
+        default = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "settings.json")
+        sys.exit(install(sys.argv[2] if len(sys.argv) > 2 else default))
+    try:
+        main()
+    except Exception:  # noqa: BLE001
+        print("")
+    sys.exit(0)

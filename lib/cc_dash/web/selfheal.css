@@ -143,6 +143,14 @@ html.sh-drawer-open .al-stack { visibility: hidden; }
 .sh-order-btn[aria-expanded="true"] { background: var(--hover); border-color: var(--line); color: var(--ink); }
 .sh-order { display: flex; flex-direction: column; gap: var(--sp-1h); }
 .sh-note { margin: 0; font-size: var(--fs-12); color: var(--ink-3); }
+/* Apply: control.css's typed confirm (.ctl-confirm, .ctl-other, .btn.warn-solid, .ctl-err) and lockBox,
+   one tick for a cautioned patch, and the status language's done pill once it is committed. */
+.sh-applied { flex: none; }
+.sh-applied-note { overflow-wrap: anywhere; }
+.sh-applied-note .mono { color: var(--ink-2); }
+.sh-apply-confirm .ctl-lock-t { color: var(--ink-2); }
+.sh-ack { display: flex; align-items: flex-start; gap: var(--sp-2); font-size: var(--fs-12); line-height: 1.45; color: var(--ink-2); cursor: pointer; }
+.sh-ack input { flex: none; margin: 2px 0 0; accent-color: var(--warn-dot); }
 /* The server's caution above a diff: control.css's bash-guard note (.ctl-guard), one line. */
 .sh-caution {
   margin: 0; padding: var(--sp-1h) var(--sp-3); border-radius: var(--r-m); font-size: var(--fs-12); line-height: 1.5; color: var(--ink); overflow-wrap: anywhere;

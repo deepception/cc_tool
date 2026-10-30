@@ -1,7 +1,9 @@
 """Self-heal: one headless `claude -p` run that reads the recent errors of every
 session and proposes harness changes (CLAUDE.md, guard rules, settings, skills,
-factory lines, cc_tool's templates) as unified diffs. Proposals only: nothing
-here ever applies a patch or runs a command it shows.
+rule files, factory lines, cc_tool's templates) as unified diffs. The run only
+proposes. A patch reaches a project only through SelfHeal.apply: a control-mode
+POST a person confirmed, which checks everything again, applies cc-dash's checked
+copy with hardened git commands and commits that one path (see its docstring).
 
 Why it is shaped like this (a quarantine):
   - The evidence is other sessions' transcripts, so it is hostile input for the
@@ -12,8 +14,9 @@ Why it is shaped like this (a quarantine):
     outside the code the control hook verifies (cc_procs.scan_code), and cc-dash
     in control mode must not run anything that hook never saw. Harness files
     are snapshotted under names Claude Code never loads as instructions
-    (SNAPSHOT_RULE: CLAUDE.md.txt, _claude/...), and a project rooted at $HOME
-    or above is left out (its .claude/ is the user's own).
+    (SNAPSHOT_RULE: CLAUDE.md.txt, _claude/...), a project rooted at $HOME
+    or above is left out (its .claude/ is the user's own), and so is one under
+    a temp directory (/tmp, $TMPDIR, tempfile.gettempdir(), by real path).
   - The child gets a fixed argv (only the run id, run dir, session id, budget
     and claude path vary; nothing from a request; claude found through the
     absolute PATH entries only), an allowlisted environment (no token, lease
@@ -48,7 +51,8 @@ overdue child whose pid, start time and argv still match. The window starts wher
 last completed run ended, so each run looks at what is new.
 
 Users: server.py (GET /api/selfheal, GET /api/selfheal/run, POST
-/api/control/selfheal), bin/cc-selfheal, tests/test_selfheal.py.
+/api/control/selfheal and /api/control/selfheal/apply), bin/cc-selfheal,
+tests/test_selfheal.py.
 """
 import ast
 import contextlib
@@ -62,6 +66,7 @@ import re
 import secrets
 import shlex
 import shutil
+import tempfile
 import signal
 import stat
 import subprocess
@@ -112,6 +117,8 @@ KILL_GRACE = 10.0                # SIGTERM, then SIGKILL this much later
 OVERDUE_GRACE = 30.0             # another process's overdue child is killed this long past its deadline
 HARNESS_MAX = 64 * 1024
 SKILL_MAX = 16 * 1024
+RULE_MAX = 16 * 1024
+MAX_RULES = 40
 CLAUDE_MD_SCAN = 1024 * 1024     # CLAUDE.md is read this far for its managed marker
 MAX_SKILLS = 40
 MAX_LISTING = 5000
@@ -134,8 +141,12 @@ FIXED_TARGETS = {"claude_md": ("CLAUDE.md",), "guard_rules": (".claude/guard-rul
                  "settings": (".claude/settings.json",), "factory_line": ("factory/line.json",),
                  "cc_tool_template": ("templates/CLAUDE_snippet.md", "templates/CLAUDE_template.md",
                                       "templates/settings.json", "templates/factory/line.json")}
-TARGET_KINDS = ("claude_md", "guard_rules", "settings", "skill", "factory_line", "cc_tool_template")
+TARGET_KINDS = ("claude_md", "guard_rules", "settings", "skill", "rules", "factory_line", "cc_tool_template")
+# .claude/rules/<name>.md: directly in .claude/rules/, a name with no dot or slash (so no traversal), .md only.
+RULE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z", re.ASCII)
+# Targets named by a pattern; each may also be created (--- /dev/null): a new skill or rule file.
 SKILL_TARGET_RE = {"skill": re.compile(r"^\.claude/skills/([a-z0-9][a-z0-9-]{0,63})/SKILL\.md\Z", re.ASCII),
+                   "rules": re.compile(r"^\.claude/rules/([a-z0-9][a-z0-9_-]{0,63})\.md\Z", re.ASCII),
                    "cc_tool_template": re.compile(r"^templates/skills/([a-z0-9][a-z0-9-]{0,63})/SKILL\.md\Z", re.ASCII)}
 PATCH_FILE_RE = re.compile(r"^proposals/([a-z0-9][a-z0-9._-]{0,63}|_cc_tool)/\d{2}-[a-z0-9][a-z0-9-]{0,79}\.patch\Z",
                            re.ASCII)
@@ -157,9 +168,39 @@ JSON_KINDS = ("settings", "guard_rules", "factory_line")
 JSON_TEMPLATES = ("templates/settings.json", "templates/factory/line.json")
 LIVE_MAX = 1024 * 1024           # a patch's target is read this far to check the patch against it
 # The drawer's warnings (caution()): settings keys that widen what an agent may do.
-WIDEN_KEYS = ("allow", "hooks", "env", "apiKeyHelper", "defaultMode", "bypassPermissions", "additionalDirectories")
-CAUTION_SETTINGS = "This patch widens permissions or adds hooks/env: read every line before applying."
+# A settings patch skips the caution only when its result adds deny/ask rules or drops allow rules and
+# changes nothing else: an allowlist, because Claude Code keeps adding settings that run commands or
+# widen access (statusLine, apiKeyHelper, awsAuthRefresh, otelHeadersHelper, MCP servers, plugins, ...).
+SETTINGS_RULE_LISTS = ("allow", "deny", "ask")
+CAUTION_SETTINGS = "This patch changes settings beyond adding deny/ask rules (it may widen permissions or run commands): read every line before applying."
 CAUTION_GUARD = "This patch weakens a guard rule: read every line before applying."
+# A skill's frontmatter can pre-approve tools (allowed-tools, for the turn that invokes the skill) and
+# add hooks: a patch that may touch it gets this caution (_skill_caution).
+CAUTION_SKILL = ("This patch changes a skill's frontmatter, where allowed-tools pre-approves tools and hooks "
+                 "run commands: read every line before applying.")
+# Applying a proposal (SelfHeal.apply): git runs only with this hardened prefix, the Python form of
+# factory-line.js's GIT_SAFE: no system or global config (the commit identity is read separately), every
+# exec-capable key switched off on the command line (which outranks the repo's own config), no hooks, no
+# pager, no signing, no auto gc, no transport. Its environment is built from scratch, so no GIT_DIR,
+# GIT_WORK_TREE or GIT_INDEX_FILE of cc-dash's reaches it. Unlike GIT_SAFE it has no --attr-source (git
+# 2.43's `apply` crashes with it): a target with any filter attribute is refused instead (_git_problem),
+# and no other attribute runs a program on apply, add or commit.
+GIT_PROTOCOLS = ("ext", "file", "ssh", "git", "http", "https")
+GIT_SAFE_ARGS = ["--no-pager", "--no-optional-locks"] + [
+    x for kv in ("core.fsmonitor=false", "core.hooksPath=/dev/null", "core.untrackedCache=false", "core.pager=cat",
+                 "core.sshCommand=false", "core.editor=false", "core.askPass=", "core.attributesFile=/dev/null",
+                 "credential.helper=", "diff.external=", "commit.gpgsign=false", "tag.gpgsign=false", "gc.auto=0",
+                 "maintenance.auto=false", "protocol.allow=never") + tuple("protocol.%s.allow=never" % p for p in GIT_PROTOCOLS)
+    for x in ("-c", kv)]
+GIT_SAFE_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_ATTR_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "", "GIT_PROTOCOL_FROM_USER": "0",
+                "GIT_NO_LAZY_FETCH": "1", "LC_ALL": "C"}
+GIT_TIMEOUT = 30
+APPLY_CONFIRM = "apply"           # the word the drawer's confirm makes you type
+# A repository in one of these states is mid-operation: a commit there would mix the patch into it.
+GIT_BUSY = {"MERGE_HEAD": "merge", "CHERRY_PICK_HEAD": "cherry-pick", "REVERT_HEAD": "revert", "rebase-merge": "rebase",
+            "rebase-apply": "rebase or am", "BISECT_LOG": "bisect", "sequencer": "sequenced pick"}
+SHA_RE = re.compile(r"^[0-9a-f]{40,64}\Z", re.ASCII)
 # self-heal.agents.json may define these two agents with these keys and tools only (_agents_problem).
 AGENT_KEYS = {"description", "prompt", "tools", "model", "omitClaudeMd"}
 AGENT_TOOLS = {"selfheal-reader": ["Read", "Grep", "Glob"], "selfheal-writer": ["Write"]}
@@ -277,8 +318,8 @@ def _target_problem(target, kind):
 
 def validate_patch(patch, target, kind, marker_line=None):
     """'' when `patch` is one unified diff of `target` that cc-dash may show, else why not:
-    exactly one file, `--- a/<target>` (`--- /dev/null` only for a new skill) and
-    `+++ b/<target>`, optional `diff --git`, `index` and (new skill) `new file mode 100644`,
+    exactly one file, `--- a/<target>` (`--- /dev/null` only for a new skill or rule file) and
+    `+++ b/<target>`, optional `diff --git`, `index` and (new file) `new file mode 100644`,
     hunks whose line counts parse, no control character but tab, and for CLAUDE.md every
     hunk's old range ending above the managed marker line."""
     why = _target_problem(target, kind)
@@ -293,7 +334,7 @@ def validate_patch(patch, target, kind, marker_line=None):
     lines = patch.split("\n")
     if lines[-1] == "":
         lines.pop()
-    can_create = kind in SKILL_TARGET_RE and bool(SKILL_TARGET_RE[kind].fullmatch(target))   # a new skill only
+    can_create = kind in SKILL_TARGET_RE and bool(SKILL_TARGET_RE[kind].fullmatch(target))   # a new skill or rule file
     i, n, mode_line, index_line = 0, len(lines), False, False
     if i < n and lines[i].startswith("diff "):
         if lines[i] != "diff --git a/%s b/%s" % (target, target):
@@ -311,7 +352,7 @@ def validate_patch(patch, target, kind, marker_line=None):
         return "the patch has no --- line"
     new = lines[i] == "--- /dev/null"
     if new and not can_create:
-        return "only a new skill may be created"
+        return "only a new skill or rule file may be created"
     if not new and lines[i] != "--- a/" + target:
         return "the --- line names another file"
     if mode_line and not new:
@@ -426,28 +467,190 @@ def _json_lines(patch):
     return out
 
 
-def caution(patch, target, kind):
-    """'' or one sentence for the drawer when a settings patch adds or widens what an agent may do
-    (allow rules, hooks, env, apiKeyHelper, defaultMode, bypassPermissions, additionalDirectories) or
-    removes deny/ask entries, or a guard_rules patch removes or weakens a rule. Errs toward warning: a
-    line whose section the hunk does not show counts as risky."""
+def _patched(old, patch):
+    """`old` with the unified diff `patch` applied, or None when a hunk does not match it exactly where
+    it says (the same strictness as live_problem). A new-file patch applies to ''."""
+    lines = old.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    out, pos, hunk = [], 0, False
+    for ln in patch.split("\n"):
+        m = HUNK_RE.fullmatch(ln)
+        if m:
+            a, b = int(m.group(1)), 1 if m.group(2) is None else int(m.group(2))
+            start = a - 1 if b else a
+            if start < pos or start > len(lines):
+                return None
+            out.extend(lines[pos:start])
+            pos, hunk = start, True
+            continue
+        if not hunk or not ln or ln.startswith("\\"):
+            continue
+        ch, text = ln[0], ln[1:]
+        if ch in " -":
+            if pos >= len(lines) or lines[pos] != text:
+                return None
+            if ch == " ":
+                out.append(text)
+            pos += 1
+        elif ch == "+":
+            out.append(text)
+    out.extend(lines[pos:])
+    return "\n".join(out) + "\n"
+
+
+def _strict_json(text):
+    """The JSON object in text (duplicate keys refused, '' as {}), or None."""
+    def pairs(items):
+        d = {}
+        for k, v in items:
+            if k in d:
+                raise ValueError("duplicate key %r" % k)
+            d[k] = v
+        return d
+    if not text.strip():
+        return {}
+    try:
+        obj = json.loads(text, object_pairs_hook=pairs)
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _settings_caution(patch, target, root):
+    """'' only when the settings file after the patch differs from the live one by deny/ask rules added
+    and allow rules removed, and in nothing else; judged on the parsed result, not on the diff's lines.
+    Anything unreadable, unparsable or otherwise changed gets the caution."""
+    new = _hunks(patch)[0]
+    if new:
+        old_text = ""
+    else:
+        data, size = _read_under(root, target, LIVE_MAX + 1) if root else (None, 0)
+        if data is None or size > LIVE_MAX:
+            return CAUTION_SETTINGS
+        old_text = data.decode("utf-8", "replace")
+    new_text = _patched(old_text, patch)
+    before, after = _strict_json(old_text), (_strict_json(new_text) if new_text is not None else None)
+    if before is None or after is None:
+        return CAUTION_SETTINGS
+    pb, pa = before.get("permissions", {}), after.get("permissions", {})
+    if not isinstance(pb, dict) or not isinstance(pa, dict):
+        return CAUTION_SETTINGS
+    if {k: v for k, v in before.items() if k != "permissions"} != {k: v for k, v in after.items() if k != "permissions"}:
+        return CAUTION_SETTINGS
+    if {k: v for k, v in pb.items() if k not in SETTINGS_RULE_LISTS} != {k: v for k, v in pa.items() if k not in SETTINGS_RULE_LISTS}:
+        return CAUTION_SETTINGS
+    rules = {}
+    for side, perm in (("b", pb), ("a", pa)):
+        for name in SETTINGS_RULE_LISTS:
+            v = perm.get(name, [])
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                return CAUTION_SETTINGS
+            rules[side, name] = set(v)
+    if not (rules["a", "deny"] >= rules["b", "deny"] and rules["a", "ask"] >= rules["b", "ask"]
+            and rules["a", "allow"] <= rules["b", "allow"]):
+        return CAUTION_SETTINGS
+    return ""
+
+
+def caution(patch, target, kind, root=None):
+    """'' or one sentence for the drawer when a settings patch does anything but add deny/ask rules or
+    drop allow rules (judged on the parsed file before and after, see _settings_caution), a guard_rules
+    patch removes or weakens a rule, or a skill patch may touch the skill's frontmatter (by line numbers
+    in the live file under `root`, see _skill_caution). Errs toward warning: a settings file that cannot
+    be read or parsed, or a skill patch whose frontmatter boundaries cannot be told, counts as risky."""
     if not isinstance(patch, str) or not patch:
         return ""
-    entry = re.compile(r'^\s*"(?:[^"\\]|\\.)*"\s*,?\s*$')
     if kind == "settings" or target == "templates/settings.json":
-        for sign, body, keys, within in _json_lines(patch):
-            if sign == "+" and (set(keys) & set(WIDEN_KEYS) or set(within) & set(WIDEN_KEYS)
-                                or (not within and entry.match(body))):
-                return CAUTION_SETTINGS
-            if sign == "-" and (set(keys) & {"deny", "ask"} or set(within) & {"deny", "ask"}
-                                or (not within and entry.match(body))):
-                return CAUTION_SETTINGS
+        return _settings_caution(patch, target, root)
     elif kind == "guard_rules":
         for sign, body, _keys, _within in _json_lines(patch):
             if sign == "-" and body.strip(" \t,[]{}"):
                 return CAUTION_GUARD           # a rule removed or changed: a deny made ask or warn among them
             if sign == "+" and re.search(r'"enabled"\s*:\s*false', body):
                 return CAUTION_GUARD
+    elif kind == "skill" or SKILL_TARGET_RE["cc_tool_template"].match(target or ""):
+        return _skill_caution(patch, target, root)
+    return ""
+
+
+def _patched_lines(patch, lines):
+    """`lines` with the patch's hunks applied at the lines they name, or None when a hunk's old
+    lines are not there (live_problem refuses such a patch anyway)."""
+    out, pos, hunk = [], 0, None
+    for ln in patch.split("\n") + ["@@ end"]:
+        m = HUNK_RE.fullmatch(ln)
+        if m or ln == "@@ end":
+            if hunk is not None:
+                a, old, new = hunk
+                start = max(a - 1, 0) if old else a
+                if start < pos or lines[start:start + len(old)] != old:
+                    return None
+                out += lines[pos:start] + new
+                pos = start + len(old)
+            hunk = (int(m.group(1)), [], []) if m else None
+        elif hunk is not None and ln[:1] in (" ", "-", "+"):
+            if ln[:1] != "+":
+                hunk[1].append(ln[1:])
+            if ln[:1] != "-":
+                hunk[2].append(ln[1:])
+    return out + lines[pos:]
+
+
+def _frontmatter_end(lines):
+    """Index of a SKILL.md's closing frontmatter fence, or None when the frontmatter cannot be told
+    unambiguously: line 1 is not exactly `---`, a line that strips to `---` or `...` but is not
+    exactly `---` (indented, trailing spaces, a BOM, a YAML document end) comes first, or there is
+    no closing fence."""
+    if not lines or lines[0] != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i] == "---":
+            return i
+        if lines[i].strip("﻿ \t\r") in ("---", "..."):
+            return None
+    return None
+
+
+def _skill_caution(patch, target, root):
+    """CAUTION_SKILL whenever the patch may touch a skill's frontmatter, where allowed-tools (which
+    pre-approves tools for the turn that invokes the skill) and hooks live. By line numbers, never by
+    reading YAML keys: an added or removed line inside the frontmatter of the live file before the
+    patch or of the result after it, a hunk that starts at or above the closing fence, a new file,
+    and anything that leaves the boundaries unclear (no readable live file, a patch that does not
+    fit it, no `---` on line 1, an odd fence) all count. Body-only edits pass."""
+    new, _h = _hunks(patch)
+    if new or not root:
+        return CAUTION_SKILL
+    data, size = _read_under(root, target, LIVE_MAX + 1)
+    if data is None or size > LIVE_MAX:
+        return CAUTION_SKILL
+    before = data.decode("utf-8", "replace").split("\n")
+    after = _patched_lines(patch, before)
+    end_old = _frontmatter_end(before)
+    end_new = _frontmatter_end(after) if after is not None else None
+    if after is None or end_old is None or end_new is None:
+        return CAUTION_SKILL
+    old_ln = new_ln = 0
+    in_hunk = False                                # the ---/+++ file headers come before the first hunk
+    for ln in patch.split("\n"):
+        m = HUNK_RE.fullmatch(ln)
+        if m:
+            in_hunk, old_ln, new_ln = True, int(m.group(1)), int(m.group(3))
+            if old_ln <= end_old + 1:              # 1-based start at or above the closing fence
+                return CAUTION_SKILL
+            continue
+        sign = ln[:1] if in_hunk else ""
+        if sign == " ":
+            old_ln, new_ln = old_ln + 1, new_ln + 1
+        elif sign == "-":
+            if old_ln <= end_old + 1:
+                return CAUTION_SKILL
+            old_ln += 1
+        elif sign == "+":
+            if new_ln <= end_new + 1:
+                return CAUTION_SKILL
+            new_ln += 1
     return ""
 
 
@@ -491,12 +694,121 @@ def _is_home(root):
     return real in ("/", home) or home.startswith(real.rstrip("/") + "/")
 
 
+def _temp_dirs():
+    """The real paths of the temp directories: /tmp, $TMPDIR and tempfile.gettempdir(), symlinks resolved."""
+    out = set()
+    for d in ("/tmp", os.environ.get("TMPDIR") or "", tempfile.gettempdir()):
+        if d and os.path.isabs(d):
+            real = os.path.realpath(d)
+            if real != "/":
+                out.add(real.rstrip("/"))
+    return out
+
+
+def _is_temp(root):
+    """True for a root at or under a temp directory (compared by real path): a scratch checkout,
+    never a project whose harness should change."""
+    real = os.path.realpath(root)
+    return any(real == t or real.startswith(t + "/") for t in _temp_dirs())
+
+
 def _cmdline_ok(pid, rec):
     """True when /proc/<pid>/cmdline is this run's child: `--session-id <its uuid>` and `self-heal <id>`."""
     argv = procs.cmdline(pid) or []
     sid = rec.get("session_id")
     return isinstance(sid, str) and ("self-heal " + rec.get("id", "")) in argv and any(
         argv[i] == "--session-id" and argv[i + 1] == sid for i in range(len(argv) - 1))
+
+
+def _root_of(roots, project):
+    """The absolute root a run's record names for a project (`_cc_tool`: cc_tool's checkout), else ''."""
+    v = roots.get(project) if isinstance(roots, dict) else None
+    return v if isinstance(v, str) and os.path.isabs(v) else ""
+
+
+def _applied_view(entry):
+    """What the drawer shows of an applied proposal ({sha, short, at, target, root, committed, backup}), or
+    None. `sha` is the commit, or for a git-ignored target (committed false) the new file's sha256."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("sha"), str) or not SHA_RE.fullmatch(entry["sha"]):
+        return None
+    at = _finite(entry.get("at"), 0, 1e12)
+    committed = entry.get("committed") is not False
+    return {"sha": entry["sha"], "short": entry["sha"][:7], "at": at, "target": _line(entry.get("target"), 200),
+            "root": tilde(entry["root"]) if isinstance(entry.get("root"), str) else "", "committed": committed,
+            "backup": "" if committed or not isinstance(entry.get("backup"), str) else tilde(entry["backup"])}
+
+
+def _git(root, args, stdin=None, identity=None):
+    """git -C root <GIT_SAFE_ARGS> <args>: (returncode, stdout, stderr), never through a shell; (127, '', why)
+    when git cannot run. `identity` is (name, email) for a commit: the global config is not read here."""
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.path.expanduser("~")}
+    env.update(GIT_SAFE_ENV)
+    if identity:
+        env.update(GIT_AUTHOR_NAME=identity[0], GIT_AUTHOR_EMAIL=identity[1],
+                   GIT_COMMITTER_NAME=identity[0], GIT_COMMITTER_EMAIL=identity[1])
+    try:
+        r = subprocess.run(["git"] + GIT_SAFE_ARGS + ["-C", root] + list(args), env=env, cwd=root,
+                           input=stdin if stdin is not None else b"", capture_output=True, timeout=GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", "git did not run: %s" % (getattr(e, "strerror", None) or e)
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+
+def _git_identity(root):
+    """(name, email) git would commit as in root: user.name and user.email from the repo's, the global and
+    the system config, read with `git config --get` (reading config runs nothing); else None."""
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "XDG_CONFIG_HOME")}
+    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0")
+    out = []
+    for key in ("user.name", "user.email"):
+        try:
+            r = subprocess.run(["git", "-C", root, "config", "--get", key], env=env, cwd=root, stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=GIT_TIMEOUT)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        v = _line(r.stdout.decode("utf-8", "replace"), 200)
+        if r.returncode or not v:
+            return None
+        out.append(v)
+    return tuple(out)
+
+
+def _git_ignored(root, target):
+    """True when git ignores `target` in root and does not track it: such a file can be changed but not
+    committed (cc_tool's deployed skills are often like this)."""
+    return bool(_git(root, ["ls-files", "--error-unmatch", "--", target])[0]) and \
+        _git(root, ["check-ignore", "-q", "--", target])[0] == 0
+
+
+def _git_problem(root, target, new=False, ignored=False):
+    """'' when root is a git work tree that may take a commit of `target` now, else why not: root inside
+    git's work tree (not redirected by core.worktree), no merge, rebase, cherry-pick, revert or bisect
+    going, an existing target tracked by git (or ignored by it: `ignored`), no filter attribute on it (a clean filter would run a
+    program on `git add`, and on `git status` too, so this comes first), and no staged, unstaged or
+    untracked change to it."""
+    rc, top, err = _git(root, ["rev-parse", "--show-toplevel"])
+    if rc:
+        return "%s is not a git work tree (%s)" % (tilde(root), _line(err, 160) or "git rev-parse failed")
+    top, real = os.path.realpath(top.strip()), os.path.realpath(root)
+    if not (real == top or real.startswith(top.rstrip("/") + "/")):
+        return "git's work tree for %s is %s, outside it" % (tilde(root), tilde(top))
+    rc, gd, _err = _git(root, ["rev-parse", "--absolute-git-dir"])
+    if rc or not os.path.isabs(gd.strip()):
+        return "cannot find the git directory of %s" % tilde(root)
+    busy = [n for n in GIT_BUSY if os.path.lexists(os.path.join(gd.strip(), n))]
+    if busy:
+        return "%s is in the middle of a %s: finish or abort it first" % (tilde(root), GIT_BUSY[busy[0]])
+    if not new and not ignored and _git(root, ["ls-files", "--error-unmatch", "--", target])[0]:
+        return "%s is not tracked by git in %s, so it cannot be committed alone" % (target, tilde(root))
+    rc, out, _err = _git(root, ["check-attr", "filter", "--", target])
+    if rc or not out.rstrip("\n").endswith(": unspecified"):
+        return "%s has a git filter attribute, which would run a program on apply and commit" % target
+    rc, out, err = _git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", target])
+    if rc:
+        return "git status failed in %s: %s" % (tilde(root), _line(err, 160))
+    if out.strip("\0"):
+        return "%s has uncommitted changes: commit or stash them first, so the commit holds only this patch" % target
+    return ""
 
 
 def validate_proposals(doc, projects, markers=None):
@@ -673,8 +985,9 @@ def _read_under(root, rel, cap, own=True):
         os.close(fd)
 
 
-def _dirs_under(root, rel):
-    """Sorted names of the real directories in root/rel (no symlink followed)."""
+def _dirs_under(root, rel, test=stat.S_ISDIR):
+    """Sorted names of the real directories (or, with test=stat.S_ISREG, plain files) in root/rel,
+    no symlink followed."""
     fd = _open_under(root, rel, want_dir=True)
     if fd is None:
         return []
@@ -682,7 +995,7 @@ def _dirs_under(root, rel):
         out = []
         for name in sorted(os.listdir(fd))[:MAX_LISTING]:
             try:
-                if stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                if test(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
                     out.append(name)
             except OSError:
                 continue
@@ -1116,30 +1429,212 @@ class SelfHeal:
             out["problems"] = problems
             return 200, out
         roots = rec.get("roots") if isinstance(rec.get("roots"), dict) else {}
+        applied = rec.get("applied") if isinstance(rec.get("applied"), dict) else {}
         copies = self._path("patches", run_id)
         for p in clean:
-            root = CC_TOOL_DIR if p["project"] == CC_TOOL else \
-                roots.get(p["project"]) if isinstance(roots.get(p["project"]), str) else ""
+            root = _root_of(roots, p["project"]) or (CC_TOOL_DIR if p["project"] == CC_TOOL else "")
             rel = p["patch_file"][len("proposals/"):] if p["patch_ok"] else ""
+            done = _applied_view(applied.get(p["id"]))
             if p["patch_ok"]:
                 # The copy cc-dash wrote at finalize is what the commands name, never the child's run dir.
-                data, size = _read_under(copies, rel, PATCH_MAX * 4 + 1) if private_dir(copies) else (None, 0)
-                why = "cc-dash's copy of the patch is missing or differs from proposals.json" \
-                    if data != p["patch"].encode("utf-8", "replace") else \
-                    (live_problem(root, p["target"], p["target_kind"], p["patch"]) if root else "the project root is unknown")
+                why = self._copy_problem(run_id, rel, p["patch"])
+                if not why and not done:      # an applied patch no longer fits the file it changed: shown as applied
+                    why = live_problem(root, p["target"], p["target_kind"], p["patch"]) if root else "the project root is unknown"
                 if why:
                     p.update(patch_ok=False, patch="", patch_problem=why)
             path = os.path.join(copies, *rel.split("/")) if p["patch_ok"] else ""
             p.update(project_root=tilde(root), patch_path=tilde(path),
-                     apply_cmd=apply_command(root, path) if p["patch_ok"] else "",
+                     apply_cmd=apply_command(root, path) if p["patch_ok"] and not done else "",
                      order_cmd=order_command(p, root) if root else "", order_note=_order_note(root) if root else "",
-                     caution=caution(p["patch"], p["target"], p["target_kind"]))
+                     caution=caution(p["patch"], p["target"], p["target_kind"], root), applied=done,
+                     can_apply=bool(p["patch_ok"] and not done and self.writable and _root_of(roots, p["project"])))
+            p["apply_commits"] = not (p["can_apply"] and _git_ignored(root, p["target"]))
         clean.sort(key=lambda p: (p["project"] == CC_TOOL, p["project"], SEVERITIES.index(p["severity"])))
         dropped = doc.get("dropped") if isinstance(doc.get("dropped"), list) else []
         out.update(proposals=clean, problems=problems, notes=_text(doc.get("notes"), 1000),
                    dropped=[{"title": _line(x.get("title"), 120), "reason": _line(x.get("reason"), 300)}
                             for x in dropped[:MAX_PROPOSALS] if isinstance(x, dict)])
         return 200, out
+
+    def _copy_problem(self, run_id, rel, patch):
+        """'' when S/patches/<id>/<rel> (cc-dash's checked copy) holds exactly `patch`, else why not."""
+        copies = self._path("patches", run_id)
+        data, _size = _read_under(copies, rel, PATCH_MAX * 4 + 1) if private_dir(copies) else (None, 0)
+        return "" if data == patch.encode("utf-8", "replace") else \
+            "cc-dash's copy of the patch is missing or differs from proposals.json"
+
+    # ── applying one proposal (control mode) ───────────────────────────────
+    def apply(self, client, body):
+        """POST /api/control/selfheal/apply {run, proposal, root, confirm: "apply", acknowledge}: apply one
+        proposal's checked patch to the live file and commit that one path in its project. Everything is
+        checked again here, under the state lock (so two requests cannot both apply it), and every
+        outcome is audited. (http status, response)."""
+        b = body if isinstance(body, dict) else {}
+        run_id, pid = b.get("run"), b.get("proposal")
+        ids = "%s %s" % (run_id if isinstance(run_id, str) and RUN_ID_RE.fullmatch(run_id) else "?",
+                         pid if isinstance(pid, str) and PROPOSAL_ID_RE.fullmatch(pid) else "?")
+
+        def refuse(code, msg, **extra):
+            self._audit(client, "apply %s refused (%d): %s" % (ids, code, msg))
+            return code, dict({"error": msg}, **extra)
+        if not self.writable:
+            return refuse(403, "Applying a proposal needs ccdash --control.")
+        if "?" in ids.split():
+            return refuse(400, "That is not a self-heal run id and proposal id.")
+        if b.get("confirm") != APPLY_CONFIRM:
+            return refuse(428, "Type apply to confirm.", confirm=APPLY_CONFIRM)
+        try:
+            with self._locked():
+                code, out = self._apply_locked(run_id, pid, b)
+        except OSError as e:
+            return refuse(500, "Cannot use the self-heal state directory: %s" % (e.strerror or e))
+        if code != 200:
+            return refuse(code, out["error"], **{k: v for k, v in out.items() if k != "error"})
+        a = out["applied"]
+        self._audit(client, "apply %s: committed %s in %s as %s" % (ids, a["target"], a["root"], a["short"]) if a["committed"]
+                    else "apply %s: changed git-ignored %s in %s (not committed; backup %s)" % (ids, a["target"], a["root"], a["backup"]))
+        return code, out
+
+    def _apply_locked(self, run_id, pid, body):
+        if not private_dir(self.base):
+            return 404, {"error": "No self-heal run with that id."}
+        rec = self._recs.get(run_id) or read_json(self._path("records", run_id + ".json"), STATE_MAX)
+        if not self._valid(rec) or rec["id"] != run_id:
+            return 404, {"error": "No self-heal run with that id."}
+        if rec["status"] != "done" or not isinstance(rec.get("proposals_sha256"), str):
+            return 409, {"error": "Only a finished run's proposals can be applied."}
+        applied = rec.get("applied") if isinstance(rec.get("applied"), dict) else {}
+        if pid in applied:
+            done = _applied_view(applied[pid]) or {}
+            return 409, {"error": "This proposal was already applied (commit %s)." % (done.get("short") or "?"),
+                         "applied": done or None}
+        raw = self._read_run(run_id, "proposals.json", PROPOSALS_MAX)
+        if raw is None or hashlib.sha256(raw).hexdigest() != rec["proposals_sha256"]:
+            return 409, {"error": "proposals.json changed after the run finished (or is gone), so nothing is applied."}
+        try:
+            doc = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            doc = None
+        clean, _problems = validate_proposals(doc, rec.get("projects"), rec.get("markers"))
+        p = next((x for x in clean if x["id"] == pid), None)
+        if p is None:
+            return 404, {"error": "This run has no proposal %s." % pid}
+        if not p["patch_ok"]:
+            return 409, {"error": "This proposal's patch is withheld: %s" % p["patch_problem"]}
+        target, kind, patch = p["target"], p["target_kind"], p["patch"]
+        why = _target_problem(target, kind) or validate_patch(patch, target, kind) or \
+            self._copy_problem(run_id, p["patch_file"][len("proposals/"):], patch)
+        if why:
+            return 409, {"error": "Not applied: %s." % why}
+        roots = rec.get("roots") if isinstance(rec.get("roots"), dict) else {}
+        root = _root_of(roots, p["project"])
+        if not root:
+            return 409, {"error": "The run recorded no project root for %s, so nothing is applied." % p["project"]}
+        if body.get("root") != tilde(root):
+            return 409, {"error": "That is not the project root this run recorded for %s (%s)." % (p["project"], tilde(root))}
+        if _is_home(root) or not os.path.isdir(root):
+            return 409, {"error": "%s is not a project directory self-heal may change." % tilde(root)}
+        if caution(patch, target, kind, root) and body.get("acknowledge") is not True:
+            return 428, {"error": "This patch widens permissions or weakens a guard: tick the acknowledgement to apply it.",
+                         "acknowledge": True}
+        why = live_problem(root, target, kind, patch)
+        if why:
+            return 409, {"error": "Not applied: the patch %s." % why if why.startswith("does not match") else "Not applied: %s." % why}
+        new = _hunks(patch)[0]
+        ignored = _git_ignored(root, target)
+        why = _git_problem(root, target, new, ignored)
+        if why:
+            return 409, {"error": "Not applied: %s." % why}
+        data = patch.encode("utf-8")
+        rc, out, _err = _git(root, ["apply", "--numstat", "-"], stdin=data)
+        names = [ln.split("\t", 2)[-1] for ln in out.splitlines() if ln.strip()]
+        rc2, prefix, _e = _git(root, ["rev-parse", "--show-prefix"])
+        if rc or rc2 or names not in ([target], [prefix.strip() + target]):
+            return 409, {"error": "Not applied: the patch does not touch only %s." % target}
+        rc, _out, err = _git(root, ["apply", "--check", "--whitespace=nowarn", "-"], stdin=data)
+        if rc:
+            return 409, {"error": "Not applied: the patch no longer applies to %s (%s)." % (target, _line(err, 200))}
+        if ignored:
+            return self._apply_ignored(rec, pid, root, target, new, data, p["project"], run_id)
+        ident = _git_identity(root)
+        if ident is None:
+            return 409, {"error": "git has no user.name and user.email for %s: set them, then apply again." % tilde(root)}
+        rc, head0, _e = _git(root, ["rev-parse", "--verify", "-q", "HEAD"])
+        head0 = head0.strip() if not rc else ""
+        rc, _out, err = _git(root, ["apply", "--whitespace=nowarn", "-"], stdin=data)
+        if rc:
+            return 409, {"error": "Not applied: git apply failed (%s)." % _line(err, 200)}
+        title = _line(p["title"], 100) or "proposal %s" % pid
+        msg = ["-m", "self-heal: " + title, "-m", "Self-heal run %s, proposal %s." % (run_id, pid)]
+        rc, _out, err = _git(root, ["add", "--", target])
+        if not rc:
+            rc, _out, err = _git(root, ["commit", "--only", "--no-verify", "--quiet"] + msg + ["--", target], identity=ident)
+        rc_h, head, _e = _git(root, ["rev-parse", "--verify", "-q", "HEAD"])
+        head = head.strip()
+        if rc or rc_h or not SHA_RE.fullmatch(head) or head == head0:
+            self._undo(root, target, new)
+            return 409, {"error": "Not applied: the commit failed (%s); %s is back as it was." % (
+                _line(err, 200) or "git exited %d" % rc, target)}
+        rc, names, _e = _git(root, ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", head])
+        prefix = prefix.strip()
+        if rc or [n for n in names.splitlines() if n] != [prefix + target]:
+            # Never undone automatically: the commit is there, so say so loudly.
+            self._record_applied(rec, pid, head, root, target, p["project"])
+            return 500, {"error": "Commit %s in %s changed more than %s: check it." % (head[:12], tilde(root), target)}
+        done = self._record_applied(rec, pid, head, root, target, p["project"])
+        return 200, {"ok": True, "applied": done}
+
+    def _apply_ignored(self, rec, pid, root, target, new, data, project, run_id):
+        """Apply to a file git ignores: there is nothing to commit, so the old file is first copied to
+        S/backups/<run>/<proposal>.orig (0600) and the record keeps the new file's sha256 and the backup."""
+        backup = ""
+        if not new:
+            old, size = _read_under(root, target, LIVE_MAX + 1)
+            if old is None or size > LIVE_MAX:
+                return 409, {"error": "Not applied: cannot read %s safely to back it up." % target}
+            ensure_private_dir(self._path("backups"))
+            ensure_private_dir(self._path("backups", run_id))
+            backup = self._path("backups", run_id, pid + ".orig")
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(backup)                     # left by an attempt whose apply failed
+            _put(self._path("backups", run_id), pid + ".orig", old)
+        rc, _out, err = _git(root, ["apply", "--whitespace=nowarn", "-"], stdin=data)
+        if rc:
+            return 409, {"error": "Not applied: git apply failed (%s)." % _line(err, 200)}
+        now, _size = _read_under(root, target, LIVE_MAX + 1)
+        digest = hashlib.sha256(now or b"").hexdigest()
+        return 200, {"ok": True, "applied": self._record_applied(rec, pid, digest, root, target, project,
+                                                                 committed=False, backup=backup)}
+
+    def _record_applied(self, rec, pid, sha, root, target, project, committed=True, backup=""):
+        """Write the applied commit into the run's record (records/<id>.json, trusted state)."""
+        entry = {"sha": sha, "at": self.clock(), "root": root, "target": target, "project": project}
+        if not committed:
+            entry.update(committed=False, backup=backup)
+        applied = dict(rec.get("applied") if isinstance(rec.get("applied"), dict) else {})
+        applied[pid] = entry
+        rec["applied"] = applied
+        if rec["id"] in self._recs:
+            self._recs[rec["id"]]["applied"] = applied
+        self._save(rec)
+        return _applied_view(entry)
+
+    @staticmethod
+    def _undo(root, target, new):
+        """Put the target back after a failed commit: a new file removed, a tracked one restored from HEAD
+        (it had no changes before the apply)."""
+        if new:
+            _git(root, ["rm", "--cached", "--quiet", "--ignore-unmatch", "--", target])
+            fd = _open_under(root, os.path.dirname(target) or ".", want_dir=True)
+            if fd is not None:
+                try:
+                    os.unlink(os.path.basename(target), dir_fd=fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+        else:
+            _git(root, ["checkout", "HEAD", "--", target])
 
     def _read_run(self, run_id, rel, cap):
         """A file the child may have written in its run dir: no symlink anywhere below the run
@@ -1345,6 +1840,8 @@ class SelfHeal:
                 dropped.add("%s (no project directory)" % label)
             elif _is_home(root):     # its .claude/ is the user's own settings, never a project's harness
                 dropped.add("%s (its root is your home directory)" % label)
+            elif _is_temp(root):     # a scratch checkout under /tmp or $TMPDIR, gone soon
+                dropped.add("%s (its root is under a temp directory)" % label)
             else:
                 by_root.setdefault(root, []).append(r)
         projects = [self._project(root, labels.get(root) or os.path.basename(root), items, rows, red)
@@ -1493,8 +1990,24 @@ class SelfHeal:
             _put(run_dir, "%s/%s" % (dst, _snap_name(rel)), text)
             files.append(rel)
             skills.append(name)
+        # .claude/rules/<name>.md, loaded like CLAUDE.md: snapshotted as _claude/rules/<name>.md.txt.
+        rules = [n[:-3] for n in _dirs_under(root, ".claude/rules", stat.S_ISREG)
+                 if n.endswith(".md") and RULE_NAME_RE.fullmatch(n[:-3])]
+        cut += max(0, len(rules) - MAX_RULES)
+        kept = []
+        for name in rules[:MAX_RULES]:
+            rel = ".claude/rules/%s.md" % name
+            data, _size = _read_under(root, rel, RULE_MAX + 1)
+            if data is None:
+                continue
+            text, short = self._snap_text(data, RULE_MAX, red)
+            cut += short
+            _put(run_dir, "%s/%s" % (dst, _snap_name(rel)), text)
+            files.append(rel)
+            kept.append(name)
         return {"dir": dst, "files": files, "snapshot_rule": SNAPSHOT_RULE, "claude_md_marker_line": marker,
-                "skills": skills, "factory_lines": line_names, "has_guard_rules": ".claude/guard-rules.json" in files}, cut
+                "skills": skills, "rules": kept, "factory_lines": line_names,
+                "has_guard_rules": ".claude/guard-rules.json" in files}, cut
 
     @staticmethod
     def _snap_text(data, cap, red):

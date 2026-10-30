@@ -4,9 +4,10 @@
 Builds the evidence bundle of every session since the last completed self-heal run
 (the errors, guard denials, stalls, corrections and reworks they hit), starts ONE
 headless `claude -p` run of the self-heal workflow on it, waits, then prints the
-proposed harness changes (CLAUDE.md, guard rules, settings, skills, factory lines,
-cc_tool's templates) as patch files, grouped by project and severity, and the cost.
-Proposals only: nothing is applied and nothing it prints is run. The same run as the
+proposed harness changes (CLAUDE.md, guard rules, settings, skills, rule files,
+factory lines, cc_tool's templates) as patch files, grouped by project and severity,
+and the cost. Proposals only: nothing is applied and nothing it prints is run (the
+dashboard's drawer can apply one, after a typed confirm). The same run as the
 Self-heal button of `cc-dash --control`; both go through lib/cc_dash/selfheal.py and
 share its state under ${XDG_STATE_HOME:-~/.local/state}/cc_tool/selfheal/ (one run
 at a time). Reads ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/ like cc-dash.
