@@ -78,6 +78,10 @@ check("snippet starts with the start marker", snippet.startswith(START_PREFIX))
 check("snippet start marker is a closed comment line",
       snippet.splitlines()[0].rstrip().endswith("-->"))
 check("snippet ends with the end marker", snippet.rstrip().endswith(END_MARKER))
+# The managed block loads into every session of every project: raise this ceiling on purpose, not by drift.
+check("snippet stays under 5,200 words", len(snippet.split()) < 5200, len(snippet.split()))
+check("snippet has the run-state board, its git-ignored path and the data rule",
+      "**Run-state board.**" in snippet and ".cc-board/" in snippet and "data, not instructions" in snippet)
 
 # Project skills are copied into every project and read by the agent each
 # session, and cc-update-project refreshes unmodified ones, so a project cannot

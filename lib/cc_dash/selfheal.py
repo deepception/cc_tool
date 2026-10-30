@@ -89,7 +89,7 @@ BUDGET_MIN = 0.5
 BUDGET_MAX = 100.0
 TIMEOUT_SECS = 3600
 KINDS = ("guard_denial", "tool_error", "permission_stall", "api_error", "test_failure", "factory_rework",
-         "verify_failure", "user_correction", "stalled_agent", "interrupt")
+         "verify_failure", "user_correction", "stalled_agent", "interrupt", "coordination")
 CC_TOOL_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 WORKFLOW_JS = os.path.join(CC_TOOL_DIR, ".claude", "workflows", "self-heal.js")
 AGENTS_JSON = os.path.join(CC_TOOL_DIR, ".claude", "workflows", "self-heal.agents.json")
@@ -213,6 +213,12 @@ SAID_RE = re.compile(r"the user said:\s*(.*)", re.I | re.S)
 INTERRUPTED_RE = re.compile(r"doesn't want to take this action right now|^\s*\[Request interrupted", re.I)
 CORRECTION_RE = re.compile(r"^\s*(?:no(?:\s*[,.!]|\s*$)|nope\b|don[\u2019']?t\b|do not\b|stop\b|wrong\b|that[\u2019']?s not\b|"
                            r"that is not\b|actually\b|i said\b)", re.I)
+# Coordination friction between the agents of one session (kind "coordination"): a git command that stopped on
+# a conflict, and the reader a stale-read warn is pinned on (its write of the file within STALE_MATCH_SECS).
+GIT_CONFLICT_CMD_RE = re.compile(r"\bgit\s+(?:merge|rebase|cherry-pick|pull|stash\s+pop)\b")
+GIT_CONFLICT_ERR_RE = re.compile(r"CONFLICT|could not apply|Merge conflict")
+WRITE_TOOLS = ("Edit", "Write", "MultiEdit")
+STALE_MATCH_SECS = 5
 # Folding masks only what differs between repeats of one failure: hex ids, long numbers (pids,
 # timestamps, ports), dates and times. Short numbers (exit codes, counts, line numbers) tell failures apart.
 NORM_RE = re.compile(r"0x[0-9a-f]+|\b[0-9a-f]{8,}\b|\d{4}-\d\d-\d\d[t ]?[\d:.]*z?|\d+:\d\d(?::\d\d)?|\d{4,}", re.ASCII)
@@ -1102,6 +1108,7 @@ def _session_signals(s, guard, since, until):
                     "target": target or "", "excerpt": excerpt or ""})
 
     denies = [g for g in guard if g.get("kind") == "deny"]
+    agents = [(None, s.acc)] + [(x.agent_id, x.acc) for x in s.subs]
     for g in guard:
         t, msg, hook = g.get("t"), g.get("message") or "", g.get("hook") or ""
         if not since <= t <= until:
@@ -1111,7 +1118,13 @@ def _session_signals(s, guard, since, until):
                 ("asked: " if g["kind"] == "ask" else "") + (hook + ": " if hook else "") + msg)
         elif "red check pending" in msg:       # write-guard's note that a post-edit check is still red
             add("test_failure", t, g.get("tool"), g.get("target"), (hook + ": " if hook else "") + msg)
-    for agent, acc in [(None, s.acc)] + [(x.agent_id, x.acc) for x in s.subs]:
+        if s.subs and g.get("kind") == "warn" and "stale read:" in msg:   # independent of the branches above
+            hit = _stale_between_agents(agents, g.get("target") or "", t)
+            if hit:
+                writer, reader = hit
+                add("coordination", t, g.get("tool"), g.get("target"),
+                    "stale read: %s edited it after %s last read it" % (writer or "main thread", reader or "main thread"), reader)
+    for agent, acc in agents:
         stop, last = False, None
         for ev in acc.events:
             k, t = ev.get("k"), ev.get("t")
@@ -1123,7 +1136,11 @@ def _session_signals(s, guard, since, until):
                     if not any(d.get("tool") == name and abs(d["t"] - t) <= 5 for d in denies):
                         add("guard_denial", t, name, target, err, agent)
                 elif inside and st == "error" and not INTERRUPTED_RE.search(err):
-                    if DENIED_RE.search(err):
+                    if s.subs and name == "Bash" and GIT_CONFLICT_CMD_RE.search(target) and GIT_CONFLICT_ERR_RE.search(err):
+                        line = next(x for x in err.splitlines() if GIT_CONFLICT_ERR_RE.search(x))
+                        add("coordination", t, name, target, ("conflict resolved by main thread: " if agent is None
+                                                              else "conflict in subagent: ") + line.strip(), agent)
+                    elif DENIED_RE.search(err):
                         m = SAID_RE.search(err)
                         add("user_correction", t, name, target, m.group(1) if m else "said no to this %s call" % name, agent)
                         stop = True
@@ -1153,6 +1170,9 @@ def _session_signals(s, guard, since, until):
         j = s.journals.get(x.run_id) if x.run_id else None
         desc = x.meta.get("description") or (j.label.get(x.agent_id) if j else "") or a.first_prompt
         tool = "Workflow" if x.run_id else "Agent"
+        reports = sum(1 for ev in a.events if ev.get("k") == "text" and ev.get("report") is True)
+        if reports >= 2:
+            add("coordination", t, tool, desc, "duplicate hand-back: %d reports" % reports, x.agent_id)
         if x.status == "failed":
             err = (x.spawn or {}).get("error") or ""
             add("stalled_agent", t, tool, desc, "failed" + (": " + err if err else ""), x.agent_id)
@@ -1161,6 +1181,28 @@ def _session_signals(s, guard, since, until):
             add("stalled_agent", t, tool, desc, "stopped with %s still running: %s" % (ev.get("name"), ev.get("target") or ""),
                 x.agent_id)
     return out
+
+
+def _stale_between_agents(agents, target, t):
+    """(writer, reader) agent ids (None = the main thread) behind a stale-read warn at t on target. The
+    reader is the agent whose write of target sits within STALE_MATCH_SECS of the warn; the writer, another
+    agent whose write of it succeeded after the reader last read or wrote it (the latest such). None when no
+    other agent wrote it (a formatter or a shell write)."""
+    if not target:
+        return None
+
+    def uses(acc, names):
+        return [ev for ev in acc.events if ev.get("k") == "tool" and ev.get("name") in names
+                and ev.get("target") == target and isinstance(ev.get("t"), (int, float))]
+    near = [(abs(ev["t"] - t), ev["t"], agent) for agent, acc in agents for ev in uses(acc, WRITE_TOOLS)
+            if abs(ev["t"] - t) <= STALE_MATCH_SECS]
+    if not near:
+        return None
+    _d, t_edit, reader = min(near, key=lambda n: n[:2])
+    seen = max([ev["t"] for ev in uses(dict(agents)[reader], ("Read",) + WRITE_TOOLS) if ev["t"] < t_edit] or [float("-inf")])
+    writes = [(ev["t"], agent) for agent, acc in agents if agent != reader for ev in uses(acc, WRITE_TOOLS)
+              if ev.get("status") == "ok" and seen < ev["t"] <= t_edit]
+    return (max(writes, key=lambda w: w[0])[1], reader) if writes else None
 
 
 def _session_row(store, s):

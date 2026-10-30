@@ -109,6 +109,9 @@ CASES = [
     ("L02", "location", ROOT, "Write", {"file_path": "/etc/hosts", "content": "x"}, "s", D),
     ("L03", "location", ROOT, "Edit", {"file_path": os.path.join(HOME, ".bashrc"), "old_string": "a", "new_string": "b"}, "s", D),
     ("L04", "location", ROOT, "Write", {"file_path": os.path.join(ROOT, ".git", "config"), "content": "x"}, "s", D),
+    # .git/cc_tool/ is hook state and the factory ledger: hooks and cc-factory write it from Python, never a write tool.
+    ("L04b", "location", ROOT, "Write", {"file_path": os.path.join(ROOT, ".git", "cc_tool", "factory", "ledger.jsonl"), "content": "{}"}, "s", D),
+    ("L04c", "location", ROOT, "Edit", {"file_path": os.path.join(ROOT, ".git", "cc_tool", "session-s.json"), "old_string": "a", "new_string": "b"}, "s", D),
     ("L05", "location", ROOT, "Write", {"file_path": "/tmp/cc-wg-test/notes.txt", "content": "x"}, "s", A),
     ("L06", "location", ROOT, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", W),
     ("L06b", "location", ASKROOT, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", K),
@@ -125,6 +128,9 @@ CASES = [
     ("G06", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(OUTSIDE, "x.txt"), "content": "x"}, "s", W),
     ("G07", "worktree", WT_MAIN, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": f'token = "{FAKE_GH}"'}, "s", D),
     ("G08", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_MAIN, ".git", "config"), "content": "x"}, "s", D),
+    # The run-state board lives in the main checkout: a lead in a lane writes its checkpoint there, no note.
+    ("G10", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_MAIN, ".cc-board", "r", "lead-a", "checkpoint.md"), "content": "x"}, "s", A),
+    ("G11", "worktree", WT_LINKED, "Write", {"file_path": os.path.join(WT_MAIN, ".git", "cc_tool", "board", "x.md"), "content": "x"}, "s", D),
     ("G09", "worktree", ROOT, "Write", {"file_path": os.path.join(WT_LINKED, "src", "a.ts"), "content": "x"}, "s", W),
     # ── Secrets in content ────────────────────────────────────────────────
     ("S01", "secret", ROOT, "Write", {"file_path": A_TS, "content": "-----BEGIN RSA PRIVATE KEY-----\nMIIE"}, "s", D),
@@ -242,6 +248,50 @@ def run_case(root, tool, tool_input, session, guard=None):
     return A, out.strip()
 
 
+ACTIVITY = os.path.join(HOOKS, "activity-log.py")
+
+
+def _post(root, tool, path, session, agent=None):
+    """Run activity-log.py (PostToolUse) as a session's main thread, or one of its subagents."""
+    d = {"session_id": session, "hook_event_name": "PostToolUse", "tool_name": tool,
+         "tool_input": {"file_path": path}, "tool_response": {}}
+    if agent:
+        d.update(agent_id=agent, agent_type="general-purpose")
+    subprocess.run([PY, ACTIVITY], input=json.dumps(d), capture_output=True, text=True, cwd=root,
+                   timeout=60, env=dict(os.environ, CLAUDE_PROJECT_DIR=root))
+
+
+def _pre_edit(root, path, session, agent=None):
+    d = {"session_id": session, "hook_event_name": "PreToolUse", "tool_name": "Edit",
+         "tool_input": {"file_path": path, "old_string": "x", "new_string": "y"}}
+    if agent:
+        d.update(agent_id=agent, agent_type="general-purpose")
+    return run_case(root, "Edit", "@@RAW@@" + json.dumps(d), session)[0]
+
+
+def agent_trajectory():
+    """((id, got), expected, note) for two subagents and their main thread on one shared file."""
+    f = os.path.join(ROOT, "src", "shared.ts")
+    open(f, "w").write("export const s = 1;\n")
+    sid = "wg-agents-session"
+    _post(ROOT, "Read", f, sid, agent="agentA")                 # A reads
+    _post(ROOT, "Read", f, sid)                                 # the main thread reads too
+    later = time.time() + 5
+    open(f, "w").write("export const s = 2;\n")                # sibling B writes it
+    os.utime(f, (later, later))
+    _post(ROOT, "Write", f, sid, agent="agentB")
+    out = [(("A01", _pre_edit(ROOT, f, sid, agent="agentA")), W, "A's read is stale after B's write"),
+           (("A02", _pre_edit(ROOT, f, sid, agent="agentB")), A, "B wrote it last: its picture is current"),
+           (("A03", _pre_edit(ROOT, f, sid)), W, "the main thread's read is stale after B's write")]
+    g = os.path.join(ROOT, "src", "only-a.ts")
+    open(g, "w").write("export const g = 1;\n")
+    _post(ROOT, "Read", g, sid, agent="agentA")
+    later = time.time() + 5
+    os.utime(g, (later, later))
+    out.append((("A04", _pre_edit(ROOT, g, sid)), A, "the main thread never read it: no stale picture to warn about"))
+    return out
+
+
 def main():
     fails = []
     for cid, section, root, tool, ti, session, expected, guard in [c + (None,) for c in CASES] + [c + (PIN_GUARD,) for c in PIN_CASES]:
@@ -262,6 +312,12 @@ def main():
         leaked = [w for w in (key, key[4:20]) if w in detail or w in log]
         if got != D or leaked or "line " not in detail or "secret" not in log:
             fails.append((cid, "redact", "DENY without the secret", got, ("leaked %s; " % leaked) + detail[:160]))
+    # Subagents share their parent's session_id and differ by agent_id. A sibling's write must not
+    # refresh this agent's picture of the file, or the stale-read warning never fires between them.
+    for cid, expected, detail_want in agent_trajectory():
+        n_extra += 1
+        if cid[1] != expected:
+            fails.append((cid[0], "agents", expected, cid[1], detail_want))
     why = STATE_GUARD.problem()
     n_extra += 1
     if why:

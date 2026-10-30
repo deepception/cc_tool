@@ -9,7 +9,8 @@ Blocks (deny):
   - writes to system paths (/etc, /usr, /bin, /boot, /dev, /proc, /sys, …)
   - writes to the user's shell/credential dotfiles (~/.ssh/*, ~/.bashrc,
     ~/.zshrc, ~/.profile, ~/.gitconfig, ~/.aws/*, ~/.npmrc, ~/.config/gh/*)
-  - writes inside the repo's .git/ directory (or another worktree's)
+  - writes inside the repo's .git/ directory (or another worktree's),
+    .git/cc_tool/ included: the hooks' state and the factory ledger
   - writes into cc-dash's control directory
     (${XDG_STATE_HOME:-~/.local/state}/cc_tool/control/) or its log, by
     Write, Edit, MultiEdit or NotebookEdit, judged on the real path of the
@@ -47,6 +48,8 @@ Warns (additionalContext, never blocks):
   - stale read: the target file changed on disk after Claude last read or
     wrote it this session (a formatter, a shell write, another agent). The
     edit is probably built on an old picture of the file — re-read first.
+    Each subagent keeps its own picture (by agent_id), so a sibling writing
+    the same file in a shared worktree counts as "another agent".
   - red check pending: the post-edit typecheck reported errors after an edit to
     a DIFFERENT file and no edit has touched it since. Fix that first, so
     errors do not pile up across files (interlinked calls this the "bash-edit
@@ -234,7 +237,9 @@ def check_location(root: str, path: str, settings: dict) -> None:
             deny(root, path, f"writing to '{real}' changes the user's shell, git, or credential setup",
                  "show the user the snippet and let them add it")
     git_dir = os.path.join(root, ".git")
-    if _under(real, git_dir) and not _under(real, os.path.join(git_dir, "cc_tool")):
+    # .git/cc_tool/ included: the hooks' state and the factory ledger are written from Python
+    # (cc_hooklib, cc-factory), never by a write tool, and a forged line there is a forged record.
+    if _under(real, git_dir):
         deny(root, path, f"writing inside .git/ ('{os.path.relpath(real, root)}')",
              "use git commands for repository state; hooks belong in the project's hook manager config")
     if _under(real, root):
@@ -289,10 +294,10 @@ def check_secrets(root: str, path: str, contents: list) -> None:
                      "fixture, make it obviously fake (EXAMPLE/xxx)")
 
 
-def check_trajectory(root: str, session_id: str, path: str) -> None:
+def check_trajectory(root: str, session_id: str, path: str, agent_id: str = "") -> None:
     if not lib:
         return
-    state = lib.load_session(root, session_id)
+    state = lib.load_session(root, session_id, agent_id)
     real = os.path.realpath(path)
     seen = state["seen"].get(real)
     now_mtime = lib.file_mtime(real)
@@ -361,7 +366,7 @@ def main() -> None:
     if TOOL != "NotebookEdit":             # notebooks: the location checks only
         check_secrets(root, path, contents)
         check_project_rules(root, path, contents)
-        check_trajectory(root, data.get("session_id") or "", path)
+        check_trajectory(root, data.get("session_id") or "", path, data.get("agent_id") or "")
     if WARNINGS:
         _log(root, "warn", path, " | ".join(WARNINGS))
         print(json.dumps({"hookSpecificOutput": {

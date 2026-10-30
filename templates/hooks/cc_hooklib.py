@@ -16,8 +16,9 @@ What it provides
                          0700 and checked; '' when no safe place exists
   log_event(...)         append one JSON line to the activity log
   load_session/save_session
-                         per-session trajectory state (files seen with their
-                         mtime, files whose post-edit check was red)
+                         per-agent trajectory state (files seen with their
+                         mtime, files whose post-edit check was red): one file
+                         per session main thread, one per subagent (agent_id)
   load_rules(root)       project rules from .claude/guard-rules.json
   match_rules(...)       apply those rules to a tool call's fields
   block_message(...)     the one BLOCKED: … Suggestion: … format every guard uses
@@ -186,18 +187,24 @@ def log_event(root: str, kind: str, **fields) -> None:
 
 
 # ── Session trajectory state ──────────────────────────────────────────────────
-def _session_path(root: str, session_id: str) -> str:
-    """The session state file, or '' when there is no safe state dir."""
+def _session_path(root: str, session_id: str, agent_id: str = "") -> str:
+    """The state file of one session's main thread, or of one of its subagents
+    (they share the parent's session_id and differ by agent_id: with one file
+    between them, a sibling's write would refresh this agent's "seen" mtime and
+    hide the stale read). '' when there is no safe state dir."""
     sid = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "unknown")[:80]
+    aid = re.sub(r"[^A-Za-z0-9_.-]", "_", agent_id)[:100] if isinstance(agent_id, str) else ""
     d = state_dir(root)
-    return os.path.join(d, f"session-{sid}.json") if d else ""
+    if not d:
+        return ""
+    return os.path.join(d, f"session-{sid}@{aid}.json" if aid else f"session-{sid}.json")
 
 
-def load_session(root: str, session_id: str) -> dict:
+def load_session(root: str, session_id: str, agent_id: str = "") -> dict:
     """{"seen": {path: mtime}, "failed": {path: ts}, "notes": {key: ts}}."""
     base = {"seen": {}, "failed": {}, "notes": {}}
     try:
-        path = _session_path(root, session_id)
+        path = _session_path(root, session_id, agent_id)
         if not path:
             return base
         data = json.loads(_read(path))
@@ -210,9 +217,9 @@ def load_session(root: str, session_id: str) -> dict:
     return base
 
 
-def save_session(root: str, session_id: str, data: dict) -> None:
+def save_session(root: str, session_id: str, data: dict, agent_id: str = "") -> None:
     try:
-        path = _session_path(root, session_id)
+        path = _session_path(root, session_id, agent_id)
         if not path:
             return
         _write_atomic(path, json.dumps(data))

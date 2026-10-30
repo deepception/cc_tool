@@ -13,7 +13,8 @@ Two jobs, both silent (this hook never prints to Claude):
    .git/ so it is never committed and dies with the clone.
 
 2. Record what Claude has seen: after a Read, Edit, Write or MultiEdit the
-   file's current mtime goes into the session state. write-guard.py compares
+   file's current mtime goes into the session state (the main thread's, or
+   the subagent's own: they share session_id and differ by agent_id). write-guard.py compares
    that to the mtime at the next edit — if the file moved on since, the edit is
    about to be built on a stale picture (a formatter, a `sed -i`, another
    agent) and Claude is told to re-read. post-edit-typecheck.py records red
@@ -70,9 +71,10 @@ def main() -> None:
             real = os.path.realpath(path)
             mtime = lib.file_mtime(real)
             if mtime:
-                state = lib.load_session(root, session)
+                agent = data.get("agent_id") or ""
+                state = lib.load_session(root, session, agent)
                 state["seen"][real] = mtime
-                lib.save_session(root, session, state)
+                lib.save_session(root, session, state, agent)
 
 
 if __name__ == "__main__":

@@ -631,6 +631,18 @@ else
     echo "  ✓ .taste-skill/ added to .gitignore"
 fi
 
+# ── 4c. .gitignore: the run-state board ──────────────────────────────────────
+# The managed block's "Run-state board": each agent of a multi-agent run keeps its
+# brief, checkpoint and report under .cc-board/<run>/<label>/ in the main
+# checkout. Model output about one run, never source.
+if [[ -f "$GITIGNORE" ]] && grep -qxE '/?\.cc-board/?' "$GITIGNORE"; then
+    echo "  ✓ .cc-board/ already in .gitignore"
+else
+    [[ -s "$GITIGNORE" && -n "$(tail -c1 "$GITIGNORE")" ]] && echo >> "$GITIGNORE"
+    printf '# run-state board of multi-agent runs (cc_tool)\n.cc-board/\n' >> "$GITIGNORE"
+    echo "  ✓ .cc-board/ added to .gitignore"
+fi
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "Done! What's active in this project:"

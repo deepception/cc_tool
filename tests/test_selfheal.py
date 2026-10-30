@@ -12,6 +12,9 @@ Covered, by name prefix:
               sk-ant keys and a private-key block in a prompt, a tool error, a command, CLAUDE.md, settings and a
               skill: none survive in evidence.json or harness/), the bounds, pretty-printing, zero items -> done
               without spawning.
+  coordination: the coordination kind: a stale read caused by a sibling agent (and none without subagents or
+              without another writer), merge conflicts the main thread or a subagent hit, a duplicate hand-back,
+              and self-heal.js's KINDS matching sh.KINDS.
   state:      transitions, 0700 / 0600 modes, O_NOFOLLOW on state.json and runs/, one run at a time (409), a dead
               owner or child -> interrupted and a new run may start, a read-only instance creating nothing.
   endpoint:   POST /api/control/selfheal (404 without --control, 401, 403 unlock, bad Origin / Content-Type /
@@ -50,7 +53,7 @@ Run:  python3 tests/test_selfheal.py
 Env:  CC_DASH_PLAYWRIGHT  playwright-core directory     CC_DASH_CHROME  Chrome binary
       CC_DASH_SHOTS       directory for screenshots: header-off, header-on, header-running, header-done and
                           drawer, each at 1440x900 and 390x844, light and dark
-      SELFHEAL_ONLY       comma list of sections to run (evidence,state,endpoint,spawn,gate,proposals,workflow,review,apply,targets,ui)
+      SELFHEAL_ONLY       comma list of sections to run (evidence,coordination,state,endpoint,spawn,gate,proposals,workflow,review,apply,targets,ui)
 """
 import difflib
 import hashlib
@@ -365,6 +368,26 @@ class World:
                 fh.write(json.dumps(r) + "\n")
         return sid
 
+    def subagent(self, project, key, aid, recs, cwd=None):
+        """A subagent transcript of session `key`: <pdir>/<sid>/subagents/agent-<aid>.jsonl."""
+        cwd = cwd or self.dirs[project]
+        sid = self.sid[key]
+        d = os.path.join(self.cfg, "projects", cwd.replace("/", "-").replace(".", "-"), sid, "subagents")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "agent-%s.jsonl" % aid), "a") as fh:
+            for r in recs:
+                r = dict(r, sessionId=sid, cwd=cwd, isSidechain=True, agentId=aid)
+                fh.write(json.dumps(r) + "\n")
+        return sid
+
+    def guard_log(self, project, lines):
+        """cc_tool hook lines in <project>/.git/cc_tool/activity.jsonl (where the store looks for them)."""
+        d = os.path.join(self.dirs[project], ".git", "cc_tool")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "activity.jsonl"), "a") as fh:
+            for r in lines:
+                fh.write(json.dumps(r) + "\n")
+
     def make(self):
         self.store = Store(root=self.cfg, days=self.days)
         self.store.refresh(force=True)
@@ -393,6 +416,29 @@ def tool_error(t, n, tool, target, text, key="command"):
                          "usage": {"input_tokens": 1, "output_tokens": 1}}},
             {"type": "user", "timestamp": iso(t + 1), "uuid": "r" + tid,
              "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": text, "is_error": True}]}}]
+
+
+def tool_ok(t, n, tool, target, text="ok", key="command"):
+    """An assistant tool_use at t and its successful tool_result a second later."""
+    recs = tool_error(t, n, tool, target, text, key)
+    recs[1]["message"]["content"][0]["is_error"] = False
+    return recs
+
+
+def handback(t, n, message="report"):
+    """A subagent's SubagentHandback call (its report travels in the tool input)."""
+    tid = "hb_%d_%s" % (int(t), n)
+    return [{"type": "assistant", "timestamp": iso(t), "uuid": "a" + tid,
+             "message": {"id": "m" + tid, "model": "claude-haiku-5-5", "role": "assistant", "stop_reason": "tool_use",
+                         "content": [{"type": "tool_use", "id": tid, "name": "SubagentHandback", "input": {"message": message}}],
+                         "usage": {"input_tokens": 1, "output_tokens": 1}}}]
+
+
+def stale_warn(t, path, tool="Edit"):
+    """write-guard's warn line for a stale read (its notes joined with " | ", as the hook logs them)."""
+    return {"ts": t, "kind": "warn", "tool": tool, "hook": "write-guard", "path": path,
+            "message": "stale read: f.py changed on disk after you last read or wrote it this session "
+                       "(formatter, shell write, or another agent). Re-read it before editing. | some other note"}
 
 
 def evidence_dir(w, out=None):
@@ -620,6 +666,108 @@ def test_evidence():
     check("evidence: zero items -> the run is done at once, no child spawned, proposals 0, cost 0, window advanced",
           rec and rec.get("status") == "done" and rec.get("proposals") == 0 and not rec.get("cost_usd") and rec.get("error") == ""
           and not fake_records(wz.claude) and lc.get("id") == rid and lc["window"]["until"] == rec["window"]["until"], (out[0], rec, bool(fake_records(wz.claude))))
+
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# 1b. coordination
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+def test_coordination():
+    P = "coordination"
+    if not need_module(P):
+        return
+    now = time.time()
+    H = 3600
+
+    def items_of(w):
+        out = w.sh.start(days=1, origin="cli", dry_run=True, background=False)
+        _d, ev = load_evidence(w, out)
+        return (find_project(ev, "alpha") or {}).get("items", [])
+
+    def coord(items):
+        return [i for i in items if i["kind"] == "coordination"]
+
+    check("coordination: is one of the evidence kinds", "coordination" in sh.KINDS, sh.KINDS)
+
+    # 1. sibling B edits f after A read it; A's Edit then gets the stale-read warn
+    w = World("co1", ("alpha",))
+    f = os.path.join(w.dirs["alpha"], "src", "f.py")
+    t0 = now - 2 * H
+    w.session("alpha", "s", [prompt(t0, "split the work")] + tool_ok(t0 + 1, "m1", "Bash", "ls"))
+    w.subagent("alpha", "s", "agentA", tool_ok(t0 + 10, "a1", "Read", f, key="file_path")
+               + tool_ok(t0 + 30, "a2", "Edit", f, key="file_path"))
+    w.subagent("alpha", "s", "agentB", tool_ok(t0 + 20, "b1", "Edit", f, key="file_path"))
+    w.guard_log("alpha", [stale_warn(t0 + 30.2, f)])
+    w.make()
+    c = coord(items_of(w))
+    check("coordination: a stale read after a sibling's edit -> one item, agent = the reader, excerpt names the writer",
+          len(c) == 1 and c[0]["agent"] == "agentA" and c[0]["excerpt"] == "stale read: agentB edited it after agentA last read it"
+          and c[0]["target"].endswith("src/f.py"), c)
+
+    # 2. the same warn in a session without subagents; and a main-thread conflict there stays a tool_error
+    w = World("co2", ("alpha",))
+    f = os.path.join(w.dirs["alpha"], "src", "f.py")
+    w.session("alpha", "s", [prompt(t0, "edit alone")] + tool_ok(t0 + 10, "m1", "Read", f, key="file_path")
+              + tool_ok(t0 + 30, "m2", "Edit", f, key="file_path")
+              + tool_error(t0 + 60, "m3", "Bash", "git merge feat", "Auto-merging f.py\nCONFLICT (content): Merge conflict in f.py"))
+    w.guard_log("alpha", [stale_warn(t0 + 30.2, f)])
+    w.make()
+    items = items_of(w)
+    check("coordination: a stale read in a session without subagents -> no item", not coord(items), coord(items))
+    check("coordination: a conflict in a session without subagents stays a tool_error",
+          any(i["kind"] == "tool_error" and i["target"] == "git merge feat" for i in items), items)
+
+    # 3. a multi-agent session, but nobody else wrote f (formatter or shell noise)
+    w = World("co3", ("alpha",))
+    f = os.path.join(w.dirs["alpha"], "src", "f.py")
+    w.session("alpha", "s", [prompt(t0, "split the work")] + tool_ok(t0 + 1, "m1", "Bash", "ls"))
+    w.subagent("alpha", "s", "agentA", tool_ok(t0 + 10, "a1", "Read", f, key="file_path")
+               + tool_ok(t0 + 30, "a2", "Edit", f, key="file_path"))
+    w.subagent("alpha", "s", "agentB", tool_ok(t0 + 20, "b1", "Edit", os.path.join(w.dirs["alpha"], "other.py"), key="file_path"))
+    w.guard_log("alpha", [stale_warn(t0 + 30.2, f)])
+    w.make()
+    c = coord(items_of(w))
+    check("coordination: a stale read no other agent caused -> no item", not c, c)
+
+    # 4 + 5. merge conflicts with subagents around; a merge failing for another reason stays a tool_error
+    w = World("co4", ("alpha",))
+    w.session("alpha", "s", [prompt(t0, "merge the branches")]
+              + tool_error(t0 + 60, "m1", "Bash", "git merge feat", "Auto-merging f.py\nCONFLICT (content): Merge conflict in f.py\n"
+                           "Automatic merge failed; fix conflicts and then commit the result.")
+              + tool_error(t0 + 120, "m2", "Bash", "git merge other", "merge: other - not something we can merge"))
+    w.subagent("alpha", "s", "agentC", tool_ok(t0 + 10, "c1", "Bash", "ls")
+               + tool_error(t0 + 20, "c2", "Bash", "git rebase main", "error: could not apply 1234567... feat\nResolve all conflicts manually"))
+    w.make()
+    items = items_of(w)
+    c = coord(items)
+    main_c = [i for i in c if i["excerpt"].startswith("conflict resolved by main thread: ")]
+    check("coordination: a main-thread merge conflict with subagents -> 'conflict resolved by main thread' with the conflict line",
+          len(main_c) == 1 and main_c[0]["agent"] is None and main_c[0]["excerpt"].endswith("CONFLICT (content): Merge conflict in f.py"), c)
+    check("coordination: ... and no tool_error for it", not any(i["kind"] == "tool_error" and i["target"] == "git merge feat" for i in items), items)
+    sub_c = [i for i in c if i["excerpt"].startswith("conflict in subagent: ")]
+    check("coordination: a subagent's rebase conflict -> 'conflict in subagent', agent set",
+          len(sub_c) == 1 and sub_c[0]["agent"] == "agentC" and "could not apply" in sub_c[0]["excerpt"], c)
+    check("coordination: a git merge failing without a conflict stays a tool_error",
+          any(i["kind"] == "tool_error" and i["target"] == "git merge other" for i in items)
+          and not any(i["target"] == "git merge other" for i in c), items)
+
+    # 6. a subagent that handed back twice
+    w = World("co6", ("alpha",))
+    w.session("alpha", "s", [prompt(t0, "delegate")] + tool_ok(t0 + 1, "m1", "Bash", "ls"))
+    w.subagent("alpha", "s", "agentD", tool_ok(t0 + 10, "d1", "Bash", "ls") + handback(t0 + 20, "d2", "first")
+               + handback(t0 + 30, "d3", "second"))
+    w.subagent("alpha", "s", "agentE", tool_ok(t0 + 10, "e1", "Bash", "ls") + handback(t0 + 20, "e2", "once"))
+    w.make()
+    c = coord(items_of(w))
+    check("coordination: a subagent with two hand-backs -> one 'duplicate hand-back' item for it",
+          len(c) == 1 and c[0]["agent"] == "agentD" and c[0]["excerpt"] == "duplicate hand-back: 2 reports", c)
+
+    # 7. the workflow's KINDS is the Python list
+    m = re.search(r"const KINDS = \[([^\]]*)\]", strip_js_comments(open(WF_JS).read()))
+    js = re.findall(r"'([a-z_]+)'", m.group(1)) if m else None
+    check("coordination: self-heal.js's KINDS equals sh.KINDS, in order", js == list(sh.KINDS), (js, sh.KINDS))
+    wf = open(WF_JS).read()
+    check("coordination: the workflow tells the classifier what a coordination item means",
+          re.search(r"coordination: [^`]*CLAUDE\.md", wf) is not None)
 
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
@@ -2614,7 +2762,7 @@ def test_targets():
 
 
 def main():
-    sections = (("evidence", test_evidence), ("state", test_state), ("endpoint", test_endpoint), ("spawn", test_spawn), ("proposals", test_proposals),
+    sections = (("evidence", test_evidence), ("coordination", test_coordination), ("state", test_state), ("endpoint", test_endpoint), ("spawn", test_spawn), ("proposals", test_proposals),
                 ("workflow", test_workflow), ("review", test_review), ("apply", test_apply), ("targets", test_targets), ("ui", test_ui))
     try:
         for name, fn in sections:

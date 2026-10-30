@@ -12,7 +12,8 @@ StateGuard confirms the real projects.json is unchanged afterwards):
     skill, and installs .claude/workflows/factory-line.js
   - re-running is idempotent: each .gitignore line once, a hand-edited line.json kept,
     an existing .gitignore without a final newline is appended to, never glued
-  - plain `cc-setup <proj>` (no flag) creates no factory/ and edits no .gitignore for it
+  - plain `cc-setup <proj>` (no flag) creates no factory/ and edits no .gitignore for it,
+    but git-ignores the run-state board, .cc-board/, once across setup and update
   - `cc-factory init <proj>` alone gives the same scaffold
 
 Part of tests/test_factory.py (python3 tests/test_factory.py setup runs only this part;
@@ -194,6 +195,12 @@ def test_plain_setup_has_no_factory():
     r = run([os.path.join(REPO, "bin", "cc-update-project"), proj])
     check("plain: cc-update-project exits 0", r.returncode == 0, tail(r))
     check("plain: cc-update-project creates no factory/", not os.path.exists(os.path.join(proj, "factory")), os.listdir(proj))
+    # The run-state board (the managed block's "Run-state board") is git-ignored in every project, once.
+    gi = lines_of(os.path.join(proj, ".gitignore"))
+    check("plain: .cc-board/ is git-ignored exactly once after setup and update", gi.count(".cc-board/") == 1, gi)
+    os.makedirs(os.path.join(proj, ".cc-board", "run", "lead-a"), exist_ok=True)
+    r = run(["git", "-C", proj, "check-ignore", "-q", ".cc-board/run/lead-a/checkpoint.md"])
+    check("plain: git ignores a board file", r.returncode == 0, tail(r))
 
 
 def test_init_alone():

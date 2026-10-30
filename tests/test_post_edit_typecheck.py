@@ -79,12 +79,15 @@ def main():
         state = os.path.join(t, "state")
         os.makedirs(state)
 
-        def run(file_path, project, cwd=None):
+        def run(file_path, project, cwd=None, agent=None, path_dir=None):
             if os.path.exists(log):
                 os.remove(log)
-            env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""),
+            env = dict(os.environ, PATH=(path_dir or bindir) + os.pathsep + os.environ.get("PATH", ""),
                        CLAUDE_PROJECT_DIR=project, XDG_STATE_HOME=state)
-            payload = json.dumps({"tool_input": {"file_path": file_path}, "session_id": "scope-test"})
+            d = {"tool_input": {"file_path": file_path}, "session_id": "scope-test"}
+            if agent:
+                d["agent_id"] = agent
+            payload = json.dumps(d)
             subprocess.run([sys.executable, HOOK], input=payload, text=True, env=env, cwd=cwd or project,
                            capture_output=True, timeout=60)
             if not os.path.exists(log):
@@ -115,6 +118,30 @@ def main():
 
         r = run(os.path.join("src", "main.rs"), proj, cwd=proj)
         check("a relative path inside the project still runs", r == [["cargo", proj]], str(r))
+
+        # A subagent's red check lands in its own state file (it shares the session_id
+        # with its parent and siblings), not in the main thread's.
+        red = os.path.join(t, "red")
+        os.makedirs(os.path.join(red, ".git"))
+        write(os.path.join(red, "tsconfig.json"), "{}")
+        write(os.path.join(red, "a.ts"))
+        redbin = os.path.join(t, "redbin")
+        write(os.path.join(redbin, "tsc"), "#!/bin/sh\necho \"a.ts(1,1): error TS2322: nope\"\nexit 2\n")
+        os.chmod(os.path.join(redbin, "tsc"), 0o755)
+        run(os.path.join(red, "a.ts"), red, agent="agentA", path_dir=redbin)
+        sdir = os.path.join(red, ".git", "cc_tool")
+
+        def failed(name):
+            try:
+                with open(os.path.join(sdir, name)) as fh:
+                    return json.load(fh).get("failed") or {}
+            except (OSError, ValueError):
+                return {}
+        check("a subagent's red check is recorded in its own state",
+              os.path.realpath(os.path.join(red, "a.ts")) in failed("session-scope-test@agentA.json"),
+              str(sorted(os.listdir(sdir)) if os.path.isdir(sdir) else "no state dir"))
+        check("the main thread's state does not inherit a subagent's red check",
+              failed("session-scope-test.json") == {}, str(failed("session-scope-test.json")))
     finally:
         shutil.rmtree(t, ignore_errors=True)
 

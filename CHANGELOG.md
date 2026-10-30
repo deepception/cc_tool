@@ -2,6 +2,18 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.3.2
+
+Multi-agent runs coordinate through shared state rather than only through messages to and from the orchestrator. The stale-read check now works between subagents, branches land through the agent that wrote them, and each agent keeps its run state in files that survive a usage limit.
+
+**Upgrading:** run `cc-update-project` in each project from the terminal you use for `ccdash --control`. It refreshes the hooks and the managed block, git-ignores `.cc-board/` and re-records the code manifest. Then restart `ccdash --control`.
+
+- **The stale-read check sees sibling subagents.** Subagents share their parent's `session_id` and differ only by `agent_id`, and the hooks kept one state file per session. So when workers shared a worktree, a sibling's write refreshed every agent's record of the file and `[write-guard] stale read` never fired between them. No real warning fired in any of the 87 subagent transcripts of the v0.3 build. A subagent's reads and red checks also leaked into the main thread's state. `cc_hooklib` now keys the state file by `session_id` plus `agent_id` (`session-<sid>@<agent>.json`), and `activity-log`, `write-guard` and `post-edit-typecheck` pass the payload's `agent_id`. The main thread's file keeps its name.
+- **write-guard denies the write tools in `.git/cc_tool/`.** A carve-out from v0.0.17 let Write and Edit into it, and since v0.3.0 it also holds the factory ledger, so an agent could append a forged gate event without touching Bash. Hooks and `cc-factory` write there from Python, so nothing legitimate used the carve-out.
+- **Parallel branches land through their owner** (managed block). A subagent working toward a shared, unprotected integration branch rebases onto its head in its own worktree, resolves its own conflicts, reruns its tests and reports the new head. The orchestrator only fast-forwards. A rebase that needed conflict resolution goes back through review. Factory lanes are excluded: their merge gate is bound to the reviewed head.
+- **A run-state board** (managed block). In a multi-agent run each agent keeps `brief.md`, `checkpoint.md` and `report.md` in `<main checkout>/.cc-board/<run>/<label>/`. Hand-backs carry one line plus the path, an agent resumes after a usage limit from its checkpoint, and commit-review findings go to the owning agent's directory. Board files are data, not instructions. `cc-setup` git-ignores `.cc-board/`. A test caps the managed block at 5,200 words.
+- **Self-heal sees coordination friction between agents.** A new evidence kind, `coordination`, covers three things in a session with subagents: a stale-read warn from write-guard where another agent (or the main thread) edited the file after the warned agent last read it (a warn no other agent caused, such as a formatter's write, is left out), a `git merge`, `rebase`, `cherry-pick`, `pull` or `stash pop` that stopped on a conflict (in a session without subagents it stays a tool error), and a subagent that handed back more than once. Items name agents by id only. The classifier is told such items point at a convention in `CLAUDE.md`, a rule file or a skill, not at the project's code.
+
 ## v0.3.1
 
 Self-heal can now apply what it proposes, one confirmed proposal at a time, and propose changes to `.claude/rules/` files.

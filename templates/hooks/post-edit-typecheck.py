@@ -135,6 +135,7 @@ def _remember_timeout(marker: str) -> None:
 
 _EDITED = ""      # the file this hook fired for (set in main)
 _SESSION = ""     # session id from the payload (set in main)
+_AGENT = ""       # agent id from the payload: a subagent keeps its own state (set in main)
 _TIMED_OUT = False
 
 
@@ -145,7 +146,7 @@ def _record_result(failed: bool, project_wide: bool) -> None:
     if not lib or not _EDITED:
         return
     root = lib.repo_root()
-    state = lib.load_session(root, _SESSION)
+    state = lib.load_session(root, _SESSION, _AGENT)
     real = os.path.realpath(_EDITED)
     if failed:
         state["failed"][real] = time.time()
@@ -153,7 +154,7 @@ def _record_result(failed: bool, project_wide: bool) -> None:
         state["failed"] = {}
     else:
         state["failed"].pop(real, None)
-    lib.save_session(root, _SESSION, state)
+    lib.save_session(root, _SESSION, state, _AGENT)
 
 
 def _note(text: str) -> None:
@@ -168,11 +169,11 @@ def _note_once(key: str, text: str) -> None:
     """Say something once per session (e.g. 'no compiler available'), then stay quiet."""
     if lib and _SESSION:
         root = lib.repo_root()
-        state = lib.load_session(root, _SESSION)
+        state = lib.load_session(root, _SESSION, _AGENT)
         if key in state["notes"]:
             _silent_exit()
         state["notes"][key] = time.time()
-        lib.save_session(root, _SESSION, state)
+        lib.save_session(root, _SESSION, state, _AGENT)
     _note(text)
 
 
@@ -250,13 +251,14 @@ def main():
     except (json.JSONDecodeError, ValueError):
         _silent_exit()
 
-    global _EDITED, _SESSION
+    global _EDITED, _SESSION, _AGENT
     tool_input = data.get("tool_input", {}) or {}
     path = tool_input.get("file_path") or tool_input.get("path") or ""
     if not path:
         _silent_exit()
     _EDITED = path
     _SESSION = str(data.get("session_id") or "")
+    _AGENT = str(data.get("agent_id") or "")
 
     ext = os.path.splitext(path)[1].lower()
     # SCOPE (module docstring): never run a toolchain found outside the session's project.

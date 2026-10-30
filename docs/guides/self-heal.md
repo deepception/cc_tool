@@ -2,7 +2,7 @@
 
 # Self-heal: proposals from your agents' recent mistakes
 
-Self-heal reads what went wrong in your recent sessions and proposes changes to the project harness so the same mistakes stop recurring. It looks at guard denials, repeated tool errors, permission stalls, API errors, failing tests and type checks, factory rework and verify failures, your corrections, and stalled agents. The harness here means `CLAUDE.md`, guard rules, settings, skills, rule files, factory lines and cc_tool's own templates.
+Self-heal reads what went wrong in your recent sessions and proposes changes to the project harness so the same mistakes stop recurring. It looks at guard denials, repeated tool errors, permission stalls, API errors, failing tests and type checks, factory rework and verify failures, your corrections, stalled agents, and coordination friction between the agents of one session (an agent editing a file a sibling changed after it last read it, a merge or rebase stopping on a conflict while subagents worked, a subagent handing back more than once). The harness here means `CLAUDE.md`, guard rules, settings, skills, rule files, factory lines and cc_tool's own templates.
 
 The run only proposes. A patch reaches a project only when you press **Apply** on it in the dashboard and confirm. Nothing it prints is run. It closes the loop the factory assessment calls the kaizen gap (#17): failures turn into reviewed rule, prompt and line changes.
 
