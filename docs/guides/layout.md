@@ -56,6 +56,7 @@ cc_tool/
       reflect/SKILL.md                        session reflection and learning extraction
       skills-audit/SKILL.md                   audit installed skills for quality and overlap
       skill-engineer/SKILL.md                 create and update skills from workflow descriptions
+      skill-optimize/SKILL.md                 score-gated loop over one skill or CLAUDE.md file: headless sessions, noise gate, one held-out test
       dynamic-workflows/SKILL.md              the 6 Workflow patterns + operational controls (full catalog)
       loop-engineering/SKILL.md               structural model of an autonomous loop: loop-type taxonomy, six-component anatomy, disk state, inner/outer layers
       gauntlet-loop/SKILL.md                  builder vs. independent critic iterated against a concrete reference bar (technique: somethingbig.ai/gauntlet-loop)
@@ -113,6 +114,7 @@ cc_tool/
     test_factory.py              factory formats, ledger folding and file safety, worktree ledger path, cc-factory end to end, cc-setup --factory, factory-line.js sanity (parts: lib, cli, setup, workflow)
     test_selfheal.py             self-heal: window, redaction and bounds of the bundle, state and one run at a time, the control-scoped POST, the child's fixed argv and scrubbed env (fake claude), no self-approval, patch validation, workflow sanity, the header and drawer in headless Chrome
     test_docs_migrate.py         cc-docs-migrate on fixture projects: dry run writes nothing, classification and planned keys, skip reasons, link fixes, apply/log/backups, plans.py parse unchanged, idempotent re-apply, byte-identical undo, refusals (dirty tree, non-git, symlinked docs/, subdirectory), opt-in orders through cc-factory, --only
+    test_skill_optimize.py       skill-optimize's ratchet.py against a fake claude and real git: refusals, split, noise floor, keep/discard/void, guards, stops, restart, the one-time held-out test
   .claude/
     workflows/                   saved Workflow definitions (run via the Workflow tool)
       model-recalibration-audit.js  re-audit this setup against a new Claude model
@@ -138,6 +140,7 @@ python3 tests/test_usage_limits.py      # cc-statusline and cc-dash usage limits
 python3 tests/test_cc_dash_routing.py   # cc-dash Routing panel: classifier, flags, rewrites, endpoint, browser
 python3 tests/test_selfheal.py          # self-heal: bundle, state, control-scoped trigger, fixed child argv and env, patches, UI
 python3 tests/test_route_nudge.py       # route-nudge hook: nudge, silence, effort suffix, rollout
+python3 tests/test_skill_optimize.py    # skill-optimize: ratchet gates against a fake claude and real git
 ```
 
 ## Project guard rules

@@ -176,6 +176,8 @@ When updating an existing skill:
 5. Run the validation checklist
 6. Report what changed
 
+To measure whether a change helps rather than judge it, use `skill-optimize`.
+
 ## Anti-Patterns to Avoid
 
 - **Bloated skills**: Over 200 lines in SKILL.md. Split into SKILL.md + reference.md

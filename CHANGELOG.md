@@ -2,6 +2,15 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.3.3
+
+A new skill measures whether an edit to a skill or CLAUDE.md file actually helps, using headless Claude Code sessions on your login rather than an API key.
+
+**Upgrading:** run `cc-update-project` in each project to get `/skill-optimize`.
+
+- **`skill-optimize`, a score-gated loop over one instruction file.** `/skill-optimize <path>` runs fixed tasks through `claude -p`, grades the end state with your check scripts, and edits one hypothesis per round. `scripts/ratchet.py` owns every gate and every git step: a noise floor from paired task differences, a null run without the target, `guard` tasks and `protected` phrases an edit may not lose, a harness hash, a session cap, and one held-out test that prints `review-for-merge` or `do-not-merge`. It joins autoresearch's loop shape (one file, keep or restore, hard stops) to the validity rules of the `/claude-api hillclimb` guide. It only commits to a feature branch, and it never merges. The skill is manual-only because a full run is about 320 sessions. Workspaces are not a sandbox: sessions run as you with a reduced environment, so allow narrow tools and use a devcontainer for broad shell access.
+- **`skill-engineer` points to it** for measuring a change rather than judging it.
+
 ## v0.3.2
 
 Multi-agent runs coordinate through shared state rather than only through messages to and from the orchestrator. The stale-read check now works between subagents, branches land through the agent that wrote them, and each agent keeps its run state in files that survive a usage limit.
