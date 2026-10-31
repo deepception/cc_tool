@@ -10,3 +10,8 @@ docs/*
 .taste-skill/
 # cc_tool factory: holdout scenarios and lane worktrees
 .factory-holdout/
+# this repo's own harness: cc-update-project generates it from templates/
+/CLAUDE.md
+.claude/hooks/
+.claude/skills/
+.claude/settings.json

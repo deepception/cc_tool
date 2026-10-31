@@ -2,6 +2,14 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.4.2
+
+The harness `cc-update-project` deploys into this repository no longer shows up as uncommitted work.
+
+**Upgrading:** nothing to do in your projects. In a cc_tool checkout you ran `cc-update-project` on, copy `.claude/settings.json` aside and run `git checkout .claude/settings.json` before `git pull`, then copy it back: the pull removes the tracked file, and refuses to run while it has local changes.
+
+- **This repository's own harness is ignored.** `CLAUDE.md`, `.claude/hooks/`, `.claude/skills/` and `.claude/settings.json` are generated from `templates/`, and `cc_tool_root` and `cc_dash_manifest.json` are specific to one machine, so `.gitignore` now lists them and `.claude/settings.json` is no longer tracked. Tracking them would have repeated every template change in each release.
+
 ## v0.4.1
 
 `cc-setup` now recognises a skill copied from a branch that was later squashed, so `cc-update-project` refreshes it instead of reporting a local edit.
