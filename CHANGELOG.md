@@ -2,6 +2,18 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.4.3
+
+Setup for macOS and Windows: the README has a section for each, and `install.sh` checks what it needs first.
+
+**Upgrading:** cc_tool now requires Python 3.12+ as `python3`. Nothing else to do.
+
+- **`install.sh` checks its prerequisites before writing anything:** Python 3.12+, git, node/npx and Claude Code, with the install command for your system when one is missing. Under WSL it rejects a Windows `claude` or `npx` picked up from the Windows PATH, and warns when cc_tool sits on `/mnt/`.
+- **Git Bash stops with directions.** cc_tool needs a Unix terminal and `/proc`, so on Windows it runs in WSL 2.
+- **A new Mac gets a working PATH.** With no `~/.zshrc`, `install.sh` wrote to `~/.profile`, which zsh never reads, so `cc-setup` was not found. A zsh user now gets `~/.zshrc`, and bash on macOS gets `~/.bash_profile`.
+- **`cc-setup --devcontainer` works on macOS's bash 3.2.** With no `--cloud` or `--firewall` flags it stopped at `DEVCONTAINER_ARGS[@]: unbound variable`.
+- **`.gitattributes` keeps LF.** A Windows checkout with CRLF breaks every script's shebang.
+
 ## v0.4.2
 
 The harness `cc-update-project` deploys into this repository no longer shows up as uncommitted work.

@@ -6,11 +6,81 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$SCRIPT_DIR/bin"
 
+# ── 0. Prerequisites ──────────────────────────────────────────────────────────
+# Checked before anything is written, so a failed run leaves the machine as it was.
+case "$(uname -s)" in
+    Darwin) OS=macos ;;
+    MINGW*|MSYS*|CYGWIN*)
+        echo "Error: cc_tool does not run in Git Bash or native Windows: it needs a Unix terminal and /proc." >&2
+        echo "  Install WSL 2 (in PowerShell: wsl --install), then clone and run install.sh inside it." >&2
+        echo "  See \"Windows\" in README.md." >&2
+        exit 1
+        ;;
+    *) if grep -qi microsoft /proc/version 2>/dev/null; then OS=wsl; else OS=linux; fi ;;
+esac
+
+case "$OS" in
+    macos)
+        HINT_PYTHON="brew install python"
+        HINT_GIT="xcode-select --install"
+        HINT_NODE="brew install node"
+        ;;
+    wsl)
+        HINT_PYTHON="sudo apt install python3 (Ubuntu 24.04 or newer ships 3.12+)"
+        HINT_GIT="sudo apt install git"
+        HINT_NODE="sudo apt install nodejs npm"
+        ;;
+    *)
+        HINT_PYTHON="install python3 with your package manager"
+        HINT_GIT="install git with your package manager"
+        HINT_NODE="install nodejs and npm with your package manager"
+        ;;
+esac
+
+missing=0
+need() {  # need <what> <how to get it>
+    echo "✗ $1 — $2" >&2
+    missing=1
+}
+# WSL sees the Windows PATH, and a Windows claude or npx found there fails on Linux paths.
+windows_copy() {
+    [[ "$OS" == wsl && "$(command -v "$1")" == /mnt/* ]]
+}
+
+# Running them, not `command -v`: macOS ships python3 and git as stubs until the
+# Command Line Tools are installed.
+python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' 2>/dev/null \
+    || need "Python 3.12+ as python3" "$HINT_PYTHON"
+git --version >/dev/null 2>&1 || need "git" "$HINT_GIT"
+if ! command -v npx >/dev/null 2>&1; then
+    need "node/npx" "$HINT_NODE"
+elif windows_copy npx; then
+    need "node/npx inside WSL (found the Windows one: $(command -v npx))" "$HINT_NODE"
+fi
+if ! command -v claude >/dev/null 2>&1; then
+    need "Claude Code" "curl -fsSL https://claude.ai/install.sh | bash"
+elif windows_copy claude; then
+    need "Claude Code inside WSL (found the Windows one: $(command -v claude))" \
+        "curl -fsSL https://claude.ai/install.sh | bash"
+fi
+if (( missing )); then
+    echo "Install the above, open a new terminal, and run ./install.sh again." >&2
+    exit 1
+fi
+if [[ "$OS" == wsl && "$SCRIPT_DIR" == /mnt/* ]]; then
+    echo "⚠ cc_tool is on the Windows disk ($SCRIPT_DIR). Clone it into your WSL home (~) instead: /mnt/ is slow and loses file modes."
+fi
+
 chmod +x "$BIN_DIR/cc-setup" "$BIN_DIR/cc-update" "$BIN_DIR/cc-install-superpowers" "$BIN_DIR/cc-install-security" "$BIN_DIR/cc-install-tasteskill" "$BIN_DIR/cc-devcontainer" "$BIN_DIR/cc-token" "$BIN_DIR/cc-update-project" "$BIN_DIR/cc-update-permissions" "$BIN_DIR/cc-vault" "$BIN_DIR/cc-dash" "$BIN_DIR/cc-factory" "$BIN_DIR/cc-docs-migrate" "$BIN_DIR/cc-selfheal" "$BIN_DIR/cc-statusline"
 
 # ── 1. PATH ───────────────────────────────────────────────────────────────────
-if [[ -f "$HOME/.zshrc" ]]; then
+# A zsh user gets ~/.zshrc even before the file exists: a new Mac has none, and
+# zsh never reads ~/.profile. Terminal on macOS starts bash as a login shell,
+# which reads ~/.bash_profile and not ~/.bashrc.
+if [[ "${SHELL:-}" == */zsh || -f "$HOME/.zshrc" ]]; then
     PROFILE="$HOME/.zshrc"
+elif [[ "$OS" == macos ]]; then
+    PROFILE="$HOME/.bash_profile"
 elif [[ -f "$HOME/.bashrc" ]]; then
     PROFILE="$HOME/.bashrc"
 else

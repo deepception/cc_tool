@@ -2,18 +2,61 @@
 
 One-command setup for Claude Code projects: Superpowers skills, a toolbox of project skills, ten hooks (guards, logs, attention alerts and a model-routing nudge), a calibrated `settings.json`, and a managed methodology block in `CLAUDE.md`. The software factory (`cc-factory`: work orders, a line of stations, two human gates, a ledger) is on by default and takes work that needs a spec or a plan. Optional per-project extras: a self-writing vault (`cc-vault`) and a sandboxed devcontainer (`cc-devcontainer`). Across all projects, `cc-dash` shows how your agents are working, as one live graph on its Factory floor, and where each order, plan and document stands on its Work page.
 
-**Prerequisites:** `python3` (hooks and the JSON merges), `node`/`npx` (global skills installed via `npx skills`).
-
 ## Quick start
+
+Works on Linux, macOS 13+ and Windows through WSL 2. You need [Claude Code](https://code.claude.com/docs/en/setup), Python 3.12+ as `python3` (hooks and the JSON merges), `git`, and `node`/`npx` (global skills installed via `npx skills`). `install.sh` checks all four before it changes anything and prints the install command for whatever is missing.
 
 ```bash
 # once per machine: PATH, the ccdash shortcut, Superpowers plugin, security-guidance plugin, taste-skill design skills
-cd /path/to/cc_tool && ./install.sh
-source ~/.zshrc   # or ~/.bashrc
+git clone https://github.com/deepception/cc_tool.git ~/cc_tool
+cd ~/cc_tool && ./install.sh
+# open a new terminal
 
 # once per project
 cc-setup /path/to/your/project
 ```
+
+Keep the clone: your PATH points into it, and `cc-setup` reads its git history, so a downloaded ZIP won't do.
+
+### macOS
+
+Get the prerequisites first, using [Homebrew](https://brew.sh). Don't rely on Apple's `python3`: the one in the Command Line Tools is older than 3.12.
+
+```bash
+xcode-select --install             # git
+brew install python node
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+Then run the Quick start commands. Hooks, skills, Superpowers and `cc-dash` work. The factory's gates and the dashboard's control mode need Linux's `/proc`, so they stay off: `cc-setup` leaves the project on Superpowers and says so.
+
+### Windows
+
+cc_tool needs a Unix terminal and `/proc`, so it runs inside WSL 2, even though Claude Code itself can also run natively on Windows. In Git Bash, `install.sh` stops and points here.
+
+In PowerShell, once (restart if asked, then create a Linux user):
+
+```powershell
+wsl --install
+```
+
+Everything else happens in the Ubuntu terminal, not PowerShell:
+
+```bash
+sudo apt update && sudo apt install git python3 nodejs npm wslu
+curl -fsSL https://claude.ai/install.sh | bash
+echo 'export BROWSER=wslview' >> ~/.bashrc   # lets ccdash open your Windows browser
+```
+
+Then run the Quick start commands. Three things keep this working:
+
+- **Keep cc_tool and your projects in the Linux home (`~/...`), not `/mnt/c/...`.** The Windows disk is slow from WSL and loses file modes. In VS Code, install the WSL extension and run `code .` from the Ubuntu terminal.
+- **Install Claude Code and Node inside WSL.** WSL also sees the Windows PATH, so `install.sh` rejects a Windows `claude` or `npx` it finds there.
+- **Use Ubuntu 24.04 or newer.** Older releases ship a Python below 3.12.
+
+WSL 2 is Linux, so the factory and the dashboard's control mode should work, but neither has been tested on it. If a gate refuses your terminal, `cc-setup --no-factory` keeps the project on Superpowers.
+
+### What `cc-setup` does
 
 `cc-setup` installs hooks into `.claude/hooks/`, copies skills into `.claude/skills/`, creates or updates `.claude/settings.json` (your permissions are never overwritten), and creates `CLAUDE.md` from the template or appends the managed block to an existing one. Re-running is safe and idempotent. On Linux, in a git work tree, it also scaffolds the software factory (`factory/`); `--no-factory` keeps the project on Superpowers instead. Add `--vault` for a self-writing vault or `--devcontainer` for a sandbox.
 

@@ -4,7 +4,8 @@
 
 ```
 cc_tool/
-  install.sh                     one-time machine setup (PATH + Superpowers)
+  install.sh                     one-time machine setup (prerequisite check, PATH + Superpowers)
+  .gitattributes                 keeps the LF line endings the scripts need on every checkout
   bin/
     cc-setup                     first-time project setup (--vault / --devcontainer chain to cc-vault / cc-devcontainer; the factory is scaffolded through cc-factory init by default, --no-factory opts out and writes .claude/no-factory); prunes the five retired skill copies when byte-identical to a shipped version
     cc-vault                     scaffold a self-writing vault (single-inbox autonomous note processing)

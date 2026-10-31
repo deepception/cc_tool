@@ -756,5 +756,5 @@ fi
 if (( WITH_DEVCONTAINER )); then
     echo ""
     echo "── Devcontainer ────────────────────────────────────────────────────"
-    "$CC_TOOL_DIR/bin/cc-devcontainer" "$PROJECT_DIR" "${DEVCONTAINER_ARGS[@]}"
+    "$CC_TOOL_DIR/bin/cc-devcontainer" "$PROJECT_DIR" ${DEVCONTAINER_ARGS[@]+"${DEVCONTAINER_ARGS[@]}"}
 fi
