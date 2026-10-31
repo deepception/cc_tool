@@ -1116,8 +1116,9 @@ _GIT_ENV_NAMES_RE = re.compile(r"(?<![A-Za-z0-9_])(?:HOME|XDG_CONFIG_HOME|PATH|G
 # message editor, which can be any program, git commands that move a branch included.
 _EDITOR_ENV_RE = re.compile(r"^(?:GIT_SEQUENCE_EDITOR|GIT_EDITOR|EDITOR|VISUAL)=")
 _GIT_SUB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_LANDING_SUGGESTION = ("land work on a protected branch through a pull request (the factory's merge gate), or "
-                       "confirm with the user that this change to it is intended")
+_LANDING_SUGGESTION = ("land work on a protected branch through a pull request merged with a merge commit (a squash or "
+                       "rebase cannot pass the factory's merge gate), or confirm with the user that this change to it is "
+                       "intended")
 
 
 def _protected_named(tok: str) -> str:

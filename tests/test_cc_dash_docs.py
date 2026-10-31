@@ -109,6 +109,14 @@ def build(base):
         "src/lib/notes.md": "# Other notes\n",
         "src/app.py": "print(1)\n",
         "dist/out.md": "# built\n",
+        "docs/plans/quiet-fox.md": "# Quiet fox\n",
+        ".cc-board/run1/lab/checkpoint.md": "# Checkpoint\nsecret ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8\n",
+        ".cc-board/run1/lab/report.md": "# Report\n",
+        ".cc-board/run1/lab/data.json": "{}\n",
+        ".cc-board/run1/lab/shot.png": "png\n",
+        ".cc-board/run1/.hid/x.md": "# hidden board dir\n",
+        ".cc-board/x.json": "{}\n",
+        ".factory-holdout/FO-001/scenario.md": "# holdout scenario\n",
     }
     for rel, text in files.items():
         w(proj, rel, text)
@@ -123,6 +131,7 @@ def build(base):
     os.symlink("../README.md", os.path.join(proj, "docs", "link-in.md"))
     os.symlink("../.env", os.path.join(proj, "docs", "link-env.md"))
     os.symlink(outside, os.path.join(proj, "docs", "dirlink"))
+    os.symlink(os.path.join(base, "work", "outside.md"), os.path.join(proj, ".cc-board", "run1", "lab", "link.md"))
     os.mkfifo(os.path.join(proj, "docs", "fifo.md"))
     w(other, "README.md", "# Other project\n")
     now = time.time()
@@ -204,12 +213,17 @@ def run(base):
             "docs/superpowers/plans/2026-10-01-plan.md": "plans", "docs/superpowers/specs/spec.md": "plans",
             "docs/superpowers/research/r.md": "plans", "docs/guide.md": "docs", "docs/page.html": "docs",
             ".claude/skills/s1/SKILL.md": "skills", ".claude/skills/s1/references/r.md": "skills", "src/lib/notes.md": "other",
+            "docs/plans/quiet-fox.md": "plans", ".cc-board/run1/lab/checkpoint.md": "board", ".cc-board/run1/lab/report.md": "board",
         }
         wrong = {k: (paths.get(k), v) for k, v in expect.items() if paths.get(k) != v}
         check("tree: files land in their sections", st == 200 and not wrong, json.dumps(wrong))
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib", "cc_dash", "web", "docs.js")) as fh:
+            check("tree: the page renders the board section", "{ k: 'board'," in fh.read())
         never = [".claude/skills/.hidden/x.md", ".claude/agents/a.md", ".claude/worktrees/wt1/README.md", "node_modules/pkg/README.md",
                  ".git/x.md", ".env", ".env.md", "id_rsa.txt", "credentials.txt", "sub/.hidden.md", "dist/out.md",
-                 "docs/link-out.md", "docs/link-in.md", "docs/link-env.md", "docs/dirlink/secret.md", "docs/fifo.md", "requirements.txt"]
+                 "docs/link-out.md", "docs/link-in.md", "docs/link-env.md", "docs/dirlink/secret.md", "docs/fifo.md", "requirements.txt",
+                 ".cc-board/run1/lab/link.md", ".cc-board/x.json", ".cc-board/run1/lab/data.json", ".cc-board/run1/lab/shot.png",
+                 ".cc-board/run1/.hid/x.md", ".factory-holdout/FO-001/scenario.md"]
         listed = [p for p in never if p in paths]
         check("tree: skipped folders, dotfiles, secrets, symlinks and FIFOs are not listed", not listed, str(listed))
         check("tree: section counts add up", sum(t.get("counts", {}).values()) == len(paths) and t["counts"].get("vault") == 7, json.dumps(t.get("counts")))
@@ -243,6 +257,9 @@ def run(base):
         st, d, _ = file("docs/keys.md")
         txt = d.get("text", "")
         check("redaction: a live-looking API key is replaced", st == 200 and "[redacted: Anthropic API key]" in txt and "A1b2C3d4A1b2" not in txt, txt[:200])
+        st, d, _ = file(".cc-board/run1/lab/checkpoint.md")
+        check("board: a checkpoint is served and its secret redacted", st == 200 and "[redacted: GitHub token]" in d.get("text", "")
+              and "ghp_a1B2" not in d.get("text", "") and d.get("section") == "board", str(st))
         check("redaction: an obvious placeholder stays", "sk-ant-your-key-goes-here-example" in txt, txt[:200])
 
         # ── traversal and refusals ──────────────────────────────────────
@@ -255,6 +272,8 @@ def run(base):
             ".env": (403, 415), ".env.md": (403,), "id_rsa.txt": (403,), "credentials.txt": (403,), "key.pem": (415,),
             "src/app.py": (415,), "docs/img/pic.png": (415,), ".git/x.md": (403,), "node_modules/pkg/README.md": (403,),
             ".claude/agents/a.md": (403,), ".claude/skills/.hidden/x.md": (403,), ".claude/worktrees/wt1/README.md": (403,),
+            ".cc-board/x.json": (403,), ".cc-board/run1/lab/data.json": (403,), ".cc-board/run1/.hid/x.md": (403,),
+            ".cc-board/run1/lab/link.md": (403,), ".factory-holdout/FO-001/scenario.md": (403,), ".factory-holdout": (403,),
             "sub/.hidden.md": (403,), "docs/nope.md": (404,), "": (400,), "a" * 1100 + ".md": (400,),
         }
         for rel, want in cases.items():

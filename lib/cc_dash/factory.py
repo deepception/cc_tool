@@ -28,6 +28,10 @@ single order dict: status, per-station progress, gate, lane, rework count.
 Who reads it
   lib/cc_dash/graph.py   project_orders / line_config / ledger_path, polled
                          every few seconds by the read-only dashboard.
+  lib/cc_dash/gates.py   a gate's card in control mode: the order, the ledger
+                         and spec_hash, so a hash has one definition, and
+                         clean_note, so its audit log keeps a note as the
+                         ledger does.
   bin/cc-factory         loads THIS file by path (importlib), hence no import
                          of any other cc_dash module, and the writer side of
                          the formats lives there, not here.
@@ -48,6 +52,7 @@ Guarantees
 """
 import copy
 import datetime
+import hashlib
 import itertools
 import json
 import math
@@ -96,6 +101,16 @@ DEFAULT_LINE = {"version": 1, "lines": {"default": {
     ],
     "gates": {"spec": "human", "merge": "human"},
     "retries": 1,
+}, "quick": {
+    # No holdout, spec gate passes by itself; the merge stays a human act.
+    "stations": [
+        {"name": "plan", "title": "Plan", "model": "opus", "holdout": False},
+        {"name": "build", "title": "Build", "model": "sonnet", "holdout": False, "effort": "medium"},
+        {"name": "test", "title": "Test", "model": "sonnet", "holdout": False},
+        {"name": "review", "title": "Review", "model": "opus", "holdout": False},
+    ],
+    "gates": {"spec": "auto", "merge": "human"},
+    "retries": 1,
 }}}
 
 # ── Internal limits and patterns ──────────────────────────────────────────────
@@ -124,6 +139,7 @@ _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}")
 _SHA_RE = re.compile(r"[0-9a-fA-F]{4,64}")
 _FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40,64}")
 _HASH_RE = re.compile(r"[0-9a-f]{64}")
+TICKET_RE = re.compile(r"[0-9a-f]{32}")
 _DATE_RE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
 _DQ_FALLBACK_RE = re.compile(r'"(.*?)"\s*(?:\s#.*)?', re.DOTALL)
 _COMMENT_RE = re.compile(r"(?:^|\s)#")
@@ -194,6 +210,34 @@ def clip(s, n=NOTE_MAX):
         return _CTRL_RE.sub("", s)[:n]
     except Exception:  # noqa: BLE001
         return ""
+
+
+_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\Z)", re.S),
+    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{8,}"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
+)
+_SECRET_PAIR = re.compile(
+    r"(?i)\b([\w.-]{0,40}(?:password|passwd|secret|token|api[_-]?key)[\w.-]{0,40})([\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s,;]+)")
+
+
+def redact(text, limit=2000):
+    """Secret shapes replaced by [redacted]: a small subset of what the write guard blocks,
+    deliberately greedy (a ledger note is better over-redacted than leaking). Only the first
+    `limit` characters are looked at and kept."""
+    text = text[:limit]
+    for rx in _SECRET_PATTERNS:
+        text = rx.sub("[redacted]", text)
+    return _SECRET_PAIR.sub(lambda m: m.group(1) + m.group(2) + "[redacted]", text)
+
+
+def clean_note(text):
+    """A note as the ledger keeps it: redacted first, then clipped to NOTE_MAX characters."""
+    return clip(redact(text if isinstance(text, str) else ("" if text is None else str(text))), NOTE_MAX).strip()
 
 
 def _one_line(s, n):
@@ -417,6 +461,18 @@ def line_threshold(line):
     except Exception:  # noqa: BLE001
         pass
     return 1.0
+
+
+def spec_hash(body, line):
+    """sha256 over what the spec gate approves: the order body, the line (stations, gates, retries) and
+    the holdout threshold, as canonical JSON. cc-factory stores it; cc-dash recomputes it for a gate card.
+    `body` and `line` are what read_order and line_for return (line_for's lines always have those keys)."""
+    doc = {"body": body, "line": {"stations": line["stations"], "gates": line["gates"], "retries": line["retries"]},
+           "threshold": line_threshold(line)}
+    cmds = {k: line[k] for k in COMMAND_KEYS if line.get(k)}
+    if cmds:   # verify runs these: changing them after approval needs a new approval (absent, the hash is as before)
+        doc["line"]["commands"] = cmds
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii")).hexdigest()
 
 
 def line_config(root):
@@ -742,8 +798,9 @@ def valid_event(rec):
     attempt an int 1..999, cause in CAUSES, recommendation in RECOMMENDATIONS,
     flag in FLAGS, satisfaction a number in [0, 1], scenarios an int
     0..100000, no_holdout only True, merge_sha / lane_head / target full hex
-    shas, spec_hash 64 lowercase hex digits, briefing clipped to BRIEFING_MAX
-    (newlines kept)."""
+    shas, line a line name, line_hash and spec_hash 64 lowercase hex digits, briefing clipped to BRIEFING_MAX
+    (newlines kept), via only "dashboard" and ticket 32 lowercase hex digits (a gate
+    passed from cc-dash in control mode, and the ticket it spent)."""
     try:
         if not isinstance(rec, dict):
             return None
@@ -797,9 +854,18 @@ def valid_event(rec):
             v = rec.get(key)
             if isinstance(v, str) and _FULL_SHA_RE.fullmatch(v):
                 out[key] = v.lower()
-        v = rec.get("spec_hash")
-        if isinstance(v, str) and _HASH_RE.fullmatch(v):
-            out["spec_hash"] = v
+        v = rec.get("line")
+        if isinstance(v, str) and _LINE_NAME_RE.fullmatch(v):
+            out["line"] = v   # the line an order was created on: cc-factory refuses a later change
+        for key in ("spec_hash", "line_hash"):
+            v = rec.get(key)
+            if isinstance(v, str) and _HASH_RE.fullmatch(v):
+                out[key] = v
+        if rec.get("via") == "dashboard":
+            out["via"] = "dashboard"
+        v = rec.get("ticket")
+        if isinstance(v, str) and TICKET_RE.fullmatch(v):
+            out["ticket"] = v
         v = rec.get("briefing")
         if isinstance(v, str):
             v = clip(v, BRIEFING_MAX).strip()

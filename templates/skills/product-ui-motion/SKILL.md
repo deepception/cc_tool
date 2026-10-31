@@ -124,5 +124,5 @@ taste skill gives for product UI, this skill wins:
 
 Layout, density, colour and type scale → the project's component system. Landing pages,
 heroes, marketing choreography → `design-director`. Module or API shape →
-`design-an-interface`. Motion findings during a code review → `frontend-review`
+`design-an-interface`. Motion findings during a code review → `app-qa` (frontend)
 dimension 9, which reads this same catalog.

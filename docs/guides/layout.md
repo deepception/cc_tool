@@ -6,11 +6,11 @@
 cc_tool/
   install.sh                     one-time machine setup (PATH + Superpowers)
   bin/
-    cc-setup                     first-time project setup (--vault / --devcontainer / --factory chain to cc-vault / cc-devcontainer / cc-factory init)
+    cc-setup                     first-time project setup (--vault / --devcontainer chain to cc-vault / cc-devcontainer; the factory is scaffolded through cc-factory init by default, --no-factory opts out and writes .claude/no-factory); prunes the five retired skill copies when byte-identical to a shipped version
     cc-vault                     scaffold a self-writing vault (single-inbox autonomous note processing)
     cc-devcontainer              drop .devcontainer/ to sandbox Claude Code in Docker
     cc-token                     generate/refresh CLAUDE_CODE_OAUTH_TOKEN on host (for sandboxed containers)
-    cc-dash                      local read-only dashboard of Claude Code sessions (Python stdlib server on 127.0.0.1)
+    cc-dash                      local dashboard of Claude Code sessions, read-only outside control mode (Python stdlib server on 127.0.0.1)
     cc-factory                   software-factory CLI: work orders, spec and merge gates, lanes (worktree + branch), holdout dirs; the only writer of the factory ledger
     cc-selfheal                  self-heal from a terminal: the evidence bundle, one headless self-heal run, the proposals and their patch paths (--dry-run: the bundle only)
     cc-docs-migrate              bring a project's docs/ and vault/notes/ to the docs standard (docs/guides/docs-standard.md): frontmatter, relative links, opt-in factory orders via cc-factory new; dry run by default, every write logged with sha256 before/after and undoable from backups
@@ -23,11 +23,13 @@ cc_tool/
     limits.py                    usage limits for /api/graph (usage_limits): the freshest reading cc-statusline saved, per window, marked expired past its reset
     attention.py                 open alerts for /api/alerts: tails the attention hook's log, resolve rules, session registry, transcript fallback
     routing.py                   /api/routing: who picked each subagent's model and effort, work-type heuristic, cache-expiry rewrites, flags against the managed block's routing
-    docs.py                      Docs view: per-project file tree, search, one-time HTML frame tickets; path allowlisting, secret refusal, redaction
+    docs.py                      Docs view: per-project file tree, search, one-time HTML frame tickets; path allowlisting, secret refusal, redaction; serves the .md files of the run-state board .cc-board/ (section "Agent runs")
+    plans.py                     /api/plans: plan progress, plus the Work view's orders, documents and agent-run checkpoints (spec joins, docs/plans/ plan-mode files)
+    doctypes.py                  the document classifier (folder, name, shape) shared by cc-docs-migrate and the Work view
     graph.py                     /api/graph: the Factory floor's one live graph (projects, sessions, agents, workflows, orders, their edges, alerts, feed, KPIs), joined from the board, session rows, plans, alerts and orders
     factory.py                   work orders, the line and the ledger: the one implementation of the formats, read-only (cc-dash reads it, cc-factory writes through it)
     selfheal.py                  self-heal: the evidence bundle (bounded, redacted), the run's state and window, the fixed-argv child with a scrubbed env, finalize, proposal and patch validation, /api/selfheal
-    web/                         the page: index.html, app.css, app.js, alerts.js/.css (toasts, bell drawer, title badge), alerts-worker.js (background-tab poller), markdown.js (pure Markdown renderer), docs.js/.css (Docs view), routing.js/.css (the Overview's Routing panel), graph.js (dependency-free graph engine), factory.js/.css (the Factory floor), selfheal.js/.css (the header's Self-heal control and its results drawer); no CDN, no network
+    web/                         the page: index.html, app.css, app.js, alerts.js/.css (toasts, bell drawer, title badge), alerts-worker.js (background-tab poller), markdown.js (pure Markdown renderer), docs.js/.css (Docs view), plans.js/.css (the Work view; route #/plans), routing.js/.css (the Overview's Routing panel), graph.js (dependency-free graph engine), factory.js/.css (the Factory floor), selfheal.js/.css (the header's Self-heal control and its results drawer); no CDN, no network
     cc-update-project            update an existing project (hooks + skills + permissions)
     cc-update                    update global plugins (Superpowers + security-guidance)
     cc-update-permissions        [internal] deny/ask merge helper, called by cc-update-project
@@ -45,7 +47,7 @@ cc_tool/
       index.md, log.md             routing table + append-only run ledger seeds
     factory/                     scaffold dropped into project factory/ by cc-factory init
       README.md                    what the folder is, the order lifecycle in one table
-      line.json                    the default line: plan, build, test, verify (holdout), review; spec and merge gates
+      line.json                    the lines: default (plan, build, test, verify (holdout), review; human spec and merge gates) and quick (no verify, automatic spec gate)
       order-template.md            frontmatter + Intent / Acceptance criteria / Notes
     devcontainer/                files dropped into project .devcontainer/ by cc-devcontainer
       devcontainer.json            base config (cloud-specific mounts/env added at setup)
@@ -54,11 +56,10 @@ cc_tool/
       managed-settings.json        org-policy settings (highest precedence inside container)
     skills/                      project skills copied to .claude/skills/ on cc-setup
       reflect/SKILL.md                        session reflection and learning extraction
-      skills-audit/SKILL.md                   audit installed skills for quality and overlap
       skill-engineer/SKILL.md                 create and update skills from workflow descriptions
       skill-optimize/SKILL.md                 score-gated loop over one skill or CLAUDE.md file: headless sessions, noise gate, one held-out test
-      dynamic-workflows/SKILL.md              the 6 Workflow patterns + operational controls (full catalog)
       loop-engineering/SKILL.md               structural model of an autonomous loop: loop-type taxonomy, six-component anatomy, disk state, inner/outer layers
+        references/workflow-patterns.md         the 6 Workflow patterns + operational controls (full catalog; the former dynamic-workflows skill)
       gauntlet-loop/SKILL.md                  builder vs. independent critic iterated against a concrete reference bar (technique: somethingbig.ai/gauntlet-loop)
       knowledge-wiki/SKILL.md                 Karpathy compile-once wiki: distill a codebase/topic into a durable wiki
       vault/SKILL.md                          self-writing vault operations: process inbox → linked notes + digest, weekly synthesis, graph health
@@ -79,17 +80,12 @@ cc_tool/
       improve-codebase-architecture/SKILL.md  surface deep-module refactor opportunities as GitHub-issue RFCs (adapted from mattpocock/skills, MIT)
         REFERENCE.md, LICENSE                   RFC template; upstream MIT licence; source and SHA in the SKILL.md header
       triage/SKILL.md                         GitHub issue triage: bug/enhancement x 5-state machine, verify-before-label, agent-brief handoff (derived from mattpocock/skills)
-      app-qa/SKILL.md                         full QA engagement orchestrator: e2e + UI/UX review + frontend review over shared discovery, up to three docs
-      e2e-testing/SKILL.md                    plan + execute e2e tests of any app type; agent-run or paired mode; ✅/❌ walkthrough plan doc
-        references/                             test-plan doc format + app-type driving-tools table
-      ui-ux-review/SKILL.md                   live severity-tagged UX walkthrough (🔴🟡🔵) with beyond-happy-path sweep
-        references/                             severity rubric, doc structure, app-type adaptation table
-      frontend-review/SKILL.md                static interface-layer source review; no-duplication contract vs sibling docs
-        references/                             the 9 review dimensions + coverage-mapping format
+      app-qa/SKILL.md                         /app-qa e2e|ux|frontend|all: one QA activity or the full engagement over shared discovery, up to three docs
+        references/                             e2e.md, ux.md, frontend.md (the three former skills' instructions), test-plan format, severity rubric, the 9 review dimensions, app-type driving-tools table, a worked example
     hooks/
       cc_procs.py                process checks shared by dash-control.py and cc-dash (not a hook): which process is the real dashboard, which wrote a request, the sha256 record of cc-dash's code
       cc_hooklib.py              shared helpers (not a hook): repo root, BLOCKED: message format, activity log, per-session trajectory state, .claude/guard-rules.json loader
-      session-context.py         SessionStart: git state, sensitive files, vault state, detected quality commands
+      session-context.py         SessionStart: git state, sensitive files, vault state, the factory line (and open order ids and statuses, never titles), detected quality commands
       bash-guard.py              PreToolUse Bash: block commits/pushes to main/master, --no-verify, secret-file reads via grep/awk/xargs/inline interpreters, destructive commands (rm -rf on roots/.git/lockfiles/CI, sudo rm, pkill <name>, push --force, curl|sh, env|curl, registry redirection, mkfs/dd, chmod 777); ask only before installs, deletions, GitHub API writes and landing work on a protected branch, by allowlist (with HEAD on main/master/production/release, or moved to one or to an unknown branch earlier in the command, only git commands that cannot move it run: reads, add/mv/stash, fetch without a refspec, branch listing or a new branch, checkout/switch without -B/-C, config reads, `git pull --ff-only` from its own verified upstream; anything else asks, aliases, `-c` and GIT_DIR included; on any branch, a non-read git command that names a protected branch, or one it cannot read such as `-`, @{-1} or an expansion, asks, as do update-ref --stdin, symbolic-ref writes, remote add/set-url/set-branches and config writes to alias, remote, branch, url, pull, include or core.hooksPath; an unparseable git command asks; a text guard whose documented residual class is a `cd` into another repository and `.git/config` edited by hand through the shell); deleting anything that is not scratch or an untracked regenerable cache (rm / rmdir / find -delete / xargs rm / rsync --delete, git rm, checkout -- / restore <paths>, worktree remove --force, reset --hard, clean -f, branch -D, stash drop, docker prune, kubectl delete --all, terraform destroy, DROP-TRUNCATE-DELETE-without-WHERE), and `npx <pkg>` when the package is not on disk (installed dev dependencies and exact versions already in the npx cache run without a prompt), and a `gh api` call that may write (-X/--method other than GET, -f/-F fields without `-X GET`, --input, a method-override header, a GraphQL query with `mutation` or a `$`, or any word that is not literal: a `$`/backtick (no variable is resolved), an unquoted glob or brace, process substitution, IFS, or a command name bash builds such as `$G api`; reads such as `gh api repos/o/r --jq …` stay prompt-free under the `Bash(gh api *)` allow rule), or one sent to another host (--hostname, a full URL other than https://api.github.com/…, any mention of GH_HOST, GH_CONFIG_DIR, XDG_CONFIG_HOME or HOME beyond a plain $HOME read, or a builtin or loop that can set a variable by a built name: declare, export, read, printf -v, for …); git options that run a command or write a file, anywhere in the arguments, past `--` too (--exec, --upload-pack, --receive-pack and git's abbreviations of them, clone -u, clone -c/--config, --output); and a command it cannot finish checking within 2.4 s of its 3 s timeout (a hook that times out lets the command run unchecked); warn on shell writes into source files (> / tee / sed -i / patch / git apply); applies project rules
       write-guard.py             PreToolUse Edit|Write|MultiEdit|NotebookEdit, on every path field: deny writes into cc-dash's control directory, log and project registry, self-heal's state directory, and anywhere in the pinned cc_tool checkout (unless the project is that checkout or one of its worktrees); deny writes to system paths, shell/credential dotfiles, .git/ (NotebookEdit gets these location checks only); deny real-looking secrets in content (keys, tokens, JWTs, credential assignments; placeholders and .env* pass); warn on writes outside the repo (tunable to ask; the repo's other git worktrees count as inside); warn on stale reads (file changed on disk since last read) and on a red check pending in another file; applies project rules
       route-nudge.py             PreToolUse Agent|Task: one line of additionalContext when the call names no `model` (and, above medium session effort, no `effort`); never asks, denies or prints for a call that names a model
@@ -114,11 +110,15 @@ cc_tool/
     test_factory.py              factory formats, ledger folding and file safety, worktree ledger path, cc-factory end to end, cc-setup --factory, factory-line.js sanity (parts: lib, cli, setup, workflow)
     test_selfheal.py             self-heal: window, redaction and bounds of the bundle, state and one run at a time, the control-scoped POST, the child's fixed argv and scrubbed env (fake claude), no self-approval, patch validation, workflow sanity, the header and drawer in headless Chrome
     test_docs_migrate.py         cc-docs-migrate on fixture projects: dry run writes nothing, classification and planned keys, skip reasons, link fixes, apply/log/backups, plans.py parse unchanged, idempotent re-apply, byte-identical undo, refusals (dirty tree, non-git, symlinked docs/, subdirectory), opt-in orders through cc-factory, --only
+    test_session_context.py      session-context.py's factory part: no factory, no cc-factory on PATH, a fake cc-factory, malformed JSON, a timeout, a hostile title kept out, exit 0 and valid JSON throughout
+    test_skill_prune.py          cc-setup's retired-skill pruning against this repo's git history: an unmodified copy goes; an edited copy, an extra file and a user's own same-named skill stay
+    test_cc_dash_plans.py        /api/plans: plan discovery and progress, the Work payload (orders, documents, board), spec joins, path safety
+    test_cc_dash_work_ui.py      the Work page in headless Chrome: sections and counts, order deep link, hostile titles as text, phone width, both themes
+    test_settings_template.py    templates/settings.json shape: no Write(path) rules, nothing cc-setup retires, plansDirectory set once and never overriding a project's
     test_skill_optimize.py       skill-optimize's ratchet.py against a fake claude and real git: refusals, split, noise floor, keep/discard/void, guards, stops, restart, the one-time held-out test
   .claude/
     workflows/                   saved Workflow definitions (run via the Workflow tool)
       model-recalibration-audit.js  re-audit this setup against a new Claude model
-      ship-pipeline.js              Planner → Coder → Tester → Reviewer pipeline
       loop-until-clean.js           loop-until-done sweep: stop after two dry rounds, then verify survivors
       factory-line.js               the factory line: plan → build → test → holdout verify → review, rework loop, never merges (copied into projects by cc-factory init)
       self-heal.js                  self-heal: classify → root cause → propose → adversarial check → write, readers read-only (run by cc-dash and cc-selfheal, never by hand)

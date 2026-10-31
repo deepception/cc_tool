@@ -11,7 +11,8 @@ Every endpoint is a GET behind the pairing token (server.py). What may be read:
     resolve (realpath, so symlinks are followed first) to a location inside
     the root's realpath; a symlink that leaves the root is refused, and the
     checks below run again on the resolved path.
-  - no segment may start with '.', except the subtree .claude/skills/; no
+  - no segment may start with '.', except the subtree .claude/skills/ and the .md files of the
+    run-state board .cc-board/<run>/<label>/ (section `board`); no
     segment may be a skipped directory (.git, node_modules, .venv, dist, ...).
   - only .md/.markdown/.html/.htm/.txt (docs) and .png/.jpg/.jpeg/.gif/.webp/
     .svg/.avif/.bmp/.ico (assets); nothing bash-guard calls secret material
@@ -47,6 +48,7 @@ IMG_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".g
 MAX_DOC = 2 * 1024 * 1024
 MAX_IMG = 10 * 1024 * 1024
 MAX_PATH = 1024
+BOARD_DIR = ".cc-board"      # the run-state board; its .md files are served, nothing else under a dot-directory
 
 # Directories never walked or served (besides every dot-directory but .claude/skills).
 SKIP_DIRS = {"node_modules", "dist", "build", "out", "__pycache__", "venv", "env", "site-packages",
@@ -186,10 +188,12 @@ def section_of(rel):
     parts = rel.split("/")
     if parts[0] == "vault":
         return "vault"
-    if parts[0] == "docs" and len(parts) > 2 and parts[1] == "superpowers":
+    if parts[0] == "docs" and len(parts) > 2 and parts[1] in ("superpowers", "plans"):
         return "plans"
     if parts[0] == "docs":
         return "docs"
+    if parts[0] == BOARD_DIR and len(parts) > 1:
+        return "board"
     if len(parts) == 1:
         return "root"
     if rel.startswith(".claude/skills/"):
@@ -200,10 +204,12 @@ def section_of(rel):
 def _segment_ok(parts):
     """'' when every segment may be served, else why not."""
     in_skills = len(parts) > 2 and parts[0] == ".claude" and parts[1] == "skills"
+    # The run-state board: Markdown files only, and only the top directory may be a dot-directory.
+    in_board = len(parts) > 1 and parts[0] == BOARD_DIR and parts[-1].lower().endswith(".md")
     for i, seg in enumerate(parts):
         if seg in ("", ".", ".."):
             return "bad segment"
-        if seg.startswith(".") and not (in_skills and i < 2):
+        if seg.startswith(".") and not (in_skills and i < 2) and not (in_board and i == 0):
             return "hidden file or directory"
         if seg in SKIP_DIRS and i < len(parts) - 1:
             return "skipped directory"
@@ -403,6 +409,9 @@ class Docs:
                             # Inside .claude only skills/ (never worktrees/, agents/, ...).
                             if rel not in (".claude", ".claude/skills") and not (
                                     rel.startswith(".claude/skills/") and not name.startswith(".")):
+                                continue
+                        elif rel == BOARD_DIR or rel.startswith(BOARD_DIR + "/"):
+                            if name.startswith(".") and rel != BOARD_DIR:
                                 continue
                         elif name.startswith("."):
                             continue

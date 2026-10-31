@@ -55,6 +55,17 @@ the line and its threshold into the spec gate's event, and `run-args` and `recor
 it no longer matches; `approve --gate merge` checks with git that the lane branch is merged.
 On a line whose spec gate is human, `lane` and `run-args` also need the spec gate's pass in
 the ledger, and both refuse a lane whose commit tracks files under .factory-holdout/.
+
+The one other way a gate decision reaches `approve` and `reject` is cc-dash in control mode
+(lib/cc_dash/gates.py): after a human unlocked it and typed the decision, cc-dash starts this
+script itself, with a socket on --ticket-fd, a flag only that child has any use for. It proves
+nothing by being passed: the kernel must name the socket's other end as this process's parent
+(SO_PEERCRED and getppid, never a path or a lease) and as held by it alone (peer_holder_problem),
+that parent must pass the rules the control hook applies to a dashboard (the project's
+cc_dash_manifest.json, dashboard_problem, code_after_start) and be in control mode
+(control_mode_problem: --control and a controlling terminal), and the single-use ticket it hands
+over must name exactly this order, gate, decision and spec hash or reviewed head. Anything else
+refuses, and an agent's tool call has no such parent. See dashboard_ticket().
 """
 import os
 import sys
@@ -84,6 +95,7 @@ import math  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import select  # noqa: E402
+import socket  # noqa: E402
 import stat  # noqa: E402
 import subprocess  # noqa: E402
 import termios  # noqa: E402
@@ -159,37 +171,15 @@ def block_message(reason, suggestion=""):
 
 # ── Text hygiene ──────────────────────────────────────────────────────────────
 _CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_SECRET_PATTERNS = (
-    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\Z)", re.S),
-    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{8,}"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})"),
-    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{8,}"),
-    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}"),
-)
-_SECRET_PAIR = re.compile(
-    r"(?i)\b([\w.-]{0,40}(?:password|passwd|secret|token|api[_-]?key)[\w.-]{0,40})([\"']?\s*[:=]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s,;]+)")
-
-
-def redact(text, limit=2000):
-    """Secret shapes replaced by [redacted]: a small subset of what the write guard blocks,
-    deliberately greedy (a ledger note is better over-redacted than leaking). Only the first
-    `limit` characters are looked at and kept."""
-    text = text[:limit]
-    for rx in _SECRET_PATTERNS:
-        text = rx.sub("[redacted]", text)
-    return _SECRET_PAIR.sub(lambda m: m.group(1) + m.group(2) + "[redacted]", text)
 
 
 def clean_note(text):
-    """A note as the ledger keeps it: redacted first, then clipped to 500 characters."""
-    return F.clip(redact(text if isinstance(text, str) else ("" if text is None else str(text))), F.NOTE_MAX).strip()
+    return F.clean_note(text)
 
 
 def clean_briefing(text):
     """The merge-gate briefing as the ledger keeps it: redacted, clipped to BRIEFING_MAX (marked)."""
-    text = redact(text, 4 * F.BRIEFING_MAX)
+    text = F.redact(text, 4 * F.BRIEFING_MAX)
     if len(text) > F.BRIEFING_MAX:
         tail = "\n… (clipped here for the ledger; cc-factory record printed all of it)"
         text = text[:F.BRIEFING_MAX - len(tail)] + tail
@@ -477,6 +467,54 @@ def load_order(main, oid):
 
 def line_of(main, order):
     return F.line_for(F.line_config(main), order.get("line"))
+
+
+def line_hash(line):
+    """sha256 of the normalised line definition (stations, gates, retries, threshold, run/test commands) as
+    canonical JSON: the part of a line that decides which checks an order gets."""
+    doc = {"stations": line["stations"], "gates": line["gates"], "retries": line["retries"], "threshold": F.line_threshold(line)}
+    cmds = {k: line[k] for k in F.COMMAND_KEYS if line.get(k)}
+    if cmds:
+        doc["commands"] = cmds
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def refuse_line_flip(oid, o, events):
+    """Refuse an order whose `line:` no longer names the line its `created` event pinned, whatever approval
+    exists: a spec-gate pass hashes the body and line, so approving after a flip would bless the flipped line.
+    A missing `created` event or one without a `line` is left to the hash fallback."""
+    ev = next((e for e in events if e.get("event") == "created"), None)
+    now = o.get("line") or "default"
+    if ev is not None and ev.get("line") and ev["line"] != now:
+        refuse("%s was created on the %s line but its order file now says %s: a line is never changed after creation"
+               % (oid, one_line(ev["line"], 40), one_line(now, 40)),
+               "restore `line: %s` in the order file; for another line, reject the order and file a new order" % one_line(ev["line"], 40))
+
+
+def check_line_pin(oid, o, events, line, body):
+    """Refuse when the line an order runs on is not the one it was created on. The `created` event pins the
+    line's name and a hash of its definition: an agent that edits the order's `line:` to `quick`, or rewrites
+    the line in factory/line.json (spec gate to auto, verify dropped), would otherwise shed verify and the
+    spec gate. Fail closed: an order proceeds only when its `created` event carries both `line` and `line_hash`
+    and both match now, or when a spec-gate pass exists whose stored hash matches the current body and line.
+    Anything else (no created event, a pin without a hash, an order from before the pin) is refused."""
+    ev = next((e for e in events if e.get("event") == "created"), None)
+    now = o.get("line") or "default"
+    refuse_line_flip(oid, o, events)
+    if ev is not None and ev.get("line") == now and ev.get("line_hash") and ev["line_hash"] == line_hash(line):
+        return
+    e = spec_gate_event(events)
+    if e is not None and e["state"] == "pass" and e.get("spec_hash") == spec_hash(body, line):
+        return
+    if e is not None and e["state"] == "pass":
+        if line["gates"]["spec"] != "human":
+            refuse("%s: the line's definition changed since approval, and this line has no human spec gate to approve it again" % oid,
+                   "reject the order and file a new order")
+        refuse("%s: the spec changed since approval (the order body, its line or the line's definition differ from what was approved)" % oid,
+               "a human reads the spec again and runs cc-factory approve %s, or reject the order and file a new order" % oid)
+    refuse("%s cannot be tied to the %s line it runs on: its creation record does not pin that line's definition, or factory/line.json "
+           "has changed since, and no spec approval matches the current order and line" % (oid, one_line(now, 40)),
+           "restore the line as it was, or reject the order and file a new order")
 
 
 def reload_order(main, oid):
@@ -770,7 +808,8 @@ def cmd_new(args):
                 refuse("could not find a free order number", "retry")
         finally:
             os.close(dfd)
-        write_event(lfd, make_rec(oid, "created", status="queued"))
+        write_event(lfd, make_rec(oid, "created", status="queued", line=line_name,
+                                          line_hash=line_hash(cfg["lines"][line_name])))
     finally:
         os.close(lfd)
     print("%s  factory/orders/%s" % (oid, name))
@@ -862,7 +901,7 @@ def describe_event(e):
     for k in ("gate", "station", "state", "status"):
         if e.get(k):
             bits.append("%s=%s" % (k, e[k]))
-    for k in ("attempt", "cause", "recommendation", "flag", "run_id", "branch"):
+    for k in ("attempt", "cause", "recommendation", "flag", "run_id", "branch", "via"):
         if e.get(k):
             bits.append("%s=%s" % (k, e[k]))
     if e.get("merge_sha"):
@@ -925,6 +964,9 @@ def cmd_mark(args):
     if status == "review":
         refuse("review is the line's verdict; only cc-factory record of a passing run writes it",
                "run the line (/factory run %s), then record what it returned: cc-factory record %s --workflow-run <runId>" % (oid, oid))
+    if status is not None and o["status"] in TERMINAL:
+        refuse("%s is %s, which is final, so mark cannot give it a new status" % (oid, o["status"]),
+               "file a new order with cc-factory new; cc-factory show %s has its history" % oid)
     if args.no_holdout and status != "spec":
         raise Usage("--no-holdout goes with status spec: cc-factory mark %s spec --no-holdout" % oid)
     if (args.station is None) != (args.state is None):
@@ -985,19 +1027,14 @@ def need_spec_approval(oid, line, events, what):
 
 
 def spec_hash(body, line):
-    """sha256 over what the spec gate approves: the order body, the line (stations, gates, retries) and
-    the holdout threshold, as canonical JSON."""
-    doc = {"body": body, "line": {"stations": line["stations"], "gates": line["gates"], "retries": line["retries"]},
-           "threshold": F.line_threshold(line)}
-    cmds = {k: line[k] for k in F.COMMAND_KEYS if line.get(k)}
-    if cmds:   # verify runs these: changing them after approval needs a new approval (absent, the hash is as before)
-        doc["line"]["commands"] = cmds
-    return hashlib.sha256(json.dumps(doc, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii")).hexdigest()
+    """sha256 over what the spec gate approves (the library's, the one cc-dash recomputes for a gate card)."""
+    return F.spec_hash(body, line)
 
 
 def spec_change(oid, line, events, body):
     """Why the approved spec is not the current one ('' when it is, or on a line whose spec gate is
-    automatic): the approval carries no hash, or the hash of body + line + threshold differs."""
+    automatic): the approval carries no hash, or the hash of body + line + threshold differs. A line that
+    reads `auto` only by an edit after approval is caught earlier, by check_line_pin."""
     if line["gates"]["spec"] != "human":
         return ""
     e = spec_gate_event(events)
@@ -1058,15 +1095,179 @@ def origin_problem():
     return one_line(why, 300)
 
 
+def refuse_no_proc(decision, command):
+    refuse("%s is a human's decision, and this system has no /proc, which factory gates need to tell your terminal from "
+           "an agent's: in this release they work on Linux only" % decision,
+           "run %s on a Linux machine, from your own terminal" % command)
+
+
 def need_human(decision, command):
     why = origin_problem()
     if why == NO_PROC:
-        refuse("%s is a human's decision, and this system has no /proc, which factory gates need to tell your terminal from "
-               "an agent's: in this release they work on Linux only" % decision,
-               "run %s on a Linux machine, from your own terminal" % command)
+        refuse_no_proc(decision, command)
     if why:
         refuse("%s is a human's decision, and this cc-factory was not started from your own terminal (%s)" % (decision, why.rstrip(".")),
                "run it from your own terminal: %s" % command)
+
+
+# ── A human's decision made on the dashboard ─────────────────────────────────
+TICKET_TIMEOUT = 15          # seconds for cc-dash to answer on the ticket socket
+MAX_TICKET_BYTES = 16 * 1024
+
+
+def read_manifest(path):
+    """The dict in cc_dash_manifest.json, read as the control hook reads it (a plain file of ours that nobody
+    else can write, not through a symlink), or None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022 or st.st_size >= (1 << 20):
+            return None
+        data = os.read(fd, 1 << 20)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        doc = json.loads(data)
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def dashboard_problem(procs, main, pid):
+    """'' when pid is the cc-dash the project's control hook would trust and it is in control mode, else why
+    not: the hook's three checks, in the same order, from the record cc-setup wrote beside the hook (its code,
+    its interpreter, its terminals), for the checkout this script runs from, then control_mode_problem."""
+    hooks = os.path.join(main, ".claude", "hooks")
+    if not (real_dir(os.path.dirname(hooks)) and real_dir(hooks)):
+        return "this project has no .claude/hooks directory (run cc-update-project)"
+    pin = procs.read_pin(hooks)
+    if not pin or os.path.realpath(pin) != os.path.realpath(CC_TOOL_DIR):
+        return "this project was not set up from the cc_tool checkout cc-dash runs from (run cc-update-project)"
+    path = os.path.join(hooks, procs.MANIFEST_NAME)
+    manifest = read_manifest(path)
+    if manifest is None:
+        return "there is no usable %s beside the project's hooks (run cc-update-project)" % procs.MANIFEST_NAME
+    terminals = manifest.get("terminal_hosts") if isinstance(manifest.get("terminal_hosts"), list) else []
+    # Each must answer exactly '': a None from one must not fall through to the next and read as a pass.
+    for check in (lambda: procs.manifest_problem(CC_TOOL_DIR, manifest),
+                  lambda: procs.dashboard_problem(pid, CC_TOOL_DIR, python=manifest.get("python"), terminals=terminals),
+                  lambda: procs.code_after_start(pid, CC_TOOL_DIR, path),
+                  lambda: procs.control_mode_problem(pid)):
+        why = check()
+        if why != "":
+            return why if isinstance(why, str) else "cc_procs gave no answer"
+    return ""
+
+
+def read_ticket(sock, ask):
+    """What the other end of the ticket socket answers to the request `ask`: one JSON object on one line, or None."""
+    sock.settimeout(TICKET_TIMEOUT)
+    sock.sendall(json.dumps(ask, separators=(",", ":")).encode("ascii") + b"\n")
+    buf = b""
+    while b"\n" not in buf and len(buf) <= MAX_TICKET_BYTES:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    try:
+        doc = json.loads(buf.partition(b"\n")[0])
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def ticket_from_parent(fd, main, ask):
+    """(the ticket's dict, '') from the dashboard that started this process, or (None, why not). Only the
+    kernel's word counts: the socket on `fd` must be a connected Unix stream socket whose other end was made
+    by this process's parent, of our user (SO_PEERCRED, which says no more than who made it), is held by that
+    parent alone (peer_holder_problem, as the hook channel asks), and that parent must pass dashboard_problem.
+    A lease, a socket path or an address would be something anything running as you can plant, so none is read.
+    Fails closed: cc_procs that cannot be loaded, raises or answers oddly is a reason."""
+    try:
+        procs = load_procs()
+    except Exception as e:  # noqa: BLE001 - any failure to load is a refusal
+        return None, "%s could not be loaded (%s)" % (os.path.relpath(PROCS_PATH, CC_TOOL_DIR), one_line("%s: %s" % (type(e).__name__, e), 160))
+    try:
+        if procs.have_proc() is not True:
+            return None, NO_PROC
+        why = procs.claude_env(os.environ)
+        if why != "":
+            return None, why if isinstance(why, str) else "cc_procs gave no answer"
+        if fd < 3:
+            return None, "file descriptor %d is not a ticket socket" % fd
+        try:
+            sock = socket.socket(fileno=fd)
+        except OSError:
+            return None, "file descriptor %d is not a socket" % fd
+        with sock:
+            if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
+                return None, "file descriptor %d is not a Unix stream socket" % fd
+            parent = os.getppid()
+            peer, uid = procs.peer_cred(sock)
+            if peer != parent or uid != os.getuid():
+                return None, "the process at the other end of its socket (%s) is not the process that started it (%d)" % (peer, parent)
+            why = procs.peer_holder_problem(sock, parent)
+            if why != "":
+                return None, ("its socket is not its parent's alone: %s" % why) if isinstance(why, str) else "cc_procs gave no answer"
+            why = dashboard_problem(procs, main, parent)
+            if why:
+                return None, "its parent is not your dashboard: %s" % why
+            answer = read_ticket(sock, ask)
+        if os.getppid() != parent:
+            return None, "the dashboard that started it went away"
+    except Exception as e:  # noqa: BLE001 - whatever went wrong, nothing here proves a human decided
+        return None, "the ticket could not be read (%s)" % one_line("%s: %s" % (type(e).__name__, e), 160)
+    if answer is None or answer.get("ok") is not True:
+        return None, "the dashboard gave no ticket%s" % (": " + one_line(answer.get("error"), 160) if answer and answer.get("error") else "")
+    return answer.get("ticket"), ""
+
+
+def ticket_problem(t, ask, events):
+    """Why ticket `t` does not carry the decision asked for, or ''."""
+    if not isinstance(t, dict) or not (isinstance(t.get("id"), str) and F.TICKET_RE.fullmatch(t["id"])):
+        return "it is not a ticket"
+    if any(t.get(k) != ask[k] for k in ("order", "gate", "decision", "rework")):
+        return "it was issued for another decision"
+    if not (isinstance(t.get("value"), str) and isinstance(t.get("note"), str)):
+        return "it is not a complete ticket"
+    expires = num_field(t.get("expires"))
+    if expires is None or time.time() >= expires:
+        return "it has expired"
+    if any(e.get("ticket") == t["id"] for e in events):
+        return "it was already used"
+    return ""
+
+
+def dashboard_ticket(args, main, oid, gate, verb, rework, decision, command, events):
+    """The human's decision from cc-dash in control mode, or a refusal: the only process that gets past this
+    is the child cc-dash started for a decision it just took (lib/cc_dash/gates.py has the threat model)."""
+    ask = {"order": oid, "gate": gate, "decision": verb, "rework": rework}
+    ticket, why = ticket_from_parent(args.ticket_fd, main, dict(ask, v=1, op="redeem"))
+    if why == NO_PROC:
+        refuse_no_proc(decision, command)
+    why = why or ticket_problem(ticket, ask, events)
+    if why:
+        refuse("%s is a human's decision, and this cc-factory has no valid ticket from your dashboard (%s)" % (decision, one_line(why, 300).rstrip(".")),
+               "run it from your own terminal: %s" % command)
+    return ticket
+
+
+def gate_authority(args, main, oid, gate, verb, rework, decision, command, events):
+    """Who may take this decision, checked before the order's state: a ticket from the dashboard (returned)
+    when --ticket-fd is given, else a human at their own terminal (None; confirm_human asks them)."""
+    if args.ticket_fd is None:
+        need_human(decision, command)
+        return None
+    return dashboard_ticket(args, main, oid, gate, verb, rework, decision, command, events)
+
+
+def ticket_fields(ticket):
+    return {"via": "dashboard", "ticket": ticket["id"]} if ticket else {}
 
 
 CONFIRM_TIMEOUT = 300
@@ -1114,8 +1315,15 @@ def tty_problem(what):
         os.close(fd)
 
 
-def confirm_human(oid, decision, command):
-    """The last step before a gate decision is written: the code shown on the terminal, typed back."""
+def confirm_human(oid, decision, command, ticket=None, value=""):
+    """The last step before a gate decision is written: the code shown on the terminal, typed back; or, for a
+    decision from the dashboard, `value` (the spec hash or the reviewed head as it is right now) being the very
+    one the human saw."""
+    if ticket is not None:
+        if not hmac.compare_digest(ticket["value"].encode("utf-8", "replace"), value.encode("utf-8", "replace")):
+            refuse("%s: what the dashboard showed is no longer what is there (it showed %s, it is now %s)"
+                   % (decision, ticket["value"][:12] or "nothing", value[:12] or "nothing"), "read it again and decide again")
+        return
     why = tty_problem(decision)
     if why:
         refuse("%s needs the code shown on your terminal typed back to confirm, and %s" % (decision, why.rstrip(".")),
@@ -1231,21 +1439,23 @@ def cmd_approve(args):
     gate = args.gate or ("merge" if o["status"] == "review" else "spec")
     command = "cc-factory approve %s --gate %s%s%s" % (oid, gate, " --into %s" % one_line(args.into, 60) if args.into else "",
                                                        " --note ..." if args.note else "")
-    need_human("passing %s's %s gate" % (oid, gate), command)
+    ticket = gate_authority(args, main, oid, gate, "approve", False, "passing %s's %s gate" % (oid, gate), command, events)
     gate = gate_args(o, args, "approve")
     line = line_of(main, o)
-    if args.into and gate != "merge":
-        raise Usage("--into applies to the merge gate: cc-factory approve %s --gate merge --into REF" % oid)
-    note = clean_note(args.note) if args.note else ""
+    if args.into and (gate != "merge" or ticket):
+        raise Usage("--into applies to the merge gate at a terminal: cc-factory approve %s --gate merge --into REF" % oid)
+    note = clean_note(ticket["note"] if ticket else args.note) if (ticket or args.note) else ""
     if gate == "spec":
         # Behind it only when it was passed for this very spec: an order marked building without an
         # approval, or one whose spec changed since, can still get one.
         if o["status"] in ("building", "verifying", "review") and spec_approved(events) and not spec_change(oid, line, events, raw["body"]):
             refuse("%s is %s; the spec gate is behind it" % (oid, o["status"]),
                    "use --gate merge once it reaches review, or reject it")
+        refuse_line_flip(oid, o, events)
         h = spec_hash(raw["body"], line)
-        confirm_human(oid, "pass %s's spec gate (approve the spec as it is now, sha256 %s)" % (oid, h[:16]), command)
-        append_event(main, make_rec(oid, "gate", gate="spec", state="pass", status="approved", note=note, spec_hash=h))
+        confirm_human(oid, "pass %s's spec gate (approve the spec as it is now, on the %s line, sha256 %s)"
+                      % (oid, one_line(o.get("line") or "default", 40), h[:16]), command, ticket, h)
+        append_event(main, make_rec(oid, "gate", gate="spec", state="pass", status="approved", note=note, spec_hash=h, **ticket_fields(ticket)))
         print("%s  spec gate passed: approved (spec sha256 %s)" % (oid, h[:16]))
         if line_has_verify(line):
             n = holdout_count(main, oid)
@@ -1256,31 +1466,41 @@ def cmd_approve(args):
     reviewed = reviewed_head(oid, events)
     head, target, msha = merged_lane(main, oid, events, args.into, reviewed)
     confirm_human(oid, "pass %s's merge gate (the reviewed lane head %s, merged into %s by %s)"
-                  % (oid, head[:10], one_line(args.into or "HEAD", 60), msha[:10]), command)
+                  % (oid, head[:10], one_line(args.into or "HEAD", 60), msha[:10]), command, ticket, reviewed)
     append_event(main, make_rec(oid, "gate", gate="merge", state="pass", status="done", note=note,
-                                merge_sha=msha, lane_head=head, target=target))
+                                merge_sha=msha, lane_head=head, target=target, **ticket_fields(ticket)))
     print("%s  merge gate passed: done" % oid)
     print("reviewed lane head %s is in %s (%s), merged by %s%s" % (head[:10], one_line(args.into or "HEAD", 60), target[:10], msha[:10],
                                                                     " (a fast-forward)" if msha == head else ""))
     return 0
 
 
+def seen_value(main, o, raw, events, gate):
+    """What a gate's human was shown, as a ticket names it: the spec hash at the spec gate, the reviewed lane head
+    (or nothing, on a review that recorded none) at the merge gate."""
+    if gate == "spec":
+        return spec_hash(raw["body"], line_of(main, o))
+    ev = next((e for e in reversed(events) if e.get("event") == "status" and e.get("status") == "review"), None)
+    return (ev.get("lane_head") or "") if ev else ""
+
+
 def cmd_reject(args):
     main = resolve_main(args)
     oid = need_id(args.id)
-    o, _raw, _events = load_order(main, oid)
+    o, raw, events = load_order(main, oid)
     gate = args.gate or ("merge" if o["status"] == "review" else "spec")   # who runs it is checked first, as in approve
     decision = ("sending %s back from the merge gate for rework" % oid if args.rework
                 else "rejecting %s at the %s gate" % (oid, gate))
     command = "cc-factory reject %s --gate %s%s%s" % (oid, gate, " --rework" if args.rework else "", " --note ..." if args.note else "")
-    need_human(decision, command)
+    ticket = gate_authority(args, main, oid, gate, "reject", bool(args.rework), decision, command, events)
     gate = gate_args(o, args, "reject")
     if args.rework and gate != "merge":
         raise Usage("--rework applies to the merge gate: cc-factory reject %s --gate merge --rework" % oid)
     confirm_human(oid, "send %s back from the merge gate for another run" % oid if args.rework
-                  else "reject %s at the %s gate" % (oid, gate), command)
+                  else "reject %s at the %s gate" % (oid, gate), command, ticket, seen_value(main, o, raw, events, gate) if ticket else "")
     status = "approved" if args.rework else "rejected"
-    append_event(main, make_rec(oid, "gate", gate=gate, state="fail", status=status, note=clean_note(args.note) if args.note else ""))
+    note = clean_note(ticket["note"] if ticket else args.note) if (ticket or args.note) else ""
+    append_event(main, make_rec(oid, "gate", gate=gate, state="fail", status=status, note=note, **ticket_fields(ticket)))
     if args.rework:
         print("%s  merge gate failed: back to approved, ready for another run" % oid)
         print("next: /factory run %s (the lane is reused)" % oid)
@@ -1315,8 +1535,9 @@ def resolve_commit(main, ref):
 def cmd_lane(args):
     main = resolve_main(args)
     oid = need_id(args.id)
-    o, _raw, events = load_order(main, oid)
+    o, raw, events = load_order(main, oid)
     line = line_of(main, o)
+    check_line_pin(oid, o, events, line, raw["body"])
     if o["status"] in TERMINAL:
         refuse("%s is %s" % (oid, o["status"]), "a finished order has no lane to make")
     if line["gates"]["spec"] == "human" and o["status"] not in LANE_OK:
@@ -1448,16 +1669,29 @@ def last_lane_base(events, branch):
     return ""
 
 
+def plan_doc_path(raw, o):
+    """Root-relative path of the order's plan document (contract A): docs/superpowers/plans/<created>-fo-nnn-<slug>.md,
+    the slug being the order file's own. "" when the order file name or its created date does not fit."""
+    created = raw.get("created_date") or ""
+    if not created and o.get("created"):
+        created = time.strftime("%Y-%m-%d", time.localtime(o["created"]))
+    m = re.fullmatch(r"FO-\d{3,6}-([A-Za-z0-9][A-Za-z0-9_-]*)\.md", os.path.basename(o.get("path") or ""))
+    if not m or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", created):
+        return ""
+    return "docs/superpowers/plans/%s-%s-%s.md" % (created, o["id"].lower(), m.group(1))
+
+
 def cmd_run_args(args):
     main = resolve_main(args)
     oid = need_id(args.id)
     o, raw, events = load_order(main, oid)
+    line = line_of(main, o)   # read once: the pin check and the run use the same definition
+    check_line_pin(oid, o, events, line, raw["body"])
     if o["status"] in TERMINAL:
         refuse("%s is %s" % (oid, o["status"]), "a finished order does not run")
     lane = o.get("lane") or {}
     if not lane.get("branch") or not lane.get("worktree"):
         refuse("%s has no lane yet" % oid, "run cc-factory lane %s first" % oid)
-    line = line_of(main, o)
     need_spec_approval(oid, line, events, "run")
     changed = spec_change(oid, line, events, raw["body"])
     if changed:
@@ -1483,6 +1717,10 @@ def cmd_run_args(args):
         "base": last_lane_base(events, lane["branch"]), "holdout": os.path.join(main, F.HOLDOUT_DIR, oid),
         "stations": line["stations"], "retries": line["retries"], "line": o.get("line") or "default",
         "threshold": F.line_threshold(line)}}
+    plan_doc = plan_doc_path(raw, o)
+    if plan_doc:
+        out["args"]["planDoc"] = plan_doc
+        out["args"]["orderPath"] = o["path"]
     for key in F.COMMAND_KEYS:   # human-written in line.json: the only run/test commands verify is given
         if line.get(key):
             out["args"][key] = line[key]
@@ -1840,8 +2078,11 @@ def review_check(main, oid, o, events, line, res, hist, entries, verified):
     else:
         facts["why_none"] = "the order's %s line has no verify station" % (o.get("line") or "default")
     h = facts["holdout"]
-    facts["recommendation"] = ("needs-scenarios" if not (h and h["total"]) else
-                               "merge" if h["executed"] else "needs-human-check")
+    if not line_has_verify(line):
+        facts["recommendation"] = "merge"   # no hidden scenarios by design on this line, so none are missing
+    else:
+        facts["recommendation"] = ("needs-scenarios" if not (h and h["total"]) else
+                                   "merge" if h["executed"] else "needs-human-check")
     problem, lf = lane_facts(main, oid, lane)
     if problem:
         return problem, None
@@ -1905,13 +2146,14 @@ def para(text, indent):
     return t.replace("\n", "\n" + indent)
 
 
-def briefing_lines(oid, res, facts, line, summary):
+def briefing_lines(oid, res, facts, line, summary, line_name=""):
     """The merge-gate briefing: facts from git and the ledger's lane, the holdout verdict ids, and review's
     full decision text (summary, every should-fix item, nextSteps, its own test run). Never a scenario reason."""
     lf = facts["lane"]
-    out = ["Lane %s: %d commit%s past base %s, head %s." % (lf["branch"], len(lf["commits"]), "" if len(lf["commits"]) == 1 else "s",
-                                                              lf["base"][:10], lf["head"][:10]),
-           "Commits (git log --oneline %s..%s):" % (lf["base"][:10], lf["branch"])]
+    out = ["Line: %s." % one_line(line_name, 40)] if line_name else []
+    out += ["Lane %s: %d commit%s past base %s, head %s." % (lf["branch"], len(lf["commits"]), "" if len(lf["commits"]) == 1 else "s",
+                                                             lf["base"][:10], lf["head"][:10]),
+            "Commits (git log --oneline %s..%s):" % (lf["base"][:10], lf["branch"])]
     out += ["  " + c for c in capped(lf["commits"], LIST_CAP_COMMITS)]
     stat_lines = lf["stat"]
     tail = stat_lines[-1:] if stat_lines and "changed" in stat_lines[-1] else []
@@ -1919,7 +2161,10 @@ def briefing_lines(oid, res, facts, line, summary):
     out.append("Changes (git diff --stat %s...%s):" % (lf["base"][:10], lf["branch"]))
     out += ["  " + s for s in capped(files, LIST_CAP_FILES) + tail]
     h = facts["holdout"]
-    if facts["recommendation"] == "needs-scenarios":
+    if not line_has_verify(line):
+        out.append("Holdout: this line has no hidden scenarios by design; its %s stations are all the checking there was."
+                   % ", ".join(one_line(s["name"], 40) for s in line["stations"]))
+    elif facts["recommendation"] == "needs-scenarios":
         out.append("Holdout: NO hidden scenario checked this work (%s). The line's own tests and the review are all the checking "
                    "there was: try the behaviour yourself before you merge." % facts["why_none"])
     else:
@@ -1984,6 +2229,8 @@ def cmd_record(args):
     main = resolve_main(args)
     oid = need_id(args.id)
     o, raw, events = load_order(main, oid)
+    line = line_of(main, o)   # read once: the pin check and the record use the same definition
+    check_line_pin(oid, o, events, line, raw["body"])
     if o["status"] in TERMINAL:
         refuse("%s is already %s" % (oid, o["status"]), "a finished order takes no more runs")
     run_id, wf_args = args.run_id, None
@@ -2003,7 +2250,6 @@ def cmd_record(args):
     named = res.get("order")
     if isinstance(named, str) and named.strip() and F.norm_id(named) != oid:
         refuse("the result is for %s, not %s" % (one_line(named, 20), oid), "record it against the order it ran for")
-    line = line_of(main, o)
     names = [s["name"] for s in line["stations"]]
     hist, entries, skipped = parse_history(res, names)
     recs = entries
@@ -2041,7 +2287,7 @@ def cmd_record(args):
 
     briefing = []
     if status == "review":
-        briefing = briefing_lines(oid, res, facts, line, summary)
+        briefing = briefing_lines(oid, res, facts, line, summary, o.get("line") or "default")
     leaks = leak_findings(main, oid, raw, res, names)
     rec_kw = {"status": status, "run_id": run_id, "note": clean_note(note_text)}
     if status == "review":
@@ -2190,6 +2436,8 @@ def build_parser():
         sp.add_argument("id")
         sp.add_argument("--gate", choices=("spec", "merge"), help="default: merge when the order is in review, else spec")
         sp.add_argument("--note")
+        # Hidden: cc-dash passes it to the child it starts for a decision; from anything else it only refuses.
+        sp.add_argument("--ticket-fd", type=int, metavar="FD", help=argparse.SUPPRESS)
         if name == "approve":
             sp.add_argument("--into", metavar="REF",
                             help="merge gate: the branch or commit the lane was merged into (default: the main checkout's HEAD); "

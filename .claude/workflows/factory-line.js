@@ -1,7 +1,7 @@
 export const meta = {
   name: 'factory-line',
   description: 'Runs one software-factory work order down its line: plan, then build, test, holdout verify and review in the order\'s own lane worktree, reworking on failure, and stops at the human merge gate with a merge-gate summary.',
-  whenToUse: 'Driven by the /factory skill for one approved work order: pass the args OBJECT printed by `cc-factory run-args FO-NNN` ({order, title, spec, root, worktree, branch, base, holdout, stations, retries, line}, optional threshold, run and test), then record the returned object (contract 2) with `cc-factory record FO-NNN --workflow-run <runId>`. Station models, efforts and retries come from the order\'s line in factory/line.json. It never merges, pushes or deletes the lane: a human merges at the merge gate.',
+  whenToUse: 'Driven by the /factory skill for one approved work order: pass the args OBJECT printed by `cc-factory run-args FO-NNN` ({order, title, spec, root, worktree, branch, base, holdout, stations, retries, line}, optional threshold, planDoc, orderPath, run and test), then record the returned object (contract 2) with `cc-factory record FO-NNN --workflow-run <runId>`. Station models, efforts and retries come from the order\'s line in factory/line.json. It never merges, pushes or deletes the lane: a human merges at the merge gate.',
   phases: [
     { title: 'Plan', detail: 'Read-only planner grounds a file-level plan in the lane worktree and maps acceptance criteria to steps, or rules the spec infeasible' },
     { title: 'Build', detail: 'Implements the plan inside the lane worktree only and commits on the lane branch; on rework it gets the failing station\'s feedback, and from attempt 3 it runs on Opus' },
@@ -48,6 +48,12 @@ const BRANCH = str(cfg.branch)
 const BASE = str(cfg.base)
 const HOLDOUT_IN = str(cfg.holdout).replace(/(.)\/+$/, '$1')
 const LINE = str(cfg.line) || 'default'
+// The plan document (contract A): a root-relative path the build station writes in the lane. Anything
+// that is not the expected shape is dropped, so a bad arg means no plan-file instruction, never a stray write.
+const PLAN_DOC_RE = /^docs\/superpowers\/plans\/\d{4}-\d{2}-\d{2}-fo-\d{3,6}-[A-Za-z0-9][A-Za-z0-9_-]*\.md$/
+const ORDER_PATH_RE = /^factory\/orders\/FO-\d{3,6}-[A-Za-z0-9][A-Za-z0-9_-]*\.md$/
+const PLAN_DOC = PLAN_DOC_RE.test(str(cfg.planDoc)) && ORDER_PATH_RE.test(str(cfg.orderPath)) ? str(cfg.planDoc) : ''
+const ORDER_PATH = PLAN_DOC ? str(cfg.orderPath) : ''
 const intIn = (v) => (typeof v === 'number' && Number.isInteger(v) ? v : (typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v) : null))
 const RETRIES = intIn(cfg.retries) == null ? 1 : Math.min(3, Math.max(0, intIn(cfg.retries)))
 const MAX_ATTEMPTS = 1 + RETRIES
@@ -525,6 +531,41 @@ const INFRA_OUT = { pass: false, infra: true }
 
 let plan = null, lastBuild = null, lastTest = null, lastReview = null
 
+// The plan JSON as the plan document of contract A: a `**Spec:**` header, one `### Task N:` per step, each
+// with one `- [ ] <file>: <change>` box. Pure: every free-text field goes through one() and loses backticks,
+// so a title or step holding a newline or markup stays on one line of its own.
+const mdOne = (v, n) => one(v, n).replace(/`/g, "'")
+const renderPlanDoc = (p, title, orderPath, worktree) => {
+  const rel = (f) => {
+    const x = one(f, 300)
+    return worktree && x.startsWith(worktree + '/') ? x.slice(worktree.length + 1) : x
+  }
+  const steps = arr(p && p.steps).filter((x) => x && typeof x === 'object')
+    .map((x, i) => ({ order: Number.isInteger(x.order) ? x.order : i + 1, file: mdOne(rel(x.file), 200) || 'n/a', change: mdOne(x.change, 400) }))
+    .sort((a, b) => a.order - b.order)
+  const out = [`# ${mdOne(title, 120) || 'Plan'}: implementation plan`, '', `**Spec:** ${orderPath}`, '']
+  const goal = mdOne(p && p.summary, 600)
+  if (goal) out.push(`**Goal:** ${goal}`, '')
+  const approach = mdOne(p && p.approach, 600)
+  if (approach) out.push(`**Approach:** ${approach}`, '')
+  out.push('---', '')
+  steps.forEach((x, i) => {
+    out.push(`### Task ${i + 1}: ${mdOne(x.change, 70) || x.file}`, '', `- [ ] ${x.file}: ${x.change}`, '')
+  })
+  return out.join('\n').replace(/\n+$/, '\n')
+}
+const PLAN_FILE = PLAN_DOC && ORDERED.some((s) => s.kind === 'plan') ? `${WORKTREE}/${PLAN_DOC}` : ''
+const planFileBlock = (attempt) => {
+  if (!PLAN_FILE || !plan || plan.feasible !== true || !arr(plan.steps).length) return ''
+  if (attempt > 1) return `\nPLAN FILE: the plan document ${PLAN_FILE} is already written. Do not rewrite or reformat it; only tick a box (\`- [ ]\` to \`- [x]\`) for each step you finish, and commit the ticks with your other changes.\n`
+  const doc = renderPlanDoc(plan, TITLE, ORDER_PATH, WORKTREE)
+  return `
+PLAN FILE: write exactly the text between the markers below, verbatim, to ${PLAN_FILE} (create the directories; if the file already exists from an earlier run, keep it and change nothing but its ticks). Commit it first, on its own, as \`${ORDER}: plan\` (stage only that file). Then, as you finish each step, tick its box (\`- [ ]\` to \`- [x]\`) and commit the ticks with that step's changes. Change nothing else in the file. If git ignores that path (\`git -C ${W} check-ignore -q ${sq(PLAN_DOC)}\` succeeds), still write it, leave it uncommitted, and say so in your summary.
+----- BEGIN PLAN FILE -----
+${doc}----- END PLAN FILE -----
+`
+}
+
 const planStation = async (st) => {
   const p = await run(st, 1,
 `You are the PLAN station of a software-factory line. Turn the work order's spec into a concrete, file-level implementation plan for the build station. ${READ_ONLY}
@@ -574,7 +615,7 @@ const buildStation = async (st, attempt, fb) => {
 ${HEADER}
 
 ${PLAN_BLOCK()}
-${reworkBlock(attempt, fb)}${fb && lastBuild ? `\nYOUR PREVIOUS BUILD REPORT (JSON):\n${json(lastBuild)}\n` : ''}
+${planFileBlock(attempt)}${reworkBlock(attempt, fb)}${fb && lastBuild ? `\nYOUR PREVIOUS BUILD REPORT (JSON):\n${json(lastBuild)}\n` : ''}
 ${LANE_RULES}
 
 ${FENCE}
@@ -792,7 +833,7 @@ ${FENCE}
 METHOD:
 - The change under review is the lane diff: \`git -C ${W} diff ${BASE || '<base>'}...HEAD\` (and \`git -C ${W} log --oneline ${BASE || '<base>'}..HEAD\`). Also run \`git -C ${W} status --porcelain\`: uncommitted or untracked changes are themselves a blocking issue, since the merge gate takes only commits (set uncommittedChanges).
 - Re-run the tests yourself from the worktree; do not take the test report's word for it. Run the test report's command and the build's howToTest, plus the existing suite where it is cheap enough. If the project has no tests, run the program the way howToTest says. Fill testRun with what you observed: ran=true only if you executed them in this review, passed=true only with passing output you saw, command = what you ran, output = the tail of that output.
-- Check the diff against the spec's acceptance criteria and the plan: correctness, edge cases, error handling, security, unrelated changes, commit messages starting with \`${ORDER}:\`, and tests that really exercise the criteria (not tautological, not coupled to the implementation, not asserting a builder's assumption the spec does not state).
+${PLAN_FILE ? `- The plan document ${PLAN_DOC} in the diff was written by the build station on purpose; it is not an unrelated change.\n` : ''}- Check the diff against the spec's acceptance criteria and the plan: correctness, edge cases, error handling, security, unrelated changes, commit messages starting with \`${ORDER}:\`, and tests that really exercise the criteria (not tautological, not coupled to the implementation, not asserting a builder's assumption the spec does not state).
 - verdict='pass' ONLY if the acceptance criteria are met, your own test run passed, the tree is clean, and nothing is blocking. Otherwise 'fail'.
 - Each issue: severity (blocking / should-fix / nit), location (file + line), the problem, how to show it fails (a failing input, test, or command the build station can run), and a suggestion. Blocking = you would stop the merge for it.
 - nextSteps: if fail, what the build station must change; if pass, what the human should look at before merging.
@@ -944,7 +985,15 @@ if (passed) {
       ...tail,
     ].join(' '))
   }
-  const why = !ST.verify ? 'there is no verify station on this line' : vacuousWhy(lastVerify)
+  if (!ST.verify) {
+    // A line with no verify station has no hidden scenarios by design: none are missing, and the line's own stations are the whole check.
+    return result('review', '', 'merge', [
+      `${ORDER} "${TITLE}" passed the line on attempt ${judged} of ${MAX_ATTEMPTS}${reworks() ? ` after ${reworks()} rework(s)` : ''} and is waiting at the human merge gate (recommendation: merge).`,
+      `Holdout: this line has no hidden scenarios by design; its ${ORDERED.map((s) => s.name).join(', ')} stations are all the checking there was.`,
+      ...tail,
+    ].join(' '))
+  }
+  const why = vacuousWhy(lastVerify)
   return result('review', '', 'needs-scenarios', [
     `${ORDER} "${TITLE}" passed every station on attempt ${judged} of ${MAX_ATTEMPTS}${reworks() ? ` after ${reworks()} rework(s)` : ''} and is waiting at the human merge gate, but no hidden scenario was checked (${why}). Recommendation: needs-scenarios, not merge: nothing independent of the builders confirmed the work.`,
     `Holdout: ${satText()}.`,

@@ -12,8 +12,11 @@ StateGuard confirms the real projects.json is unchanged afterwards):
     skill, and installs .claude/workflows/factory-line.js
   - re-running is idempotent: each .gitignore line once, a hand-edited line.json kept,
     an existing .gitignore without a final newline is appended to, never glued
-  - plain `cc-setup <proj>` (no flag) creates no factory/ and edits no .gitignore for it,
-    but git-ignores the run-state board, .cc-board/, once across setup and update
+  - plain `cc-setup <proj>` scaffolds the factory by default; --no-factory writes
+    .claude/no-factory and later plain runs and updates honour it; --factory clears it;
+    a non-git project, a missing /proc (CC_SETUP_PROC_STATUS, test-only) skip with exit 0;
+    an init failure warns in default mode and aborts under --factory; reruns change nothing
+  - .cc-board/ is git-ignored once across setup and update
   - `cc-factory init <proj>` alone gives the same scaffold
 
 Part of tests/test_factory.py (python3 tests/test_factory.py setup runs only this part;
@@ -178,29 +181,215 @@ def test_rollout():
     check("rollout: re-running keeps the orders dir", os.path.isdir(os.path.join(proj, "factory", "orders")))
 
 
-def test_plain_setup_has_no_factory():
+def snapshot_tree(proj):
+    out = {}
+    # settings.json is skipped: cc-update-permissions rewrites it on an update, which is not this task's concern.
+    for d, dirs, files in os.walk(proj):
+        dirs[:] = [x for x in dirs if x != ".git"]
+        for f in files:
+            p = os.path.join(d, f)
+            if f == "settings.json":
+                continue
+            out[os.path.relpath(p, proj)] = open(p, "rb").read()
+    return out
+
+
+def test_default_on():
     if shutil.which("git") is None:
         return
     proj = new_project("plain")
     r = run([SETUP, proj])
-    check("plain: cc-setup without the flag exits 0", r.returncode == 0, tail(r))
-    check("plain: no factory/ directory", not os.path.exists(os.path.join(proj, "factory")), os.listdir(proj))
-    check("plain: no Factory banner", "── Factory ──" not in r.stdout)
-    gi = "\n".join(lines_of(os.path.join(proj, ".gitignore")))
-    check("plain: .gitignore does not mention the holdout", ".factory-holdout" not in gi, gi)
-    check("plain: factory-line.js is not installed", not os.path.exists(os.path.join(proj, ".claude", "workflows", "factory-line.js")))
+    check("default: cc-setup without a flag exits 0", r.returncode == 0, tail(r))
+    check("default: the Factory banner is printed", "── Factory ──" in r.stdout, r.stdout[-400:])
+    check_scaffold("default", proj)
+    check("default: no opt-out marker", not os.path.exists(os.path.join(proj, ".claude", "no-factory")))
+    check("default: factory-line.js is installed",
+          os.path.isfile(os.path.join(proj, ".claude", "workflows", "factory-line.js")))
     skill = os.path.join(proj, ".claude", "skills", "factory", "SKILL.md")
-    check("plain: the /factory skill ships to every project", os.path.isfile(skill), skill)
-    # The updater never opts a project into the factory.
-    r = run([os.path.join(REPO, "bin", "cc-update-project"), proj])
-    check("plain: cc-update-project exits 0", r.returncode == 0, tail(r))
-    check("plain: cc-update-project creates no factory/", not os.path.exists(os.path.join(proj, "factory")), os.listdir(proj))
+    check("default: the /factory skill ships", os.path.isfile(skill), skill)
+    # A rerun and an update change nothing.
+    before = snapshot_tree(proj)
+    r = run([SETUP, proj])
+    check("default: a rerun exits 0", r.returncode == 0, tail(r))
+    r2 = run([os.path.join(REPO, "bin", "cc-update-project"), proj])
+    check("default: cc-update-project exits 0", r2.returncode == 0, tail(r2))
+    check("default: a rerun and an update change no file", snapshot_tree(proj) == before,
+          sorted(k for k, v in snapshot_tree(proj).items() if before.get(k) != v))
     # The run-state board (the managed block's "Run-state board") is git-ignored in every project, once.
     gi = lines_of(os.path.join(proj, ".gitignore"))
-    check("plain: .cc-board/ is git-ignored exactly once after setup and update", gi.count(".cc-board/") == 1, gi)
+    check("default: .cc-board/ is git-ignored exactly once after setup and update", gi.count(".cc-board/") == 1, gi)
     os.makedirs(os.path.join(proj, ".cc-board", "run", "lead-a"), exist_ok=True)
     r = run(["git", "-C", proj, "check-ignore", "-q", ".cc-board/run/lead-a/checkpoint.md"])
-    check("plain: git ignores a board file", r.returncode == 0, tail(r))
+    check("default: git ignores a board file", r.returncode == 0, tail(r))
+    # An update on a project with a factory but no workflow copy installs it (a hand-edited copy is kept: init's rule).
+    js = os.path.join(proj, ".claude", "workflows", "factory-line.js")
+    os.remove(js)
+    run([os.path.join(REPO, "bin", "cc-update-project"), proj])
+    if os.path.isfile(WORKFLOW_SRC):
+        check("default: cc-update-project restores factory-line.js",
+              os.path.isfile(js) and open(js, "rb").read() == open(WORKFLOW_SRC, "rb").read())
+
+
+def test_opt_out():
+    if shutil.which("git") is None:
+        return
+    proj = new_project("optout")
+    marker = os.path.join(proj, ".claude", "no-factory")
+    r = run([SETUP, proj, "--no-factory"])
+    check("opt-out: --no-factory exits 0", r.returncode == 0, tail(r))
+    check("opt-out: the marker is written", os.path.isfile(marker))
+    check("opt-out: no factory/ and no Factory banner",
+          not os.path.exists(os.path.join(proj, "factory")) and "── Factory ──" not in r.stdout, r.stdout[-300:])
+    before = snapshot_tree(proj)
+    r = run([SETUP, proj])
+    check("opt-out: a plain rerun exits 0 and says it skipped", r.returncode == 0 and "factory skipped" in r.stdout, tail(r))
+    check("opt-out: a plain rerun scaffolds nothing", not os.path.exists(os.path.join(proj, "factory")))
+    r = run([os.path.join(REPO, "bin", "cc-update-project"), proj])
+    check("opt-out: cc-update-project honours the marker",
+          r.returncode == 0 and not os.path.exists(os.path.join(proj, "factory")), tail(r))
+    check("opt-out: reruns change no file", snapshot_tree(proj) == before,
+          sorted(k for k, v in snapshot_tree(proj).items() if before.get(k) != v))
+    r = run([SETUP, proj, "--factory"])
+    check("opt-out: --factory exits 0, removes the marker and scaffolds",
+          r.returncode == 0 and not os.path.exists(marker) and os.path.isfile(os.path.join(proj, "factory", "line.json")),
+          tail(r))
+    r = run([SETUP, proj, "--factory", "--no-factory"], timeout=60)
+    check("opt-out: --factory with --no-factory exits 1", r.returncode == 1, tail(r))
+    # cc-update-project passes --no-factory on.
+    proj2 = new_project("optout-update")
+    run([SETUP, proj2, "--no-factory"])
+    os.remove(os.path.join(proj2, ".claude", "no-factory"))
+    r = run([os.path.join(REPO, "bin", "cc-update-project"), proj2, "--no-factory"])
+    check("opt-out: cc-update-project --no-factory exits 0 and writes the marker",
+          r.returncode == 0 and os.path.isfile(os.path.join(proj2, ".claude", "no-factory"))
+          and not os.path.exists(os.path.join(proj2, "factory")), tail(r))
+
+
+def test_marker_symlinks():
+    if shutil.which("git") is None:
+        return
+    # A planted marker symlink must not be written through.
+    proj = new_project("marker-link")
+    victim = os.path.join(BASE, "victim.txt")
+    with open(victim, "wb") as fh:
+        fh.write(b"precious\n")
+    os.makedirs(os.path.join(proj, ".claude"))
+    marker = os.path.join(proj, ".claude", "no-factory")
+    os.symlink(victim, marker)
+    r = run([SETUP, proj, "--no-factory"])
+    check("symlink: --no-factory with a marker symlink exits 0 and says so",
+          r.returncode == 0 and "is a symlink" in r.stdout, tail(r))
+    check("symlink: the link target's bytes are unchanged", open(victim, "rb").read() == b"precious\n")
+    check("symlink: no factory/ was scaffolded", not os.path.exists(os.path.join(proj, "factory")))
+    # --factory removes the link itself, never its target.
+    r = run([SETUP, proj, "--factory"])
+    check("symlink: --factory removes the link, keeps the target",
+          r.returncode == 0 and not os.path.lexists(marker) and open(victim, "rb").read() == b"precious\n", tail(r))
+    # A dangling marker symlink still counts as opted out.
+    proj = new_project("marker-dangling")
+    os.makedirs(os.path.join(proj, ".claude"))
+    os.symlink(os.path.join(BASE, "does-not-exist"), os.path.join(proj, ".claude", "no-factory"))
+    r = run([SETUP, proj])
+    check("symlink: a dangling marker symlink counts as opted out",
+          r.returncode == 0 and "factory skipped" in r.stdout and not os.path.exists(os.path.join(proj, "factory")),
+          tail(r))
+    check("symlink: the dangling target was not created", not os.path.lexists(os.path.join(BASE, "does-not-exist")))
+    # A symlinked .claude/ is refused for the marker.
+    proj = new_project("claude-link")
+    real = os.path.join(BASE, "real-claude")
+    os.makedirs(real)
+    os.symlink(real, os.path.join(proj, ".claude"))
+    r = run([SETUP, proj, "--no-factory"])
+    check("symlink: a symlinked .claude/ is refused for the marker",
+          r.returncode == 0 and ".claude is a symlink" in r.stdout and not os.path.lexists(os.path.join(real, "no-factory")),
+          tail(r))
+
+
+def test_safe_skips():
+    if shutil.which("git") is None:
+        return
+    nogit = os.path.join(BASE, "nogit")
+    os.makedirs(nogit)
+    r = run([SETUP, nogit])
+    check("skip: a non-git project exits 0", r.returncode == 0, tail(r))
+    check("skip: a non-git project says why and gets no factory/",
+          "factory skipped: not a git work tree" in r.stdout and not os.path.exists(os.path.join(nogit, "factory")),
+          r.stdout[-300:])
+    proj = new_project("noproc")
+    e = env()
+    e["CC_SETUP_PROC_STATUS"] = os.path.join(BASE, "no-such-proc-status")    # test-only stand-in for /proc/self/status
+    r = subprocess.run([SETUP, proj], capture_output=True, text=True, env=e, stdin=subprocess.DEVNULL, timeout=600)
+    check("skip: a missing /proc exits 0 with the Linux line",
+          r.returncode == 0 and "factory skipped: its gates need Linux /proc; this project stays on Superpowers" in r.stdout,
+          tail(r))
+    check("skip: a missing /proc scaffolds nothing", not os.path.exists(os.path.join(proj, "factory")))
+    # An init failure in default mode warns and setup carries on; under --factory it aborts.
+    proj = new_project("initfail")
+    os.symlink(os.path.join(BASE, "elsewhere"), os.path.join(proj, "factory"))   # init refuses a symlinked factory/
+    r = run([SETUP, proj])
+    check("skip: an init failure in default mode warns and exits 0",
+          r.returncode == 0 and "factory scaffold failed" in r.stdout, tail(r))
+    r = run([SETUP, proj, "--factory"])
+    check("skip: the same failure under --factory aborts", r.returncode != 0, tail(r))
+
+
+def commit_empty(repo):
+    subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"],
+                   capture_output=True, env=env())
+
+
+def test_enclosing_repo():
+    if shutil.which("git") is None:
+        return
+    # A package inside a repository: skipped with one line, nothing written above it.
+    mono = new_project("mono")
+    pkg = os.path.join(mono, "pkg")
+    os.makedirs(pkg)
+    r = run([SETUP, pkg])
+    check("enclosing: a subdirectory of a repo exits 0 and names the repository",
+          r.returncode == 0 and "factory skipped: " in r.stdout and "is inside the git repository" in r.stdout
+          and os.path.realpath(mono) in r.stdout and "pass --factory" in r.stdout, tail(r))
+    check("enclosing: no factory/ or .gitignore appears above or in the subdirectory",
+          not os.path.exists(os.path.join(mono, "factory")) and not os.path.exists(os.path.join(mono, ".gitignore"))
+          and not os.path.exists(os.path.join(pkg, "factory")), os.listdir(mono))
+    # A $HOME-style dotfiles repo around a project directory.
+    dots = new_project("dotfiles")
+    proj = os.path.join(dots, "code", "app")
+    os.makedirs(proj)
+    r = run([SETUP, proj])
+    check("enclosing: a project under a dotfiles-style repo is skipped and writes nothing above",
+          r.returncode == 0 and "is inside the git repository" in r.stdout and not os.path.exists(os.path.join(dots, "factory"))
+          and not os.path.exists(os.path.join(dots, ".gitignore")), tail(r))
+    # --factory keeps today's behaviour on the subdirectory.
+    r = run([SETUP, pkg, "--factory"])
+    check("enclosing: --factory on a subdirectory still scaffolds", r.returncode == 0
+          and os.path.isfile(os.path.join(mono, "factory", "line.json")), tail(r))
+    # A marker at the root of a repo is honoured from a linked worktree.
+    main_ = new_project("wt-main")
+    commit_empty(main_)
+    r = run([SETUP, main_, "--no-factory"])
+    check("enclosing: the main checkout opts out", os.path.isfile(os.path.join(main_, ".claude", "no-factory")), tail(r))
+    wt = os.path.join(BASE, "wt-linked")
+    r = run(["git", "-C", main_, "worktree", "add", "-q", "-b", "side", wt])
+    check("enclosing: the linked worktree was made", r.returncode == 0, tail(r))
+    r = run([SETUP, wt])
+    check("enclosing: a linked worktree honours the marker at the main checkout",
+          r.returncode == 0 and "factory skipped: .claude/no-factory exists in the main checkout" in r.stdout
+          and not os.path.exists(os.path.join(wt, "factory")), tail(r))
+    # Without a marker anywhere, a linked worktree is its own top level and scaffolds.
+    main2 = new_project("wt-main2")
+    commit_empty(main2)
+    wt2 = os.path.join(BASE, "wt-linked2")
+    run(["git", "-C", main2, "worktree", "add", "-q", "-b", "side2", wt2])
+    r = run([SETUP, wt2])
+    check("enclosing: a linked worktree with no marker scaffolds (init puts the scaffold in the main checkout)",
+          r.returncode == 0 and "── Factory ──" in r.stdout and os.path.isfile(os.path.join(main2, "factory", "line.json")), tail(r))
+    # --no-factory on a project that already has the scaffold says it stays.
+    kept = new_project("scaffold-kept")
+    run([SETUP, kept])
+    r = run([SETUP, kept, "--no-factory"])
+    check("enclosing: --no-factory on a scaffolded project says the scaffold and routing stay",
+          r.returncode == 0 and "routing stays on until you remove factory/line.json" in r.stdout, tail(r))
 
 
 def test_init_alone():
@@ -218,7 +407,7 @@ def test_init_alone():
 
 def main():
     try:
-        for fn in (test_syntax_and_usage, test_rollout, test_plain_setup_has_no_factory, test_init_alone):
+        for fn in (test_syntax_and_usage, test_rollout, test_default_on, test_opt_out, test_marker_symlinks, test_safe_skips, test_enclosing_repo, test_init_alone):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001

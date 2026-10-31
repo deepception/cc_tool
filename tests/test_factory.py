@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """The software-factory core: lib/cc_dash/factory.py, bin/cc-factory, cc-setup
---factory and .claude/workflows/factory-line.js, in four parts.
+--factory and .claude/workflows/factory-line.js, in five parts.
 
   lib       this file: the library (below)
   cli       tests/factory_cli_cases.py: bin/cc-factory end to end in temp git
             repos (init, new, list/show, mark, gates, lane, holdout, run-args,
             record, file modes and symlink / hard-link / FIFO refusal)
+  gates     tests/factory_gate_cases.py: approve and reject with a dashboard's
+            ticket: agent-like processes refused, forged tickets, fail closed
   setup     tests/factory_setup_cases.py: cc-setup --factory rollout into a
             temp project, idempotency, no factory/ without the flag
   workflow  tests/factory_workflow_cases.py: factory-line.js meta and syntax,
@@ -447,7 +449,7 @@ def test_line_config():
         "gates": {"spec": "auto"}, "retries": 0}}})
     cfg = F.line_config(root)
     fast = cfg["lines"].get("fast")
-    check("custom line added next to default", set(cfg["lines"]) == {"default", "fast"} and cfg["lines"]["default"] == d, str(set(cfg["lines"])))
+    check("custom line added next to default", set(cfg["lines"]) == {"default", "quick", "fast"} and cfg["lines"]["default"] == d, str(set(cfg["lines"])))
     check("custom line normalised", fast == {"stations": [
         {"name": "build", "title": "Quick build", "model": "sonnet", "holdout": False, "effort": "low"},
         {"name": "check", "title": "Check", "model": "", "holdout": True}],
@@ -548,7 +550,7 @@ def test_line_config():
 
     write_line(root, {"lines": {"Fast": {"stations": [stn("a")]}, "-x": {"stations": [stn("a")]}, "": {"stations": [stn("a")]},
                                 "a" * 33: {"stations": [stn("a")]}, "good_1-x": {"stations": [stn("a")]}, "0lead": {"stations": [stn("a")]}}})
-    check("invalid line names are ignored", set(F.line_config(root)["lines"]) == {"default", "good_1-x", "0lead"}, str(set(F.line_config(root)["lines"])))
+    check("invalid line names are ignored", set(F.line_config(root)["lines"]) == {"default", "quick", "good_1-x", "0lead"}, str(set(F.line_config(root)["lines"])))
 
     # safety: symlink, oversize, FIFO, symlinked factory/
     lj = os.path.join(root, "factory", "line.json")
@@ -1521,7 +1523,7 @@ def test_worktree_and_names():
 
 
 # ── module hygiene ────────────────────────────────────────────────────────────
-STDLIB_OK ={"copy", "datetime", "itertools", "json", "math", "os", "re", "stat", "threading", "time", "unicodedata"}
+STDLIB_OK ={"copy", "datetime", "hashlib", "itertools", "json", "math", "os", "re", "stat", "threading", "time", "unicodedata"}
 
 
 def test_module_hygiene():
@@ -1595,7 +1597,7 @@ def run_part(fname):
     return mod.RESULTS
 
 
-PARTS = {"lib": None, "cli": "factory_cli_cases.py", "setup": "factory_setup_cases.py",
+PARTS = {"lib": None, "cli": "factory_cli_cases.py", "gates": "factory_gate_cases.py", "setup": "factory_setup_cases.py",
          "workflow": "factory_workflow_cases.py"}
 
 

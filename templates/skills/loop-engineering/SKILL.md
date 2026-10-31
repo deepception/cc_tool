@@ -1,6 +1,6 @@
 ---
 name: loop-engineering
-description: The structural model of an autonomous loop, covering the four loop types (turn-based, goal-based, time-based, proactive), the six components, and inner/outer layering, for designing a loop rather than one-off prompting. Consult when turning a repeated task into a loop, picking the right loop type, deciding what a loop must contain to run unattended, or when the user asks to "set up a loop / make this run on its own". For the native Workflow tool's orchestration patterns see dynamic-workflows; for the operational safety checklist see "Safe autonomous loops" in CLAUDE.md.
+description: The structural model of an autonomous loop, covering the four loop types (turn-based, goal-based, time-based, proactive), the six components, and inner/outer layering, for designing a loop rather than one-off prompting. Consult when turning a repeated task into a loop, picking the right loop type, deciding what a loop must contain to run unattended, or when the user asks to "set up a loop / make this run on its own". Also covers choosing and composing the native Workflow tool's orchestration patterns (fan-out, adversarial verification, loop-until-done, tournament; see references/workflow-patterns.md). For the operational safety checklist see "Safe autonomous loops" in CLAUDE.md.
 user-invocable: true
 ---
 
@@ -23,7 +23,7 @@ Four types, by trigger and stop condition (the Claude Code team's taxonomy). Pic
 
 `/goal` mechanics worth knowing: each time the agent tries to stop, a separate evaluator model checks the stated condition and sends it back until the goal is met or the turn cap hits, so deterministic criteria (N tests pass, score clears a threshold) beat judgment calls, which let the loop end at "good enough". A turn-based loop has no such check, which matters on Opus 5.5: on long multi-part tasks it sometimes ends a turn on a progress report rather than the next tool call, and without `/goal` a headless run stops right there. (The six elements of a complete `/goal` are in "Safe autonomous loops" in CLAUDE.md.)
 
-A proactive loop is a composition, not a primitive: `/schedule` (trigger) + `/goal` + verification skills (stop) + a workflow (orchestration) + auto mode (no permission stalls). The self-writing vault (`vault` skill) is the shipped example.
+A proactive loop is a composition, not a primitive: `/schedule` (trigger) + `/goal` + verification skills (stop) + a workflow (orchestration; patterns in [references/workflow-patterns.md](references/workflow-patterns.md)) + auto mode (no permission stalls). The self-writing vault (`vault` skill) is the shipped example.
 
 ## Six components
 
@@ -56,7 +56,7 @@ And when an individual result misses the bar, don't stop at fixing that result. 
 ## Keeping a loop cheap
 
 - Match the trigger interval to how often the watched thing actually changes; react to events over polling where possible.
-- Pilot on a small slice before a large run, since fan-outs balloon well past the naive estimate (see the token-budget control in `dynamic-workflows`).
+- Pilot on a small slice before a large run, since fan-outs balloon well past the naive estimate (see the token-budget control in [references/workflow-patterns.md](references/workflow-patterns.md)).
 - Push deterministic steps into scripts the loop calls (scaffolding, parsing, form-filling) instead of re-reasoning them every run. This is the loop-shaped case of the "Right tool for the job" critical rule.
 - Monitor: `/usage` breaks down spend by skill/subagent/MCP; `/goal` with no arguments shows turns and tokens so far; `/workflows` shows per-agent usage and lets you stop an agent.
 

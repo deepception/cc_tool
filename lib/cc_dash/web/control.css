@@ -111,6 +111,13 @@ html:not(.ctl-paired) .ctl-inline { display: none; }
 .ctl-rv-open { display: inline-flex; align-items: center; height: var(--h-ctl-s); margin-left: calc(-1 * var(--sp-3)); font-size: var(--fs-12); }
 .ctl-rv-foot .ctl-keys { margin-left: auto; gap: var(--sp-3); }
 html.ctl-locked .ctl-rv-foot .ctl-keys { display: none; }   /* locked, y and n only focus the code field */
+/* A work order's gate (gates.js): wider, for reading a whole spec. A gate takes the typed word, so no y and n, and no foot. */
+.ctl-review.ctl-gate { width: min(760px, calc(100vw - 32px)); }
+.ctl-review.ctl-gate .ctl-rv-foot { display: none; }
+.ctl-review.ctl-gate .ctl-rv-body .ctl-card { display: flex; flex-direction: column; gap: var(--sp-2h); }
+.ctl-review.ctl-gate .ctl-rv-body .ctl-card .ctl-who { display: block; }
+.ctl-review.ctl-gate .ctl-plan-text { max-height: min(52dvh, 480px); }
+.ctl-card.k-gate .ctl-where, .ctl-card.k-gate .ctl-meta { margin-top: 0; }
 
 /* ── Session and subagent page: open decisions, Stop, history ────────── */
 .ctl-panel { display: flex; flex-direction: column; gap: var(--sp-3); margin: 0 0 var(--sp-5); }

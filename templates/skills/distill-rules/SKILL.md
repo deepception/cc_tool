@@ -1,6 +1,7 @@
 ---
 name: distill-rules
 description: Turn the hard imperatives in CLAUDE.md, AGENTS.md and the project's skills ("never run X", "always use pnpm", "don't edit files under db/migrations") into deterministic hook rules in .claude/guard-rules.json, enforced by bash-guard.py and write-guard.py. Use when the user says "make my CLAUDE.md enforced", "add a guard rule", "this repo uses X not Y, stop the agent from using Y", or when a rule you wrote keeps being ignored. Manual invocation only; never fires on its own.
+disable-model-invocation: true
 ---
 
 # distill-rules

@@ -5,6 +5,7 @@
   "env": {
     "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-5-5"
   },
+  "plansDirectory": "docs/plans",
   "permissions": {
     "allow": [
       "Bash(git diff *)",

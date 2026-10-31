@@ -11,6 +11,16 @@
       ],
       "gates": {"spec": "human", "merge": "human"},
       "retries": 1
+    },
+    "quick": {
+      "stations": [
+        {"name": "plan", "title": "Plan", "model": "opus"},
+        {"name": "build", "title": "Build", "model": "sonnet", "effort": "medium"},
+        {"name": "test", "title": "Test", "model": "sonnet"},
+        {"name": "review", "title": "Review", "model": "opus"}
+      ],
+      "gates": {"spec": "auto", "merge": "human"},
+      "retries": 1
     }
   }
 }

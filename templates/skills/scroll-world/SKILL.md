@@ -13,6 +13,7 @@ description: >
   the fallback biller. Use when the user wants a "3D world" /
   "browse-through-the-industry" hero, a scroll cinematic, a diorama landing, or to
   turn a business into a scrollable world.
+disable-model-invocation: true
 ---
 
 <!-- Vendored from https://github.com/oso95/scroll-world (MIT, (c) 2026 cyw);

@@ -101,3 +101,28 @@
   .pl-table .pl-cell-t { white-space: normal; }
   .pl-card .card-foot .mono { display: none; }
 }
+
+/* ── The Work page: orders, documents and agent runs reuse the compact table, .seg chips and the floor's stepper ── */
+.pl-sec > * + * { margin-top: var(--sp-4); }
+.pl-sec > .sec-h { margin-bottom: var(--sp-3); }
+.pl-sec .filters { margin-bottom: 0; }
+.pl-wk { table-layout: fixed; width: 100%; }
+.pl-wk td { overflow: hidden; text-overflow: ellipsis; }
+.pl-wk .pl-cell-t { font-weight: 500; color: var(--ink); overflow: hidden; text-overflow: ellipsis; }
+.pl-wk .pl-cell-t.ellipsis { white-space: nowrap; }
+.pl-wk td .ellipsis { display: block; }
+.pl-orders th:nth-child(1) { width: 34%; } .pl-orders th:nth-child(2) { width: 140px; } .pl-orders th:nth-child(3) { width: 320px; } .pl-orders th:nth-child(4) { width: 18%; }
+.pl-docs th:nth-child(2) { width: 120px; } .pl-docs th:nth-child(3) { width: 120px; } .pl-docs th:nth-child(4) { width: 104px; }
+.pl-runs th:nth-child(1) { width: 34%; } .pl-runs th:nth-child(3) { width: 104px; }
+.pl-line-c { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-12); }
+.pl-line-c .fx-steps { flex: 1 1 auto; min-width: 60px; }
+.pl-gate { margin-top: var(--sp-1h); font-size: var(--fs-12); white-space: normal; }
+.pl-wk td:has(.pl-gate) { overflow: visible; }
+.pl-gate code { display: block; width: fit-content; max-width: 100%; margin-top: var(--sp-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 640px) {
+  .pl-wk th.opt, .pl-wk td.opt { display: none; }
+  .pl-orders th:nth-child(1), .pl-runs th:nth-child(1) { width: auto; }
+  .pl-orders th:nth-child(2) { width: 96px; } .pl-orders th:nth-child(3) { width: 120px; }
+  .pl-line-c .num { display: none; }
+}

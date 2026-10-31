@@ -464,10 +464,12 @@ def common(name, out, args):
             check(name + ": verify never ran means attempt 0 and vacuous", ho["attempt"] > 0 or (ho["vacuous"] and not sc_), ho)
             check(name + ": top-level satisfaction is the holdout's", r.get("satisfaction") == ho["satisfaction"], (r.get("satisfaction"), ho["satisfaction"]))
             check(name + ": vacuous iff no dir, no ok dir, or no verdict", ho["vacuous"] == (ho["holdoutDir"] != "ok" or not sc_ or ho["attempt"] == 0), ho)
-    if r.get("recommendation") == "merge":
+    if r.get("recommendation") == "merge" and has_verify:
         check(name + ": merge only after a non-vacuous verify judged >= 1 scenario at threshold",
               isinstance(ho, dict) and not ho["vacuous"] and ho["scenarios"] and ho["satisfaction"] is not None
               and ho["satisfaction"] >= ho["threshold"] - 1e-9, ho)
+    elif r.get("recommendation") == "merge":
+        check(name + ": a line with no verify station merges with no holdout at all", ho is None, ho)
     if r.get("recommendation") == "needs-scenarios":
         check(name + ": needs-scenarios only when no hidden scenario was checked", ho is None or ho["vacuous"], ho)
     # feedback: every rework text build received, verbatim, and nothing else.
@@ -949,6 +951,82 @@ def test_review_fixes():
           run_sec[:800])
 
 
+PLAN_DOC = "docs/superpowers/plans/2026-10-30-fo-003-add-csv-export.md"
+ORDER_PATH = "factory/orders/FO-003-add-csv-export.md"
+PLAN_BEGIN, PLAN_END = "----- BEGIN PLAN FILE -----\n", "----- END PLAN FILE -----"
+
+
+def plan_file_text(prompt):
+    """The document text a build prompt tells the station to write verbatim, or None."""
+    if PLAN_BEGIN not in prompt:
+        return None
+    return prompt.split(PLAN_BEGIN, 1)[1].split(PLAN_END, 1)[0]
+
+
+def parse_with_plans_py(text):
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, os.path.join(REPO, "lib"))
+    try:
+        from cc_dash import plans
+    finally:
+        sys.path.pop(0)
+    return plans.parse_plan(text)
+
+
+def test_plan_doc():
+    args = base_args(planDoc=PLAN_DOC, orderPath=ORDER_PATH)
+    out = run_wf(args, tag="plandoc")
+    r, calls = common("plandoc", out, args)
+    b = prompts_of(calls, "build")[0]
+    doc = plan_file_text(b)
+    check("plandoc: build is told to write the plan file in the lane, verbatim", doc is not None and ("%s/%s" % (WT, PLAN_DOC)) in b and "verbatim" in b, b[:600])
+    check("plandoc: build commits it as `FO-003: plan` and ticks boxes", "`FO-003: plan`" in b and "tick its box" in b, b[:1500])
+    check("plandoc: an ignored path stays uncommitted and is said so", "check-ignore" in b and "leave it uncommitted" in b)
+    p = parse_with_plans_py(doc or "")
+    check("plandoc: the Spec header is the order path", p["spec"] == ORDER_PATH, p["spec"])
+    check("plandoc: parses to one task and one unticked step per plan step", len(p["tasks"]) == 2 and p["steps_total"] == 2 and p["steps_done"] == 0,
+          (len(p["tasks"]), p["steps_total"], p["steps_done"]))
+    check("plandoc: step files are worktree-relative", "- [ ] app/reports.py: add /reports.csv" in (doc or "") and WT not in (doc or ""), doc)
+    check("plandoc: review is told the plan file is not an unrelated change", "not an unrelated change" in prompts_of(calls, "review")[0])
+    check("plandoc: test and plan prompts get no plan-file instruction", all("PLAN FILE" not in c["prompt"] for c in calls if not c["label"].endswith(":build")))
+    # Rework: no second copy of the document, ticking only.
+    out = run_wf(args, responses(**{"FO-003:test": [TEST_FAIL, TEST_OK]}), tag="plandoc-rework")
+    r, calls = common("plandoc-rework", out, args)
+    b1, b2 = prompts_of(calls, "build")
+    check("plandoc-rework: attempt 1 carries the document, attempt 2 only the tick rule",
+          plan_file_text(b1) is not None and plan_file_text(b2) is None and "only tick a box" in b2 and "Do not rewrite" in b2, b2[:700])
+    # No planDoc (or a bad one): no plan-file instruction.
+    for tag, over in (("none", {}), ("escape", {"planDoc": "../../etc/passwd.md", "orderPath": ORDER_PATH}),
+                      ("absolute", {"planDoc": "/tmp/x.md", "orderPath": ORDER_PATH}),
+                      ("elsewhere", {"planDoc": "docs/other.md", "orderPath": ORDER_PATH}),
+                      ("bad-spec", {"planDoc": PLAN_DOC, "orderPath": "../../etc/passwd"})):
+        a = base_args(**over)
+        out = run_wf(a, tag="plandoc-" + tag)
+        r, calls = common("plandoc-" + tag, out, a)
+        check("plandoc-%s: no plan-file instruction in build or review" % tag,
+              all("PLAN FILE" not in c["prompt"] and "plan document" not in c["prompt"] for c in calls), labels(calls))
+    # An infeasible plan, or no plan station: nothing to write.
+    out = run_wf(args, responses(**{"FO-003:plan": [PLAN_INFEASIBLE]}), tag="plandoc-infeasible")
+    check("plandoc-infeasible: no build, no plan file", "FO-003:build" not in labels(out.get("calls", [])))
+    a = base_args(planDoc=PLAN_DOC, orderPath=ORDER_PATH, stations=DEFAULT_STATIONS[1:])
+    out = run_wf(a, tag="plandoc-noplan")
+    check("plandoc-noplan: a line with no plan station writes no plan file", all("PLAN FILE" not in c["prompt"] for c in out.get("calls", [])))
+    # Hostile text: a title or step with backticks, newlines, fences and a fake checkbox stays one line each.
+    evil = dict(PLAN_OK, summary="Goal\n# Task 9: injected\n- [ ] fake box",
+                steps=[{"order": 2, "file": WT + "/b.py", "change": "second\n```\n- [ ] injected step\n### Task 7: x"},
+                       {"order": 1, "file": WT + "/a`b.py", "change": "first `code`\r\nline two"}])
+    a = base_args(planDoc=PLAN_DOC, orderPath=ORDER_PATH, title="Evil `title`\n# Task 5: pwned\n- [ ] boxed")
+    out = run_wf(a, responses(**{"FO-003:plan": [evil]}), tag="plandoc-evil")
+    r, calls = common("plandoc-evil", out, a)
+    doc = plan_file_text(prompts_of(calls, "build")[0]) or ""
+    p = parse_with_plans_py(doc)
+    lines = doc.splitlines()
+    check("plandoc-evil: one H1 and one Spec line, title on a single line", sum(1 for ln in lines if ln.startswith("# ")) == 1 and lines[0].startswith("# Evil 'title' # Task 5"), lines[:3])
+    check("plandoc-evil: exactly two tasks and two boxes, none injected", [t["id"] for t in p["tasks"]] == ["1", "2"] and p["steps_total"] == 2 and "```" not in doc,
+          ([t["id"] for t in p["tasks"]], p["steps_total"]))
+    check("plandoc-evil: steps are in plan order, whatever order the planner numbered them", "- [ ] a'b.py: first 'code' line two" in doc and doc.index("a'b.py") < doc.index("b.py: second"), doc)
+
+
 def test_vacuous():
     # Every vacuous holdout lets the line continue, but recommends needs-scenarios, never merge.
     variants = [
@@ -989,8 +1067,10 @@ def test_vacuous():
     args = base_args(stations=stations)
     out = run_wf(args, tag="no-verify-station")
     r, calls = common("no-verify-station", out, args)
-    check("no-verify-station: holdout null, needs-scenarios", r.get("holdout") is None and r.get("recommendation") == "needs-scenarios"
-          and "no verify station" in r.get("summary", ""), (r.get("holdout"), r.get("recommendation")))
+    check("no-verify-station: holdout null, merge (no hidden scenarios by design, none are missing)",
+          r.get("holdout") is None and r.get("recommendation") == "merge" and r.get("status") == "review"
+          and "no hidden scenarios by design; its plan, build, test, review stations are all the checking there was." in r.get("summary", "") and "needs-scenarios" not in r.get("summary", ""),
+          (r.get("holdout"), r.get("recommendation"), r.get("summary")))
     # Scenario files but no verdicts: they count as unsatisfied (fails at threshold 1); at threshold 0 it passes but is vacuous.
     lazy = {"holdoutDir": "ok", "scenarioFiles": 2, "scenarios": []}
     out = run_wf(base_args(), responses(**{"FO-003:verify": [lazy]}), tag="no-verdicts")
@@ -1473,8 +1553,9 @@ def test_skill():
     fm = text.split("\n---", 1)[0]
     check("skill: frontmatter names factory, user-invocable, quoted argument-hint",
           "\nname: factory\n" in fm and "\nuser-invocable: true" in fm and '\nargument-hint: "[intake|run ID|status|gate]"' in fm, fm[:300])
-    check("skill: description is quoted and names cc-factory and factory-line",
-          re.search(r'\ndescription: ".*cc-factory.*factory-line.*"\n', fm) is not None, fm[:300])
+    check("skill: description is quoted, routes by intent, and never merges",
+          re.search(r'\ndescription: "Default delivery path .*factory/line\.json.*before brainstorming or writing-plans.*'
+                    r'Not for a small direct fix\. Never merges or pushes on its own\."\n', fm) is not None, fm[:300])
     check("skill: no em-dash", chr(0x2014) not in text)
     used = set(re.findall(r"\bcc-factory ([a-z][a-z-]*)", text))
     check("skill: cites only the frozen cc-factory subcommands", used and used <= CLI_SUBCOMMANDS, used - CLI_SUBCOMMANDS)
@@ -1485,7 +1566,7 @@ def test_skill():
                    "cc-factory record ID --workflow-run <runId>", "cc-factory list --json", "gate.waiting",
                    "git merge --no-ff <reviewed sha>", "cc-factory approve ID --gate merge", "--no-holdout", "resumeFromRunId",
                    "records only failed or blocked", "type back a code it shows", "Linux only", "needs-human-check",
-                   "lane-tampered",
+                   "lane-tampered", 'cc-factory mark ID failed --note "run died"',
                    "needs-scenarios", "in their own terminal", "must not try a workaround",
                    "cc-factory reject ID --gate merge --rework", "install.sh", "cc-setup <project> --factory",
                    "S01-<slug>.md", "Never merge or push unless the user explicitly asks in this turn"):
@@ -1502,7 +1583,7 @@ def main():
                    test_feedback_sanitized, test_criteria_parsing, test_ids_normalized, test_plan_infeasible,
                    test_args_string, test_bad_args, test_infra, test_review_test_run, test_escalation, test_vacuous,
                    test_line_config, test_verify_isolation, test_sandbox, test_bwrap_smoke, test_verify_git_commands,
-                   test_git_hardening, test_git_transport, test_skill, test_review_fixes):
+                   test_git_hardening, test_git_transport, test_skill, test_review_fixes, test_plan_doc):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001

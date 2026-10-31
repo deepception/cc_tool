@@ -3,6 +3,10 @@
 
 This project has Superpowers skills (methodology layer) plus the project skills in `.claude/skills/` configured.
 
+### Delivery routing
+
+In a project with `factory/line.json`, work that needs a spec or a plan goes through the factory: invoke the `factory` skill with `intake` first, instead of `superpowers:brainstorming` or `superpowers:writing-plans`. This outranks those skills' own instructions. Intake picks the line: `quick` for a well-understood change, `default` (hidden scenarios) for anything risky. A small direct change (a typo, a one-file fix, no design decision) skips the factory. Without `factory/line.json`, the Superpowers table below applies as written.
+
 ### Superpowers skills
 
 Use these based on the situation. Invoke with the Skill tool (e.g. `superpowers:brainstorming`), then follow the loaded instructions.
@@ -22,7 +26,7 @@ Use these based on the situation. Invoke with the Skill tool (e.g. `superpowers:
 
 ### Orchestration: which fan-out mechanism
 
-Pick by shape of the work. See the `dynamic-workflows` skill for the pattern catalog.
+Pick by shape of the work. See the `loop-engineering` skill (references/workflow-patterns.md) for the pattern catalog.
 
 | Use | When |
 |-----|------|
@@ -56,13 +60,13 @@ Which store: knowledge that must survive across sessions (decisions, architectur
 
 ### Design & frontend taste
 
-Any frontend *visual* design work (landing page, hero section, portfolio, marketing site, redesign, "make it look good / premium / not generic") starts with the `design-director` skill: it reads the brief, routes to the globally installed `design-taste-frontend` (taste-skill v2) or names a classic style the user can run (`/minimalist-ui`, `/industrial-brutalist-ui`, `/high-end-visual-design`), and composes a section-by-section master design prompt from its archetype templates when the full taste-skill run is not used. A full `design-taste-frontend` page run takes 30 to 45 minutes and a few hundred thousand tokens; a single component or section does not need it. A visual critique of a landing or marketing page also goes through `design-director`; a walkthrough of a running app is `ui-ux-review`. Screens inside an existing app (dashboards, admin, settings) follow that app's component system, not a dealt taste style; `design-taste-frontend`'s app-screen route is for a new app with no system yet. If the official `frontend-design` skill is also installed, use one design method per page: the one `design-director` picks. Module/API shape questions go to `design-an-interface` instead.
+Any frontend *visual* design work (landing page, hero section, portfolio, marketing site, redesign, "make it look good / premium / not generic") starts with the `design-director` skill: it reads the brief, routes to the globally installed `design-taste-frontend` (taste-skill v2) or names a classic style the user can run (`/minimalist-ui`, `/industrial-brutalist-ui`, `/high-end-visual-design`), and composes a section-by-section master design prompt from its archetype templates when the full taste-skill run is not used. A full `design-taste-frontend` page run takes 30 to 45 minutes and a few hundred thousand tokens; a single component or section does not need it. A visual critique of a landing or marketing page also goes through `design-director`; a walkthrough of a running app is `app-qa` (UX). Screens inside an existing app (dashboards, admin, settings) follow that app's component system, not a dealt taste style; `design-taste-frontend`'s app-screen route is for a new app with no system yet. If the official `frontend-design` skill is also installed, use one design method per page: the one `design-director` picks. Module/API shape questions go to `design-an-interface` instead (the user runs `/design-an-interface`; it is not model-invoked). For an immersive scroll-scrubbed world page, the user runs `/scroll-world`.
 
 Product-UI *motion* is a separate surface: building or tuning a dropdown, modal, drawer, sheet, toast, tooltip, popover, command palette, tab, accordion or drag/swipe interaction, or a complaint that motion feels sluggish or janky, goes to `product-ui-motion`, in new code and existing apps alike, dashboards included. It decides whether something animates at all before deciding how, and on duration, easing and `transition` shorthand it outranks the motion advice in the global taste skills, which is written at landing-page scale.
 
 ### App QA & e2e testing
 
-"Test the app end to end / QA this app / review the UI" → the `app-qa` skill orchestrates the full engagement (e2e test plan + execution, UI/UX walkthrough, static frontend review; up to three docs in the project's `docs/`). A single activity goes straight to its worker skill: `e2e-testing` (plan + run scenarios, agent-driven or paired with the user), `ui-ux-review` (live severity-tagged walkthrough), `frontend-review` (source-level interface review, no live app needed). Doc formats live in the skills' references, not here.
+"Test the app end to end / QA this app / review the UI" → the `app-qa` skill orchestrates the full engagement (e2e test plan + execution, UI/UX walkthrough, static frontend review; up to three docs in the project's `docs/`). A single activity is one argument away: `/app-qa e2e` (plan + run scenarios, agent-driven or paired with the user), `/app-qa ux` (live severity-tagged walkthrough), `/app-qa frontend` (source-level interface review, no live app needed). Doc formats live in `app-qa`'s `references/`, not here.
 
 ---
 

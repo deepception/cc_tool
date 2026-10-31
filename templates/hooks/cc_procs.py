@@ -14,7 +14,7 @@ refuses to start, cc-dash shows no request, the hook leaves every prompt in the
 terminal, and cc-setup records no terminal. The rules that decide also fail
 closed on their own when what they read cannot be read (python_problem,
 claude_lineage, terminal_problem, hook_problem, peer_holder_problem,
-code_after_start, recording_problem).
+code_after_start, recording_problem, control_mode_problem).
 
   have_proc()                   whether there is a /proc to read (tests patch
                                 it to play a system without one)
@@ -23,6 +23,8 @@ code_after_start, recording_problem).
                                 root, run by the recorded Python interpreter,
                                 launched the way cc-dash launches itself and
                                 from outside Claude Code ('' when it is)
+  control_mode_problem(pid)     why that dashboard is not in control mode: no
+                                --control flag, or no controlling terminal
   hook_problem(pid, root)       why pid is not a dash-control.py hook installed
                                 by that checkout ('' when it is)
   peer_cred(sock), peer_pidfd   who is at the other end of the hook's Unix
@@ -969,6 +971,28 @@ def dashboard_problem(pid, root, proc="/proc", python=None, terminals=None, cach
     why = env_problem(env) or origin_problem(
         pid, proc, terminal=lambda: terminal_problem(pid, proc, terminals=terminals, cache=cache))[1]
     return ("process %d: %s" % (pid, why)) if why else ""
+
+
+def control_mode_problem(pid, proc="/proc"):
+    """'' when pid, a dashboard by dashboard_problem, is in control mode; else why
+    not. dashboard_problem cannot tell: any flags may follow the script, and a
+    process with no terminal passes unless it was also re-parented. Control mode
+    has `--control` after `<python> -I <script>` (cc-dash takes no other spelling,
+    allow_abbrev=False) and a controlling terminal of any kind: cc-dash goes no
+    further without opening /dev/tty for the control code, and /dev/tty is the
+    terminal tty_nr names. `ccdash` keeps it (nohup, setpgid and the redirections
+    leave the session alone). It goes only when the session's leader or its
+    terminal does, and a dashboard whose leader is gone fails claude_lineage
+    anyway. Fails closed: a process that cannot be read counts."""
+    st = proc_stat(pid, proc)
+    argv = cmdline(pid, proc)
+    if st is None or argv is None:
+        return "process %d cannot be inspected" % pid
+    if "--control" not in argv[3:]:
+        return "process %d was not started with --control" % pid
+    if not st["tty"]:
+        return "process %d has no controlling terminal, and control mode needs one" % pid
+    return ""
 
 
 def read_pin(hooks_dir):

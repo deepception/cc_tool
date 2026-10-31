@@ -40,6 +40,7 @@ A plan with neither tasks nor checkboxes shows its executing session's todo
 list instead, and says so.
 """
 import os
+import posixpath
 import re
 import stat
 import statistics
@@ -47,6 +48,7 @@ import subprocess
 import threading
 import time
 
+from . import docs as docs_mod
 from . import pricing
 from .parser import ACTIVE_GAP, clip, tilde
 
@@ -81,6 +83,15 @@ SKIP_DIRS = {"node_modules", ".git", ".venv", "venv", "__pycache__", "dist", "bu
 GENERIC_NAMES = {"readme.md", "plan.md", "tasks.md", "todo.md", "log.md", "spec.md", "index.md", "notes.md",
                  "changelog.md", "claude.md", "agents.md", "progress.md", "kickoff.md", "start-here.md"}
 EXEC_SKILLS = ("executing-plans", "subagent-driven-development")
+META_BYTES = 16 * 1024             # a spec's or document's head read for its frontmatter and title
+MAX_DOCUMENTS = 200                # the Work view's Documents list (newest)
+MAX_BOARD = 60                     # ...and its Agent runs
+MAX_META = 4000                    # cached head reads before a reset
+DOC_PARSE_BYTES = 512 * 1024       # a document above this is typed by folder and name only
+_BOARD_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+_CTRL = re.compile("[\x00-\x1f\x7f-\x9f]")
+_FM_KEY = re.compile(r"^(title|status|type)\s*:\s*(.*)$")
+_DOC_TYPE = re.compile(r"^[a-z][a-z-]{0,19}$")
 
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 _HEAD = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
@@ -336,11 +347,65 @@ def is_plan(parsed, where):
     """Whether a parsed file is worth tracking, by where it sits."""
     if parsed is None:
         return False
+    if where == "planmode":     # docs/plans/: Claude Code's plan-mode files, tracked even with no checkbox
+        return True
     if where == "plans":
         return parsed["mode"] == "tasks" or parsed["checkboxes"] >= 2
     if where == "root":
         return parsed["checkboxes"] >= 1
     return parsed["checkboxes"] >= 3
+
+
+# ── the Work view's joins: specs, document heads, the run-state board ─────────
+def spec_path(raw):
+    """The normalised relative path a plan's `**Spec:**` value names, or '' when it names none, is
+    absolute, '~'-based, escapes the checkout, passes through a dot-directory or is not Markdown."""
+    s = (raw or "").strip()
+    m = re.search(r"\]\(([^)\s]+)\)", s)
+    tok = m.group(1) if m else (s.split() or [""])[0]
+    tok = tok.strip("`'\"()<>[],;")
+    if not tok or "\x00" in tok or "\\" in tok or tok[0] in "/~" or not tok.lower().endswith(".md"):
+        return ""
+    n = posixpath.normpath(tok)
+    if n == ".." or n.startswith("../") or n.startswith("/"):
+        return ""
+    if any(seg.startswith(".") for seg in n.split("/")):
+        return ""
+    return n
+
+
+def _plain(s, n):
+    """Free text from a file made safe for the payload: no control characters, no live credential."""
+    return clip(docs_mod.redact(_CTRL.sub(" ", s or "")), n)
+
+
+def head_meta(text):
+    """{title, status, type} from a document's head: the frontmatter keys, the title falling back to the
+    first H1. Values are plain one-line text."""
+    lines = text.split("\n")
+    out = {"title": "", "status": "", "type": ""}
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for i in range(1, min(len(lines), 101)):
+            if lines[i].strip() == "---":
+                start = i + 1
+                break
+            m = _FM_KEY.match(lines[i].rstrip("\r"))
+            if m:
+                v = m.group(2).strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                    v = v[1:-1]
+                out[m.group(1)] = v
+    if not out["title"]:
+        fence = False
+        for ln in lines[start:]:
+            if ln.lstrip().startswith(("```", "~~~")):
+                fence = not fence
+            elif not fence and ln.startswith("# "):
+                out["title"] = ln[2:].strip()
+                break
+    return {"title": _plain(out["title"], 200), "status": _plain(out["status"], 40),
+            "type": out["type"] if _DOC_TYPE.match(out["type"]) else ""}
 
 
 # ── the engine ────────────────────────────────────────────────────────────
@@ -355,6 +420,8 @@ class Plans:
         self._ledger_parse = {}
         self._git = {}         # args tuple + reflog stamp -> commits
         self._ev = {}          # (session id, plans signature) -> (signature, evidence); one per window's plan set
+        self._meta = {}        # abs path -> (size, mtime_ns, head_meta); specs and Work documents
+        self._docs = None      # a Docs tree reader, made on first use (the Work view's Documents)
 
     # discovery ------------------------------------------------------------
     @staticmethod
@@ -426,6 +493,11 @@ class Plans:
         if os.path.isdir(plans_dir) and not os.path.islink(plans_dir):
             for p in self._walk_md(plans_dir, MAX_DOC_FILES):
                 found.append((p, "plans"))
+                seen.add(p)
+        pm_dir = os.path.join(checkout, "docs", "plans")
+        if os.path.isdir(pm_dir) and not os.path.islink(pm_dir):
+            for p in self._walk_md(pm_dir, MAX_DOC_FILES):
+                found.append((p, "planmode"))
                 seen.add(p)
         docs = os.path.join(checkout, "docs")
         if os.path.isdir(docs) and not os.path.islink(docs):
@@ -1048,9 +1120,13 @@ class Plans:
             "executors": exec_list, "sessions": sessions_out[:30], "mtime": r["mtime"], "copies": len(r["copies"]),
             "ledger": tilde(r["ledger"]) if r["ledger"] else None,
         }
+        spec = spec_path(p["spec"])
+        info = self._spec_info(spec, (r["checkout"], r["root"])) if spec else None
+        out.update(order=None, spec=spec, spec_title=info["title"] if info else "",
+                   spec_status=info["status"] if info else "", spec_exists=info is not None)
         if detail:
             series = sorted(t["finished"] for t in tasks if t["done"] and t["finished"])
-            out.update(task_list=[_task_out(t) for t in tasks], series=series, commits=commits, spec=p["spec"],
+            out.update(task_list=[_task_out(t) for t in tasks], series=series, commits=commits, spec_text=p["spec"],
                        loose=p["loose"], copies_list=[{"path": tilde(c["abs"]), "steps_done": c["parsed"]["steps_done"],
                                                        "mtime": c["mtime"]} for c in r["copies"]],
                        done_untimed=sum(1 for t in tasks if t["done"] and not t["finished"]))
@@ -1185,9 +1261,156 @@ class Plans:
             d["plans"] += 1
             d["recent"] += p["recent"]
             d["active"] += p["status"] in ("live", "active", "blocked")
+        try:
+            orders, documents, board = self._work(project, plans, shown, days, now)
+        except Exception:  # noqa: BLE001 - the plans list must survive a broken orders or documents read
+            orders, documents, board = [], [], []
         return {"now": now, "days": days, "plans": shown, "older": len(plans) - len([p for p in plans if p["recent"]]),
                 "total": len(plans), "chips": chips, "projects": sorted(projects.values(), key=lambda x: x["project"].lower()),
-                "scope": {"project": project}, "pause_secs": PAUSE_SECS}
+                "scope": {"project": project}, "pause_secs": PAUSE_SECS,
+                "orders": orders, "documents": documents, "board": board}
+
+    # the Work view: orders, documents and agent runs joined to the plans ----------------
+    def _head(self, path):
+        """head_meta of a file's first META_BYTES, cached by (size, mtime); None when unreadable."""
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return None
+        c = self._meta.get(path)
+        if c and c[0] == st.st_size and c[1] == st.st_mtime_ns:
+            return c[2]
+        try:
+            meta = head_meta(read_text(path, META_BYTES))
+        except OSError:
+            return None
+        if len(self._meta) >= MAX_META:
+            self._meta.clear()
+        self._meta[path] = (st.st_size, st.st_mtime_ns, meta)
+        return meta
+
+    def _spec_info(self, rel, bases):
+        """head_meta of the spec `rel` (already through spec_path) in the first checkout holding it as a
+        regular file whose real path stays inside that checkout; None when there is none. Bounded, never
+        follows a symlink out."""
+        for base in bases:
+            if not base:
+                continue
+            real_base = os.path.realpath(base)
+            real = os.path.realpath(os.path.join(real_base, rel))
+            if not real.startswith(real_base.rstrip("/") + "/"):
+                continue
+            try:     # a symlink inside the checkout must not reach what the Docs viewer refuses (.factory-holdout, secrets)
+                docs_mod.check_rel(os.path.relpath(real, real_base), ("doc",))
+            except docs_mod.DocsError:
+                continue
+            meta = self._head(real)
+            if meta is not None:
+                return meta
+        return None
+
+    def _work(self, project, plans, shown, days, now):
+        """(orders, documents, board) for Contract B, over the projects of the window."""
+        from . import doctypes, graph   # graph imports this module; doctypes needs is_plan
+        st = self.store
+        with st.lock:
+            groups = self._gather(project, days, now)
+        fac = graph._factory()
+        if self._docs is None:
+            self._docs = docs_mod.Docs(st)
+        orders, documents, board = [], [], []
+        for label, root, _sess in groups:
+            orders_p, documents_p, board_p = [], [], []   # one project's rows land only when its whole read worked
+            try:
+                mine = [p for p in plans if p["project"] == label]
+                by_spec = {}
+                for p in sorted(mine, key=lambda x: x["mtime"]):
+                    if p["spec"]:
+                        by_spec[p["spec"]] = p
+                recs = {}
+                if fac is not None:
+                    try:
+                        main = getattr(fac, "main_checkout", None)
+                        for ev in fac.read_ledger(fac.ledger_path(main(root) if main else root)):
+                            if ev.get("recommendation") in fac.RECOMMENDATIONS and isinstance(ev.get("order"), str):
+                                recs[ev["order"]] = ev["recommendation"]
+                    except Exception:  # noqa: BLE001
+                        recs = {}
+                for o in (graph._project_orders(st, fac, root, now) if fac is not None else []):
+                    plan = by_spec.get(o["path"])
+                    if plan is not None:
+                        plan["order"] = o["id"]
+                    lane = o["lane"] or {}
+                    sts = [{"name": s["name"], "title": s["title"], "status": "pass" if s["status"] == "done" else s["status"]}
+                           for s in o["stations"]]
+                    orders_p.append({
+                        "project": label, "id": o["id"], "title": o["title"], "status": o["status"], "priority": o["priority"],
+                        "line": o["line"], "gate": o["gate"], "stations": sts,
+                        "done": sum(1 for s in sts if s["status"] == "pass"), "total": len(sts), "rework": o["rework"],
+                        "recommendation": recs.get(o["id"], ""), "branch": lane.get("branch", ""),
+                        "worktree": lane.get("worktree", ""), "path": o["path"],
+                        "plan": {"key": plan["key"], "path": plan["doc"] or "", "title": plan["title"], "tasks": plan["tasks"]} if plan else None,
+                        "updated": o["updated"] or 0})
+                # documents: the Docs tree minus what the Plans and Orders sections already show
+                skip = {p["key"] for p in shown if p["project"] == label}
+                skip |= {p["doc"] for p in shown if p["project"] == label and p["doc"]}
+                tree = self._docs._tree(root)
+                # Only docs/: the docs standard's home for what a project produces. The rest of the tree holds
+                # scaffolding and source (factory/order-template.md, templates/, marketing/).
+                cand = [f for f in tree["files"] if f["kind"] == "md" and f["section"] in ("docs", "plans") and f["path"] not in skip]
+                cand.sort(key=lambda f: -f["mtime"])
+                for f in cand[:MAX_DOCUMENTS]:
+                    path = os.path.join(tree["real_root"], f["path"])
+                    meta = self._head(path) or {"title": "", "status": "", "type": ""}
+                    parsed = None
+                    if f["size"] <= DOC_PARSE_BYTES:
+                        parsed = self.parsed(path)[0]
+                    dtype = meta["type"] or doctypes.classify(f["path"], parsed, meta["title"])
+                    documents_p.append({"project": label, "path": f["path"], "type": dtype,
+                                      "title": meta["title"] or clip(posixpath.splitext(posixpath.basename(f["path"]))[0], 200),
+                                      "status": meta["status"], "updated": f["mtime"]})
+                board_p.extend(self._board(label, root))
+            except Exception:  # noqa: BLE001 - one broken project must not blank the others' rows
+                continue
+            orders += orders_p
+            documents += documents_p
+            board += board_p
+        orders.sort(key=lambda o: -o["updated"])
+        documents.sort(key=lambda d: -d["updated"])
+        board.sort(key=lambda b: -b["updated"])
+        return orders, documents[:MAX_DOCUMENTS], board[:MAX_BOARD]
+
+    @staticmethod
+    def _board(label, root):
+        """[{project, run, label, path, head, updated}] from <root>/.cc-board/<run>/<label>/checkpoint.md;
+        symlinks and odd names are skipped, `head` is the first non-empty line, redacted."""
+        base = os.path.join(root, docs_mod.BOARD_DIR)
+        out = []
+        try:
+            if not stat.S_ISDIR(os.lstat(base).st_mode):    # a .cc-board that is itself a symlink leads outside the root
+                return out
+            runs = [e for e in os.scandir(base) if e.is_dir(follow_symlinks=False) and _BOARD_NAME.match(e.name)]
+        except OSError:
+            return out
+        for run in runs[:200]:
+            try:
+                labels = [e for e in os.scandir(run.path) if e.is_dir(follow_symlinks=False) and _BOARD_NAME.match(e.name)]
+            except OSError:
+                continue
+            for lab in labels[:200]:
+                cp = os.path.join(lab.path, "checkpoint.md")
+                try:
+                    st = os.stat(cp, follow_symlinks=False)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    text = read_text(cp, 8192)
+                except OSError:
+                    continue
+                head = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
+                out.append({"project": label, "run": run.name, "label": lab.name,
+                            "path": "%s/%s/%s/checkpoint.md" % (docs_mod.BOARD_DIR, run.name, lab.name),
+                            "head": _plain(head, 200), "updated": st.st_mtime})
+        return out
 
     def resolve(self, project, path, days=None):
         """The plan key for (project, path) when it is safe, else None.

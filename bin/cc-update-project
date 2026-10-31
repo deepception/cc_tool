@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # cc-update-project: Update cc_tool-managed files (hooks, skills, permissions deny-list)
 # in an existing project. For first-time setup use cc-setup. For external deps use cc-update.
-# Usage: cc-update-project [project_path] [--reset-terminals]
+# Usage: cc-update-project [project_path] [--reset-terminals] [--no-factory]
+#   --no-factory       opt the project out of the software factory (cc-setup writes .claude/no-factory)
 #   --reset-terminals  replace the recorded terminal hosts (control mode) with this terminal's
 set -euo pipefail
 
@@ -10,7 +11,7 @@ SETUP_FLAGS=()
 PROJECT_DIR=""
 for a in "$@"; do
     case "$a" in
-        --reset-terminals) SETUP_FLAGS+=("$a") ;;
+        --reset-terminals|--no-factory) SETUP_FLAGS+=("$a") ;;
         -*) echo "Unknown flag: $a" >&2; exit 1 ;;
         *) PROJECT_DIR="$a" ;;
     esac

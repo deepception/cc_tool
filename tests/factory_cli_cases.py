@@ -837,6 +837,8 @@ def test_gates():
     check("approve: gate inferred as merge when the order is in review; status done", r.returncode == 0 and e["gate"] == "merge" and e["state"] == "pass" and e["status"] == "done", (r.stderr, e))
     check("approve merge: folded done, no gate, no station left pending (skipped or done)", o["status"] == "done" and o["gate"] is None
           and all(s["status"] in ("done", "skipped") for s in o["stations"]), o)
+    r = cli(d, "mark", b, "blocked", "--note", "reopen")
+    check("mark on a done order: BLOCKED, it stays done", blocked(r) and "done" in r.stderr and order_of(d, b)["status"] == "done", (r.returncode, r.stderr))
     r = cli(d, "approve", b)
     check("approve on a done order: BLOCKED", blocked(r) and "done" in r.stderr, (r.returncode, r.stderr))
     r = cli(d, "reject", b)
@@ -852,6 +854,10 @@ def test_gates():
     check("approve on a rejected order: BLOCKED", blocked(r) and "rejected" in r.stderr, (r.returncode, r.stderr))
     r = cli(d, "reject", c)
     check("reject on a rejected order: BLOCKED", blocked(r), (r.returncode, r.stderr))
+    r = cli(d, "mark", c, "queued")
+    check("mark on a rejected order: BLOCKED, the rejection stands", blocked(r) and "rejected" in r.stderr and order_of(d, c)["status"] == "rejected", (r.returncode, r.stderr))
+    r = cli(d, "mark", c, "--note", "dropped for the quarter")
+    check("a note on a rejected order still records and moves nothing", r.returncode == 0 and order_of(d, c)["status"] == "rejected", (r.returncode, r.stderr))
 
     e1 = new_order(d, "Rework at merge")
     cli(d, "approve", e1)
@@ -868,6 +874,9 @@ def test_gates():
     force_review(d, f1)
     r = cli(d, "reject", f1, "--gate", "merge")
     check("reject --gate merge: status rejected", r.returncode == 0 and order_of(d, f1)["status"] == "rejected" and events(d, f1)[-1]["gate"] == "merge", r.stderr)
+    r = cli(d, "mark", f1, "blocked", "--note", "reopen")
+    check("mark after a merge-gate rejection: BLOCKED, and run-args stays refused", blocked(r) and order_of(d, f1)["status"] == "rejected"
+          and blocked(cli(d, "run-args", f1)), (r.returncode, r.stderr))
     g1 = new_order(d, "Merge gate while queued")
     r = cli(d, "reject", g1, "--gate", "merge")
     check("reject --gate merge outside review: BLOCKED", blocked(r), (r.returncode, r.stderr))
@@ -940,7 +949,7 @@ def test_human_gates():
     m2 = CODE_RE.search(r.tty.encode())
     check("human gate: the stub tree approves once the shown code is typed back, after a line typed ahead was discarded "
           "(exit 0, the gate event written; the question names the spec hash)",
-          r.returncode == 0 and events(d, a)[-1]["event"] == "gate" and "pass %s's spec gate (approve the spec as it is now, sha256" % a in r.tty,
+          r.returncode == 0 and events(d, a)[-1]["event"] == "gate" and "pass %s's spec gate (approve the spec as it is now, on the default line, sha256" % a in r.tty,
           (r.returncode, r.stderr, r.tty[-300:]))
     led = read(ledger_file(d))
     check("human gate: the code is fresh each time and never reaches stdout, stderr or the ledger (the terminal only)",
@@ -1246,8 +1255,11 @@ def test_run_args():
     head = git(d, "rev-parse", "HEAD").stdout.strip()
     check("run-args: name and scriptPath (the project's copy wins)", j["name"] == "factory-line" and j["scriptPath"] == script and set(j) == {"name", "scriptPath", "args"}, j.get("scriptPath"))
     check("run-args: args has exactly the contract keys (threshold: the line's, default 1)", set(args) == {
-        "order", "title", "spec", "root", "worktree", "branch", "base", "holdout", "stations", "retries", "line", "threshold"}
-        and args["threshold"] == 1, sorted(args))
+        "order", "title", "spec", "root", "worktree", "branch", "base", "holdout", "stations", "retries", "line", "threshold",
+        "planDoc", "orderPath"} and args["threshold"] == 1, sorted(args))
+    check("run-args: planDoc and orderPath follow contract A (created date, lower-case id, the order file's slug)",
+          args["orderPath"] == "factory/orders/%s-args-order.md" % a
+          and args["planDoc"] == "docs/superpowers/plans/%s-%s-args-order.md" % (time.strftime("%Y-%m-%d"), a.lower()), (args["planDoc"], args["orderPath"]))
     check("run-args: order, title, root, worktree, branch, base, holdout, retries, line", args["order"] == a and args["title"] == "Args order" and args["root"] == d
           and args["worktree"] == lane["worktree"] and args["branch"] == lane["branch"] and args["base"] == head
           and args["holdout"] == os.path.join(d, ".factory-holdout", a) and args["retries"] == 1 and args["line"] == "default", args)
@@ -1312,6 +1324,200 @@ def test_run_args():
     check("run-args: a missing worktree directory is refused", blocked(r), (r.returncode, r.stderr))
     r = cli(d, "lane", c)
     check("lane: a registered but missing worktree is BLOCKED with the prune hint", blocked(r) and "prune" in r.stderr, (r.returncode, r.stderr))
+
+
+def set_order_line(repo, oid, line):
+    """What an agent with write access does: edit the `line:` of an order file."""
+    o = order_of(repo, oid)
+    p = os.path.join(repo, o["path"])
+    text = read(p)
+    if re.search(r"(?m)^line:", text):
+        new = re.sub(r"(?m)^line:.*$", "line: %s" % line, text, count=1)
+    else:   # the shipped template writes no line: key, so an agent adds one
+        new = re.sub(r"(?m)^(created:.*)$", r"\1\nline: %s" % line, text, count=1)
+    check("pin setup: the edit changed the order file", new != text or ("line: %s" % line) in text, text[:200])
+    write(p, new)
+
+
+def test_quick_and_pin():
+    # The quick line: from the shipped template and from the built-in default, the same shape.
+    tpl = json.loads(read(os.path.join(REPO, "templates", "factory", "line.json")))["lines"]["quick"]
+    d = mkrepo()
+    cfg = F.line_config(d)
+    q = cfg["lines"]["quick"]
+    for src, line in (("template", F.line_config(d)["lines"]["quick"]), ("built-in default", F.DEFAULT_LINE["lines"]["quick"])):
+        check("quick (%s): plan, build, test, review; spec auto, merge human; 1 retry" % src,
+              [s["name"] for s in line["stations"]] == ["plan", "build", "test", "review"] and line["gates"] == {"spec": "auto", "merge": "human"}
+              and line["retries"] == 1 and not any(s.get("holdout") for s in line["stations"]), line)
+    dflt = cfg["lines"]["default"]["stations"]
+    check("quick: same models and efforts as the default line",
+          all({k: s.get(k) for k in ("model", "effort")} == {k: next(x for x in dflt if x["name"] == s["name"]).get(k) for k in ("model", "effort")}
+              for s in q["stations"]) and [s["model"] for s in tpl["stations"]] == [s["model"] for s in q["stations"]], q["stations"])
+    # Without a line.json the built-in default serves the quick line too.
+    os.unlink(os.path.join(d, "factory", "line.json"))
+    check("quick: the built-in default has it when factory/line.json is gone", "quick" in F.line_config(d)["lines"])
+    write(os.path.join(d, "factory", "line.json"), json.dumps({"version": 1, "lines": json.loads(read(os.path.join(REPO, "templates", "factory", "line.json")))["lines"]}))
+
+    # A quick order: pinned in the created event, no approval needed, merge on a no-verify line.
+    qo = new_order(d, "Quick change", "--line", "quick")
+    created = next(e for e in events(d, qo) if e["event"] == "created")
+    check("pin: the created event stores the line", created.get("line") == "quick", created)
+    check("pin: a default order's created event stores 'default'", next(e for e in events(d, new_order(d, "Plain")) if e["event"] == "created").get("line") == "default")
+    wt, branch = lane_with_commit(d, qo)
+    hist = [{"station": "plan", "state": s, "attempt": 1, "note": ""} for s in ("start", "pass")]
+    hist += [{"station": k, "state": s, "attempt": 1, "note": ""} for k in ("build", "test", "review") for s in ("start", "pass")]
+    r = record_saved(d, qo, v2_result(qo, order_of(d, qo)["lane"], ids=(), history=hist) | {"holdout": None})
+    last = events(d, qo)[-1]
+    check("quick: a passing run with no holdout records review with recommendation merge, line named in the briefing",
+          r.returncode == 0 and last["status"] == "review" and last["recommendation"] == "merge" and "Line: quick." in last.get("briefing", "")
+          and "no hidden scenarios by design" in last["briefing"], (r.returncode, r.stderr, last))
+
+    # The downgrade: an approved default order whose file is edited to `line: quick`.
+    a = new_order(d, "Pinned order")
+    scenarios(d, a)
+    cli(d, "mark", a, "spec")
+    cli(d, "approve", a)
+    cli(d, "lane", a)
+    ok_before = cli(d, "run-args", a)
+    check("pin: run-args works while the line is unchanged", ok_before.returncode == 0, ok_before.stderr)
+    set_order_line(d, a, "quick")
+    n_ev = len(events(d))
+    for what, r in (("lane", cli(d, "lane", a)), ("run-args", cli(d, "run-args", a)),
+                    ("record", cli(d, "record", a, stdin=json.dumps(v2_result(a, order_of(d, a)["lane"]))))):
+        check("pin: %s is refused after the order's line is flipped to quick" % what,
+              blocked(r) and "created on the default line" in r.stderr and "quick" in r.stderr and not r.stdout.strip(), (r.returncode, r.stderr, r.stdout[:200]))
+    check("pin: a refused flip writes nothing to the ledger", len(events(d)) == n_ev, len(events(d)) - n_ev)
+    # Flipping to a line that does not exist is a change too: the name is pinned, whatever approval exists.
+    set_order_line(d, a, "nope")
+    for what, r in (("run-args", cli(d, "run-args", a)), ("lane", cli(d, "lane", a))):
+        check("pin: an unknown line name on an approved default order is refused by %s" % what,
+              blocked(r) and "created on the default line" in r.stderr, (r.returncode, r.stderr))
+    write(os.path.join(d, order_of(d, a)["path"]), re.sub(r"(?m)^line:.*\n", "", read(os.path.join(d, order_of(d, a)["path"]))))
+    check("pin: removing the key reads as default, the pinned line, so it runs", cli(d, "run-args", a).returncode == 0)
+    set_order_line(d, a, "default")
+    check("pin: restoring the line lets run-args through again", cli(d, "run-args", a).returncode == 0)
+    # Flip before approval: approve itself refuses, so the spec gate never blesses the flipped line, and lane stays refused.
+    fl = new_order(d, "Flipped before approval")
+    scenarios(d, fl)
+    cli(d, "mark", fl, "spec")
+    set_order_line(d, fl, "quick")
+    n_ev = len(events(d))
+    r = cli(d, "approve", fl)
+    check("pin: approve refuses an order whose line was flipped before approval, naming the creation line",
+          blocked(r) and "created on the default line" in r.stderr and "quick" in r.stderr and not r.stdout.strip(), (r.returncode, r.stderr, r.stdout[:200]))
+    check("pin: ...and writes no spec-gate pass", not any(e.get("event") == "gate" and e.get("state") == "pass" for e in events(d, fl)) and len(events(d)) == n_ev)
+    r = cli(d, "lane", fl)
+    check("pin: lane stays refused for the flipped, unapproved order", blocked(r) and "created on the default line" in r.stderr, (r.returncode, r.stderr))
+    set_order_line(d, fl, "default")
+    # A quick order flipped UP to default is refused too (the pin is the creation line, whichever way).
+    set_order_line(d, qo, "default")
+    r = cli(d, "run-args", qo)
+    check("pin: a quick order edited to default is refused as well", blocked(r) and "created on the quick line" in r.stderr, (r.returncode, r.stderr))
+    set_order_line(d, qo, "quick")
+
+    def strip_pin(oid):
+        """Make the order look like one created before the pin: no line, no line hash on its created event."""
+        out = []
+        for ln in read(ledger_file(d)).splitlines():
+            e = json.loads(ln)
+            if e.get("order") == oid and e.get("event") == "created":
+                e.pop("line", None)
+                e.pop("line_hash", None)
+            out.append(json.dumps(e))
+        write(ledger_file(d), "\n".join(out) + "\n")
+
+    def refused_everywhere(label, oid, needle):
+        res = (("lane", cli(d, "lane", oid)), ("run-args", cli(d, "run-args", oid)),
+               ("record", cli(d, "record", oid, stdin=json.dumps(v2_result(oid, order_of(d, oid).get("lane") or {"branch": "x", "worktree": "/x"})))))
+        for what, r in res:
+            check("pin: %s: %s is refused (BLOCKED, %s)" % (label, what, needle), blocked(r) and needle in r.stderr and not r.stdout.strip(),
+                  (r.returncode, r.stderr, r.stdout[:200]))
+
+    def edit_line_json(fn):
+        path = os.path.join(d, "factory", "line.json")
+        cfg_ = json.loads(read(path))
+        fn(cfg_["lines"])
+        write(path, json.dumps(cfg_))
+
+    # The line's definition is pinned with its name: an approved default order, then factory/line.json is rewritten.
+    spec_auto = new_order(d, "Spec gate weakened")
+    scenarios(d, spec_auto)
+    cli(d, "mark", spec_auto, "spec")
+    cli(d, "approve", spec_auto)
+    cli(d, "lane", spec_auto)
+    saved = read(os.path.join(d, "factory", "line.json"))
+    edit_line_json(lambda ls: ls["default"].__setitem__("gates", {"spec": "auto", "merge": "human"}))
+    refused_everywhere("gates.spec set to auto on default after approval", spec_auto, "file a new order")
+    write(os.path.join(d, "factory", "line.json"), saved)
+    check("pin: restoring line.json lets the order through again", cli(d, "run-args", spec_auto).returncode == 0)
+    edit_line_json(lambda ls: ls["default"].__setitem__("stations", [s for s in ls["default"]["stations"] if s["name"] != "verify"]))
+    refused_everywhere("verify dropped from the line after approval", spec_auto, "file a new order")
+    write(os.path.join(d, "factory", "line.json"), saved)
+
+    # A pre-pin order (no line hash): only the stored spec hash protects it.
+    strip_pin(spec_auto)
+    edit_line_json(lambda ls: ls["default"].__setitem__("gates", {"spec": "auto", "merge": "human"}))
+    refused_everywhere("pre-pin approved order, gates.spec set to auto", spec_auto, "file a new order")
+    write(os.path.join(d, "factory", "line.json"), saved)
+    check("pin: a pre-pin approved order whose hash still matches runs", cli(d, "run-args", spec_auto).returncode == 0)
+
+    # A pre-pin order that was approved cannot be flipped to quick.
+    old_ap = new_order(d, "Old approved")
+    strip_pin(old_ap)
+    scenarios(d, old_ap)
+    cli(d, "mark", old_ap, "spec")
+    cli(d, "approve", old_ap)
+    cli(d, "lane", old_ap)
+    check("pin: the pre-pin approved order runs while untouched", cli(d, "run-args", old_ap).returncode == 0)
+    set_order_line(d, old_ap, "quick")
+    refused_everywhere("pre-pin approved order flipped to quick", old_ap, "file a new order")
+
+    # A quick order whose definition changed after creation.
+    edit_line_json(lambda ls: ls["quick"]["stations"][1].__setitem__("model", "opus"))
+    refused_everywhere("quick order, line definition changed after creation", qo, "file a new order")
+    write(os.path.join(d, "factory", "line.json"), saved)
+    check("pin: ...and runs again once the definition is restored", cli(d, "run-args", qo).returncode == 0)
+
+    # Fail closed: no exemption for an order from before the pin, approved or not.
+    old = new_order(d, "Before the pin")
+    strip_pin(old)
+    check("pin: the old order's created event has no line", "line" not in next(e for e in events(d, old) if e["event"] == "created"))
+    refused_everywhere("old never-approved order, no pin", old, "file a new order")
+    set_order_line(d, old, "quick")
+    refused_everywhere("old never-approved order flipped to quick", old, "file a new order")
+
+    # A pinned line with no line hash is refused.
+    nohash = new_order(d, "Pin without hash")
+    strip_pin(nohash)
+    lines_ = []
+    for ln in read(ledger_file(d)).splitlines():
+        e = json.loads(ln)
+        if e.get("order") == nohash and e.get("event") == "created":
+            e["line"] = "default"
+        lines_.append(json.dumps(e))
+    write(ledger_file(d), "\n".join(lines_) + "\n")
+    refused_everywhere("line pinned without a line hash", nohash, "file a new order")
+
+    # No created event at all (fell out of the ledger tail): refused unless a spec pass still matches.
+    def drop_created(oid):
+        keep = [ln for ln in read(ledger_file(d)).splitlines()
+                if not (json.loads(ln).get("order") == oid and json.loads(ln).get("event") == "created")]
+        write(ledger_file(d), "\n".join(keep) + "\n")
+
+    nocreated = new_order(d, "Created event gone")
+    drop_created(nocreated)
+    refused_everywhere("no created event, never approved", nocreated, "file a new order")
+    gone_ap = new_order(d, "Created gone but approved")
+    scenarios(d, gone_ap)
+    cli(d, "mark", gone_ap, "spec")
+    cli(d, "approve", gone_ap)
+    cli(d, "lane", gone_ap)
+    drop_created(gone_ap)
+    check("pin: no created event but a matching spec-gate pass: still runs", cli(d, "run-args", gone_ap).returncode == 0)
+    # The ledger library keeps a valid line and drops a bad one.
+    ev = F.valid_event({"t": 1.0, "order": "FO-001", "event": "created", "line": "quick"})
+    bad = F.valid_event({"t": 1.0, "order": "FO-001", "event": "created", "line": "../x; rm"})
+    check("pin: valid_event keeps a line name and drops a malformed one", ev.get("line") == "quick" and "line" not in bad, (ev, bad))
 
 
 # ── record ────────────────────────────────────────────────────────────────────
@@ -1831,8 +2037,12 @@ def test_record_checks():
     lw = order_of(d, w)["lane"]
     hist = [{"station": s, "state": t, "attempt": 1, "note": ""} for s in ("build", "review") for t in ("start", "pass")]
     r = record_saved(d, w, v2_result(w, lw, ids=(), history=hist, holdout=None) | {"holdout": None})
-    check("record: a line with no verify station is review with needs-scenarios, and says so", r.returncode == 0
-          and events(d, w)[-1]["recommendation"] == "needs-scenarios" and "has no verify station" in r.stdout, (r.returncode, r.stderr))
+    check("record: a line with no verify station is review with merge, and the briefing says it has no hidden scenarios by design",
+          r.returncode == 0 and events(d, w)[-1]["recommendation"] == "merge" and "recommendation: merge" in r.stdout
+          and "Holdout: this line has no hidden scenarios by design; its build, review stations are all the checking there was." in r.stdout
+          and "NO hidden scenario checked" not in r.stdout and "Line: lite." in r.stdout, (r.returncode, r.stderr, r.stdout[:600]))
+    # A line WITH a verify station and no scenarios still needs them (the check above this block, on the default line).
+    check("record: the merge-gate briefing stored in the ledger names the line", "Line: lite." in (events(d, w)[-1].get("briefing") or ""), events(d, w)[-1])
     x = new_order(d, "Custom station", "--line", "custom")
     cli(d, "approve", x)
     lane_with_commit(d, x)
@@ -2211,7 +2421,7 @@ def main():
     try:
         make_trees()
         for fn in (test_cli_basics, test_init, test_init_line_js, test_new, test_list_show, test_mark, test_gates, test_human_gates,
-                   test_lane, test_holdout, test_run_args, test_spec_hash, test_record, test_merge_gate, test_record_checks,
+                   test_lane, test_holdout, test_run_args, test_quick_and_pin, test_spec_hash, test_record, test_merge_gate, test_record_checks,
                    test_workflow_run, test_safety):
             try:
                 fn()

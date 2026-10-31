@@ -70,7 +70,7 @@ import urllib.parse  # noqa: E402
 
 sys.path.insert(0, os.path.join(CC_TOOL_DIR, "lib"))
 try:
-    from cc_dash import plans  # noqa: E402
+    from cc_dash import doctypes, plans  # noqa: E402
 except Exception as e:  # noqa: BLE001 - any failure to load the parser is one message
     print("cc-docs-migrate: cannot load %s (%s: %s)" % (os.path.join(CC_TOOL_DIR, "lib", "cc_dash", "plans.py"),
                                                        type(e).__name__, e), file=sys.stderr)
@@ -993,50 +993,12 @@ def scan_links(doc, ctx):
 # ── Keys ──────────────────────────────────────────────────────────────────────
 _STATUS = re.compile(r"^\s*(?:[-*]\s*)?\**Status\**\s*:\s*\**\s*([A-Za-z][A-Za-z -]*)")
 _STATUS_HEAD = re.compile(r"^\s*(?:[-*]\s*)?\**Status\**\s*:")
-_TRACKER_NAMES = {"tasks.md", "todo.md", "backlog.md", "open-items.md"}
-_REPORT_NAMES = {"e2e-test-plan.md", "ui-ux-review.md", "frontend-review.md"}
 _SPEC_TOKEN = re.compile(r"[A-Za-z0-9_./-]+\.md")
-_GUIDE_NAME = re.compile(r"(?i)(^|[-_.])(guide|how-?to)([-_.]|$)")            # not GUIDELINES.md
-_REPORT_NAME = re.compile(r"(?i)(^|[-_.])(report|review|audit|assessment|findings)([-_.]|$)")
 
 
 def doc_type(doc):
-    """The folder first, then the name, then the shape (contract v2 order: spec, plan, adr, glossary,
-    start-here, task, tracker, plan by checkboxes, guide, reference, prd, log, report, plan by a
-    `plans` folder, note)."""
-    rel, name, parts = doc.rel, doc.name, set(doc.parts)
-    low = name.lower()
-    if rel.startswith("vault/notes/"):
-        return "note"
-    if rel.startswith("docs/superpowers/specs/"):
-        return "spec"
-    if rel.startswith("docs/superpowers/plans/") and plans.is_plan(doc.parsed, "plans"):
-        return "plan"
-    if parts & {"adr", "adrs", "decisions"}:
-        return "adr"
-    if low == "glossary.md":
-        return "glossary"
-    if rel == "docs/start-here.md":
-        return "start-here"
-    if "tasks" in parts:
-        return "task"
-    if low in _TRACKER_NAMES or re.search(r"(?i)[-_](tasks|todo|backlog)\.md$", name):
-        return "tracker"
-    if plans.is_plan(doc.parsed, "docs"):
-        return "plan"   # what cc-dash's Plans view tracks as one
-    if parts & {"guides", "how-to-guides", "how-to"} or _GUIDE_NAME.search(name):
-        return "guide"
-    if "reference" in parts or re.match(r"(?i)^(architecture|structure|api|quick-reference|reference)\b", name):
-        return "reference"
-    if re.search(r"(?i)(^|[-_])prd([-_.]|$)", name) or "product requirements" in doc.first_h1().lower():
-        return "prd"
-    if re.search(r"(?i)(^|[-_])(log|journal|history)\.md$", name) or low == "log.md":
-        return "log"
-    if low in _REPORT_NAMES or "reports" in parts or _REPORT_NAME.search(name):
-        return "report"
-    if "plans" in parts:
-        return "plan"   # a plan folder's prose plan (LOG.md, reviews and evidence beside it matched above)
-    return "note"
+    """The type rules live in lib/cc_dash/doctypes.py, shared with cc-dash's Work view."""
+    return doctypes.classify(doc.rel, doc.parsed, doc.first_h1())
 
 
 def doc_title(doc, h1=True):

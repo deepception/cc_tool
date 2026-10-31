@@ -2,7 +2,7 @@
 
 # Docs standard (one frontmatter, fixed homes, links that resolve)
 
-One small format for every Markdown document a cc_tool project keeps: Superpowers specs and plans, task files, factory orders, decisions, guides, reports and vault notes. Each document says what it is in a short frontmatter block, lives in a known folder, and links to its neighbours with relative links. The standard fixes the outside of a document, not its contents: Superpowers keeps its plan format, the vault keeps its contract, and the factory keeps its orders. `cc-docs-migrate` brings existing docs in line without rewriting them.
+One small format for every Markdown document a cc_tool project keeps: Superpowers specs and plans, task files, factory orders, decisions, guides, reports and vault notes. Each document says what it is in a short frontmatter block, lives in a known folder, and links to its neighbours with relative links. The standard fixes the outside of a document, not its contents: Superpowers keeps its plan format, the vault keeps its contract, and the factory keeps its orders. `cc-docs-migrate` brings existing docs in line without rewriting them. cc-dash's Work page groups a project's documents by the same type rules (`lib/cc_dash/doctypes.py` is shared by both), using a document's own `type:` when it has one.
 
 ```bash
 cc-docs-migrate /path/to/project                 # dry run: the per-file plan, nothing written
@@ -39,7 +39,7 @@ links: [docs/reference/architecture.md]
 
 - **Syntax.** The first line is `---` and the closing `---` comes within 100 lines (the limit `lib/cc_dash/factory.py` reads to). One `key: value` per line, lower-case keys, no nesting. A value with `:`, `#` or a leading YAML indicator is double-quoted JSON-style (`title: "Ladle: stage 2"`), the way `cc-factory new` writes titles. Lists are one-line flow lists, `[a, b]`. Keys the standard does not name are kept as they are.
 - **Paths in frontmatter are from the project root**, like the `**Spec:**` line Superpowers puts in a plan header. Paths in the body are relative to the file (see [Links](#links)).
-- **`status` lives in exactly one place.** A plan's progress is its checkboxes (cc-dash's Plans view counts them). A task's state is its folder (`active/`, `backlog/`, `completed/`), or its order once it has one. An order's state is the factory ledger. A doc under `archive/` is archived. None of these get a `status` key. Specs, ADRs and PRDs have no other home for it, so they carry one.
+- **`status` lives in exactly one place.** A plan's progress is its checkboxes (cc-dash's Work view counts them). A task's state is its folder (`active/`, `backlog/`, `completed/`), or its order once it has one. An order's state is the factory ledger. A doc under `archive/` is archived. None of these get a `status` key. Specs, ADRs and PRDs have no other home for it, so they carry one.
 - **Relations are read, not copied.** A plan names its spec in its `**Spec:**` line, and that line is the link. Nothing writes the same path again into `source`, and no spec keeps a list of its plans.
 - **Per-type extras:** an order keeps the factory's `id`, `priority` and `line`, and its `status` is only the `queued` or `spec` seed the ledger starts from. A task that became an order gets `order: FO-NNN`. Vault notes keep the vault's own `summary`, `type`, `status`, `date` and `tags`, with `date` counting as `created`.
 - **Frontmatter comes after the fact.** Skills that write documents (writing-plans, brainstorming, `start-project`, `cc-factory new`) don't have to add it. Rerunning the migration types new files, and does nothing to files already in line.
@@ -51,7 +51,7 @@ The folder is the contract the tools already rely on. The migration never moves 
 | `type` | Lives in | Created by | Example |
 |--------|----------|------------|---------|
 | `spec` | `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` | Superpowers brainstorming | `type: spec`, `status: active` |
-| `plan` | `docs/superpowers/plans/YYYY-MM-DD-<feature>.md` | Superpowers writing-plans | `type: plan`, `created: 2026-10-06` (no status: the checkboxes are the progress) |
+| `plan` | `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`; plan-mode plans in `docs/plans/` | Superpowers writing-plans; the factory's plan station (`...-fo-nnn-<slug>.md`); Claude Code plan mode (`plansDirectory`) | `type: plan`, `created: 2026-10-06` (no status: the checkboxes are the progress) |
 | `task` | `docs/tasks/{active,backlog,completed}/<name>.md` | `start-project`, `next-task`, `update-documentation` | `type: task`, `order: FO-004` once it became an order |
 | `tracker` | `docs/TASKS.md`, `docs/OPEN-ITEMS.md`: running multi-item lists | you, long runs | `type: tracker` |
 | `order` | `factory/orders/FO-NNN-<slug>.md` | `cc-factory new` only | the factory's own keys, plus `source: docs/tasks/backlog/monitoring.md` for a migrated task (the folder gives the type) |
@@ -60,7 +60,7 @@ The folder is the contract the tools already rely on. The migration never moves 
 | `start-here` | `docs/start-here.md` | `start-project` (read by `next-task`) | `type: start-here` |
 | `guide` | `docs/guides/<topic>.md` | you | `type: guide` |
 | `reference` | `docs/reference/<topic>.md` (architecture, API, data model) | you | `type: reference` |
-| `report` | `docs/E2E-TEST-PLAN.md`, `docs/UI-UX-REVIEW.md`, `docs/FRONTEND-REVIEW.md` (app-qa), `docs/reports/` | skills and audits | `type: report`, `created: 2026-10-12` |
+| `report` | `docs/E2E-TEST-PLAN.md`, `docs/UI-UX-REVIEW.md`, `docs/FRONTEND-REVIEW.md` (`/app-qa e2e`, `ux`, `frontend`), `docs/reports/` | skills and audits | `type: report`, `created: 2026-10-12` |
 | `prd` | `docs/prd/<product>.md` | you | `type: prd`, `status: draft` |
 | `log` | next to the loop that appends to it (`LOG.md`) | a loop, append-only | `type: log` |
 | `note` | `docs/notes/`, or anything that fits nothing above | anyone | `type: note` |

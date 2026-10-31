@@ -43,7 +43,7 @@ For each piece, run two separate fresh-context agents:
 - **Builder**: produces or revises the piece.
 - **Critic**: grades only by comparing the current output against the agreed reference bar from Step 2. Give it the bar and the candidate, never the builder's reasoning or prior iterations. This holds regardless of dispatch mechanism: a Workflow-tool script (see below) enforces it by schema, but for an ad hoc single piece dispatched straight from here, nothing enforces it structurally, so build the critic's prompt fresh from just the bar and the candidate rather than continuing the builder's thread or the main conversation. Where the format allows it, withhold which side is the reference, because a labeled "which one is AI" question invites leniency a blind comparison doesn't.
 
-This is the `dynamic-workflows` adversarial-verification pattern with a concrete artifact standing in for the rubric: the builder never grades itself.
+This is the `loop-engineering` skill's (references/workflow-patterns.md) adversarial-verification pattern with a concrete artifact standing in for the rubric: the builder never grades itself.
 
 ## Step 5: One round
 
@@ -66,7 +66,7 @@ Per piece: rounds taken, final critic verdict, and, for anything that hit the ca
 This skill is a recipe, not a new engine. Pair it with what already exists rather than reinventing it:
 
 - Pair the loop with `/goal`, using the Step 2 bar as its success criteria, for a hard completion condition instead of a soft one.
-- For 3+ pieces, or any run big enough to want its own script, write a Workflow-tool script composing `fan-out-and-synthesize` (the decomposition) + `adversarial-verification` (the critic) + `loop-until-done` (the per-piece round-repeat). See `dynamic-workflows` for the pattern APIs and `.claude/workflows/loop-until-clean.js` as a structural template. It has the same shape but a different stop condition: that script stops on two dry rounds, this stops on "matches the bar."
+- For 3+ pieces, or any run big enough to want its own script, write a Workflow-tool script composing `fan-out-and-synthesize` (the decomposition) + `adversarial-verification` (the critic) + `loop-until-done` (the per-piece round-repeat). See `loop-engineering` (references/workflow-patterns.md) for the pattern APIs and `.claude/workflows/loop-until-clean.js` as a structural template. It has the same shape but a different stop condition: that script stops on two dry rounds, this stops on "matches the bar."
 - For loop anatomy (trigger, isolation, state, verification) and the four loop types, see `loop-engineering`.
 - A recurring cadence ("gauntlet this nightly against the latest reference") composes with `/schedule`; treat the Step 2 negotiation as one-time setup captured in the `/goal`, not re-litigated on every scheduled run.
 

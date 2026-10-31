@@ -381,7 +381,7 @@ def browser_sessions(cfg, ids):
     check("sessions tab: no page errors", not out.get("errors"), out.get("errors"))
     check("sessions tab: the key s from the floor lands on #/sessions and shows the area's four tabs, Sessions current",
           ks.get("hash") == "#/sessions" and [t["key"] for t in ks.get("tabs", [])] == ["overview", "sessions", "plans", "docs"]
-          and [t["text"] for t in ks.get("tabs", [])] == ["Overview", "Sessions", "Plans", "Docs"]
+          and [t["text"] for t in ks.get("tabs", [])] == ["Overview", "Sessions", "Work", "Docs"]
           and [t["key"] for t in ks.get("tabs", []) if t["cur"] == "page"] == ["sessions"], (ks.get("hash"), ks.get("tabs")))
     check("sessions tab: it sits under the Projects tab of the nav (there is no Sessions tab up there)", ks.get("topTab") == ["projects"], ks.get("topTab"))
     check("sessions tab: every session in the window is a row, the title picker reads 'All projects'",

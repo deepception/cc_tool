@@ -556,10 +556,179 @@ def run(base):
         srv.server_close()
 
 
+# ── the Work payload: orders, documents and the board joined to the plans ────────────────────
+def put(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(text)
+
+
+def work_cases(base):
+    now = time.time()
+    cfg = os.path.join(base, "cfg")
+    repo = os.path.realpath(os.path.join(base, "wk", "shop"))
+    os.makedirs(repo)
+    git(repo, "init", "-q", "-b", "main")
+    sid = "33333333-cccc-4ccc-8ccc-000000000003"
+    sess = Transcript(sid, repo)
+    sess.prompt(now - 100, "hello")
+    sess.reply(now - 90, "hi")
+    sess.write(os.path.join(cfg, "projects", repo.replace("/", "-"), sid + ".jsonl"), now - 90)
+
+    def order(n, slug, title):
+        put(os.path.join(repo, "factory", "orders", "FO-%03d-%s.md" % (n, slug)),
+            "---\nid: FO-%03d\ntitle: %s\npriority: p1\ncreated: 2026-10-30\nline: default\nstatus: queued\n---\nBody\n" % (n, title))
+    order(1, "add-widget", "Add widget <img src=x onerror=alert(1)>")
+    order(2, "other", "Other")
+    ledger = os.path.join(repo, ".git", "cc_tool", "factory", "ledger.jsonl")
+    evs = [{"t": now - 50, "order": "FO-001", "event": "created"},
+           {"t": now - 40, "order": "FO-001", "event": "station", "station": "plan", "state": "pass"},
+           {"t": now - 39, "order": "FO-001", "event": "station", "station": "build", "state": "pass"},
+           {"t": now - 30, "order": "FO-001", "event": "lane", "branch": "factory/FO-001-add-widget",
+            "worktree": os.path.join(repo, ".claude", "worktrees", "FO-001-add-widget")},
+           {"t": now - 20, "order": "FO-001", "event": "status", "status": "review", "recommendation": "merge"}]
+    put(ledger, "".join(json.dumps(e) + "\n" for e in evs))
+
+    lane = os.path.join(repo, ".claude", "worktrees", "FO-001-add-widget")
+    lane_plan = "docs/superpowers/plans/2026-10-30-fo-001-add-widget.md"
+    body = "# Widget plan\n\n**Spec:** %s\n\n### Task 1: Parser\n\n- [ ] src/a.py: add\n\n### Task 2: View\n\n- [ ] src/b.py: add\n"
+    put(os.path.join(lane, lane_plan), body % "factory/orders/FO-001-add-widget.md")
+    put(os.path.join(repo, "docs/superpowers/plans/2026-10-29-missing.md"), body % "docs/superpowers/specs/nope.md")
+    put(os.path.join(repo, "docs/superpowers/plans/2026-10-28-escape.md"), body % "../../etc/passwd")
+    put(os.path.join(repo, "docs/superpowers/plans/2026-10-27-abs.md"), body % "/etc/passwd.md")
+    put(os.path.join(repo, "docs/superpowers/plans/2026-10-26-real.md"), body % "docs/superpowers/specs/real.md")
+    put(os.path.join(repo, "docs/superpowers/specs/real.md"), "---\nstatus: approved\ntitle: Real spec\n---\n# Heading\n")
+    put(os.path.join(repo, "docs/superpowers/plans/2026-10-25-sneak.md"), body % "docs/superpowers/specs/sneak.md")
+    put(os.path.join(repo, ".factory-holdout/FO-001/S01-hidden.md"), "---\nstatus: secret-status\n---\n# Hidden scenario heading\n")
+    os.symlink(os.path.join(repo, ".factory-holdout/FO-001/S01-hidden.md"), os.path.join(repo, "docs/superpowers/specs/sneak.md"))
+    put(os.path.join(repo, "docs/plans/quiet-fox.md"), "# Quiet fox\n\nJust prose, no checkboxes.\n")
+    put(os.path.join(repo, "docs/guide.md"), "# A guide\n")
+    put(os.path.join(repo, "docs/UI-UX-REVIEW.md"), "# Review\n")
+    put(os.path.join(repo, "factory/order-template.md"), "# {{title}}\n")
+    put(os.path.join(repo, "marketing/copy.md"), "# Copy\n")
+    put(os.path.join(repo, "vault/notes/n.md"), "# Vault note\n")
+    put(os.path.join(repo, ".claude/skills/s/SKILL.md"), "# Skill\n")
+    ghp = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+    put(os.path.join(repo, ".cc-board/run1/work-api/checkpoint.md"), "\n\nDone: pushed with %s\n- next\n" % ghp)
+    put(os.path.join(repo, ".cc-board/run1/other/checkpoint.md"), "Second\n")
+    outside = os.path.join(base, "outside-board")
+    put(os.path.join(outside, "checkpoint.md"), "Leaked\n")
+    os.symlink(outside, os.path.join(repo, ".cc-board/run1/evil"))
+    put(os.path.join(repo, ".cc-board/run1/linked/real.md"), "x\n")
+    os.symlink(os.path.join(outside, "checkpoint.md"), os.path.join(repo, ".cc-board/run1/linked/checkpoint.md"))
+
+    # Two more projects: one whose .cc-board is itself a symlink out of the root, one made to fail its Work read.
+    extra = {}
+    for n, name in ((4, "linkboard"), (5, "broken")):
+        r_ = os.path.realpath(os.path.join(base, "wk", name))
+        os.makedirs(r_)
+        git(r_, "init", "-q", "-b", "main")
+        sid_ = "33333333-cccc-4ccc-8ccc-00000000000%d" % n
+        t_ = Transcript(sid_, r_)
+        t_.prompt(now - 100, "hello")
+        t_.reply(now - 90, "hi")
+        t_.write(os.path.join(cfg, "projects", r_.replace("/", "-"), sid_ + ".jsonl"), now - 90)
+        extra[name] = r_
+    put(os.path.join(base, "outside-board2", "run9", "lab", "checkpoint.md"), "Linked head\n")
+    os.symlink(os.path.join(base, "outside-board2"), os.path.join(extra["linkboard"], ".cc-board"))
+    put(os.path.join(extra["broken"], "docs", "broken-doc.md"), "# Broken doc\n")
+
+    st = Store(root=cfg, days=7)
+    st.refresh(force=True)
+    pay = P.Plans(st).payload("", alerts=[], everything=True)
+    for k in ("orders", "documents", "board"):
+        check("work: payload has %s" % k, isinstance(pay.get(k), list), str(list(pay)))
+    orders = {o["id"]: o for o in pay["orders"]}
+    check("work: both orders listed", set(orders) == {"FO-001", "FO-002"}, str(sorted(orders)))
+    o1 = orders.get("FO-001", {})
+    keys = {"project", "id", "title", "status", "priority", "line", "gate", "stations", "done", "total", "rework",
+            "recommendation", "branch", "worktree", "path", "plan", "updated"}
+    check("work: an order carries exactly Contract B's keys", set(o1) == keys, str(set(o1) ^ keys))
+    check("work: order status, gate, progress and recommendation", o1.get("status") == "review"
+          and o1.get("gate") == {"name": "merge", "waiting": True} and (o1.get("done"), o1.get("total")) == (2, 5)
+          and o1.get("recommendation") == "merge" and o1.get("priority") == "p1", str(o1))
+    check("work: station keys and the pass vocabulary", [s["status"] for s in o1.get("stations", [])][:3] == ["pass", "pass", "pending"]
+          and set(o1["stations"][0]) == {"name", "title", "status"}, str(o1.get("stations")))
+    check("work: lane branch and worktree", o1.get("branch") == "factory/FO-001-add-widget" and o1.get("worktree", "").endswith("FO-001-add-widget"),
+          str((o1.get("branch"), o1.get("worktree"))))
+    check("work: a hostile title stays a plain string", o1.get("title") == "Add widget <img src=x onerror=alert(1)>", o1.get("title"))
+    check("work: an order with no plan has plan null", orders["FO-002"]["plan"] is None and orders["FO-002"]["gate"] is None
+          and orders["FO-002"]["recommendation"] == "", str(orders["FO-002"]))
+    check("work: the lane plan joins its order", (o1.get("plan") or {}).get("key") == lane_plan
+          and o1["plan"]["title"] == "Widget plan" and o1["plan"]["path"] == "", str(o1.get("plan")))
+    check("work: a joined plan carries its task progress", (o1.get("plan") or {}).get("tasks", {}).get("total", 0) >= 1, str(o1.get("plan")))
+    listed = {d["path"] for d in pay["documents"]}
+    check("work: documents come from docs/ only", "docs/UI-UX-REVIEW.md" in listed and all(p.startswith("docs/") for p in listed), str(sorted(listed)))
+    by = {p["key"]: p for p in pay["plans"]}
+    lp = by.get(lane_plan, {})
+    check("work: the plan points back at the order and its spec", lp.get("order") == "FO-001"
+          and lp.get("spec") == "factory/orders/FO-001-add-widget.md" and lp.get("spec_exists") is True, str(lp.get("order")))
+    check("work: plans carry the five new keys", all({"order", "spec", "spec_title", "spec_status", "spec_exists"} <= set(p) for p in pay["plans"]))
+    mp = by.get("docs/superpowers/plans/2026-10-29-missing.md", {})
+    check("work: a missing spec is spec_exists false, no order", mp.get("spec_exists") is False and mp.get("order") is None
+          and mp.get("spec") == "docs/superpowers/specs/nope.md", str(mp))
+    esc = by.get("docs/superpowers/plans/2026-10-28-escape.md", {})
+    ab = by.get("docs/superpowers/plans/2026-10-27-abs.md", {})
+    check("work: an escaping or absolute spec is never resolved", (esc.get("spec"), esc.get("spec_exists")) == ("", False)
+          and (ab.get("spec"), ab.get("spec_exists")) == ("", False), str((esc.get("spec"), ab.get("spec"))))
+    rp = by.get("docs/superpowers/plans/2026-10-26-real.md", {})
+    check("work: spec title and status come from its frontmatter", (rp.get("spec_title"), rp.get("spec_status"), rp.get("spec_exists"))
+          == ("Real spec", "approved", True), str(rp))
+    sp = by.get("docs/superpowers/plans/2026-10-25-sneak.md", {})
+    check("work: a spec symlink into .factory-holdout is not read", (sp.get("spec_exists"), sp.get("spec_title"), sp.get("spec_status"))
+          == (False, "", ""), str(sp))
+    check("work: no holdout text anywhere in the payload", "Hidden scenario" not in repr(pay) and "secret-status" not in repr(pay))
+    check("work: a plan-mode file with no checkboxes is listed", by.get("docs/plans/quiet-fox.md", {}).get("title") == "Quiet fox",
+          str(sorted(by)))
+    check("work: spec_path refuses ../../etc/passwd, /abs, ~ and dot-dirs", all(P.spec_path(s) == "" for s in
+          ("../../etc/passwd", "../../etc/passwd.md", "/etc/x.md", "~/x.md", ".factory-holdout/FO-001/s.md", "a/../../b.md")))
+    check("work: spec_path keeps a backticked path", P.spec_path("`./factory/orders/FO-001-x.md` (approved)") == "factory/orders/FO-001-x.md")
+
+    docs = {d["path"]: d for d in pay["documents"]}
+    check("work: documents hold the guide, the review and the spec", docs.get("docs/guide.md", {}).get("type") == "guide"
+          and docs.get("docs/UI-UX-REVIEW.md", {}).get("type") == "report"
+          and docs.get("docs/superpowers/specs/real.md", {}).get("type") == "spec", str(sorted(docs)))
+    check("work: a document row has Contract B's keys", set(docs["docs/guide.md"]) == {"project", "path", "type", "title", "status", "updated"}
+          and docs["docs/guide.md"]["title"] == "A guide" and docs["docs/superpowers/specs/real.md"]["status"] == "approved")
+    check("work: documents exclude plans, orders, vault and .claude", not any(
+        p.startswith(("vault/", ".claude/", "factory/orders/", "docs/superpowers/plans/", ".cc-board/")) or p == "docs/plans/quiet-fox.md"
+        for p in docs), str(sorted(docs)))
+    bd = {(b["run"], b["label"]): b for b in pay["board"]}
+    check("work: board lists the two real checkpoints, not the symlinks", set(bd) == {("run1", "work-api"), ("run1", "other")}, str(sorted(bd)))
+    check("work: a .cc-board that is itself a symlink contributes nothing", not any(b_["project"] == "linkboard" for b_ in pay["board"])
+          and "Linked head" not in json.dumps(pay), str([b_ for b_ in pay["board"] if b_["project"] == "linkboard"]))
+    b = bd.get(("run1", "work-api"), {})
+    check("work: board row keys and path", set(b) == {"project", "run", "label", "path", "head", "updated"}
+          and b["path"] == ".cc-board/run1/work-api/checkpoint.md", str(b))
+    check("work: the head is the first non-empty line, secret redacted", b.get("head", "").startswith("Done: pushed with [redacted")
+          and ghp not in json.dumps(pay), b.get("head"))
+    # One project that cannot be read must not blank the others' Orders, Documents and Agent runs.
+    real_board = P.Plans._board
+
+    def flaky_board(label, root):
+        if label == "broken":
+            raise RuntimeError("one bad project")
+        return real_board(label, root)
+
+    P.Plans._board = staticmethod(flaky_board)
+    try:
+        pay2 = P.Plans(st).payload("", alerts=[], everything=True)
+    finally:
+        P.Plans._board = staticmethod(real_board)
+    check("work: a failing project does not blank the others", {o["id"] for o in pay2["orders"]} == {"FO-001", "FO-002"}
+          and any(d["project"] == "shop" for d in pay2["documents"]) and any(b_["project"] == "shop" for b_ in pay2["board"]),
+          str((len(pay2["orders"]), len(pay2["documents"]), len(pay2["board"]))))
+    check("work: ...and the failing project shows none of its rows", not any(d["project"] == "broken" for d in pay2["documents"]),
+          str([d for d in pay2["documents"] if d["project"] == "broken"]))
+    check("work: without the failure the broken project's document is listed", any(d["project"] == "broken" for d in pay["documents"]),
+          str(sorted({d["project"] for d in pay["documents"]})))
+
+
 def main():
     base = tempfile.mkdtemp(prefix="cc-dash-plans-")
     try:
         run(base)
+        work_cases(os.path.join(base, "work"))
     finally:
         shutil.rmtree(base, ignore_errors=True)
     fails = [r for r in RESULTS if not r[1]]

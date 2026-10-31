@@ -15,7 +15,11 @@ agent stations builds and checks them, and a human approves the spec and the mer
   Makefile, package.json or pyproject.toml as they were at the lane's base commit, and it
   never takes run instructions from the build or test station.
   Several lines can live in one file; an order picks one with `line:` in its frontmatter.
-  A missing or broken `line.json` falls back to the default line.
+  `default` has hidden scenarios (verify); `quick` has plan, build, test and review only:
+  no holdout, the spec gate passes by itself (`"spec": "auto"`), the merge stays yours.
+  An order keeps the line it was created on: `cc-factory lane`, `run-args` and `record` refuse
+  when its `line:` was changed afterwards. To use another line, reject the order and make a new one.
+  A missing or broken `line.json` falls back to the built-in lines.
 - `order-template.md`: the skeleton `cc-factory new` fills in. Placeholders: `{{id}}`,
   `{{title}}`, `{{priority}}`, `{{created}}`, `{{line}}`. Edit it to suit the project.
 
@@ -61,6 +65,15 @@ recommends `needs-scenarios` and the briefing says nothing hidden checked it. Ve
 the lane's code only inside a bwrap sandbox the line builds (the holdout, `~/.claude` and the
 temp dirs hidden, no network, only a throwaway copy writable); without bubblewrap (macOS, say)
 it only reads the code, and `record` recommends `needs-human-check`, never `merge`.
+A line with no verify station (`quick`) has no hidden scenarios by design: `record` recommends
+`merge`, and the briefing says its tests and the review are all the checking there was.
+
+## The plan document
+
+The plan station's plan is also written into the lane as `docs/superpowers/plans/<created>-fo-nnn-<slug>.md`
+(a `**Spec:**` line naming the order file, one `### Task N:` per step, one checkbox each), committed
+as `FO-NNN: plan` and ticked as build finishes each step, so the Work view can show progress. If
+git ignores that path it stays uncommitted. Progress is never read from the order file.
 
 ## Commands
 

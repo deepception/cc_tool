@@ -7,7 +7,8 @@ description: >-
   reproduction/test verification and a durable agent-brief for anything handed off.
   Use when the user says "triage the backlog", "what needs my attention", "look at
   issue #N", or "move #N to ready-for-agent". GitHub Issues only. Not for the user's
-  own planned work, which is superpowers:brainstorming's job.
+  own planned work, which goes to the factory skill's intake in a project with
+  factory/line.json, and to superpowers:brainstorming otherwise.
 user-invocable: true
 ---
 
@@ -17,7 +18,7 @@ Clears an inbound issue backlog into a state a human or an agent can act on, wit
 
 ## Scope
 
-External, untriaged issues only: bug reports, feature requests, unsolicited PRs. Skip issues already past `needs-triage` unless the user asks to revisit one, and skip issues the user filed themself. Their own planned work goes through `superpowers:brainstorming` → `:writing-plans`, not this skill.
+External, untriaged issues only: bug reports, feature requests, unsolicited PRs. Skip issues already past `needs-triage` unless the user asks to revisit one, and skip issues the user filed themself. Their own planned work goes through the `factory` skill's intake in a project with `factory/line.json`, and through `superpowers:brainstorming` → `:writing-plans` otherwise, not this skill.
 
 ## Label schema
 
@@ -51,7 +52,7 @@ Per issue, on confirmation:
 
 | Target state | Action |
 |---|---|
-| `ready-for-agent` | Post a durable agent-brief comment: contracts, types, behavioral expectations. No file paths or line numbers, so it survives refactors between now and pickup. Point at `superpowers:writing-plans` / `:executing-plans` as the next step. |
+| `ready-for-agent` | Post a durable agent-brief comment: contracts, types, behavioral expectations. No file paths or line numbers, so it survives refactors between now and pickup. In a project with `factory/line.json`, hand the item to `/factory intake` as the next step; otherwise point at `superpowers:writing-plans` / `:executing-plans`. |
 | `ready-for-human` (needs a human call) | Same brief format, plus one paragraph on why this needs a human call (design judgment, security-sensitive, ambiguous product decision). |
 | `ready-for-human` (unsolicited PR, already verified correct) | Skip the brief, since there's no work left to describe. Post a verification summary (what you checked out, what you ran, the result) and recommend merge by a maintainer with write access. |
 | `needs-info` | Comment asking the reporter for the specific missing detail; state stays `needs-info`. |

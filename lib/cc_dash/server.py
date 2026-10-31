@@ -30,6 +30,9 @@ body only gives a number of days), and /api/control/selfheal/apply, which applie
 one finished run's proposal and commits it after a typed confirm (SelfHeal.apply
 re-checks everything). GET /api/selfheal and /api/selfheal/run
 show its state and a run's validated proposals to any paired token.
+
+/api/control/gate (gates.py): GET shows a work order's gate card, POST takes a human's
+decision at that gate, after a typed confirm, and hands it to the cc-factory it starts.
 """
 import argparse
 import errno
@@ -45,6 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from . import attention
+from . import gates     # factory gates from the dashboard (/api/control/gate)
 from . import graph     # the Factory floor (/api/graph)
 from . import procs
 from . import plans   # plan progress (/api/plans)
@@ -71,6 +75,7 @@ ASSETS = {
     # control mode (--control): action cards, message composer
     "/control.js": ("control.js", "text/javascript; charset=utf-8"),
     "/control.css": ("control.css", "text/css; charset=utf-8"),
+    "/gates.js": ("gates.js", "text/javascript; charset=utf-8"),   # gates.py: a work order's gate card
     # Docs view (docs.py): Markdown renderer and the reader
     "/markdown.js": ("markdown.js", "text/javascript; charset=utf-8"),
     "/docs.js": ("docs.js", "text/javascript; charset=utf-8"),
@@ -177,6 +182,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, attention.alerts_payload(store, ctl.annotate if ctl else None))
             if ctl is not None and path == "/api/control/state":
                 return self._json(200, ctl.state(q.get("session", "")[:100]))
+            if ctl is not None and path == "/api/control/gate":     # gates.py: one order's gate card
+                return self._json(*self.server.gates.view(auth.client(self.headers), {k: q.get(k, "")[:200] for k in ("project", "order")},
+                                                          sess.get("scope") == "control"))
             if path.startswith("/api/docs/"):
                 return self._docs(path, q)
             if path == "/api/live":
@@ -392,7 +400,7 @@ class Handler(BaseHTTPRequestHandler):
         self._deny(405, "cc-dash is read-only.")
 
     POSTS = ("/api/control/decide", "/api/control/message", "/api/control/cancel", "/api/control/stop",
-             "/api/control/selfheal", "/api/control/selfheal/apply")
+             "/api/control/selfheal", "/api/control/selfheal/apply", "/api/control/gate")
 
     def do_POST(self):
         if getattr(self.server, "hook_channel", False):
@@ -441,6 +449,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/control/selfheal/apply":     # one proposal's checked patch, applied and committed
                 sh = getattr(self.server, "selfheal", None)
                 code, out = sh.apply(client, body) if sh is not None else (404, {"error": "Self-heal is not available."})
+            elif path == "/api/control/gate":
+                code, out = self.server.gates.decide(client, body)
             else:
                 code, out = ctl.cancel(client, body)
         except Exception as e:  # noqa: BLE001 - report, never take the server down
@@ -452,8 +462,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def _typed_texts(body):
     """Every piece of text a control POST carries that a person typed: a deny
-    reason, a message, each answer (and the question it answers)."""
-    out = [body.get(k) for k in ("message", "text") if isinstance(body.get(k), str)]
+    reason, a message, a gate's note, each answer (and the question it answers)."""
+    out = [body.get(k) for k in ("message", "text", "note") if isinstance(body.get(k), str)]
     ans = body.get("answers")
     if isinstance(ans, dict):
         out += [x for kv in ans.items() for x in kv if isinstance(x, str)]
@@ -486,6 +496,7 @@ class DashServer(ThreadingHTTPServer):
         self._control = ctl
         self.selfheal.writable = ctl is not None
         self.selfheal.control = ctl
+        self.gates = gates.Gates(ctl, self.docs) if ctl is not None else None
 
 
 HOOK_HOST = "cc-dash-hook"

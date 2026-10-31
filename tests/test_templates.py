@@ -181,5 +181,18 @@ for path in sorted(os.listdir(SKILLS)):
              and t.strip().strip("'\"") not in READ_ONLY_TOOLS]
     check(f"allowed-tools in {rel} pre-approves only read-only tools or narrow patterns", not broad, str(broad))
 
+# Every skill's name and description is listed on every turn unless the skill sets
+# disable-model-invocation. Raise this ceiling on purpose, not by drift.
+listed = []
+for path in sorted(os.listdir(SKILLS)):
+    rel = os.path.join("templates", "skills", path, "SKILL.md")
+    if not os.path.isfile(os.path.join(REPO, rel)):
+        continue
+    text = read(rel)
+    fm = text[4:].split("\n---", 1)[0] if text.startswith("---\n") else ""
+    if not re.search(r"^disable-model-invocation:[ \t]*true[ \t]*$", fm, re.M):
+        listed.append(path)
+check("at most 11 skills listed on every turn", len(listed) <= 11, f"{len(listed)}: {', '.join(listed)}")
+
 print(f"{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

@@ -25,7 +25,7 @@ Invoke `design-taste-frontend` via the Skill tool for any page build or redesign
 | Default: landing page, portfolio, marketing site, product page | `design-taste-frontend` |
 | Existing page to upgrade, restyle or review | `design-taste-frontend` (its audit-first redesign mode: records the before, keeps the stack, proves the after) |
 | New dashboard or app screen with no component system yet | `design-taste-frontend` (its app-screen route, `references/app-screens.md`) |
-| Scroll-scrubbed 3D "fly through the world" landing built from generated video | `scroll-world` (project skill) |
+| Scroll-scrubbed 3D "fly through the world" landing built from generated video | Tell the user to run `/scroll-world` (it sets `disable-model-invocation`, so Claude cannot invoke it; don't Read its files to get around that) |
 | User asks for a classic look: clean editorial "Notion/Linear-style", raw Swiss/terminal/blueprint, or soft "expensive" agency | Name the opt-in classic so the user can run it: `/minimalist-ui`, `/industrial-brutalist-ui`, `/high-end-visual-design`. They set `disable-model-invocation`, so Claude cannot invoke them; don't Read their files to get around that. Until the user runs one, carry the style words into `design-taste-frontend` or Step 3. |
 
 Aesthetic references (read directly, not invoked as skills):

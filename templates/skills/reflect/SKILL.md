@@ -2,6 +2,7 @@
 name: reflect
 description: Reviews the current conversation to extract learning opportunities, skill improvements, and memory candidates. Presents findings for user approval.
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # Session Reflection

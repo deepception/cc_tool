@@ -9,6 +9,7 @@ Emits a compact additionalContext block with:
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -79,6 +80,51 @@ if (vault / "inbox").is_dir():
             if newest:
                 line += f"; {label}: vault/{sub}/{newest}"
     parts.append(line)
+
+
+# ── Software factory (factory skill), if the project has one ───────────────
+_ORDER_ID = re.compile(r"^FO-[0-9]{1,6}$")
+_ORDER_STATUSES = {"queued", "spec", "approved", "building", "verifying", "review", "done",
+                   "blocked", "rejected", "failed"}
+_MAX_ORDERS = 8
+
+
+def _open_orders() -> str:
+    """One line of open order ids and statuses, from ids/enums only: a title or any other
+    free text from the ledger never reaches session context. Any failure returns ''."""
+    remaining = _DEADLINE - time.monotonic()
+    if remaining <= 0.05 or not shutil.which("cc-factory"):
+        return ""
+    try:
+        out = subprocess.run(["cc-factory", "list", "--json"], cwd=project_dir, capture_output=True,
+                             text=True, timeout=min(2.0, remaining))
+        orders = json.loads(out.stdout) if out.returncode == 0 else []
+        items: list[str] = []
+        for o in orders:
+            oid, status = o.get("id"), o.get("status")
+            if not (isinstance(oid, str) and _ORDER_ID.match(oid)) or status not in _ORDER_STATUSES:
+                continue
+            if status in ("done", "rejected"):
+                continue
+            gate = o.get("gate")
+            gname = gate.get("name") if isinstance(gate, dict) and gate.get("waiting") else None
+            items.append(f"{oid} at the {gname} gate" if gname in ("spec", "merge") else f"{oid} {status}")
+        if not items:
+            return ""
+        shown = "; ".join(items[:_MAX_ORDERS])
+        if len(items) > _MAX_ORDERS:
+            shown += f"; +{len(items) - _MAX_ORDERS} more"
+        return f"Open orders: {shown}."
+    except Exception:
+        return ""
+
+
+if (project_dir / "factory" / "line.json").is_file():
+    parts.append("Software factory: work that needs a spec or a plan starts with the factory skill (intake); "
+                 "small direct changes skip it.")
+    orders_line = _open_orders()
+    if orders_line:
+        parts.append(orders_line)
 
 
 # ── Quality commands ───────────────────────────────────────────────────────

@@ -91,5 +91,44 @@ if os.path.isfile(OWN):
     denied = sorted(set(own["allow"]) & set(template["deny"]))
     check(".claude/settings.json allows nothing the template denies", not denied, str(denied))
 
+# 6. plansDirectory: the template ships docs/plans, and cc-setup adds it once without overriding a project's own.
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+
+check("template sets plansDirectory docs/plans", json.load(open(TEMPLATE, encoding="utf-8")).get("plansDirectory") == "docs/plans")
+base = tempfile.mkdtemp(prefix="plansdir-")
+try:
+    env = dict(os.environ, HOME=os.path.join(base, "home"), XDG_STATE_HOME=os.path.join(base, "state"))
+    env.pop("CLAUDE_PROJECT_DIR", None)
+
+    def setup(proj):
+        return subprocess.run([os.path.join(REPO, "bin", "cc-setup"), proj], capture_output=True, text=True, env=env,
+                              stdin=subprocess.DEVNULL, timeout=600)
+
+    def settings_of(proj):
+        return json.load(open(os.path.join(proj, ".claude", "settings.json"), encoding="utf-8"))
+
+    fresh = os.path.join(base, "fresh")
+    os.makedirs(os.path.join(fresh, ".claude"))
+    r = setup(fresh)
+    check("cc-setup on a bare project exits 0", r.returncode == 0, (r.stderr or r.stdout)[-300:])
+    check("a fresh project gets plansDirectory", settings_of(fresh).get("plansDirectory") == "docs/plans")
+    setup(fresh)
+    text = open(os.path.join(fresh, ".claude", "settings.json"), encoding="utf-8").read()
+    check("plansDirectory is added once", text.count('"plansDirectory"') == 1, text.count('"plansDirectory"'))
+    old = os.path.join(base, "old")
+    os.makedirs(os.path.join(old, ".claude"))
+    json.dump({"permissions": {"allow": []}}, open(os.path.join(old, ".claude", "settings.json"), "w"))
+    setup(old)
+    check("an existing settings file without it gains plansDirectory", settings_of(old).get("plansDirectory") == "docs/plans")
+    own = os.path.join(base, "own")
+    os.makedirs(os.path.join(own, ".claude"))
+    json.dump({"plansDirectory": "notes/plans"}, open(os.path.join(own, ".claude", "settings.json"), "w"))
+    setup(own)
+    check("a project's own plansDirectory is kept", settings_of(own).get("plansDirectory") == "notes/plans")
+finally:
+    shutil.rmtree(base, ignore_errors=True)
+
 print("%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

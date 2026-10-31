@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # cc-setup: Configure Claude Code tools (hooks + settings + skills + CLAUDE.md) in a project.
-# Usage: cc-setup [project_path] [--vault] [--factory] [--reset-terminals] [--devcontainer [--cloud aws|gcp|none] [--firewall on|off]]
+# Usage: cc-setup [project_path] [--vault] [--factory] [--no-factory] [--reset-terminals] [--devcontainer [--cloud aws|gcp|none] [--firewall on|off]]
+#   --factory / --no-factory  the factory is scaffolded by default; --no-factory opts out (marker .claude/no-factory)
 #   --reset-terminals  replace the recorded terminal hosts (control mode) with this terminal's, instead of adding it
 set -euo pipefail
 
@@ -10,6 +11,7 @@ PROJECT_DIR=""
 WITH_DEVCONTAINER=0
 WITH_VAULT=0
 WITH_FACTORY=0
+NO_FACTORY=0
 RESET_TERMINALS=0
 DEVCONTAINER_ARGS=()
 
@@ -17,6 +19,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --vault) WITH_VAULT=1; shift ;;
         --factory) WITH_FACTORY=1; shift ;;
+        --no-factory) NO_FACTORY=1; shift ;;
         --reset-terminals) RESET_TERMINALS=1; shift ;;
         --devcontainer) WITH_DEVCONTAINER=1; shift ;;
         --cloud|--cloud=*|--firewall|--firewall=*|--force)
@@ -31,6 +34,11 @@ while [[ $# -gt 0 ]]; do
         *)  PROJECT_DIR="$1"; shift ;;
     esac
 done
+
+if (( WITH_FACTORY && NO_FACTORY )); then
+    echo "Error: --factory and --no-factory contradict each other." >&2
+    exit 1
+fi
 
 PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 PROJECT_DIR="$(realpath "$PROJECT_DIR")"
@@ -353,6 +361,9 @@ if isinstance(tmpl_env, dict):
     env = settings.setdefault("env", {})
     for k, v in tmpl_env.items():
         env.setdefault(k, v)
+# Plan-mode files land in docs/plans (the Work view tracks them); a project's own value stays.
+if isinstance(template.get("plansDirectory"), str):
+    settings.setdefault("plansDirectory", template["plansDirectory"])
 # Retired managed env: v0.0.19-v0.0.20 shipped SUBAGENT_MODEL_FORCE="1", which
 # drops every per-call model and so blocks Sonnet 5.5 execution arms. Remove
 # only that exact shipped value; any other value is the project's own choice.
@@ -548,7 +559,25 @@ for skill_src in sorted(p for p in tdir.iterdir() if p.is_dir()):
         (dst / rel).unlink(missing_ok=True)
     refreshed += 1
 
+# Skills cc_tool no longer ships. A project copy goes only when it is byte-identical,
+# file for file, to a version cc_tool once shipped: an edited copy, an extra file, a
+# symlink, or a user's own skill that reuses the name all stay.
+RETIRED_SKILLS = ("skills-audit", "dynamic-workflows", "e2e-testing", "ui-ux-review", "frontend-review")
+pruned = 0
+kept_retired: list[str] = []
+for name in RETIRED_SKILLS:
+    dst = sdir / name
+    if not dst.is_dir():
+        continue
+    if not dst.is_symlink() and not any(q.is_symlink() for q in dst.rglob("*")) and snapshot(dst) in list(shipped_versions(name)):
+        shutil.rmtree(dst)
+        pruned += 1
+    else:
+        kept_retired.append(name)
+
 parts = [f"installed {installed}", f"refreshed {refreshed}", f"already current {current}"]
+if pruned:
+    parts.append(f"pruned {pruned} retired")
 if local:
     parts.append(f"locally modified {local}")
 print("  ✓ .claude/skills/ — " + ", ".join(parts))
@@ -557,6 +586,8 @@ if local_names:
     for n in local_names:
         print(f"      - {n}")
     print("    Delete the project copy to pick up the current template.")
+for n in kept_retired:
+    print(f"    ℹ Left untouched: .claude/skills/{n} (retired skill, but its content is not an unmodified shipped copy)")
 EOF
 fi
 
@@ -668,10 +699,55 @@ if (( WITH_VAULT )); then
 fi
 
 # ── 5b. Optional software factory ────────────────────────────────────────────
-if (( WITH_FACTORY )); then
+FACTORY_MARKER="$PROJECT_DIR/.claude/no-factory"
+if (( NO_FACTORY )); then
+    echo ""
+    if [[ -L "$PROJECT_DIR/.claude" ]]; then
+        echo "factory: .claude is a symlink; marker not written (replace it with a real directory)"
+    elif [[ -L "$FACTORY_MARKER" ]]; then
+        echo "factory: .claude/no-factory is a symlink; marker not written (remove the link)"
+    else
+        mkdir -p "$PROJECT_DIR/.claude"
+        # noclobber makes the redirect O_EXCL: an existing marker stays as it is, a racing symlink is not followed.
+        if [[ -e "$FACTORY_MARKER" ]] || ( set -o noclobber; : > "$FACTORY_MARKER" ) 2>/dev/null; then
+            echo "factory skipped: --no-factory (recorded in .claude/no-factory; --factory removes it)"
+            [[ -e "$PROJECT_DIR/factory/line.json" ]] \
+                && echo "factory: factory/line.json already exists, so the scaffold stays and routing stays on until you remove factory/line.json"
+        else
+            echo "factory: .claude/no-factory could not be created; marker not written"
+        fi
+    fi
+elif (( WITH_FACTORY )); then
+    # rm -f removes a symlink itself, never its target; a symlinked .claude/ is not entered.
+    [[ -L "$PROJECT_DIR/.claude" ]] || rm -f "$FACTORY_MARKER"
     echo ""
     echo "── Factory ─────────────────────────────────────────────────────────"
     "$CC_TOOL_DIR/bin/cc-factory" init "$PROJECT_DIR"
+elif [[ -e "$FACTORY_MARKER" || -L "$FACTORY_MARKER" ]]; then
+    echo ""
+    echo "factory skipped: .claude/no-factory exists (run cc-setup --factory to turn it on)"
+# CC_SETUP_PROC_STATUS is a test-only stand-in for /proc/self/status.
+elif [[ ! -r "${CC_SETUP_PROC_STATUS:-/proc/self/status}" ]]; then
+    echo ""
+    echo "factory skipped: its gates need Linux /proc; this project stays on Superpowers"
+elif ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo ""
+    echo "factory skipped: not a git work tree (git init, then re-run cc-setup)"
+elif FACTORY_TOP="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null)" \
+        && [[ "$(realpath "$FACTORY_TOP")" != "$(realpath "$PROJECT_DIR")" ]]; then
+    # Default-on must not write above the directory it was run in (a monorepo package, a dotfiles repo in $HOME).
+    echo ""
+    echo "factory skipped: $PROJECT_DIR is inside the git repository $FACTORY_TOP; run cc-setup there, or pass --factory"
+elif FACTORY_COMMON="$(git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+        && [[ -e "$(dirname "$FACTORY_COMMON")/.claude/no-factory" || -L "$(dirname "$FACTORY_COMMON")/.claude/no-factory" ]]; then
+    # A linked worktree honours the opt-out recorded at the main checkout.
+    echo ""
+    echo "factory skipped: .claude/no-factory exists in the main checkout (run cc-setup --factory to turn it on)"
+else
+    echo ""
+    echo "── Factory ─────────────────────────────────────────────────────────"
+    "$CC_TOOL_DIR/bin/cc-factory" init "$PROJECT_DIR" \
+        || echo "  ⚠ factory scaffold failed; setup continues (re-run: cc-factory init, or cc-setup --no-factory to opt out)"
 fi
 
 # ── 6. Optional devcontainer setup ──────────────────────────────────────────

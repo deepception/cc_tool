@@ -1,10 +1,6 @@
----
-name: dynamic-workflows
-description: Catalog of the native Workflow tool's 6 orchestration patterns (classify-and-act, fan-out-and-synthesize, adversarial-verification, generate-and-filter, tournament, loop-until-done) plus operational controls. Consult when designing multi-agent orchestration (how to fan out, verify at scale, loop until done, pick parallel vs pipeline, or compose patterns into a workflow).
-user-invocable: true
----
+# Workflow patterns
 
-# Dynamic Workflows
+Catalog of the native Workflow tool's 6 orchestration patterns (classify-and-act, fan-out-and-synthesize, adversarial-verification, generate-and-filter, tournament, loop-until-done) plus operational controls. Consult when designing multi-agent orchestration (how to fan out, verify at scale, loop until done, pick parallel vs pipeline, or compose patterns into a workflow).
 
 A workflow is a harness Claude writes for THIS task: a JS script that coordinates subagents. Each agent gets its own context (intermediate results stay out of the main conversation), its own model and effort (Opus 5.5 by default for judgment stages, `model: 'sonnet'` for spec'd execution arms, `effort` to tune within a model; see Model routing in CLAUDE.md), and its own isolation level (worktree or none). The structure, not better prompting, is what fixes three failure modes of long single-context work:
 
@@ -53,7 +49,6 @@ Real workflows compose 2-4 patterns. Map the failure mode you fear to the patter
 Worked examples ship in the cc_tool repo under `.claude/workflows/`:
 
 - `model-recalibration-audit.js`: fan-out research + per-component analysis with adversarial verification, wired as a pipeline.
-- `ship-pipeline.js`: plan → code → test → review with a read-only review gate, structured hand-offs between stages, per-stage models (Opus plans and reviews, Sonnet codes and tests), and optional per-stage effort.
 - `loop-until-clean.js`: loop-until-done sweep (stop after two dry rounds) + adversarial verification of survivors.
 
 Treat them as templates to adapt, not scripts to run verbatim. Copy one into your project's `.claude/workflows/` to adapt it.
