@@ -2,6 +2,17 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.4.1
+
+`cc-setup` now recognises a skill copied from a branch that was later squashed, so `cc-update-project` refreshes it instead of reporting a local edit.
+
+**Upgrading:** nothing to do in your projects. The change is in `bin/cc-setup`, which runs from this checkout.
+
+- **Skill versions are found on every branch.** The check read only the current branch's history, so after a release was squashed, a copy deployed from its branch stayed as "locally modified" for good. It now reads all refs, as the hook checks already did.
+- **A project's own file survives a skill refresh.** An extra file is removed only when its content matches a file cc_tool shipped. Matching by name, with the wider search, would have deleted a user's file that shares a name with one on any branch.
+- **`ccdash`'s restart is tested.** `tests/test_ccdash_restart.py` runs the function from `install.sh` in bash and zsh against a stub: it stops a running dashboard first, and kills one that ignores SIGTERM after 10 seconds.
+- **`factory/` is tracked here.** The scaffold `cc-setup` adds is now committed in this repository, as `cc-factory init` advises.
+
 ## v0.4.0
 
 The software factory is now the default delivery path: a plain `cc-setup` or `cc-update-project` installs it, and work that needs a spec or a plan is routed to it. The skill list is cut from 24 to 19 (11 listed to the model every turn, down from 20), and cc-dash's Plans page is now the Work page.

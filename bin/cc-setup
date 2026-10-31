@@ -506,7 +506,8 @@ def git(*args: str) -> str:
 def shipped_versions(name: str):
     """Every version of templates/skills/<name>/ this repo has ever shipped."""
     prefix = f"templates/skills/{name}/"
-    for commit in git("log", "--format=%H", "--", prefix).split():
+    # --all: a release is squashed onto master, so a copy deployed from its branch is on no version of HEAD's line.
+    for commit in git("log", "--all", "--format=%H", "--", prefix).split():
         snap = {}
         for line in git("ls-tree", "-r", commit, prefix).splitlines():
             meta, _, path = line.partition("\t")
@@ -535,11 +536,12 @@ for skill_src in sorted(p for p in tdir.iterdir() if p.is_dir()):
         current += 1
         continue
 
-    # An extra file is stale only if cc_tool once shipped it; anything else is a
-    # local addition and stays. Without this split, a skill carrying a local
-    # extra would re-report as "refreshed" on every run and never settle.
+    # An extra file is stale only if cc_tool once shipped exactly that content;
+    # anything else, a same-named file of the user's included, is a local
+    # addition and stays. Without this split, a skill carrying a local extra
+    # would re-report as "refreshed" on every run and never settle.
     versions = list(shipped_versions(name))
-    stale = extras & set().union(*versions) if versions else set()
+    stale = {rel for rel in extras if any(v.get(rel) == have[rel] for v in versions)}
     if up_to_date and not stale:
         current += 1
         continue

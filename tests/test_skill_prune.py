@@ -10,6 +10,9 @@ dirs; a StateGuard confirms the real projects.json is unchanged), and checks the
   - a same-named directory that matches no shipped version (a user's own skill) stays
   - a copy holding a symlink stays
   - the live skills are installed either way
+and that a version only a side branch holds (the commits of a squashed release) counts as shipped:
+  - a copy deployed from it is refreshed, and the file only that branch shipped goes
+  - a user's file that merely shares that file's name stays
 
 Run:  python3 tests/test_skill_prune.py
 """
@@ -148,6 +151,63 @@ check("link: cc-setup exits 0", r.returncode == 0, r.stderr[-300:] + r.stdout[-3
 check("link: the copy holding a symlink stays", os.path.isfile(os.path.join(skill_dir(proj, "skills-audit"), "SKILL.md"))
       and os.path.islink(os.path.join(skill_dir(proj, "skills-audit"), "elsewhere")))
 check("link: Left untouched line printed", "Left untouched: .claude/skills/skills-audit" in r.stdout, r.stdout[-600:])
+
+# 6-7. versions that live only on a side branch, as the commits of a squashed release do. In a clone, so
+# the history can hold a branch this checkout's HEAD never reaches.
+CLONE = os.path.join(BASE, "cc")
+subprocess.run(["git", "clone", "-q", REPO, CLONE], capture_output=True, env=env(), check=True)
+shutil.copy2(SETUP, os.path.join(CLONE, "bin", "cc-setup"))   # this checkout's script over that history
+
+
+def clone_git(*args):
+    subprocess.run(["git", "-C", CLONE, "-c", "user.name=t", "-c", "user.email=t@t", *args], capture_output=True, env=env(), check=True)
+
+
+template = os.path.join(CLONE, "templates", "skills", "factory", "SKILL.md")
+with open(template, "rb") as fh:
+    released = fh.read()
+side_only = os.path.join("references", "side-only.md")
+on_side = released + b"\nA line from a branch that was squashed.\n"
+clone_git("switch", "-q", "-c", "side")
+with open(template, "wb") as fh:
+    fh.write(on_side)
+os.makedirs(os.path.dirname(os.path.join(os.path.dirname(template), side_only)), exist_ok=True)
+with open(os.path.join(os.path.dirname(template), side_only), "wb") as fh:
+    fh.write(b"shipped only on the side branch\n")
+clone_git("add", "templates/skills/factory")
+clone_git("commit", "-q", "-m", "side")
+clone_git("switch", "-q", "-")
+newest = released + b"\nThe next release.\n"
+with open(template, "wb") as fh:
+    fh.write(newest)
+clone_git("commit", "-q", "-am", "next")
+
+
+def clone_setup(proj):
+    return subprocess.run([os.path.join(CLONE, "bin", "cc-setup"), proj], capture_output=True, text=True, env=env(),
+                          stdin=subprocess.DEVNULL, timeout=600)
+
+
+def skill_file(proj, rel):
+    with open(os.path.join(skill_dir(proj, "factory"), rel), "rb") as fh:
+        return fh.read()
+
+
+# 6. a copy deployed from that branch is a shipped copy, not a local edit, and its dropped file goes
+proj = new_project("side", {"factory": {"SKILL.md": on_side, side_only: b"shipped only on the side branch\n"}})
+r = clone_setup(proj)
+check("side: cc-setup exits 0", r.returncode == 0, r.stderr[-300:] + r.stdout[-300:])
+check("side: the copy is refreshed to the current template", skill_file(proj, "SKILL.md") == newest, r.stdout[-600:])
+check("side: the file only that branch shipped is removed", not os.path.exists(os.path.join(skill_dir(proj, "factory"), side_only)))
+check("side: it is not reported as a local edit", "locally modified" not in r.stdout, r.stdout[-600:])
+
+# 7. a user's own file that only shares its name with that branch's file stays through a refresh
+proj = new_project("namesake", {"factory": {"SKILL.md": released, side_only: b"my own notes\n"}})
+r = clone_setup(proj)
+check("namesake: cc-setup exits 0", r.returncode == 0, r.stderr[-300:] + r.stdout[-300:])
+check("namesake: the skill itself is refreshed", skill_file(proj, "SKILL.md") == newest, r.stdout[-600:])
+check("namesake: the user's file stays", os.path.exists(os.path.join(skill_dir(proj, "factory"), side_only))
+      and skill_file(proj, side_only) == b"my own notes\n")
 
 why = GUARD.problem()
 check("the real projects.json is untouched", not why, why)
