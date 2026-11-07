@@ -168,7 +168,7 @@ def _order(o):
             stations.append({"name": clip(st["name"], 40), "title": _text(st.get("title"), 80) or clip(st["name"], 80),
                              "status": st.get("status") if st.get("status") in STATION_STATUSES else "pending",
                              "t": _num(st.get("t"))})
-    g, ln = o.get("gate"), o.get("lane")
+    g, ln, w = o.get("gate"), o.get("lane"), o.get("why")
     return {"id": o["id"], "title": _text(o.get("title"), 200), "priority": _text(o.get("priority"), 8),
             "status": o.get("status") if o.get("status") in ORDER_STATUSES else "queued",
             "path": _text(o.get("path"), 300), "created": _num(o.get("created")), "updated": _num(o.get("updated")),
@@ -178,7 +178,9 @@ def _order(o):
                      "worktree": clip(tilde(ln.get("worktree")), 300) if isinstance(ln.get("worktree"), str) else ""}
             if isinstance(ln, dict) else None,
             "run_id": _text(o.get("run_id"), 100), "rework": _int(o.get("rework")), "events": _int(o.get("events")),
-            "line": _text(o.get("line"), 40)}
+            "line": _text(o.get("line"), 40),
+            "why": {"note": _text(w.get("note"), 500),
+                    "recommendation": _text(w.get("recommendation"), 40)} if isinstance(w, dict) else None}
 
 
 def _project_orders(store, fac, root, now):

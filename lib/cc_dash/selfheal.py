@@ -135,7 +135,7 @@ SEVERITIES = ("high", "medium", "low")
 PRIORITY = {"high": "p1", "medium": "p2", "low": "p3"}
 STATUSES = ("running", "done", "failed", "timeout", "interrupted")
 PUBLIC_KEYS = ("id", "status", "phase", "origin", "started", "ended", "window", "projects", "signals", "session_id",
-               "budget_usd", "cost_usd", "proposals", "by_severity", "error", "run_dir")
+               "budget_usd", "cost_usd", "proposals", "by_severity", "error", "run_dir", "partial")
 SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}\Z", re.ASCII)
 FIXED_TARGETS = {"claude_md": ("CLAUDE.md",), "guard_rules": (".claude/guard-rules.json",),
                  "settings": (".claude/settings.json",), "factory_line": ("factory/line.json",),
@@ -179,7 +179,7 @@ CAUTION_GUARD = "This patch weakens a guard rule: read every line before applyin
 CAUTION_SKILL = ("This patch changes a skill's frontmatter, where allowed-tools pre-approves tools and hooks "
                  "run commands: read every line before applying.")
 # Applying a proposal (SelfHeal.apply): git runs only with this hardened prefix, the Python form of
-# factory-line.js's GIT_SAFE: no system or global config (the commit identity is read separately), every
+# cc-factory verify-git's hardened argv (GIT_SAFE): no system or global config (the commit identity is read separately), every
 # exec-capable key switched off on the command line (which outranks the repo's own config), no hooks, no
 # pager, no signing, no auto gc, no transport. Its environment is built from scratch, so no GIT_DIR,
 # GIT_WORK_TREE or GIT_INDEX_FILE of cc-dash's reaches it. Unlike GIT_SAFE it has no --attr-source (git
@@ -1364,7 +1364,7 @@ class SelfHeal:
         if new or state["last"] is None or state["last"]["id"] == rec["id"]:
             state["last"] = rec
         lc = state["last_completed"]
-        if rec["status"] == "done" and (lc is None or (lc["window"].get("until") or 0) <= rec["window"]["until"]):
+        if rec["status"] == "done" and not rec.get("partial") and (lc is None or (lc["window"].get("until") or 0) <= rec["window"]["until"]):
             state["last_completed"] = rec
         write_json(self._path("state.json"), state)
 
@@ -2148,8 +2148,11 @@ class SelfHeal:
             status, error = "failed", "the run wrote no valid proposals.json" + (" (workflow: %s)" % why if why else "")
         else:
             status, error = "done", ""
+        partial = bool(got and got[2]) and status == "done"
+        if partial:
+            error = "some evidence was not analysed (an agent returned no result); the next run starts from the same window"
         self._finish(run_id, status, error, cost=cost, proposals=len(clean) if got else None, by_severity=sev,
-                     sha=got[0] if got else None)
+                     sha=got[0] if got else None, partial=partial)
 
     def _proposals_of(self, rec):
         """(sha256, clean proposals) of the run's proposals.json, or None when it is missing or invalid."""
@@ -2163,7 +2166,8 @@ class SelfHeal:
         if not isinstance(doc, dict) or doc.get("version") != 1 or doc.get("run_id") != rec["id"] \
                 or not isinstance(doc.get("proposals"), list):
             return None
-        return hashlib.sha256(raw).hexdigest(), validate_proposals(doc, rec["projects"], rec["markers"])[0]
+        return (hashlib.sha256(raw).hexdigest(), validate_proposals(doc, rec["projects"], rec["markers"])[0],
+                doc.get("partial") is True)
 
     def _copy_patches(self, run_id, clean):
         """Each validated patch, written into S/patches/<id>/<slug>/<NN>-<name>.patch (0700 dirs, 0600
@@ -2181,12 +2185,13 @@ class SelfHeal:
             except FileExistsError:
                 continue
 
-    def _finish(self, run_id, status, error="", cost=None, proposals=None, by_severity=None, sha=None, client=None):
+    def _finish(self, run_id, status, error="", cost=None, proposals=None, by_severity=None, sha=None, client=None,
+                partial=False):
         rec = self._recs[run_id]
         try:
             with self._locked():
                 rec.update(status=status, phase="finished", ended=self.clock(), error=_line(error, 300), cost_usd=cost,
-                           proposals=proposals, by_severity=by_severity, proposals_sha256=sha)
+                           proposals=proposals, by_severity=by_severity, proposals_sha256=sha, partial=partial)
                 self._save(rec)
             self._audit(client, "%s %s: %d proposals, $%.2f" % (run_id, status, proposals or 0, cost or 0)
                         + (" (%s)" % rec["error"] if rec["error"] else ""))

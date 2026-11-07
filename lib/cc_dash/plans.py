@@ -1347,7 +1347,7 @@ class Plans:
                         "project": label, "id": o["id"], "title": o["title"], "status": o["status"], "priority": o["priority"],
                         "line": o["line"], "gate": o["gate"], "stations": sts,
                         "done": sum(1 for s in sts if s["status"] == "pass"), "total": len(sts), "rework": o["rework"],
-                        "recommendation": recs.get(o["id"], ""), "branch": lane.get("branch", ""),
+                        "recommendation": recs.get(o["id"], ""), "why": o.get("why"), "branch": lane.get("branch", ""),
                         "worktree": lane.get("worktree", ""), "path": o["path"],
                         "plan": {"key": plan["key"], "path": plan["doc"] or "", "title": plan["title"], "tasks": plan["tasks"]} if plan else None,
                         "updated": o["updated"] or 0})

@@ -2,6 +2,23 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.4.4
+
+The factory's verify station runs lane code in a tighter sandbox, bash-guard stops treating a disguised `git rm` as a harmless untrack, and the dashboard says why an order stopped.
+
+**Upgrading:** run `cc-update-project` in each project to deploy the new `bash-guard.py`, `factory-line.js` and factory skill, then restart `ccdash` from your own terminal.
+
+- **Verify runs the lane's code against the main checkout's dependencies, offline.** That includes editable installs. A scenario verify could only judge by reading the code now stops at `needs-human-check` and never reaches the merge gate as if it had been run.
+- **The verify sandbox hides more of the machine.** `/run` and the socket env vars are gone, so lane code cannot reach user systemd or docker. `CLAUDE_CONFIG_DIR` is hidden and unset, so it cannot read the verify transcript.
+- **The installed-copy check names lane code shadowed by an installed copy.** It goes by where lane modules resolve: node_modules dirs no lockfile accounts for, packages installed from local files, and dependency files byte-identical to lane sources. A vendored file or a nameless `package.json` is not flagged.
+- **Verify's git runs through `cc-factory verify-git`.** bash-guard's verify exemption is gone. When verify's own git fails and the lane left no report, the run is recorded as blocked infra, not `lane-tampered`.
+- **A build that needs a file deleted stops the line for a human** (`needs-deletion`), since bash-guard asks for every deletion.
+- **bash-guard exempts `git rm --cached` only when every word is plain.** A `--no-cached`, an option that consumes the next word, or any word the shell may expand (`$`, backtick, braces, globs, `~-`, zsh `^` and `#`, `(` `)`) now asks. Global options such as `--attr-source`, `--config-env` and `--shallow-file` are read with their values, and `cd <lane> && git …` is judged against the lane.
+- **The dashboard says why a blocked or failed order stopped** and what to run next. An old usage reading shows its age instead of a time left, a self-heal run cut short shows as incomplete, and startup warns about projects with a stale code record or a wrong pin.
+- **`ccdash` stops prior dashboards by cc-dash's real path,** and refuses to start beside one it cannot stop.
+- **`cc-setup` refreshes a kept `factory-line.js` under `.claude/no-factory`,** in its own main checkout only.
+- **Self-heal marks a run partial** when an analysis, propose or check agent returned nothing.
+
 ## v0.4.3
 
 Setup for macOS and Windows: the README has a section for each, and `install.sh` checks what it needs first.

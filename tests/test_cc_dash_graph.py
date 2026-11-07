@@ -983,6 +983,11 @@ def test_orders(st):
           (d1["id"], d3["gate"]))
     check("orders: lane.branch is kept and lane.worktree goes through tilde",
           d3["lane"] == {"branch": BRANCH, "worktree": tilde(WT3)}, d3["lane"])
+    w = graph._order(mk_order("FO-009", "Blocked", "blocked", why={"note": "n" * 900, "recommendation": 7, "x": 1}))["why"]
+    check("orders: why is kept as {note clipped, recommendation a string}, other keys dropped",
+          set(w) == {"note", "recommendation"} and 0 < len(w["note"]) <= 500 and w["recommendation"] == "", w)
+    check("orders: why is None when the fold gave none or a non-dict",
+          d1["why"] is None and graph._order(mk_order("FO-009", "B", "blocked", why="x"))["why"] is None, d1.get("why"))
     # visibility
     check("orders: a done order older than a day (FO-004) is hidden by default", on("alpha", "FO-004") not in nodes)
     check("orders: gamma has no live session but a queued order: its hub shows with the order and no session",

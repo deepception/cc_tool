@@ -48,6 +48,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import stat
 import subprocess
@@ -602,7 +603,7 @@ def test_list_show():
     arr = json.loads(r.stdout)
     check("list --json: every order (done included), the library's dict shape", [o["id"] for o in arr] == [a, b, c]
           and set(arr[0]) == {"id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane",
-                              "run_id", "rework", "events", "line"}, arr[0] if arr else r.stdout)
+                              "run_id", "rework", "events", "line", "why"}, arr[0] if arr else r.stdout)
     check("list --json equals project_orders", [o["status"] for o in arr] == [o["status"] for o in F.project_orders(d, time.time())])
 
     r = cli(d, "show", b)
@@ -991,8 +992,12 @@ def test_human_gates():
     check("human gate, no /proc: nothing was written, the order still waits at the merge gate",
           len(events(d)) == n2 and order_of(d, a)["status"] == "review", (len(events(d)), n2))
     src = read(CLI)
-    check("source: the only environment variable cc-factory reads is CLAUDE_CONFIG_DIR (nothing turns the gate check off)",
-          re.findall(r"os\.environ\.get\(\s*[\"']([A-Za-z_]+)", src) == ["CLAUDE_CONFIG_DIR"] and "os.getenv" not in src
+    # TMPDIR only adds a tmpfs hide to verify-git's sandbox (as factory-line.js's "${TMPDIR:-/tmp}" does), never a gate.
+    check("source: the only environment variables cc-factory reads are CLAUDE_CONFIG_DIR and, for verify-git's sandbox hide, "
+          "TMPDIR (nothing turns the gate check off)",
+          sorted(re.findall(r"os\.environ\.get\(\s*[\"']([A-Za-z_]+)", src)) == ["CLAUDE_CONFIG_DIR", "TMPDIR"]
+          and src.count('os.environ.get("TMPDIR")') == 1
+          and 'os.environ.get("TMPDIR")' in src[src.index("def verify_sandbox("):src.index("def cmd_verify_git(")] and "os.getenv" not in src
           and re.findall(r"os\.environ\[", src) == [], re.findall(r"os\.environ\.get\(\s*[\"']([A-Za-z_]+)", src))
     check("source: cc_procs is loaded by path from this checkout, as cc-setup does", 'spec_from_file_location("cc_procs", PROCS_PATH)' in src
           and 'os.path.join(CC_TOOL_DIR, "templates", "hooks", "cc_procs.py")' in src)
@@ -2048,8 +2053,9 @@ def test_record_checks():
     lane_with_commit(d, x)
     hist = [{"station": "build", "state": t, "attempt": 1, "note": ""} for t in ("start", "pass")]
     r = record_saved(d, x, v2_result(x, order_of(d, x)["lane"], ids=(), history=hist) | {"holdout": None})
-    check("record: a station on the line that the run never passed (one the workflow cannot run) blocks review", blocked(r)
-          and "station docs has no pass in attempt 1" in r.stderr, (r.returncode, r.stderr))
+    # 'docs' is no station the workflow runs, so the line drops it too and record does not wait for a pass it can never get.
+    check("record: a station the workflow cannot run is not on the line, so the run reaches review", r.returncode == 0
+          and events(d, x)[-1]["status"] == "review" and "docs" not in r.stderr, (r.returncode, r.stderr))
     # A lane with nothing on it.
     y = new_order(d, "Empty")
     scenarios(d, y)
@@ -2082,6 +2088,20 @@ def test_record_checks():
     r = record_saved(d, i, v2_result(i, li))
     check("record infra: the rerun after an infra failure is not a rework (rework 0)", r.returncode == 0 and order_of(d, i)["rework"] == 0
           and order_of(d, i)["status"] == "review", (r.returncode, r.stderr, order_of(d, i)["rework"]))
+    # The shape the workflow returns when verify's own git failed and it gave no lane report: recorded as infra, never a reject.
+    g, lg = ready(d, "Verify git failed")
+    note = "infrastructure failure: verify reported git failed and no lane report (verify did not report the lane worktree's HEAD and git status before and after), and ran no lane code, so nothing shows the lane changed"
+    ghist = v2_history(1)[:-1] + [{"station": "verify", "state": "fail", "attempt": 1, "note": note, "infra": True}]
+    gres = {"contract": 2, "order": g, "status": "blocked", "reason": "infra", "recommendation": "rerun",
+            "summary": "%s is blocked by an infrastructure failure at verify on attempt 1 of 3: nothing shows the lane changed." % g,
+            "error": "infra: verify on attempt 1: verify git failed, no lane report", "satisfaction": None, "attempts": 0, "rework": 0,
+            "history": ghist, "stations": {}, "holdout": None, "feedback": []}
+    r = cli(d, "record", g, stdin=json.dumps(gres))
+    ev = events(d, g)
+    check("record verify-git infra: blocked, rerun, cause infra, no tamper or reject wording", r.returncode == 0
+          and order_of(d, g)["status"] == "blocked" and ev[-1]["recommendation"] == "rerun"
+          and [e for e in ev if e["event"] == "station"][-1]["cause"] == "infra"
+          and "lane-tampered" not in r.stdout and "reject" not in ev[-1]["recommendation"], (r.returncode, r.stderr, r.stdout[-500:]))
     j, lj = ready(d, "Real failure")
     cli(d, "record", j, stdin=json.dumps(failed_result(j)))
     r = record_saved(d, j, v2_result(j, lj))
@@ -2405,6 +2425,192 @@ def test_safety():
     check("source: the shipped order template carries every placeholder", all(("{{%s}}" % p) in read(os.path.join(REPO, "templates/factory/order-template.md")) for p in ("id", "title", "priority", "created", "line")))
 
 
+def test_verify_git():
+    """verify-git on a real order lane whose git config runs programs (core.fsmonitor, also via an include, hooks, a
+    smudge/clean filter named in .gitattributes and info/attributes, an external diff, a textconv), then an ext:: promisor
+    with a missing blob: plain git runs them; head, status, export, diff and show work and run none of them; what needs
+    the missing blob fails closed, nothing fetched. The lane is outside /tmp, which the sandbox hides."""
+    if not (os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK)):
+        print("note: /var/tmp is not writable, the verify-git test is skipped")
+        return
+    t = os.path.realpath(tempfile.mkdtemp(prefix="cc-factory-vg-", dir="/var/tmp"))
+    attempt = 97   # never an attempt number a real run on this machine uses
+    copy = None
+    try:
+        d = os.path.join(t, "proj")
+        os.makedirs(d)
+        git(d, "init", "-q")
+        write(os.path.join(d, "README.md"), "base readme\n")
+        git(d, "add", "-A")
+        git(d, "commit", "-q", "-m", "initial")
+        if cli(d, "init").returncode != 0:
+            raise RuntimeError("init failed")
+        git(d, "add", "-A")
+        git(d, "commit", "-q", "-m", "factory")
+        oid, lane = ready(d, "Verify git")
+        wt = lane["worktree"]
+        copy = "/tmp/cc-factory-verify-%s-a%d" % (oid, attempt)
+        common = os.path.join(d, ".git")
+        vg = lambda *a: cli(d, "verify-git", oid, *a)  # noqa: E731
+
+        # Usage: no free-form git, no argument but the fixed show files, --static only for head and diff.
+        for bad in (("log",), ("show", "HEAD:README.md", "--attempt", "1"), ("show", "../x", "--attempt", "1"),
+                    ("head", "extra", "--attempt", "1"), ("status", "--attempt", "1", "--static"), ("export", "--attempt", "1", "--static"),
+                    ("head",), ("head", "--attempt", "0"), ("diff", "--attempt", "1", "--", "--ext-diff")):
+            r = vg(*bad)
+            check("verify-git refuses %s" % " ".join(bad), r.returncode in (1, 2) and not r.stdout.strip(), (r.returncode, r.stdout, r.stderr[-200:]))
+        r = vg("head", "--attempt", str(attempt))
+        check("verify-git: a sandboxed op without the prepared copy is refused", r.returncode == 2 and "prepare" in r.stderr, (r.returncode, r.stderr))
+
+        marks = {k: os.path.join(t, "MARK-" + k) for k in ("fsmonitor", "include-fsmonitor", "smudge", "clean", "extdiff", "textconv", "hook", "ext")}
+
+        def script(name, extra=""):
+            p = os.path.join(t, name + ".sh")
+            write(p, "#!/bin/sh\ntouch %s\n%s" % (marks[name], extra))
+            os.chmod(p, 0o755)
+            return p
+        write(os.path.join(wt, ".gitattributes"), "*.txt filter=evil diff=tc\n")
+        write(os.path.join(wt, "app.txt"), "lane head\n")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-q", "-m", "lane change")
+        head = git(wt, "rev-parse", "HEAD").stdout.strip()
+        os.makedirs(os.path.join(common, "info"), exist_ok=True)
+        write(os.path.join(common, "info", "attributes"), "* filter=evil diff=tc\n")
+        write(os.path.join(t, "evil.cfg"), "[core]\n\tfsmonitor = %s\n" % script("include-fsmonitor", "exit 1\n"))
+        hooks = os.path.join(t, "hooks")
+        os.makedirs(hooks)
+        hook = script("hook")
+        for name in ("pre-commit", "post-checkout", "post-index-change", "reference-transaction", "pre-auto-gc", "post-rewrite"):
+            shutil.copy(hook, os.path.join(hooks, name))
+        for k, v in (("core.fsmonitor", script("fsmonitor", "exit 1\n")), ("include.path", os.path.join(t, "evil.cfg")),
+                     ("core.hooksPath", hooks), ("filter.evil.smudge", script("smudge", "cat\n")), ("filter.evil.clean", script("clean", "cat\n")),
+                     ("diff.external", script("extdiff", "exit 0\n")), ("diff.tc.textconv", script("textconv", "cat \"$1\"\n"))):
+            git(wt, "config", k, v)
+        write(os.path.join(wt, "app.txt"), "uncommitted\n")
+        os.utime(os.path.join(wt, "app.txt"), (1, 1))
+
+        def fired():
+            return sorted(k for k, p in marks.items() if os.path.exists(p))
+
+        def clear():
+            for p in marks.values():
+                if os.path.exists(p):
+                    os.unlink(p)
+        git(wt, "status", "--porcelain")
+        git(wt, "diff", "HEAD~1", "HEAD")
+        git(wt, "commit", "-q", "--allow-empty", "-m", "hook probe", rc=None)
+        git(wt, "reset", "-q", "--soft", "HEAD~1")
+        plain = fired()
+        check("verify-git: the planted lane config runs programs under plain git (fsmonitor, filter, external diff, hook)",
+              {"smudge", "extdiff", "hook"} <= set(plain) and {"fsmonitor", "include-fsmonitor"} & set(plain), plain)
+        clear()
+        runs = {"static head": vg("head", "--attempt", str(attempt), "--static"),
+                "static diff": vg("diff", "--attempt", str(attempt), "--static")}
+        check("verify-git --static: head and diff run, see the lane, and run none of its programs",
+              runs["static head"].returncode == 0 and runs["static head"].stdout.strip() == head
+              and runs["static diff"].returncode == 0 and "lane head" in runs["static diff"].stdout and fired() == [],
+              ({k: (p.returncode, p.stdout[-200:], p.stderr[-200:]) for k, p in runs.items()}, fired()))
+        clear()
+        if not shutil.which("bwrap"):
+            print("note: bwrap is not installed, the sandboxed verify-git ops are not run")
+            return
+        if os.path.lexists(copy):
+            shutil.rmtree(copy)
+        os.mkdir(copy, 0o700)
+        if subprocess.run(["bwrap", "--ro-bind", "/", "/", "--", "true"], capture_output=True, timeout=60).returncode != 0:
+            print("note: bwrap cannot make a sandbox here, the sandboxed verify-git ops are not run")
+            return
+        sb = {op: vg(*op.split(), "--attempt", str(attempt)) for op in ("head", "status", "export", "diff", "show README.md")}
+        check("verify-git: sandboxed head, status, export, diff and show run (exit 0)", all(p.returncode == 0 for p in sb.values()),
+              {k: (p.returncode, p.stderr[-300:]) for k, p in sb.items() if p.returncode})
+        check("verify-git: none of the lane's programs ran (fsmonitor, include, hooks, filters, external diff, textconv)", fired() == [], fired())
+        check("verify-git: head is the lane's HEAD, status shows the uncommitted change, show reads the base README",
+              sb["head"].stdout.strip() == head and "app.txt" in sb["status"].stdout and sb["show README.md"].stdout == "base readme\n"
+              and "lane head" in sb["diff"].stdout, {k: p.stdout[-200:] for k, p in sb.items()})
+        check("verify-git: the export put the committed HEAD in the copy, unfiltered",
+              os.path.isfile(os.path.join(copy, "app.txt")) and read(os.path.join(copy, "app.txt")) == "lane head\n"
+              and not os.path.exists(os.path.join(copy, ".git")), sorted(os.listdir(copy)))
+        # Transport: an ext:: promisor and a missing blob; a lazy fetch would run the remote's program.
+        clear()
+        blob = git(wt, "rev-parse", "HEAD:app.txt").stdout.strip()
+        os.unlink(os.path.join(common, "objects", blob[:2], blob[2:]))
+        for k, v in (("core.repositoryformatversion", "1"), ("extensions.partialClone", "evil"), ("remote.evil.url", "ext::sh -c touch% " + marks["ext"]),
+                     ("remote.evil.promisor", "true"), ("protocol.ext.allow", "always")):
+            git(d, "config", k, v)
+        git(wt, "diff", "HEAD~1", "HEAD", rc=None)
+        check("verify-git: the planted promisor runs its ext:: program under plain git", "ext" in fired(), fired())
+        clear()
+        shutil.rmtree(copy)
+        os.mkdir(copy, 0o700)
+        res = {op: vg(*op.split(), "--attempt", str(attempt)) for op in ("head", "export", "diff")}
+        res["static diff"] = vg("diff", "--attempt", str(attempt), "--static")
+        check("verify-git: with the blob missing nothing is fetched or run; head works, export and diff fail closed",
+              "ext" not in fired() and res["head"].returncode == 0 and all(res[k].returncode != 0 for k in ("export", "diff", "static diff")),
+              ({k: (p.returncode, p.stderr[-150:]) for k, p in res.items()}, fired()))
+    finally:
+        if copy and os.path.lexists(copy):
+            shutil.rmtree(copy, ignore_errors=True)
+        shutil.rmtree(t, ignore_errors=True)
+
+
+RUNTIME_ENV = ("DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR")
+# Each probe reaches a host service that can run a command outside the sandbox (user systemd over D-Bus, the
+# docker daemon) or names a socket path; inside the sandbox every one must fail or print nothing.
+RUNTIME_PROBES = (("user systemd (systemd-run --user)", "systemd-run --user --quiet --wait true"),
+                  ("the user bus (busctl --user)", "busctl --user status"),
+                  ("the docker socket", "test -S /run/docker.sock"))
+RUNTIME_LISTING = "find /run /var/run -type s 2>/dev/null | head -3; env | grep -E '^(%s)=' || true" % "|".join(RUNTIME_ENV)
+
+
+def runtime_hidden(label, inside):
+    """Check that a sandbox (inside: shell command -> CompletedProcess) cuts off the per-user runtime dir, /run's
+    sockets and the socket env vars. A probe the host itself cannot run proves nothing and is not asserted."""
+    for what, cmd in RUNTIME_PROBES:
+        if subprocess.run(["sh", "-c", cmd], capture_output=True, timeout=60).returncode == 0:
+            p = inside(cmd)
+            check("%s: lane code cannot reach %s" % (label, what), p.returncode != 0, (p.returncode, p.stdout[-200:], p.stderr[-200:]))
+    p = inside("sh -c %s" % shlex.quote(RUNTIME_LISTING))
+    check("%s: no socket under /run and no %s inside" % (label, ", ".join(RUNTIME_ENV)), p.returncode == 0 and p.stdout.strip() == "",
+          (p.returncode, p.stdout[-300:], p.stderr[-200:]))
+
+
+def test_verify_sandbox_runtime():
+    # verify-git's sandbox hides /run (the user's D-Bus and agent sockets, the docker socket) and drops the socket env vars.
+    t = tempfile.mkdtemp(prefix="ccf-vsb-", dir="/tmp")
+    # CLAUDE_CONFIG_DIR, where Claude Code keeps transcripts when it is set: outside /tmp, which the sandbox hides as a whole.
+    cfg = tempfile.mkdtemp(prefix="ccf-vsb-cfg-", dir="/var/tmp") if os.access("/var/tmp", os.W_OK) else os.path.join(t, "cfg")
+    try:
+        copy = os.path.join(t, "copy")
+        os.mkdir(copy)
+        os.makedirs(os.path.join(cfg, "projects"), exist_ok=True)
+        secret = os.path.join(cfg, "projects", "t.jsonl")
+        with open(secret, "w") as fh:
+            fh.write("CONFIG-DIR-SECRET-41\n")
+        env = dict(os.environ, CLAUDE_CONFIG_DIR=cfg)
+        code = ("import json, runpy, sys; vs = runpy.run_path(sys.argv[1], run_name='ccf')['verify_sandbox']; "
+                "vs.__globals__['F'] = vs.__globals__['load_lib'](); print(json.dumps(vs(sys.argv[2], 'FO-001', sys.argv[3])))")
+        r = subprocess.run([sys.executable, "-I", "-c", code, CLI, t, copy], capture_output=True, text=True, timeout=60, env=env)
+        argv = json.loads(r.stdout) if r.returncode == 0 else []
+        pairs = list(zip(argv, argv[1:]))
+        check("verify_sandbox: the argv hides /run before the temp dirs and unsets %s" % ", ".join(RUNTIME_ENV),
+              ("--tmpfs", "/run") in pairs and pairs.index(("--tmpfs", "/run")) < pairs.index(("--tmpfs", "/tmp"))
+              and all(("--unsetenv", k) in pairs for k in RUNTIME_ENV) and argv[-1] == "--", (r.returncode, r.stderr[-300:], argv))
+        check("verify_sandbox: the argv hides $CLAUDE_CONFIG_DIR and unsets it",
+              ("--tmpfs", cfg) in pairs and ("--unsetenv", "CLAUDE_CONFIG_DIR") in pairs, argv)
+        if not argv or not shutil.which("bwrap") or subprocess.run(argv + ["true"], capture_output=True, timeout=60, env=env).returncode != 0:
+            print("note: bwrap cannot make verify-git's sandbox here, its runtime-dir probes are not run")
+            return
+        runtime_hidden("verify_sandbox", lambda cmd: subprocess.run(argv + ["sh", "-c", cmd], capture_output=True, text=True, timeout=60))
+        p = subprocess.run(argv + ["cat", secret], capture_output=True, text=True, timeout=60, env=env)
+        check("verify_sandbox: code inside cannot read a transcript under $CLAUDE_CONFIG_DIR",
+              p.returncode != 0 and "CONFIG-DIR-SECRET" not in p.stdout + p.stderr, (p.returncode, p.stdout[:100]))
+        p = subprocess.run(argv + ["sh", "-c", 'echo "cfg=${CLAUDE_CONFIG_DIR-unset}"'], capture_output=True, text=True, timeout=60, env=env)
+        check("verify_sandbox: CLAUDE_CONFIG_DIR is unset inside", p.returncode == 0 and p.stdout.strip() == "cfg=unset", (p.returncode, p.stdout))
+    finally:
+        shutil.rmtree(t, ignore_errors=True)
+        shutil.rmtree(cfg, ignore_errors=True)
+
+
 def make_trees():
     global HUMAN_CLI, REASON_CLI, BROKEN_CLI, MISSING_CLI, NONE_CLI, THROWS_CLI, NOPROC_CLI
     HUMAN_CLI = make_tree("human", STUB_HUMAN)
@@ -2422,7 +2628,7 @@ def main():
         make_trees()
         for fn in (test_cli_basics, test_init, test_init_line_js, test_new, test_list_show, test_mark, test_gates, test_human_gates,
                    test_lane, test_holdout, test_run_args, test_quick_and_pin, test_spec_hash, test_record, test_merge_gate, test_record_checks,
-                   test_workflow_run, test_safety):
+                   test_workflow_run, test_safety, test_verify_git, test_verify_sandbox_runtime):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001

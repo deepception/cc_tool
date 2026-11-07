@@ -100,15 +100,21 @@ fi
 
 # One command to open the dashboard from any terminal: starts cc-dash in the
 # background (the browser opens and pairs itself) and returns the prompt.
-# A dashboard already running is stopped first (waiting up to 10 s, then
-# killed), so it always comes up on its usual port in the mode asked for.
+# A dashboard already running is stopped first (waiting up to 10 s, then killed),
+# so it always comes up on its usual port in the mode asked for. It is matched by
+# cc-dash's real path: cc-dash re-executes itself under that, not the symlink on PATH.
+# The signal comes from the shell's own kill, on pids from pgrep: pkill is pgrep picking
+# its mode from argv[0], and zsh runs external commands under an exported ARGV0 (Cursor's
+# terminal sets one), so there pkill only lists pids. If a dashboard survives, or pgrep
+# fails, ccdash says so and starts nothing, rather than leaving two dashboards and a
+# lease that names the wrong one.
 # Arguments pass through, e.g. `ccdash --control`. The log holds the one-time
 # pairing link (read-only), so it is written owner-only.
 # The control code (--control) never touches the log or any file: cc-dash writes
 # it straight to this terminal (/dev/tty). fd 3 is a pipe that carries nothing:
 # cc-dash closes it once the code is shown, so `| cat` holds the prompt until
 # then and the code lands above it, not in the middle of your next command.
-CCDASH_LINE='ccdash() { local b r d="${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool"; b="$(command -v cc-dash)" || { echo "cc-dash not on PATH" >&2; return 1; }; if pkill -u "$USER" -f "$b" 2>/dev/null; then for i in {1..50}; do pgrep -u "$USER" -f "$b" >/dev/null || break; sleep 0.2; done; pkill -KILL -u "$USER" -f "$b" 2>/dev/null && sleep 0.5; fi; mkdir -p "$d" || return 1; r="$( (umask 077; nohup "$b" --ready-fd 3 "$@" 3>&1 >>"$d/cc-dash.log" 2>&1 </dev/null &) )"; [ "$r" = refused ] && return 1; echo "cc-dash is opening in your browser (log: $d/cc-dash.log)"; }'
+CCDASH_LINE='ccdash() { local b r p s i n d="${XDG_STATE_HOME:-$HOME/.local/state}/cc_tool"; b="$(readlink -f -- "$(command -v cc-dash)")" || { echo "cc-dash not on PATH" >&2; return 1; }; for s in TERM KILL; do for n in {1..50}; do p="$(command pgrep -u "$UID" -f "$b")"; r=$?; [ "$r" -gt 1 ] && { echo "ccdash: pgrep failed (status $r), so a running cc-dash cannot be ruled out; not starting another" >&2; return 1; }; [ "$r" = 1 ] && break 2; [ "$n" = 1 ] && while read -r i; do builtin kill -s "$s" "$i" 2>/dev/null; done <<<"$p"; sleep 0.2; done; done; [ "$r" = 1 ] || { echo "ccdash: could not stop the running cc-dash (pid $(echo "$p" | tr "\n" " ")); not starting another" >&2; return 1; }; mkdir -p "$d" || return 1; r="$( (umask 077; nohup "$b" --ready-fd 3 "$@" 3>&1 >>"$d/cc-dash.log" 2>&1 </dev/null &) )"; [ "$r" = refused ] && return 1; echo "cc-dash is opening in your browser (log: $d/cc-dash.log)"; }'
 
 if grep -qxF -- "$CCDASH_LINE" "$PROFILE" 2>/dev/null; then
     echo "✓ ccdash already defined ($PROFILE)"

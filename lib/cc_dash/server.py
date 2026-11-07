@@ -42,6 +42,7 @@ import re
 import socketserver
 import sys
 import threading
+import unicodedata
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -598,6 +599,23 @@ def _ready(a):
         a.ready_fd = None
 
 
+def close_inherited_fds(keep=()):
+    """Close every descriptor but stdio and `keep`. A dashboard started from a terminal app inherits that
+    app's open descriptors, pty masters among them; the control checks read a pty's holder from the
+    process table (procs.terminal_problem), so a dashboard holding another terminal's master looked like
+    that terminal's owner and a live dashboard's lease was dropped as not a dashboard."""
+    try:
+        fds = [int(n) for n in os.listdir("/proc/self/fd") if n.isdigit()]
+    except OSError:
+        return
+    for fd in fds:
+        if fd > 2 and fd not in keep:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 # Process checks live in templates/hooks/cc_procs.py (procs.py loads it), the same file
 # cc-setup copies beside the control hook, so both judge a launch the same way.
 CLAUDE_ENV_SIGNALS = procs.CLAUDE_ENV_SIGNALS
@@ -668,6 +686,64 @@ def recorded_terminals(state=None, unsafe=None):
         hosts = m.get("terminal_hosts")
         out += [h for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else []
     return procs.merge_terminals(out, [])
+
+
+def uncovered_projects(state=None, me=None, proc="/proc"):
+    """Registered projects whose own manifest does not cover this process's terminal, or whose pin or code record
+    would refuse every gate anyway (a stale record after a cc_tool pull). cc-dash starts on the union
+    of every project's record, but a project's hook and `cc-factory` gates read only that project's record, so
+    the dashboard looks healthy while that project refuses every gate. Returns [(project, why)]; the records
+    are not shared or widened, this only reports. Meant for after control_refusal passed on the union."""
+    from .control import read_json
+    state = state or attention.state_dir()
+    me = os.getpid() if me is None else me
+    reg = read_json(os.path.join(state, "projects.json"), 1 << 20) or {}
+    out = []
+    for proj in reg.get("projects") or []:
+        if not isinstance(proj, str) or not os.path.isabs(proj):
+            continue
+        hooks = os.path.join(proj, ".claude", "hooks")
+        m, why = read_manifest(os.path.join(hooks, procs.MANIFEST_NAME))
+        hosts = m.get("terminal_hosts") if m else None
+        hosts = [h for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else []
+        if m is None:
+            out.append((proj, why or "has no cc_dash_manifest.json"))
+            continue
+        # The pin and code checks bin/cc-factory's dashboard_problem runs before the terminal one: after a cc_tool
+        # pull every record is stale while its terminals still match.
+        pin = procs.read_pin(hooks)
+        if not pin or os.path.realpath(pin) != os.path.realpath(CC_TOOL_DIR):
+            out.append((proj, "was not set up from the cc_tool checkout cc-dash runs from"))
+            continue
+        why = procs.manifest_problem(CC_TOOL_DIR, m) or procs.terminal_problem(
+            me, proc, terminals=procs.merge_terminals(hosts, []))
+        if why:
+            out.append((proj, why))
+    return out
+
+
+def _plain(text):
+    """text with control, format (bidi) and line-separator characters replaced by `?`: a project path or a reason
+    comes from files an agent can edit and must not reach a terminal or a log as an escape sequence or extra line."""
+    return "".join("?" if unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") else c
+                   for c in str(text))
+
+
+def uncovered_notice(items, names=3, reasons=False):
+    """One compact warning for uncovered_projects(): a count and the first few names, so it does not bury the
+    control code. With reasons (the log) every project follows on its own line. '' when there is nothing to say."""
+    if not items:
+        return ""
+    shown = ", ".join(_plain(tilde(p)) for p, _w in items[:names])
+    more = len(items) - names
+    text = ("cc-dash: warning: %d registered project%s do%s not record this terminal or this cc-dash code, so their "
+            "gates and approvals "
+            "will be refused: %s%s. In each, run `cc-update-project` from this terminal."
+            % (len(items), "" if len(items) == 1 else "s", "es" if len(items) == 1 else "", shown,
+               " (+%d more)" % more if more > 0 else ""))
+    if reasons:
+        text += "".join("\n  %s: %s" % (_plain(p), _plain(w)) for p, w in items)
+    return text
 
 
 def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=None, root=None, note=None, terminals=None,
@@ -835,6 +911,7 @@ def main(argv=None):
     except (AttributeError, ValueError):
         pass
     a = parse_args(sys.argv[1:] if argv is None else argv)
+    close_inherited_fds({a.ready_fd} if a.ready_fd is not None else ())
     if not a.control:
         _ready(a)                   # nothing to show on the terminal
     root = config_dir()
@@ -861,6 +938,11 @@ def main(argv=None):
             refuse_control(a, "cc-dash: " + why)
             srv.server_close()
             return 1
+        uncovered = uncovered_projects()
+        if uncovered:
+            # Both: stderr is the log with `ccdash`, so the terminal is the only place the human sees it.
+            print(uncovered_notice(uncovered, reasons=True), file=sys.stderr)
+            tty_write("\r\n  %s\r\n" % uncovered_notice(uncovered), "/dev/tty")
         # The control code goes to the terminal only. Without one there is no way
         # to hand it to the human, so there is no control mode.
         if not show_control_code(srv.auth.enable_control()):
@@ -920,7 +1002,7 @@ def main(argv=None):
             print(f"cc-dash: could not open the browser ({e}); open the link above.", file=sys.stderr)
     try:
         import signal
-        # SIGTERM (`ccdash` stops the previous dashboard with pkill) ends it like Ctrl-C, so the
+        # SIGTERM (`ccdash` stops the previous dashboard with it) ends it like Ctrl-C, so the
         # lease and the hook socket are removed rather than left behind.
         signal.signal(signal.SIGTERM, _interrupt)
     except (ValueError, OSError):

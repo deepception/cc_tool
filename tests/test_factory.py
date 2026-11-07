@@ -459,10 +459,25 @@ def test_line_config():
     check("line_for degrades", F.line_for(None, "x") == d and F.line_for({}, None) == d and F.line_for({"lines": 5}, "a") == d
           and F.line_for(cfg, ["unhashable"]) is cfg["lines"]["default"])
 
-    write_line(root, {"lines": {"default": {"stations": [stn("only")], "retries": 3}}})
+    # factory-line.js runs only plan/build/test/verify/review (a holdout:true station of another name is the verify)
+    # and one station per kind; record wants a pass on every station the line keeps, so the loader keeps those only.
+    write_line(root, {"lines": {"lint": {"stations": [stn("plan"), stn("build"), stn("test"), stn("lint"), stn("review")]},
+                                "two": {"stations": [stn("build"), stn("verify"), stn("review"), stn("holdout2", holdout=True)]},
+                                "kinds": {"stations": [stn("plan", holdout=True), stn("check", holdout=True), stn("build"),
+                                                       stn("plan"), stn("verify"), stn("build", title="again")]}}})
     cfg = F.line_config(root)
-    check("a same-named 'default' overrides", [s["name"] for s in cfg["lines"]["default"]["stations"]] == ["only"]
-          and cfg["lines"]["default"]["retries"] == 3 and F.line_for(cfg, "zzz")["stations"][0]["name"] == "only")
+    check("an unknown station name (no holdout) is skipped, as the workflow skips it",
+          [s["name"] for s in cfg["lines"]["lint"]["stations"]] == ["plan", "build", "test", "review"], str(cfg["lines"]["lint"]))
+    check("a second verify-kind station (holdout:true) is skipped",
+          [s["name"] for s in cfg["lines"]["two"]["stations"]] == ["build", "verify", "review"], str(cfg["lines"]["two"]))
+    kinds = cfg["lines"]["kinds"]["stations"]
+    check("one station per kind; holdout only on the verify kind",
+          [(s["name"], s["holdout"]) for s in kinds] == [("plan", False), ("check", True), ("build", False)], str(kinds))
+
+    write_line(root, {"lines": {"default": {"stations": [stn("build")], "retries": 3}}})
+    cfg = F.line_config(root)
+    check("a same-named 'default' overrides", [s["name"] for s in cfg["lines"]["default"]["stations"]] == ["build"]
+          and cfg["lines"]["default"]["retries"] == 3 and F.line_for(cfg, "zzz")["stations"][0]["name"] == "build")
     write_line(root, {"lines": {"default": {"stations": [{"name": "Bad Name"}, 5, None]}}})
     check("an invalid 'default' override leaves the built-in", F.line_config(root) == F.DEFAULT_LINE)
 
@@ -479,35 +494,38 @@ def test_line_config():
         return F.line_config(root)["lines"].get(name)
 
     check("station entries of the wrong type are skipped", [s["name"] for s in one({"stations": [
-        5, None, "x", [], stn("a"), {"name": 3}, {"name": None}, {}]})["stations"]] == ["a"])
+        5, None, "x", [], stn("build"), {"name": 3}, {"name": None}, {}]})["stations"]] == ["build"])
     bad_names = ["Plan", "1x", "a b", "", "-a", "_a", "a" * 33, "a.b", "a/b", "é", "a\n"]
-    check("invalid station names are skipped", [s["name"] for s in one({"stations": [stn(n) for n in bad_names] + [stn("ok")]})["stations"]] == ["ok"])
-    check("a 32-char name is fine", one({"stations": [stn("a" * 32)]})["stations"][0]["name"] == "a" * 32)
-    check("no valid station: line dropped", one({"stations": [stn("Bad")]}) is None and one({"stations": []}) is None)
-    st15 = one({"stations": [stn("s%d" % i) for i in range(15)]})["stations"]
-    check("more than 12 stations: the first 12 survive", [s["name"] for s in st15] == ["s%d" % i for i in range(12)], str(len(st15)))
-    dup = one({"stations": [stn("a", title="first"), stn("b"), stn("a", title="second")]})["stations"]
-    check("duplicate station names: the first wins", [(s["name"], s["title"]) for s in dup] == [("a", "first"), ("b", "B")], str(dup))
-    check("title: default is name.capitalize()", one({"stations": [stn("my-step")]})["stations"][0]["title"] == "My-step")
-    check("title: wrong type or blank falls back", [s["title"] for s in one({"stations": [stn("a", title=5), stn("b", title="  \n "), stn("c", title=None)]})["stations"]] == ["A", "B", "C"])
-    check("title clipped to 40", len(one({"stations": [stn("a", title="x" * 90)]})["stations"][0]["title"]) == 40)
-    check("title control chars removed", one({"stations": [stn("a", title="a\x00b\x1bc")]})["stations"][0]["title"] == "abc")
+    check("invalid station names are skipped", [s["name"] for s in one({"stations": [stn(n, holdout=True) for n in bad_names]
+                                                                         + [stn("ok", holdout=True)]})["stations"]] == ["ok"])
+    check("a 32-char name is fine", one({"stations": [stn("a" * 32, holdout=True)]})["stations"][0]["name"] == "a" * 32)
+    check("no valid station: line dropped", one({"stations": [stn("Bad")]}) is None and one({"stations": []}) is None
+          and one({"stations": [stn("lint"), stn("docs")]}) is None)
+    st15 = one({"stations": [stn(k) for k in F._STATION_KINDS] + [stn("s%d" % i, holdout=True) for i in range(10)]})["stations"]
+    check("a 15-station line keeps one station per kind", [s["name"] for s in st15] == list(F._STATION_KINDS), str(len(st15)))
+    dup = one({"stations": [stn("build", title="first"), stn("test"), stn("build", title="second")]})["stations"]
+    check("duplicate station names: the first wins", [(s["name"], s["title"]) for s in dup] == [("build", "first"), ("test", "Test")], str(dup))
+    check("title: default is name.capitalize()", one({"stations": [stn("my-step", holdout=True)]})["stations"][0]["title"] == "My-step")
+    check("title: wrong type or blank falls back", [s["title"] for s in one({"stations": [stn("plan", title=5), stn("build", title="  \n "),
+                                                                                           stn("test", title=None)]})["stations"]] == ["Plan", "Build", "Test"])
+    check("title clipped to 40", len(one({"stations": [stn("build", title="x" * 90)]})["stations"][0]["title"]) == 40)
+    check("title control chars removed", one({"stations": [stn("build", title="a\x00b\x1bc")]})["stations"][0]["title"] == "abc")
 
     models = {"opus": "opus", "claude-opus-4-5": "claude-opus-4-5", "claude-sonnet-5-5[1m]": "claude-sonnet-5-5[1m]",
               "a.b:c_d-e": "a.b:c_d-e", "us.anthropic.claude:v1": "us.anthropic.claude:v1", "has space": "", "-lead": "", "": "",
               "x" * 65: "", "x" * 64: "x" * 64, 123: "", None: "", "bad/slash": "", "new\nline": "", "é": ""}
     got = {}
     for m in models:
-        st = one({"stations": [stn("a", model=m)]})["stations"][0]
+        st = one({"stations": [stn("build", model=m)]})["stations"][0]
         got[m] = st["model"]
     check("model strings validated, bad -> ''", got == models, str({k: v for k, v in got.items() if models[k] != v}))
-    check("missing model -> ''", one({"stations": [stn("a")]})["stations"][0]["model"] == "")
-    eff = [(e, one({"stations": [stn("a", effort=e)]})["stations"][0].get("effort")) for e in
+    check("missing model -> ''", one({"stations": [stn("build")]})["stations"][0]["model"] == "")
+    eff = [(e, one({"stations": [stn("build", effort=e)]})["stations"][0].get("effort")) for e in
            list(F.EFFORTS) + ["ludicrous", "HIGH", "", 5, None, ["low"], True]]
     check("effort kept only when valid", eff == [(e, e) for e in F.EFFORTS] + [("ludicrous", None), ("HIGH", None), ("", None),
                                                                               (5, None), (None, None), (["low"], None), (True, None)], str(eff))
-    check("invalid effort is absent, not empty", "effort" not in one({"stations": [stn("a", effort="ludicrous")]})["stations"][0])
-    check("holdout must be a real bool", [one({"stations": [stn("a", holdout=h)]})["stations"][0]["holdout"] for h in
+    check("invalid effort is absent, not empty", "effort" not in one({"stations": [stn("build", effort="ludicrous")]})["stations"][0])
+    check("holdout must be a real bool", [one({"stations": [stn("verify", holdout=h)]})["stations"][0]["holdout"] for h in
                                           (True, False, 1, "yes", None, "true")] == [True, False, False, False, False, False])
 
     for gates, want in [({"spec": "auto", "merge": "auto"}, {"spec": "auto", "merge": "human"}),
@@ -515,54 +533,54 @@ def test_line_config():
                         ({"merge": "auto"}, {"spec": "human", "merge": "human"}), ({"spec": "AUTO"}, {"spec": "human", "merge": "human"}),
                         ("auto", {"spec": "human", "merge": "human"}), (None, {"spec": "human", "merge": "human"}),
                         ({"spec": 1}, {"spec": "human", "merge": "human"})]:
-        check("gates %s -> %s" % (gates, want), one({"stations": [stn("a")], "gates": gates})["gates"] == want)
-    check("missing gates -> human/human", one({"stations": [stn("a")]})["gates"] == {"spec": "human", "merge": "human"})
+        check("gates %s -> %s" % (gates, want), one({"stations": [stn("build")], "gates": gates})["gates"] == want)
+    check("missing gates -> human/human", one({"stations": [stn("build")]})["gates"] == {"spec": "human", "merge": "human"})
 
     def retries(v):
-        return one({"stations": [stn("a")], "retries": v})["retries"]
+        return one({"stations": [stn("build")], "retries": v})["retries"]
 
     check("retries clamped to 0..3", [retries(v) for v in (0, 1, 2, 3, 4, 99, -1, -99)] == [0, 1, 2, 3, 3, 3, 0, 0])
     check("retries: bool rejected -> default 1", retries(True) == 1 and retries(False) == 1)
     check("retries: non-int rejected -> default 1", [retries(v) for v in ("2", 2.0, 1.5, None, [], {})] == [1] * 6)
-    check("retries missing -> 1", one({"stations": [stn("a")]})["retries"] == 1)
+    check("retries missing -> 1", one({"stations": [stn("build")]})["retries"] == 1)
     check("huge int retries clamp", retries(10 ** 30) == 3)
 
     def thr(v):
-        return one({"stations": [stn("a")], "threshold": v})
+        return one({"stations": [stn("build")], "threshold": v})
 
     check("threshold: kept (as a float) when in (0, 1]", thr(0.5)["threshold"] == 0.5 and thr(1)["threshold"] == 1.0
           and isinstance(thr(1)["threshold"], float) and F.line_threshold(thr(0.75)) == 0.75)
     check("threshold: absent when invalid (0, negative, over 1, bool, string, null, NaN)",
           all("threshold" not in thr(v) for v in (0, -0.1, 1.5, True, "0.5", None, float("nan"))))
-    check("threshold: absent when not set, so a line without one keeps the shape it had", "threshold" not in one({"stations": [stn("a")]}))
+    check("threshold: absent when not set, so a line without one keeps the shape it had", "threshold" not in one({"stations": [stn("build")]}))
     # run / test: the only commands the verify station is handed, so only plain one-line strings a human wrote.
-    cmd = lambda **kw: one(dict({"stations": [stn("a")]}, **kw))  # noqa: E731
+    cmd = lambda **kw: one(dict({"stations": [stn("build")]}, **kw))  # noqa: E731
     check("run/test: kept (stripped) when a plain one-line string", cmd(run="  python3 -m app  ", test="make test").get("run") == "python3 -m app"
           and cmd(test="make test")["test"] == "make test")
     check("run/test: absent when invalid (newline, escape, control, leading '-', over 300 characters, empty, not a string)",
           all("test" not in cmd(test=v) for v in ("make test\nrm -rf ~", "make\x1b[2J", "make\ttest", "-rf /", "x" * 301, "", "   ",
                                                   42, True, None, ["make"], {"cmd": "make"})))
-    check("run/test: absent when not set, so a line without them keeps the shape it had", set(one({"stations": [stn("a")]})) == {"stations", "gates", "retries"})
+    check("run/test: absent when not set, so a line without them keeps the shape it had", set(one({"stations": [stn("build")]})) == {"stations", "gates", "retries"})
     check("line_command: 300 characters is the limit", F.line_command("x" * 300) == "x" * 300 and F.line_command("x" * 301) == ""
           and F.COMMAND_KEYS == ("run", "test"))
     check("line_threshold: 1 when the line sets none (or is junk)", F.line_threshold(F.DEFAULT_LINE["lines"]["default"]) == 1.0
           and F.line_threshold({}) == 1.0 and F.line_threshold(None) == 1.0 and F.line_threshold({"threshold": True}) == 1.0)
 
-    write_line(root, {"lines": {"Fast": {"stations": [stn("a")]}, "-x": {"stations": [stn("a")]}, "": {"stations": [stn("a")]},
-                                "a" * 33: {"stations": [stn("a")]}, "good_1-x": {"stations": [stn("a")]}, "0lead": {"stations": [stn("a")]}}})
+    write_line(root, {"lines": {"Fast": {"stations": [stn("build")]}, "-x": {"stations": [stn("build")]}, "": {"stations": [stn("build")]},
+                                "a" * 33: {"stations": [stn("build")]}, "good_1-x": {"stations": [stn("build")]}, "0lead": {"stations": [stn("build")]}}})
     check("invalid line names are ignored", set(F.line_config(root)["lines"]) == {"default", "quick", "good_1-x", "0lead"}, str(set(F.line_config(root)["lines"])))
 
     # safety: symlink, oversize, FIFO, symlinked factory/
     lj = os.path.join(root, "factory", "line.json")
     os.remove(lj)
-    target = put(os.path.join(base, "elsewhere.json"), json.dumps({"lines": {"evil": {"stations": [stn("a")]}}}))
+    target = put(os.path.join(base, "elsewhere.json"), json.dumps({"lines": {"evil": {"stations": [stn("build")]}}}))
     os.symlink(target, lj)
     check("symlinked line.json is ignored", F.line_config(root) == F.DEFAULT_LINE)
     os.remove(lj)
     pad = "x" * (F.MAX_LINE_JSON_BYTES + 10)
-    write_line(root, '{"lines": {"big": {"stations": [{"name": "a"}]}}, "pad": "%s"}' % pad)
+    write_line(root, '{"lines": {"big": {"stations": [{"name": "build"}]}}, "pad": "%s"}' % pad)
     check("oversize line.json is ignored", F.line_config(root) == F.DEFAULT_LINE)
-    ok_size = '{"lines": {"ok": {"stations": [{"name": "a"}]}}, "pad": "%s"}' % ("x" * 60000)
+    ok_size = '{"lines": {"ok": {"stations": [{"name": "build"}]}}, "pad": "%s"}' % ("x" * 60000)
     write_line(root, ok_size)
     check("a 60 KB line.json is read", "ok" in F.line_config(root)["lines"])
     os.remove(lj)
@@ -572,7 +590,7 @@ def test_line_config():
     check("FIFO line.json does not hang", time.perf_counter() - t0 < 1.0)
     os.remove(lj)
     real = os.path.join(base, "realfactory")
-    put(os.path.join(real, "line.json"), json.dumps({"lines": {"evil": {"stations": [stn("a")]}}}))
+    put(os.path.join(real, "line.json"), json.dumps({"lines": {"evil": {"stations": [stn("build")]}}}))
     root3 = fake_repo(base, "proj3")
     os.symlink(real, os.path.join(root3, "factory"))
     check("symlinked factory/ -> line.json ignored", F.line_config(root3) == F.DEFAULT_LINE)
@@ -805,7 +823,7 @@ def test_fold():
           and o["rework"] == 0 and o["lane"] is None and o["run_id"] == "", str(o))
     check("fold: the dict has exactly the contract keys", set(o) == {
         "id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane", "run_id",
-        "rework", "events", "line"}, str(sorted(o)))
+        "rework", "events", "line", "why"}, str(sorted(o)))
     check("fold: identity fields come from the order", o["id"] == "FO-003" and o["title"] == "T FO-003" and o["priority"] == "p2"
           and o["path"] == "factory/orders/FO-003-x.md" and o["line"] == "default")
     check("fold: stations are {name,title,status,t} in line order", o["stations"][0] == {"name": "plan", "title": "Plan", "status": "pending", "t": None}
@@ -886,6 +904,17 @@ def test_fold():
     check("fold failed with no active station: the last station touched", o["station"] == "plan")
     o = run_fold([st("plan", "start", 10), ev("FO-003", "status", 12.0, status="blocked")])
     check("fold blocked", o["status"] == "blocked" and o["station"] == "plan" and o["gate"] is None)
+    check("fold blocked with no note: why has an empty note", o["why"] == {"note": "", "recommendation": ""}, str(o.get("why")))
+    note = "cc-factory record: the spec changed since approval; re-approve (the run said review)"
+    o = run_fold([st("plan", "start", 10), ev("FO-003", "status", 12.0, status="blocked", note=note, recommendation="rerun")])
+    check("fold blocked: why carries the status event's note and recommendation",
+          o["why"] == {"note": note, "recommendation": "rerun"}, str(o.get("why")))
+    o = run_fold([ev("FO-003", "status", 12.0, status="failed", note="x" * 900, recommendation="bogus")])
+    check("fold failed: why's note clipped to NOTE_MAX, an unknown recommendation dropped",
+          len(o["why"]["note"]) <= F.NOTE_MAX and o["why"]["recommendation"] == "", str(o.get("why")))
+    o = run_fold([ev("FO-003", "status", 12.0, status="blocked", note="old reason"), st("plan", "start", 13),
+                  ev("FO-003", "status", 14.0, status="building")])
+    check("fold: why is None once the order is back on its path", o["why"] is None, str(o.get("why")))
     o = run_fold(base + [ev("FO-003", "gate", 105.0, gate="spec", state="fail", status="rejected")])
     check("fold rejected: gate None", o["status"] == "rejected" and o["gate"] is None and o["station"] == "")
     o = run_fold([st("plan", "pass", 10), ev("FO-003", "status", 12.0, status="queued")])
@@ -1139,7 +1168,7 @@ def test_real_git():
     check("max_order_num from the worktree", F.max_order_num(wt) == 3)
 
     # read-only: snapshot the whole tree, .git and the worktree included
-    write_line(main, {"lines": {"fast": {"stations": [stn("a")]}}})
+    write_line(main, {"lines": {"fast": {"stations": [stn("build")]}}})
     put(os.path.join(main, "factory", "orders", "FO-004-nofront.md"), "# nothing\n")
     before = snapshot(base)
     for r in (main, wt, os.path.join(base, "nonexistent")):
@@ -1241,29 +1270,29 @@ def test_project_orders():
     write_order(r6, 3, "csv", text=ORDER_TEXT)
     write_order(r6, 4, "other", text="---\nid: FO-099\ntitle: Frontmatter id is informational\nline: fast\n---\nbody\n")
     write_order(r6, 5, "", text="# Plain markdown order\n")
-    write_line(r6, {"lines": {"fast": {"stations": [stn("draft", title="Draft"), stn("ship")], "gates": {"spec": "auto"}}}})
+    write_line(r6, {"lines": {"fast": {"stations": [stn("plan", title="Draft"), stn("ship", holdout=True)], "gates": {"spec": "auto"}}}})
     lp = put_ledger(r6, [
         ev("FO-003", "created", 1000.0, status="queued"), ev("FO-003", "status", 1001.0, status="spec"),
         ev("FO-003", "gate", 1002.0, gate="spec", state="pass", status="approved"),
         ev("FO-003", "lane", 1003.0, branch="factory/FO-003-csv", worktree="/wt/csv", base="abc1234"),
         ev("FO-003", "status", 1004.0, status="building", station="plan", state="start", run_id="wf_x"),
         ev("FO-004", "status", 1005.0, status="spec"),
-        ev("FO-004", "station", 1006.0, station="draft", state="start"),
+        ev("FO-004", "station", 1006.0, station="plan", state="start"),
         ev("FO-004", "station", 1007.0, station="build", state="start"),
         ev("FO-050", "created", 1008.0, status="queued"),
     ])
     got = F.project_orders(r6, 2000.0)
     byid = {o["id"]: o for o in got}
     check("project_orders: ids come from the file names", [o["id"] for o in got] == ["FO-003", "FO-004", "FO-005"], str([o["id"] for o in got]))
-    keys = {"id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane", "run_id", "rework", "events", "line"}
-    check("project_orders: exactly the contract keys (plus line)", all(set(o) == keys for o in got), str(sorted(got[0])))
+    keys = {"id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane", "run_id", "rework", "events", "line", "why"}
+    check("project_orders: exactly the contract keys (plus line and why)", all(set(o) == keys for o in got), str(sorted(got[0])))
     a = byid["FO-003"]
     check("project_orders: FO-003 folded from the ledger", a["status"] == "building" and a["station"] == "plan" and a["run_id"] == "wf_x"
           and a["lane"] == {"branch": "factory/FO-003-csv", "worktree": "/wt/csv"} and a["created"] == 1000.0 and a["updated"] == 1004.0
           and a["events"] == 5 and a["path"] == "factory/orders/FO-003-csv.md" and a["title"] == "Add CSV export to the reports page"
           and a["priority"] == "p2" and a["line"] == "default" and a["gate"] is None, str(a))
     b = byid["FO-004"]
-    check("project_orders: custom line (stations, spec gate auto)", [s["name"] for s in b["stations"]] == ["draft", "ship"] and b["line"] == "fast"
+    check("project_orders: custom line (stations, spec gate auto)", [s["name"] for s in b["stations"]] == ["plan", "ship"] and b["line"] == "fast"
           and b["status"] == "spec" and b["gate"] is None and b["stations"][0]["status"] == "active" and b["events"] == 3, str(b))
     c = byid["FO-005"]
     check("project_orders: a bare markdown order", c["title"] == "Plain markdown order" and c["status"] == "queued" and c["events"] == 0
@@ -1292,9 +1321,9 @@ def test_project_orders():
     # line.json drives the fold
     r8 = fake_repo(base, "overridden")
     write_order(r8, 1, "a", title="A")
-    write_line(r8, {"lines": {"default": {"stations": [stn("only", title="Only")], "gates": {"spec": "auto"}}}})
+    write_line(r8, {"lines": {"default": {"stations": [stn("review", title="Only")], "gates": {"spec": "auto"}}}})
     got = F.project_orders(r8, 1.0)
-    check("a project's own default line is used", [s["name"] for s in got[0]["stations"]] == ["only"])
+    check("a project's own default line is used", [s["name"] for s in got[0]["stations"]] == ["review"])
 
     # bounded directory scan
     r9 = fake_repo(base, "scan")
@@ -1389,7 +1418,7 @@ def test_fuzz():
             got = F.project_orders(root, 1.7e9)
             for o in got:
                 if set(o) != {"id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane",
-                              "run_id", "rework", "events", "line"} or o["status"] not in F.ALL_STATUSES or o["priority"] not in F.PRIORITIES:
+                              "run_id", "rework", "events", "line", "why"} or o["status"] not in F.ALL_STATUSES or o["priority"] not in F.PRIORITIES:
                     ok, why = False, "bad shape: %s" % o
                 try:
                     json.dumps(o, ensure_ascii=False).encode("utf-8")

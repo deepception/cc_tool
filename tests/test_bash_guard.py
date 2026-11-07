@@ -75,6 +75,16 @@ def make_fixtures(base):
     open(os.path.join(badrules, ".claude", "guard-rules.json"), "w").write("{not json")
     global RULES, BADRULES
     RULES, BADRULES = rules, badrules
+    # A factory lane: a linked worktree on its own branch, beside a main checkout on master that holds node_modules.
+    global LANEMAIN, LANE
+    LANEMAIN = _repo(os.path.join(base, "repo_lanemain"), "master")
+    LANE = os.path.join(LANEMAIN, ".claude", "worktrees", "lane_wt")  # where cc-factory puts lanes
+    _git(LANEMAIN, "worktree", "add", "-q", "-b", "lane/fo-1", LANE)
+    global LANE_OUT
+    LANE_OUT = os.path.join(base, "lane_outside")  # a worktree elsewhere
+    _git(LANEMAIN, "worktree", "add", "-q", "-b", "lane/fo-2", LANE_OUT)
+    os.makedirs(os.path.join(LANEMAIN, "node_modules", ".bin"), exist_ok=True)
+    open(os.path.join(LANEMAIN, "node_modules", ".bin", "vitest"), "w").write("{}\n")
     # Upstreams for `git pull --ff-only` on master: `other` tracks master on a network
     # remote (the one form that runs without asking); BADUP tracks another branch;
     # LOCALUP's remote is a local path. Config only: nothing is ever fetched.
@@ -141,7 +151,47 @@ NPM_CACHE = os.path.join(BASE, "npm-cache")
 TMP_LINK = "/tmp/.cc-bashguard-link-%d" % os.getpid()
 MASTER, FEATURE, OTHER, NOTGIT = make_fixtures(BASE)
 
+# The hardened git call verify used to run itself (now built inside cc-factory verify-git): no exemption, so every
+# shape of it here is refused like any other core.hooksPath (the real prompt's commands run through the real guard in
+# factory_workflow_cases.py test_verify_guard).
+VERIFY_GIT = ("env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 "
+              "GIT_ALLOW_PROTOCOL= GIT_PROTOCOL_FROM_USER=0 GIT_NO_LAZY_FETCH=1 git --no-pager --no-optional-locks "
+              "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904 -c core.fsmonitor=false -c core.hooksPath=/dev/null "
+              "-c core.untrackedCache=false -c core.pager=cat -c core.sshCommand=false -c protocol.allow=never "
+              + " ".join("-c protocol.%s.allow=never" % p for p in ("ext", "file", "ssh", "git", "http", "https"))
+              + " -c diff.external= -c core.attributesFile=/dev/null -C /tmp/lane")
+
 CASES = [
+    # The factory's verify station runs git only through cc-factory verify-git, which takes no git arguments: no prompt.
+    ("VG01", "verify", MASTER, "cc-factory -C /srv/app verify-git FO-003 head --attempt 1", A),
+    ("VG02", "verify", FEATURE, "cc-factory -C /srv/app verify-git FO-003 export --attempt 2", A),
+    ("VG03", "verify", MASTER, "cc-factory -C /srv/app verify-git FO-003 diff --attempt 1 --static", A),
+    ("VG04", "verify", FEATURE, "cc-factory verify-git FO-003 show Makefile --attempt 1", A),
+    # -c ahead of other shell options still hands the next word to the shell as code.
+    ("SC01", "shell", FEATURE, "bash -c -e '$X arg'", K),
+    # A station chaining `cd <lane> && <cmd>` from another cwd: guard judges git against the cwd's checkout and npx
+    # against the lane alone, as on f3141a2 (stations use `git -C <lane>`). The rest are attack shapes against a lane
+    # lead, kept to show none of them gets through.
+    ("LN01", "lane", LANEMAIN, "cd %s && git status --porcelain" % LANE, K),
+    ("LN02", "lane", LANEMAIN, 'cd %s && git add a.py && git commit -m "FO-002: x"' % LANE, D),
+    ("LN03", "lane", LANEMAIN, "cd %s && npx vitest run" % LANE, K),
+    ("LN04", "lane", LANEMAIN, "cd %s && npx nonexistent-pkg-zz run" % LANE, K),
+    ("LN05", "lane", LANEMAIN, "cd %s && git commit -m x" % LANEMAIN, D),
+    ("LN06", "lane", LANEMAIN, "git commit -m x", D),
+    ("LN16", "lane", LANEMAIN, "cd %s && npx vitest run" % LANE_OUT, K),
+    ("LN07", "lane", LANEMAIN, "cd %s && cd %s && git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN08", "lane", LANEMAIN, "cd %s && git status; cd %s && git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN09", "lane", LANEMAIN, "cd %s && cd .. && git commit -m x" % LANE, D),
+    ("LN10", "lane", LANEMAIN, "cd %s && (cd %s && git commit -m x)" % (LANE, LANEMAIN), D),
+    ("LN11", "lane", LANEMAIN, "cd %s && pushd %s && git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN12", "lane", LANEMAIN, "cd %s && cd - && git commit -m x" % LANE, D),
+    ("LN13", "lane", LANEMAIN, "cd %s && false || cd %s && git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN14", "lane", LANEMAIN, "cd %s && GIT_DIR=%s/.git git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN15", "lane", LANEMAIN, "cd %s && export GIT_DIR=%s/.git && git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN17", "lane", LANEMAIN, "cd %s && uv run --directory %s git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN18", "lane", LANEMAIN, "cd %s && pnpm -C %s exec git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN19", "lane", LANEMAIN, "cd %s && pnpm --dir %s exec git commit -m x" % (LANE, LANEMAIN), D),
+    ("LN20", "lane", LANEMAIN, "cd %s && npm --prefix %s exec -- git commit -m x" % (LANE, LANEMAIN), D),
     # ── Protected-branch commit ────────────────────────────────────────────
     ("C01", "commit", MASTER, "git commit -m 'x'", D),
     ("C02", "commit", MASTER, "git commit --amend --no-edit", K),               # merge gate: an amend moves master
@@ -154,6 +204,105 @@ CASES = [
     ("C09", "commit", FEATURE, "git commit -m 'ci: drop --no-verify'", A),       # BG-3 inverse
     ("C09b", "commit", FEATURE, 'git commit -m "ci: drop --no-verify from CI"', A),  # BG-3 inverse (real form)
     ("C10", "commit", FEATURE, "git -c core.hooksPath=/dev/null commit -m 'x'", D),  # BG-4b
+    ("HP01", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null push origin x', D),
+    ("HP02", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null merge x', D),
+    ("HP03", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null rebase x', D),
+    ("HP04", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null am p.patch', D),
+    ("HP05", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null cherry-pick abc', D),
+    ("HP06", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null revert abc', D),
+    ("HP07", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null pull --ff-only', D),
+    ("HP08", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null checkout x', D),
+    ("HP09", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null switch x', D),
+    ("HP10", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null worktree add ../w x', D),
+    ("HP11", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null frobnicate', D),
+    # The old verify shape gets no exemption: verify's git goes through cc-factory verify-git (VG01..).
+    ("HP12", "hookspath", FEATURE, VERIFY_GIT + ' rev-parse HEAD', D),
+    ("HP13", "hookspath", FEATURE, VERIFY_GIT + ' status --porcelain', D),
+    ("HP14", "hookspath", FEATURE, VERIFY_GIT + ' archive --format=tar HEAD', D),
+    ("HP15", "hookspath", FEATURE, VERIFY_GIT + ' diff --no-ext-diff --no-textconv --no-color a...HEAD', D),
+    ("HP16", "hookspath", FEATURE, VERIFY_GIT + ' show a:Makefile', D),
+    ("HP17", "hookspath", FEATURE, 'git -c core.hooksPath=/tmp/x status', D),
+    ("HP18", "hookspath", MASTER, 'git -c core.hooksPath=/dev/null rev-parse HEAD', D),
+    ("HP19", "hookspath", FEATURE, 'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git status', K),
+    ("HP20", "hookspath", FEATURE, 'GIT_CONFIG_GLOBAL=/tmp/x git status', K),
+    ("HP21", "hookspath", FEATURE, 'GIT_CONFIG_NOSYSTEM=0 git status', K),
+    ("HP22", "hookspath", FEATURE, 'GIT_CONFIG_COUNT=1 git status', K),
+    ("HP23", "hookspath", FEATURE, 'env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git commit -m x', K),
+    ("HP24", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null --attr-source status commit -m x', D),
+    ("HP25", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null --attr-source diff commit -m x', D),
+    ("HP26", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null --attr-source show push origin master', D),
+    ("HP27", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null --attr-source rev-parse merge x', D),
+    ("HP28", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null --attr-source archive rebase x', D),
+    ("HP29", "hookspath", FEATURE, 'git --attr-source status -c core.hooksPath=/dev/null commit', D),
+    ("HP30", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null --config-env x=Y status commit', D),
+    ("HP31", "hookspath", FEATURE, 'git -c core.hooksPath=/dev/null --attr-source HEAD status', D),
+    ("HP32", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null -c core.fsmonitor='git commit -m x' status", D),
+    ("HP33", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null -c diff.external='git commit -m x' diff --ext-diff", D),
+    ("HP34", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null -c core.pager='git commit -m x' -p diff", D),
+    ("HP35", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null -c diff.foo.textconv='git commit -m x' show", D),
+    ("HP36", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null --config-env=core.fsmonitor=V status", D),
+    ("HP37", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null --exec-path=/tmp/x status", D),
+    ("HP38", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null --git-dir=/tmp/x status", D),
+    ("HP39", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null -p diff", D),
+    ("HP40", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null -c core.fsmonitor=true status", D),
+    ("HP41", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null -c include.path=/tmp/x status", D),
+    ("HP42", "hookspath", FEATURE, "GIT_EXTERNAL_DIFF='git commit -m x' git -c core.hooksPath=/dev/null diff", D),
+    ("HP43", "hookspath", FEATURE, "GIT_PAGER='git commit -m x' git -c core.hooksPath=/dev/null diff", D),
+    ("HP44", "hookspath", FEATURE, "PAGER='git commit -m x' git -c core.hooksPath=/dev/null diff", D),
+    ("HP45", "hookspath", FEATURE, "export GIT_EXTERNAL_DIFF='git commit -m x'; git -c core.hooksPath=/dev/null diff", D),
+    ("HP46", "hookspath", FEATURE, "GIT_CONFIG_PARAMETERS=x git -c core.hooksPath=/dev/null status", D),
+    ("HP47", "hookspath", FEATURE, "git -C /tmp --no-pager --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.pager=cat -c diff.external= status", D),
+    # The env switches and the hooksPath switch hold only for verify's exact call: nothing else skips a hook unasked.
+    ("HP48", "hookspath", FEATURE, 'GIT_CONFIG_GLOBAL=/dev/null git commit -m x', K),
+    ("HP49", "hookspath", FEATURE, 'GIT_CONFIG_NOSYSTEM=1 git commit -m x', K),
+    ("HP50", "hookspath", FEATURE, 'GIT_CONFIG_GLOBAL=/dev/null git push origin feature', K),
+    ("HP51", "hookspath", FEATURE, 'GIT_CONFIG_GLOBAL=/dev/null git merge x', K),
+    ("HP52", "hookspath", FEATURE, 'GIT_CONFIG_GLOBAL=/dev/null git rebase x', K),
+    ("HP53", "hookspath", FEATURE, 'GIT_CONFIG_GLOBAL=/dev/null git status; git commit -m x', K),
+    ("HP54", "hookspath", FEATURE, VERIFY_GIT + ' commit -m x', D),
+    ("HP55", "hookspath", FEATURE, VERIFY_GIT.replace("-c core.fsmonitor=false ", "") + ' status --porcelain', D),
+    ("HP56", "hookspath", FEATURE, VERIFY_GIT.replace("GIT_NO_LAZY_FETCH=1 ", "") + ' status --porcelain', D),
+    ("HP57", "hookspath", FEATURE, VERIFY_GIT.replace("--attr-source=" + "4b825dc642cb6eb9a060e54bf8d69288fbee4904", "--attr-source=HEAD") + ' status --porcelain', D),
+    ("HP58", "hookspath", FEATURE, "bwrap --ro-bind / / --setenv GIT_PAGER 'git commit -m x' " + VERIFY_GIT.removeprefix("env ") + " rev-parse HEAD", D),
+    ("HP59", "hookspath", FEATURE, "bwrap --ro-bind / / --setenv PATH /tmp/x " + VERIFY_GIT + " rev-parse HEAD", D),
+    ("HP60", "hookspath", FEATURE, "bwrap --ro-bind / / --setenv GIT_PAGER 'git commit -m x' git -c core.hooksPath=/dev/null -c core.pager=cat diff", D),
+    ("HP61", "hookspath", FEATURE, "bwrap --ro-bind / / --setenv GIT_CONFIG_GLOBAL /tmp/x git -c core.hooksPath=/dev/null status", D),
+    ("HP62", "hookspath", FEATURE, "git -c core.hooksPath=/dev/null diff --ext-diff", D),
+    ("HP63", "hookspath", FEATURE, VERIFY_GIT + ' diff --ext-diff --no-textconv --no-color a...HEAD', D),
+    ("HP64", "hookspath", FEATURE, VERIFY_GIT + ' diff --no-ext-diff --no-textconv --no-color --ext-diff a...HEAD', D),
+    ("HP65", "hookspath", FEATURE, VERIFY_GIT + ' diff a...HEAD', D),
+    ("HP66", "hookspath", FEATURE, VERIFY_GIT + ' archive --format=evil HEAD', D),
+    ("HP67", "hookspath", FEATURE, VERIFY_GIT + ' archive --format=tar --format=evil HEAD', D),
+    ("HP68", "hookspath", FEATURE, VERIFY_GIT + ' show HEAD', D),
+    ("HP69", "hookspath", FEATURE, VERIFY_GIT + ' show --textconv a:Makefile', D),
+    ("HP70", "hookspath", FEATURE, VERIFY_GIT + ' status', D),
+    # Attack shapes found against the removed verify exemption: with no exemption, each keeps the refusal.
+    ("HP71", "hookspath", FEATURE, "bwrap --ro-bind / / --tmpfs /srv/GIT_REPOS/app/.factory-holdout --bind /srv/PAGER/a /srv/PAGER/a --chdir /srv/PAGER/a -- " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP72", "hookspath", FEATURE, VERIFY_GIT.replace("env ", "env --split-string=GIT_EXEC_PATH=/tmp/e ", 1) + ' status --porcelain', D),
+    ("HP73", "hookspath", FEATURE, VERIFY_GIT.replace("env ", "env -S 'GIT_EXEC_PATH=/tmp/e' ", 1) + ' status --porcelain', D),
+    ("HP74", "hookspath", FEATURE, "eval 'export GIT_EXEC_PATH=/tmp/e'; " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP75", "hookspath", FEATURE, "bwrap --setenv=GIT_EXEC_PATH /tmp/e -- " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP78", "hookspath", FEATURE, "bwrap --unsetenv --bind --setenv GIT_EXEC_PATH /tmp/e --ro-bind / / -- " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP79", "hookspath", FEATURE, "bwrap --dir --bind --setenv GIT_EXEC_PATH /tmp/e -- " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP80", "hookspath", FEATURE, "bwrap --symlink a --ro-bind --setenv GIT_EXEC_PATH /tmp/e -- " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP81", "hookspath", FEATURE, "bwrap --tmpfs --setenv GIT_EXEC_PATH /tmp/e -- " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP82", "hookspath", FEATURE, "echo --ro-bind export; echo --bind GIT_EXEC_PATH; " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP83", "hookspath", FEATURE, "echo bwrap --bind export GIT_EXEC_PATH; " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP84", "hookspath", FEATURE, "bwrap --tmpfs ; export GIT_EXEC_PATH; " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP85", "hookspath", FEATURE, "bwrap --tmpfs /a -- export GIT_EXEC_PATH; " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP86", "hookspath", FEATURE, "read < bwrap --bind GIT_EXEC_PATH x; " + VERIFY_GIT + ' status --porcelain', D),
+    ("HP87", "hookspath", FEATURE, "bwrap --tmpfs /srv/GIT_REPOS/a -- " + VERIFY_GIT + " archive --format=tar HEAD | bwrap --tmpfs /srv/PAGER/a -- tar -x -f -", D),
+    # Git inside a string a shell or eval runs is not judged (sh -c wrappers are out of scope, see the docstring):
+    # ALLOW on purpose, as on f3141a2.
+    ("HP76", "hookspath", FEATURE, "bash -c 'GIT_EXEC_PATH=/tmp/e " + VERIFY_GIT + " status --porcelain'", A),
+    ("HP77", "hookspath", FEATURE, "sh -c 'export GIT_EXEC_PATH=/tmp/e; " + VERIFY_GIT + " status --porcelain'", A),
+    ("HP88", "hookspath", FEATURE, "bash -ce 'GIT_EXEC_PATH=/tmp/e " + VERIFY_GIT + " status --porcelain'", A),
+    ("HP89", "hookspath", FEATURE, "bash -ce 'git -c core.hooksPath=/dev/null commit -m x'", A),
+    ("HP90", "hookspath", FEATURE, "bash -c -e 'git -c core.hooksPath=/dev/null commit -m x'", A),
+    ("HP91", "hookspath", FEATURE, "eval 'GIT_EXEC_PATH=/tmp/e " + VERIFY_GIT + " status --porcelain'", A),
+    ("HP92", "hookspath", FEATURE, "eval 'git -c core.hooksPath=/dev/null commit -m x'", A),
+    ("HP93", "hookspath", FEATURE, "A=/bin/bash bash -ce 'git -c core.hooksPath=/dev/null commit -m x'", A),
+    ("HP94", "hookspath", FEATURE, "bash -lc '" + VERIFY_GIT + " status --porcelain'", A),
     ("C11", "commit", MASTER, "echo hi\ngit commit -m 'x'", D),
     ("C12", "commit", MASTER, "npm test && git commit -m 'x'", D),
     ("C13", "commit", NOTGIT, "git commit -m 'x'", A),
@@ -162,6 +311,23 @@ CASES = [
     ("C16", "commit", MASTER, "env GIT_AUTHOR_NAME=x git commit -m 'x'", D),
     ("C17", "commit", MASTER, "git\tcommit -m 'x'", D),
     ("C18", "commit", MASTER, "git${IFS}commit -m 'x'", K),                      # gap closed: built command word asks
+    # --shallow-file takes the next word: `status` is its value, so the real subcommand is commit / push.
+    ("C19", "commit", MASTER, "git --shallow-file status commit -m x", D),
+    ("C20", "commit", MASTER, "git --shallow-file status push --force origin master", D),
+    # A value-taking option never eats a shell operator, so the second git is still read.
+    ("C21", "commit", MASTER, "git -C ; git commit -m x", D),
+    ("C22", "commit", MASTER, "git -C && git commit -m x", D),
+    ("C23", "commit", MASTER, "git --git-dir | git commit -m x", D),
+    # shlex drops quotes, so `';'` and a real `;` are the same token: an operator after a value option is
+    # still taken as its value (the quoted reading), and the bare-separator reading is covered by C21-C23.
+    ("C24", "commit", MASTER, "git --namespace ';' commit -m x", D),
+    ("C25", "commit", MASTER, "git --shallow-file '|' commit -m x", D),
+    ("C26", "commit", MASTER, "git --super-prefix ';' commit -m x", D),
+    ("C27", "commit", MASTER, "git --namespace '&&' push --force origin master", D),
+    # Bash strips the redirection, so git sees `-c core.hooksPath=/dev/null commit`: never let it through.
+    ("C28", "commit", MASTER, "git -c > /dev/null core.hooksPath=/dev/null commit -m x", K),
+    ("C29", "commit", MASTER, "git -C > /dev/null . commit -m x", K),
+    ("C30", "commit", MASTER, "git --namespace >/dev/null status commit -m x", K),
     # ── --no-verify ────────────────────────────────────────────────────────
     ("N01", "noverify", FEATURE, "git push --no-verify origin feature/x", D),
     ("N02", "noverify", FEATURE, "git commit --no-verify -m 'x'", D),
@@ -587,6 +753,51 @@ CASES = [
     ("W19", "bypass2", FEATURE, "S=/tmp/x; read S < f; rm -rf $S", K),
     ("W20", "bypass2", FEATURE, "CDPATH=/tmp; cd lib; rm -rf x", K),
     ("W21", "bypass2", FEATURE, "git rm --cached lib/x", A),
+    # `git rm --cached` only unstages, whatever global options come before `rm`
+    ("W21a", "bypass2", FEATURE, "git -C /x rm --cached lib/x", A),
+    ("W21b", "bypass2", FEATURE, "git -c a.b=1 rm --cached lib/x", A),
+    ("W21c", "bypass2", FEATURE, "git -C ';' rm --cached lib/x", K),      # tokenizes like `git -C ; rm …`
+    ("W21d", "bypass2", FEATURE, "git -c a.b=1 rm lib/x --dry-run; echo --cached", K),
+    ("W21e", "bypass2", FEATURE, "git -C /x rm --cached lib/x && rm -rf lib", K),
+    ("W21f", "bypass2", FEATURE, "git rm -- --cached", K),                       # a path named --cached, deleted
+    ("W21g", "bypass2", FEATURE, "git rm --pathspec-from-file --cached", K),     # its file name, not the option
+    ("W21h", "bypass2", FEATURE, "git rm --cached -- lib/x", A),
+    # git reads options in order: a later --no-cached (or an abbreviation) deletes again
+    ("W21p", "bypass2", FEATURE, "git rm --cached --no-cached lib/x", K),
+    ("W21q", "bypass2", FEATURE, "git rm --cached --no-ca lib/x", K),
+    ("W21r", "bypass2", FEATURE, "git rm --no-cached --cached lib/x", K),        # fail closed on any --no-c
+    ("W21t", "bypass2", FEATURE, "git rm --cached --pathspec-file-nul --no-cached lib/x", K),  # takes no value
+    ("W21u", "bypass2", FEATURE, "git rm --pathspec-f --cached --no-cached lib/x", K),  # ambiguous prefix
+    ("W21v", "bypass2", FEATURE, "git rm --pathspec-from-file=f --cached", A),
+    ("W21w", "bypass2", FEATURE, "git rm --cached --pathspec-from-file --pathspec-from-file --no-cached lib/x", K),
+    ("W21x", "bypass2", FEATURE, "git rm --cached --pathspec-from-file -- --no-cached lib/x", K),  # `--` is the value
+    # a word the shell expands could become --no-cached
+    ("W21y", "bypass2", FEATURE, "git rm --cached {--cached,--no-cached} lib/x", K),
+    ("W21z", "bypass2", FEATURE, "X=--no-cached; git rm --cached $X lib/x", K),
+    ("W21za", "bypass2", FEATURE, "git rm --cached \"$(echo --no-cached)\" lib/x", K),
+    ("W21zb", "bypass2", FEATURE, "git rm --cached [-]-no-cached lib/x", K),
+    ("W21zc", "bypass2", FEATURE, "git rm --cached $'--no-cached' lib/x", K),
+    ("W21zd", "bypass2", FEATURE, "git rm --cached `echo --no-cached` lib/x", K),
+    ("W21ze", "bypass2", FEATURE, "git rm --cached \"`echo --no-cached`\" lib/x", K),
+    ("W21zf", "bypass2", FEATURE, "git rm --cached --pathspec-from-file {f,--no-cached}", K),  # the value splits
+    ("W21zg", "bypass2", FEATURE, "git rm --cached --pathspec-from-file --*", K),
+    ("W21zh", "bypass2", FEATURE, "git rm --cached (--no-cached|zz) lib/x", K),                 # zsh alternation
+    ("W21zi", "bypass2", FEATURE, "git rm --cached --pathspec-from-file f (--no-cached|zz)", K),
+    # only plain words are read literally: tilde forms and zsh extended globs may become --no-cached
+    ("W21zj", "bypass2", FEATURE, "OLDPWD=--no-cached; git rm --cached ~- lib/x", K),
+    ("W21zk", "bypass2", FEATURE, "hash -d n=--no-cached; git rm --cached ~n lib/x", K),
+    ("W21zl", "bypass2", FEATURE, "setopt extendedglob; git rm --cached ^f", K),
+    ("W21zm", "bypass2", FEATURE, "git rm --cached -#-no-cached lib/x", K),
+    ("W21zn", "bypass2", FEATURE, "git rm -r --cached src/a_b.py lib/@scope/x+y,z.js", A),
+    ("W21s", "bypass2", FEATURE, "git rm --cached --end-of-options --no-cached", A),  # a path after end-of-options
+    # the exemption needs `git` as the command word, not an option value of another program
+    ("W21i", "bypass2", FEATURE, "env -u git -- rm -rf x --cached", K),
+    ("W21j", "bypass2", FEATURE, "POSIXLY_CORRECT=1 env -u git rm -rf x --cached", K),
+    ("W21k", "bypass2", FEATURE, "xargs -a git -- rm -rf x --cached", K),
+    ("W21l", "bypass2", FEATURE, "runuser -u git -- rm -rf x --cached", K),
+    ("W21m", "bypass2", FEATURE, "POSIXLY_CORRECT=1 sudo -u git -E rm -rf /home/u/x --cached", K),
+    ("W21n", "bypass2", FEATURE, "git -C /x -- rm -rf x --cached", K),
+    ("W21o", "bypass2", FEATURE, "cd /x && GIT_TRACE=1 git -C /x rm -r --cached lib", A),
     ("W22", "bypass2", FEATURE, "pushd /tmp && rm -rf cc-guard-x; popd", K),           # pushd: not a prefix cd
     ("W23", "bypass2", FEATURE, "rsync -a --delete lib/ /tmp/cc-guard-mirror/", K),   # literal-only exemption (v0.0.26)
     ("W24", "bypass2", FEATURE, "rm -rf /tmp/cc-guard-a /tmp/cc-guard-nomatch-*", K),   # v0.0.27: only `rm /abs/scratch` alone is exempt

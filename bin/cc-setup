@@ -702,6 +702,15 @@ fi
 
 # ── 5b. Optional software factory ────────────────────────────────────────────
 FACTORY_MARKER="$PROJECT_DIR/.claude/no-factory"
+# Under the marker a kept factory/line.json keeps routing on, and cc-factory run-args drives the
+# project's own factory-line.js, so that one file still gets refreshed (a known shipped version only).
+# cc-factory refreshes only when that checkout is its own main checkout, so nothing is written elsewhere.
+refresh_kept_factory_workflow() {  # <checkout whose files are checked and refreshed>
+    local line="$1/factory/line.json" js="$1/.claude/workflows/factory-line.js"
+    [[ -f "$line" && ! -L "$line" && -f "$js" && ! -L "$js" ]] || return 0
+    echo "factory: factory/line.json exists, so routing stays on; checking its workflow"
+    "$CC_TOOL_DIR/bin/cc-factory" init "$1" --line-js-only || echo "  ⚠ factory workflow refresh failed"
+}
 if (( NO_FACTORY )); then
     echo ""
     if [[ -L "$PROJECT_DIR/.claude" ]]; then
@@ -728,6 +737,7 @@ elif (( WITH_FACTORY )); then
 elif [[ -e "$FACTORY_MARKER" || -L "$FACTORY_MARKER" ]]; then
     echo ""
     echo "factory skipped: .claude/no-factory exists (run cc-setup --factory to turn it on)"
+    refresh_kept_factory_workflow "$PROJECT_DIR"
 # CC_SETUP_PROC_STATUS is a test-only stand-in for /proc/self/status.
 elif [[ ! -r "${CC_SETUP_PROC_STATUS:-/proc/self/status}" ]]; then
     echo ""
@@ -745,6 +755,7 @@ elif FACTORY_COMMON="$(git -C "$PROJECT_DIR" rev-parse --path-format=absolute --
     # A linked worktree honours the opt-out recorded at the main checkout.
     echo ""
     echo "factory skipped: .claude/no-factory exists in the main checkout (run cc-setup --factory to turn it on)"
+    refresh_kept_factory_workflow "$(dirname "$FACTORY_COMMON")"
 else
     echo ""
     echo "── Factory ─────────────────────────────────────────────────────────"

@@ -176,8 +176,9 @@ def line(data, wins, now):
 
 def install(settings):
     """Make this script the status line in `settings` (install.sh passes the
-    user-level ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json), so every session
-    in every project records its limits. A status line that is already set to
+    user-level ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json), so every terminal
+    (cli) session in every project records its limits; VS Code extension and
+    SDK/headless sessions never run the status line. A status line that is already set to
     something else is left alone. Returns the exit status."""
     me = os.path.realpath(__file__)
     command = shlex.quote(me)

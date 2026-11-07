@@ -348,7 +348,10 @@ def current_branch(repo_args=()) -> str:
 _SHELL_OP_CHARS = set("();<>|&\n")
 # Operator tokens that DON'T end a pipeline (a pipeline is the unit for `xargs`).
 _PIPE_TOKENS = {"|", "|&"}
-_GIT_GLOBAL_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+# --attr-source / --config-env / --super-prefix / --shallow-file take their value as the NEXT word; missing one
+# here lets a decoy subcommand (`git --attr-source status commit`) be read as the real one.
+_GIT_GLOBAL_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+                          "--attr-source", "--config-env", "--super-prefix", "--shallow-file"}
 # Repo-selecting global options only — these are safe to forward to rev-parse.
 _GIT_REPO_VALUE_OPTS = {"-C", "--git-dir", "--work-tree"}
 _GIT_REPO_INLINE_OPTS = ("--git-dir=", "--work-tree=")
@@ -812,9 +815,14 @@ def git_invocations(tokens):
     """[(subcommand, global-opts, args, repo_args)] for every real `git …` call.
 
     global-opts is [(opt, value|None)]; args stops at the end of the simple
-    command. Scanning resumes just after the subcommand (as the old push parser
-    did), so a nested `git` later in the same simple command is still found.
+    command. Scanning resumes at the subcommand, so a nested `git` later in the
+    same simple command (or as the subcommand itself) is still found.
     """
+    return [call[1:] for call in _git_calls(tokens)]
+
+
+def _git_calls(tokens):
+    """git_invocations with the subcommand's token index first in each tuple."""
     n = len(tokens)
     out = []
     i = 0
@@ -826,6 +834,8 @@ def git_invocations(tokens):
         gopts = []
         while j < n and tokens[j].startswith("-"):
             if tokens[j] in _GIT_GLOBAL_VALUE_OPTS:
+                # Always take the next token, operator or not: shlex drops quotes, so `--namespace ';' commit`
+                # and `-C ; git commit` tokenize alike. The rescan from the subcommand below covers the latter.
                 gopts.append((tokens[j], tokens[j + 1] if j + 1 < n else ""))
                 j += 2
             else:
@@ -846,8 +856,10 @@ def git_invocations(tokens):
                 repo_args += [opt, val]
             elif opt.startswith(_GIT_REPO_INLINE_OPTS):
                 repo_args.append(opt)
-        out.append((sub, gopts, args, tuple(repo_args)))
-        i = j + 1
+        out.append((j, sub, gopts, args, tuple(repo_args)))
+        # Resume AT the subcommand: when an option ate a real separator (`git -C ; git commit`), the
+        # "subcommand" is the next git, which must be read as its own call too.
+        i = j
     return out
 
 
@@ -2939,14 +2951,57 @@ def _exempt_rm(cmd: str) -> bool:
     return bool(paths) and all(".." not in p.split("/") and _scratch_path(p) for p in paths)
 
 
+# Words the cached-only exemption reads as literal: anything else may be a shell expansion that becomes
+# --no-cached under bash or zsh (an allow list, since each blocklist missed one: ~-, ~name, ^glob, -#-).
+_RM_PLAIN_WORD = re.compile(r"[A-Za-z0-9._/@:+,%-][A-Za-z0-9._/@:+,=%-]*")
+
+
+def _rm_cached_only(args) -> bool:
+    """`git rm` args that only unstage: `--cached` as an option, not a path after `--`
+    or the file name of a `--pathspec-from-file` written as two words. Options are read in order the
+    way git reads them. Fails closed: any `--no-c…` word (an abbreviation of `--no-cached`) counts as a
+    deletion wherever it stands, and only a prefix of `--pathspec-from-file` alone (not one it shares with
+    `--pathspec-file-nul`, which takes no value) eats the next word."""
+    def takes_value(p):
+        return "=" not in p and len(p) > 3 and "--pathspec-from-file".startswith(p) \
+            and not "--pathspec-file-nul".startswith(p)
+    cached = skip = False
+    for a in args:
+        if not _RM_PLAIN_WORD.fullmatch(a):
+            return False  # only plain words: anything bash or zsh may expand (~-, ~n, ^f, -#-, $X, …) asks
+        if skip:  # a word used up as --pathspec-from-file's value, even `--` or another option
+            skip = False
+            continue
+        if a in ("--", "--end-of-options"):
+            break
+        if a.startswith("--no-c"):
+            return False
+
+        if takes_value(a):
+            skip = True
+        elif a == "--cached":
+            cached = True
+    return cached
+
+
+def _is_command_word(tokens, i) -> bool:
+    """tokens[i] is the word a simple command runs: only assignments or keywords before it,
+    never an option value of another program (`env -u git rm …` runs rm)."""
+    k = i - 1
+    while k >= 0 and (_ASSIGN_RE.match(tokens[k]) or tokens[k] in _SHELL_KEYWORDS | {"if", "while", "until"}):
+        k -= 1
+    return k < 0 or _is_op(tokens[k])
+
+
 def check_deletes(tokens) -> None:
+    calls = _git_calls(tokens) if any(_cmd_name(t) == "git" for t in tokens) else []
     # git's own discards first: they ask with a specific message
-    for sub, _gopts, args, _repo in (git_invocations(tokens) if any(_cmd_name(t) == "git" for t in tokens) else []):
+    for _j, sub, _gopts, args, _repo in calls:
         if sub == "worktree" and args[:1] == ["remove"] and (
                 "--force" in args or any("f" in _short_flags(a) for a in args[1:])):
             _ask_delete("'git worktree remove --force' deletes the worktree and any uncommitted work in",
                         [a for a in args[1:] if not a.startswith("-")])
-        elif sub == "rm" and "--cached" not in args:
+        elif sub == "rm" and not _rm_cached_only(args):
             _ask_delete("'git rm' deletes from the working tree", [a for a in args if not a.startswith("-")])
         elif sub in ("checkout", "restore"):
             if "--" in args:
@@ -2960,9 +3015,14 @@ def check_deletes(tokens) -> None:
     markers = _delete_markers(tokens)
     if not markers:
         return
-    # `git rm --cached` only unstages: its `rm` is the git subcommand word
-    git_cached = {i for i in markers if tokens[i] == "rm" and i > 0 and _cmd_name(tokens[i - 1]) == "git"
-                  and "--cached" in tokens[i:]}
+    # `git rm --cached` only unstages: its `rm` is the git subcommand word, after any global options
+    # (`git -C d rm --cached x`), none of which ate a shell operator (`git -C ';' rm` reads as `git -C ; rm`)
+    # or is `--`; and `git` must be the command word itself (`env -u git rm -rf x --cached` runs rm).
+    # A `(` or `)` word ends the args early here, but zsh reads `(--no-cached|x)` as a glob git sees, so none.
+    git_cached = set() if {"(", ")"} & set(tokens) else {j for j, sub, gopts, args, _repo in calls
+                  if sub == "rm" and _rm_cached_only(args)
+                  and _is_command_word(tokens, j - 1 - sum(1 if v is None else 2 for _o, v in gopts))
+                  and not any(o == "--" or (v is not None and _is_op(v)) for o, v in gopts)} & set(markers)
     if not set(markers) - git_cached:
         return
     if _exempt_rm(_CMD_FOR_LOG):
@@ -3305,17 +3365,18 @@ _SHELL_VALUE_OPTS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
 
 def _shell_code(cmd):
     """The string a shell runs with -c, also when -c sits in a cluster (-lc, -ec,
-    -xec) or behind -o/-O options; None when the shell runs a script file."""
-    k = 1
+    -xec), before other options (-c -e) or behind -o/-O options; None when the
+    shell runs a script file."""
+    k, has_c = 1, False
     while k < len(cmd):
         a = cmd[k]
         if a in _SHELL_VALUE_OPTS:
             k += 2
             continue
         if a == "--" or not a.startswith(("-", "+")):
-            return None
-        if a.startswith("-") and not a.startswith("--") and "c" in a[1:]:
-            return cmd[k + 1] if k + 1 < len(cmd) else None
+            code = cmd[k + 1 if a == "--" else k] if k + (a == "--") < len(cmd) else None
+            return code if has_c else None
+        has_c = has_c or (a.startswith("-") and not a.startswith("--") and "c" in a[1:])
         k += 1
     return None
 

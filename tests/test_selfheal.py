@@ -813,6 +813,14 @@ def test_state():
              "claude.err": mode(os.path.join(w.base, "runs", rid, "claude.err"))}
     bad = {k: oct(v) for k, v in modes.items() if v != (0o700 if k in ("base", "runs", "records", "run dir") else 0o600)}
     check("state: directories are 0700 and files 0600", not bad, bad)
+    wp = error_world("stpart", claude=make_fake(mode="ok", files=dict(ok_files(), **{"proposals.json": json.dumps(dict(proposals_doc(), partial=True))})))
+    outp = wp.sh.start(days=1, origin="cli", background=False)
+    ridp = (outp[1].get("run") or {}).get("id") if isinstance(outp[1], dict) else None
+    recp = waitfor(wp.sh, ridp) if ridp else None
+    sp = get_state(wp) or {}
+    check("state: a partial run keeps its proposals but does not close the window (last_completed unmoved)",
+          recp and recp.get("status") == "done" and recp.get("partial") is True and recp.get("proposals") == 1
+          and (sp.get("last") or {}).get("id") == ridp and not sp.get("last_completed"), (recp, sp))
     check("state: a new run after a finished one is allowed", w.sh.start(days=1, origin="cli", background=False)[0] < 300)
 
     # a dead owner (collecting) or dead child (analyzing) -> interrupted; a new run may then start
@@ -1456,6 +1464,8 @@ WF_RUNNER = r"""
 const fs = require('fs')
 const src = fs.readFileSync(process.argv[2], 'utf8')
 const argsMode = process.argv[3]
+const nullStage = process.argv[4] || ''
+let writePrompt = ''
 const body = src.replace(/^export const meta = /m, 'const meta = ')
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const fn = new AsyncFunction('agent', 'pipeline', 'parallel', 'phase', 'log', 'args', 'budget', body)
@@ -1467,6 +1477,8 @@ const agent = async (prompt, opts) => {
   opts = opts || {}
   calls.push({ label: opts.label, agentType: opts.agentType, model: opts.model })
   const stage = ((/^selfheal:(\w+)/.exec(opts.label || '')) || [])[1]
+  if (stage === nullStage) return null
+  if (stage === 'write') writePrompt = prompt
   if (stage === 'classify') return { marker_line: 10, items_read: 2, clusters: [{ name: 'heredoc commits denied', kinds: ['guard_denial'], refs: ['e1'], occurrences: 3, sessions: 2, significance: 'high', summary: 's' }] }
   if (stage === 'rootcause') return { harness_cause: true, scope: 'project', cause: 'c', gap: 'g', target_kind: 'claude_md', target: 'CLAUDE.md', refs: ['e1'] }
   if (stage === 'propose') return { change: true, no_change_reason: '', title: 'Commit messages with -F', severity: 'high', target_kind: 'claude_md', target: 'CLAUDE.md', failure_mode: 'fm', evidence: [{ ref: 'e1', kind: 'guard_denial', session: '0b6f2c1e-1111-4222-8333-944455556666', count: 3, excerpt: 'x' }], patch: PATCH, risk: 'r' }
@@ -1478,22 +1490,24 @@ const parallel = async (thunks) => Promise.all(thunks.map((t) => Promise.resolve
 const pipeline = async (items, ...stages) => Promise.all(items.map(async (item, i) => { let v = item; for (const st of stages) { try { v = await st(v, item, i) } catch (e) { return null } } return v }))
 const budget = { total: null, spent: () => 0, remaining: () => Infinity }
 fn(agent, pipeline, parallel, () => {}, () => {}, argsMode === 'json' ? JSON.stringify(ARGS) : ARGS, budget)
-  .then((r) => process.stdout.write(JSON.stringify({ calls, result: r })))
+  .then((r) => process.stdout.write(JSON.stringify({ calls, result: r, writePrompt })))
   .catch((e) => process.stdout.write(JSON.stringify({ calls, error: String(e && e.stack || e) })))
 """
 
 
-def run_workflow(args_json=False):
+def run_workflow(args_json=False, null_stage="", want_prompt=False):
     """(agent calls' {label, agentType, model}, the returned object, error text) of self-heal.js run under
     node with stubbed hooks and canned answers (one project, one cluster, one proposal)."""
     runner = os.path.join(BASE, "wf-runner.js")
     with open(runner, "w") as fh:
         fh.write(WF_RUNNER)
-    r = subprocess.run(["node", runner, WF_JS, "json" if args_json else "obj"], capture_output=True, text=True, timeout=60)
+    r = subprocess.run(["node", runner, WF_JS, "json" if args_json else "obj", null_stage], capture_output=True, text=True, timeout=60)
     try:
         out = json.loads(r.stdout)
     except ValueError:
         return [], None, (r.stderr or r.stdout or "no output")
+    if want_prompt:
+        return out.get("calls") or [], out.get("result"), out.get("writePrompt") or ""
     return out.get("calls") or [], out.get("result"), out.get("error") or ""
 
 
@@ -1555,6 +1569,13 @@ def test_workflow():
                 check("workflow: written names are script-made (proposals.json, proposals.md, proposals/<slug>/NN-kebab.patch)",
                       all(re.match(r"^(proposals\.json|proposals\.md|proposals/(_cc_tool|[a-z0-9][a-z0-9._-]{0,63})/\d{2}-[a-z0-9-]+\.patch)$", w) for w in result.get("written") or []),
                       result.get("written"))
+            _c3, res3, wp3 = run_workflow(null_stage="rootcause", want_prompt=True)
+            check("workflow: every rootcause agent without a result -> status partial, proposals.json marked partial",
+                  isinstance(res3, dict) and res3.get("status") == "partial" and res3.get("ok") is True and '"partial": true' in wp3, (res3, wp3[:200]))
+            for stg in ("propose", "check"):
+                _c4, res4, wp4 = run_workflow(null_stage=stg, want_prompt=True)
+                check(f"workflow: every {stg} agent without a result -> status partial, proposals.json marked partial",
+                      isinstance(res4, dict) and res4.get("status") == "partial" and res4.get("ok") is True and '"partial": true' in wp4, (res4, wp4[:200]))
             _calls2, result2, err2 = run_workflow(args_json=True)
             check("workflow: args given as a JSON string are parsed (same stages run)", err2 == "" and isinstance(result2, dict) and result2.get("status") == "done", (err2[-300:], result2))
         bad = [x for x in ("Date.now", "Math.random", "new Date") if re.search(re.escape(x).replace(r"\ ", r"\s*"), src)]
@@ -1626,6 +1647,9 @@ class UiHandler(server_mod.Handler):
                     put_state(w, last=r, last_completed=(get_state(w) or {}).get("last_completed"))
                 elif kind == "failed":
                     put_state(w, last=mk_rec("failed", until=now - 1800, error="boom: the run failed on purpose"), last_completed=(get_state(w) or {}).get("last_completed"))
+                elif kind == "partial":            # a usage limit cut the run short: saved as done, flagged partial
+                    r = mk_rec("done", until=now - 1800, partial=True, proposals=0, error="some evidence was not analysed: usage limit")
+                    put_state(w, last=r, last_completed=r)
                 elif kind == "age":                # push the finished run's end time back so "last: ..." is about to tick over
                     st = get_state(w) or {}
                     for k in ("last", "last_completed"):
@@ -1922,6 +1946,26 @@ async function shot(page, name, o) {
     await sleep(1500);
     const info = await page.evaluate(() => { const r = document.querySelector('#selfheal'); return { text: r.textContent.replace(/\s+/g, ' ').trim(), titles: [...r.querySelectorAll('[title]')].map((e) => e.title).join(' | ') + ' ' + (r.title || ''), aria: [...r.querySelectorAll('[aria-label]')].map((e) => e.getAttribute('aria-label')).join(' | ') }; });
     ck('ui failed: the failure shows a time and the error in a title or accessible name', /boom/.test(info.titles + ' ' + info.aria) && /ago|\d/.test(info.text), JSON.stringify(info).slice(0, 300));
+    await page.ctx.close();
+  });
+  // A run cut short (usage limit, an agent returning nothing) must not read as a clean "0 proposals" run.
+  await step('partial', async () => {
+    await getJSON(URLS.on, '/__test/craft?kind=partial');
+    const page = await newPage(URLS.on);
+    await root(page);
+    await sleep(1500);
+    const info = await page.evaluate(() => {
+      const r = document.querySelector('#selfheal'), b = r.querySelector('.sh-badge'), d = document.getElementById('selfheal-desc'), st = document.getElementById('selfheal-st'), n = document.getElementById('selfheal-n');
+      return { state: r.dataset.state, badge: !!b && !b.hidden, desc: d ? d.textContent : '', title: st ? st.title : '', text: st ? st.textContent : '', count: !!n && !n.hidden };
+    });
+    ck('ui partial: data-state is "partial", the badge shows and the description says incomplete',
+       info.state === 'partial' && info.badge && /incomplete/i.test(info.desc), JSON.stringify(info));
+    ck('ui partial: the status title carries the error, the text says incomplete, the count button stays',
+       /usage limit/.test(info.title) && /incomplete/i.test(info.text) && info.count, JSON.stringify(info));
+    await (await button(page)).click();
+    const row = await page.evaluate(() => { const p = document.querySelector('#selfheal-pop .sh-now'); return p ? p.textContent : ''; });
+    ck('ui partial: the popover row says incomplete and shows the error', /incomplete/i.test(row) && /usage limit/.test(row), row);
+    ck('ui partial: no page errors', page.rec.errs.length === 0, page.rec.errs.join(' | '));
     await page.ctx.close();
   });
   await browser.close();

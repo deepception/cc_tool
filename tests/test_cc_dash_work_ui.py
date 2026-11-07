@@ -7,7 +7,8 @@ like every /api route. GET /__test/v?n=full|bare switches the payload: `full` ha
 
 Browser steps (needs node, playwright-core and Chrome, else "browser: skipped" and exit 0): all four sections render
 in order with their counts and the Work tab label; empty sections are absent; the type chips filter Documents and a
-row opens Docs; an order at a gate shows the terminal commands; an order deep link highlights its row; an order title
+row opens Docs; an order at a gate shows the terminal commands; a blocked order shows why, as text, and what to run
+next; an order deep link highlights its row; an order title
 holding <img onerror> stays text; phone width has no horizontal scroll; light and dark both render without errors.
 
 Run:  python3 tests/test_cc_dash_work_ui.py
@@ -71,7 +72,9 @@ def payload(n):
                  "plan": {"key": plans[0]["key"], "path": plans[0]["path"], "title": "Widget plan", "tasks": {"done": 3, "total": 7}}}
         waiting = dict(order, id="FO-002", title=EVIL, status="review", gate={"name": "merge", "waiting": True}, plan=None, branch="factory/FO-002-y",
                        path="factory/orders/FO-002-y.md")
-        d["orders"] = [dict(order, id="FO-001"), waiting]
+        blocked = dict(order, id="FO-003", title="Blocked one", status="blocked", plan=None, branch="", path="factory/orders/FO-003-z.md",
+                       why={"note": "cc-factory record: the spec changed " + EVIL, "recommendation": "rerun"})
+        d["orders"] = [dict(order, id="FO-001"), waiting, blocked]
         d["documents"] = [{"project": "alpha", "path": "docs/UI-UX-REVIEW.md", "type": "report", "title": "UI review", "status": "", "updated": now - 90},
                           {"project": "alpha", "path": "docs/adr/0001.md", "type": "decision", "title": "Use SQLite", "status": "accepted", "updated": now - 99},
                           {"project": "alpha", "path": "docs/notes.md", "type": "report", "title": "Notes", "status": "", "updated": now - 120}]
@@ -146,6 +149,7 @@ const secs = (page) => page.$$eval('.pl-sec', (e) => e.map((x) => [x.dataset.key
       r.hint = await page.$eval('tr[data-order="FO-002"] .pl-gate', (e) => e.textContent);
       if (process.env.SHOTS) await page.screenshot({ path: process.env.SHOTS + '/work-' + scheme + '.png', fullPage: true });
       r.nohint =await page.$eval('tr[data-order="FO-001"]', (e) => !e.querySelector('.pl-gate'));
+      r.why = await page.$eval('tr[data-order="FO-003"] .pl-why', (e) => e.textContent);
       r.cardSpec = await page.$$eval('.pl-card a', (e) => e.map((a) => a.textContent + '|' + a.getAttribute('href')));
       r.planLink = await page.$eval('tr[data-order="FO-001"] a[href^="#/plan?"]', (a) => a.textContent);
       if (scheme === 'light') {
@@ -196,7 +200,7 @@ def test_browser(srv):
         check("browser: the page check ran", False, r.stderr[-1200:])
         return
     o = json.loads(r.stdout.strip().splitlines()[-1])
-    want = [["sec:orders", "2"], ["sec:plans", "2"], ["sec:docs", "3"], ["sec:runs", "1"]]
+    want = [["sec:orders", "3"], ["sec:plans", "2"], ["sec:docs", "3"], ["sec:runs", "1"]]
     for scheme in ("light", "dark"):
         s = o[scheme]
         check("%s: four sections in order, each with its count" % scheme, s["sections"] == want, s["sections"])
@@ -208,6 +212,9 @@ def test_browser(srv):
         check("%s: an order row shows its plan's task progress" % scheme, s["planTasks"] is True, s["planTasks"])
         check("%s: an order waiting at a gate shows the terminal commands, one that is not shows none" % scheme,
               "cc-factory approve FO-002 --gate merge" in s["hint"] and "cc-factory reject FO-002 --gate merge" in s["hint"] and s["nohint"], s["hint"])
+        check("%s: a blocked order shows its reason as text, the recommendation and the next-step commands" % scheme,
+              "the spec changed <img src=x" in s["why"] and "Recommended: rerun" in s["why"] and "/factory run FO-003" in s["why"]
+              and "cc-factory reject FO-003" in s["why"], s["why"])
         check("%s: a plan card links its spec and its order" % scheme,
               any(x.startswith("Spec") and "#/docs?p=alpha&f=factory%2Forders%2FFO-001-x.md" in x for x in s["cardSpec"])
               and any(x.startswith("FO-001|#/plans?p=alpha&order=FO-001") for x in s["cardSpec"]), s["cardSpec"])

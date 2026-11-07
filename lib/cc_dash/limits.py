@@ -18,7 +18,9 @@ only rises, and a later resets_at is a newer window. Each window is taken from
 the record with the latest resets_at and, within it, the highest percentage;
 as_of is the latest time any session saw that reading (seen_at, else changed_at,
 for records cc-statusline wrote before it had seen_at). A reading is as fresh as
-the last API reply of any open session; nothing here estimates usage.
+the last API reply of a terminal (cli) session: only those run the status line,
+while VS Code extension and SDK/headless sessions (factory, self-heal) never do,
+so their replies record nothing. Nothing here estimates usage.
 
 Known limit: a percentage that falls within one window (a plan change mid-window)
 shows the older, higher figure until a session that has not replied since is

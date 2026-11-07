@@ -10,7 +10,7 @@ lib/cc_dash/factory.py.
 
 Writes only: factory/ and .gitignore (init, new), .claude/workflows/factory-line.js (init),
 the ledger, lane worktrees and branches under .claude/worktrees/ (lane), and the git-ignored
-.factory-holdout/ (holdout). It never merges, pushes or deletes anything, never runs a shell,
+.factory-holdout/ (holdout), and verify-git export's extract into the verify attempt's /tmp copy. It never merges, pushes or deletes anything, never runs a shell,
 and never executes anything read from an order file: git gets argument lists, branch names
 come from the order id and a slug of its title, and order text is never copied into the
 ledger. Notes are redacted for secret shapes and clipped to 500 characters; the merge-gate
@@ -24,7 +24,7 @@ templates/hooks/cc_procs.py of its own checkout (approve, reject) and, for recor
 Python 3 standard library only.
 
 Usage:
-  cc-factory [-C DIR] init [PROJECT] [--force]
+  cc-factory [-C DIR] init [PROJECT] [--force] [--line-js-only]
   cc-factory new TITLE... [--priority p1|p2|p3] [--line NAME]
   cc-factory list [--all] [--json]                    (alias: status)
   cc-factory show ID [--json] [--events N]
@@ -35,6 +35,8 @@ Usage:
   cc-factory lane ID [--base REF] [--json]            (last stdout line: the worktree)
   cc-factory holdout ID                               (last stdout line: the directory)
   cc-factory run-args ID                              (JSON for the Workflow tool)
+  cc-factory verify-git ID head|status|export|diff|show FILE --attempt N [--static]
+                                                      (the verify station's only git)
   cc-factory record ID --workflow-run wf_...          (the result Claude Code saved for that run)
   cc-factory record ID [--run-id R] [--file F]        (or the run's result JSON on stdin)
 
@@ -95,6 +97,7 @@ import math  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import select  # noqa: E402
+import shutil  # noqa: E402
 import socket  # noqa: E402
 import stat  # noqa: E402
 import subprocess  # noqa: E402
@@ -617,7 +620,7 @@ def shipped_oids(rel):
     return oids
 
 
-def refresh_line_js(root, force):
+def refresh_line_js(root, force, create=True):
     src_path = os.path.join(CC_TOOL_DIR, LINE_JS_REL)
     dst_path = os.path.join(root, LINE_JS_REL)
     src = read_file(src_path, MAX_RESULT_BYTES)
@@ -657,6 +660,9 @@ def refresh_line_js(root, force):
             return
         print("  ✓ %s %s" % (LINE_JS_REL, verdict))
         return
+    if not create:
+        print("  ℹ %s is not there; not created" % LINE_JS_REL)
+        return
     if not (mkdir_real(os.path.join(root, ".claude")) and mkdir_real(parent)):
         print("  ⚠ %s is not a real directory; %s not copied" % (os.path.relpath(parent, root), LINE_JS_REL))
         return
@@ -676,6 +682,14 @@ def cmd_init(args):
     found = find_root(start)
     has_git = found is not None
     root = F.main_checkout(found) if has_git else start
+    if args.line_js_only:
+        # cc-setup under .claude/no-factory: the scaffold is not touched, only the workflow the routing still runs.
+        # It names the checkout it checked; one that resolves elsewhere (a package in an enclosing repo) is left alone.
+        if root != start:
+            print("  ℹ %s resolves to %s; %s not refreshed" % (start, root, LINE_JS_REL))
+            return 0
+        refresh_line_js(root, args.force, create=False)
+        return 0
     print("Setting up the software factory in: %s" % root)
     if has_git and root != start:
         print("  (the project's main checkout; %s is inside it)" % start)
@@ -1728,6 +1742,120 @@ def cmd_run_args(args):
     return 0
 
 
+# ── verify-git ────────────────────────────────────────────────────────────────
+# The verify station's only git. The lane's git config is the builder's (core.fsmonitor, an include, hooks, a filter
+# driver named in .gitattributes or .git/info/attributes, an external diff or textconv, a transport re-enabled for an
+# ext:: promisor can each run a program), so the argv is built here, never by a shell or a station: config from the
+# system and global files off, the exec-capable keys switched off on the command line (which outranks every config
+# file, included ones too), attributes from the empty tree, no optional index writes, no pager, no transport and no
+# lazy fetch. A filter driver in .git/info/attributes still reaches status and archive, so every op but the static
+# head and diff runs inside the same bwrap sandbox as the lane code, with only the attempt's copy writable.
+VERIFY_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+VERIFY_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_ATTR_NOSYSTEM": "1",
+                  "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "", "GIT_PROTOCOL_FROM_USER": "0", "GIT_NO_LAZY_FETCH": "1"}
+VERIFY_GIT_CONFIG = (["core.fsmonitor=false", "core.hooksPath=/dev/null", "core.untrackedCache=false", "core.pager=cat",
+                      "core.sshCommand=false", "protocol.allow=never"]
+                     + ["protocol.%s.allow=never" % p for p in ("ext", "file", "ssh", "git", "http", "https")]
+                     + ["diff.external=", "core.attributesFile=/dev/null"])
+VERIFY_OPS = ("head", "status", "export", "diff", "show")
+VERIFY_STATIC_OPS = ("head", "diff")
+VERIFY_SHOW_FILES = ("README.md", "Makefile", "package.json", "pyproject.toml")   # how-to-run sources at the base commit
+VERIFY_TIMEOUT = 600
+# Socket addresses under the hidden /run, and the transcript dir (which may sit outside $HOME/.claude).
+VERIFY_SANDBOX_UNSET = ("DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "CLAUDE_CONFIG_DIR")
+
+
+def verify_copy(oid, attempt):
+    return "/tmp/cc-factory-verify-%s-a%d" % (oid, attempt)
+
+
+def verify_sandbox(main, oid, copy):
+    """factory-line.js SANDBOX as an argv: everything read-only, /run, the holdout dirs, $HOME/.claude, $CLAUDE_CONFIG_DIR and the
+    temp dirs behind empty tmpfs mounts (a hide whose directory is absent has nothing to hide), the socket env vars unset, only
+    the copy writable, no network. A read-only mount does not stop connect(): /run holds the user's D-Bus (user systemd
+    runs any command outside bwrap), agent sockets and the docker socket. It goes first, so a TMPDIR under it still mounts."""
+    top = os.path.join(main, F.HOLDOUT_DIR)
+    hides = [d for d in (top, os.path.join(top, oid)) if os.path.isdir(d)]
+    # Transcripts live under CLAUDE_CONFIG_DIR when it is set, so hide it as well as $HOME/.claude.
+    claude = list(dict.fromkeys(d for d in (os.path.join(os.path.expanduser("~"), ".claude"), claude_config_dir())
+                                if os.path.isdir(d)))
+    argv = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/run", "--tmpfs", "/tmp",
+            "--tmpfs", os.environ.get("TMPDIR") or "/tmp"]
+    for d in hides + claude:
+        argv += ["--tmpfs", d]
+    for k in VERIFY_SANDBOX_UNSET:
+        argv += ["--unsetenv", k]
+    return argv + ["--bind", copy, copy, "--chdir", copy, "--unshare-net", "--unshare-pid", "--die-with-parent",
+                   "--new-session", "--"]
+
+
+def cmd_verify_git(args):
+    main = resolve_main(args)
+    oid = need_id(args.id)
+    o, _raw, events = load_order(main, oid)
+    op = args.op
+    if not 1 <= args.attempt <= 99:
+        raise Usage("--attempt must be 1..99")
+    if (op == "show") != (args.file is not None):
+        raise Usage("show takes one of %s; no other op takes an argument" % ", ".join(VERIFY_SHOW_FILES))
+    if op == "show" and args.file not in VERIFY_SHOW_FILES:
+        raise Usage("show reads only %s at the base commit" % ", ".join(VERIFY_SHOW_FILES))
+    if args.static and op not in VERIFY_STATIC_OPS:
+        raise Usage("--static runs only %s (without a sandbox)" % " and ".join(VERIFY_STATIC_OPS))
+    lane = o.get("lane") or {}
+    if not lane.get("branch") or not lane.get("worktree"):
+        refuse("%s has no lane" % oid, "run cc-factory lane %s first" % oid)
+    wt = os.path.realpath(lane["worktree"])
+    if wt == main or not os.path.isdir(wt) or wt not in [w["path"] for w in worktree_list(main)]:
+        refuse("the recorded lane worktree %s is not a registered git worktree" % one_line(lane["worktree"], 300),
+               "run cc-factory lane %s to make it again" % oid)
+    base = last_lane_base(events, lane["branch"])
+    if base and not re.fullmatch(r"[0-9a-f]{40,64}", base):
+        refuse("the lane's recorded base %r is not a commit id" % one_line(base, 60), "run cc-factory lane %s again" % oid)
+    if op == "show" and not base:
+        refuse("%s's lane has no recorded base commit to read %s from" % (oid, args.file), "read the main checkout's file instead")
+    sub = {"head": ["rev-parse", "HEAD"], "status": ["status", "--porcelain"], "export": ["archive", "--format=tar", "HEAD"],
+           "diff": ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "%s...HEAD" % base if base else "HEAD~1...HEAD"],
+           "show": ["show", "%s:%s" % (base, args.file)]}[op]
+    gitv = ["git", "--no-pager", "--no-optional-locks", "--attr-source=" + VERIFY_EMPTY_TREE]
+    for kv in VERIFY_GIT_CONFIG:
+        gitv += ["-c", kv]
+    gitv += ["-C", wt] + sub
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    genv = dict(env, **VERIFY_GIT_ENV)
+    wrap = []
+    if not args.static:
+        copy = verify_copy(oid, args.attempt)
+        try:
+            st = os.lstat(copy)
+        except OSError:
+            st = None
+        if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            refuse("the throwaway copy %s is not a directory of yours" % copy, "run verify's prepare commands first")
+        if not shutil.which("bwrap"):
+            refuse("bwrap is not installed", "verify runs only the --static head and diff without a sandbox")
+        wrap = verify_sandbox(main, oid, copy)
+    run = dict(stdin=subprocess.DEVNULL, cwd="/")
+    try:
+        if op != "export":
+            return subprocess.run(wrap + gitv, env=genv, timeout=VERIFY_TIMEOUT, **run).returncode
+        tar = ["tar", "-x", "--no-same-owner", "--no-overwrite-dir", "-f", "-", "-C", copy]
+        p1 = subprocess.Popen(wrap + gitv, env=genv, stdout=subprocess.PIPE, **run)
+        p2 = subprocess.Popen(wrap + tar, env=env, stdin=p1.stdout, cwd="/")
+        p1.stdout.close()
+        try:
+            rc2, rc1 = p2.wait(timeout=VERIFY_TIMEOUT), p1.wait(timeout=VERIFY_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            p1.kill()
+            p2.kill()
+            raise
+        return rc1 or rc2
+    except FileNotFoundError as e:
+        refuse("cannot run %s" % one_line(str(e.filename), 80), "install it, then retry")
+    except subprocess.TimeoutExpired:
+        refuse("verify git %s timed out" % op, "check the lane, then retry")
+
+
 # ── record ────────────────────────────────────────────────────────────────────
 KINDS = ("plan", "build", "test", "verify", "review")
 REASONS = ("args", "infeasible", "infra", "lane-tampered")
@@ -2400,6 +2528,9 @@ def build_parser():
     sp = add("init", cmd_init, "scaffold factory/, the ignores and the ledger directory")
     sp.add_argument("project", nargs="?", help="project directory (default: -C or the current directory)")
     sp.add_argument("--force", action="store_true", help="replace README/line/template and factory-line.js")
+    sp.add_argument("--line-js-only", action="store_true",
+                    help="only refresh an existing .claude/workflows/factory-line.js in PROJECT's own main checkout"
+                         " (a known shipped version is replaced; a missing one is not created)")
     sp = add("new", cmd_new, "create an order")
     sp.add_argument("title", nargs="+", metavar="TITLE")
     sp.add_argument("--priority", choices=("p1", "p2", "p3"))
@@ -2453,7 +2584,14 @@ def build_parser():
     sp.add_argument("id")
     sp = add("run-args", cmd_run_args, "the Workflow tool call for the factory-line script, as JSON")
     sp.add_argument("id")
-    sp = add("record", cmd_record, "write a finished run's result to the ledger; review only for a run that passed every check")
+    sp = add("verify-git", cmd_verify_git, "the verify station's git on the order's lane: a fixed, hardened argv, sandboxed")
+    sp.add_argument("id")
+    sp.add_argument("op", choices=VERIFY_OPS)
+    sp.add_argument("file", nargs="?", help="show only: one of " + ", ".join(VERIFY_SHOW_FILES) + " at the lane's base")
+    sp.add_argument("--attempt", type=int, required=True, metavar="N", help="the verify attempt (its copy: "
+                    "/tmp/cc-factory-verify-ID-aN)")
+    sp.add_argument("--static", action="store_true", help="head or diff without the sandbox (verify's static mode)")
+    sp = add("record", cmd_record,"write a finished run's result to the ledger; review only for a run that passed every check")
     sp.add_argument("id")
     sp.add_argument("--workflow-run", metavar="RUN_ID",
                     help="read the result Claude Code saved for this Workflow run (wf_...) under "

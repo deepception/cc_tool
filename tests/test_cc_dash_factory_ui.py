@@ -16,7 +16,7 @@ returns without reloading the page:
   empty   no nodes
   long    poll 1 plus two project hubs with 40-character names (one unbroken, one in underscored words)
   cycles  poll 1 plus two workflows that parent each other and one that parents itself
-  robust  poll 1 plus an order with detail null, a duplicate node id and string costs
+  robust  poll 1 plus an order with detail null, a duplicate node id and string costs; FO-003 blocked, markup in its reason
   garbage a 200 whose body is not JSON          objnodes  a payload whose nodes is an object
   rates   poll 1 with every session unpriced (burn in new tokens a minute only)
   noseries poll 1 without `series` (an older server)
@@ -88,6 +88,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE = tempfile.mkdtemp(prefix="cc-dash-factory-ui-test-")
 os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(BASE, "claude")     # before cc_dash is imported: an empty config dir
 os.makedirs(os.environ["CLAUDE_CONFIG_DIR"], exist_ok=True)
+# and an empty state dir: /api/alerts otherwise tails your real attention.jsonl, and live toasts cover graph nodes
+os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "state")
 sys.path.insert(0, os.path.join(REPO, "lib"))
 from cc_dash import server as server_mod  # noqa: E402
 from cc_dash.auth import Auth  # noqa: E402
@@ -248,6 +250,9 @@ def robust_variant():
     junk = dict(copy.deepcopy(proto), id=ROBUST["junk"], label="Cost is junk", cost="abc", tokens="many")
     num = dict(copy.deepcopy(proto), id=ROBUST["str"], label="Cost is a string", cost="12.5")
     d["nodes"] += [order, dup, junk, num]
+    o3 = next(n for n in d["nodes"] if n["id"] == ORDER3)   # blocked, its reason carrying markup that must stay text
+    o3.update(state="blocked")
+    o3["detail"].update(status="blocked", why={"note": 'the spec changed <img src=x onerror="window.__pwn=1">', "recommendation": "rerun"})
     sr = d["series"]       # junk inside series (strings, a short array, a negative, null): nothing usable in any measure
     sr["tokens"] = ["abc", None, -5] + [0] * 17
     sr["tokens_by_family"] = {"opus": [0, 0, 0], "sonnet": None, "haiku": "x"}
@@ -1628,6 +1633,10 @@ async function clickInPlace(page, id) {
       r.openMs = await waitInsp(page, 3000);
       r.insp = await page.evaluate(() => __t.insp().text.slice(0, 600));
       await page.keyboard.press('Escape');
+      await clickNode(page, X.robust.blocked);
+      r.blockedMs = await waitInsp(page, 3000);
+      r.blocked = await page.evaluate(() => ({ text: __t.insp().text, imgs: document.querySelectorAll('aside.fx-inspector img').length, pwn: window.__pwn || null }));
+      await page.keyboard.press('Escape');
       await page.click('.fx-mode button[data-mode="list"]');
       await page.waitForTimeout(400);
       r.items = await page.evaluate(() => [...document.querySelectorAll('button.fx-li[data-node]')].map((b) => b.dataset.node));
@@ -2314,7 +2323,7 @@ def expectations():
                   "feed8": feed8(POLL1), "feedKeys": [x["key"] for x in feed8(POLL1)],
                   "ticks": {n["id"]: n["target"] for n in POLL1["nodes"] if len(n.get("target") or "") > 3}},
         "gone": {"id": gone, "parent": p1[gone]["parent"], "parentSurvives": p1[gone]["parent"] in p2},
-        "cycles": list(CYCLES), "robust": dict(ROBUST, dup=S6, reports="p:reports-app", n=len(POLL1["nodes"]) + 3),
+        "cycles": list(CYCLES), "robust": dict(ROBUST, dup=S6, reports="p:reports-app", blocked=ORDER3, n=len(POLL1["nodes"]) + 3),
         "poll2": {"ids": [n["id"] for n in POLL2["nodes"]], "added": added, "removed": removed,
                   "parentOf": {i: p2[i]["parent"] for i in added}, "feed": feed(POLL2),
                   "feed8": feed8(POLL2), "feedKeys": [x["key"] for x in feed8(POLL2)], "alert": POLL2["alerts"][0]["node"]},
@@ -2889,6 +2898,11 @@ def evaluate(steps, exp):
               why(r) or (f.get("junk"), f.get("str")))
         check("robust: a duplicate node id keeps the first node, on the floor and in the list", f.get("dupCount") == 1 and "DUPLICATE" not in ((f.get("dup") or {}).get("text") or "")
               and "DUPLICATE" not in (r.get("dupRow") or "") and r.get("dupRow"), why(r) or (f.get("dup"), r.get("dupRow")))
+        b = r.get("blocked") or {}
+        check("robust: a blocked order's inspector shows Why (the note as text, the recommendation) and Next (rerun or reject)",
+              r.get("blockedMs", -1) >= 0 and "the spec changed <img src=x" in (b.get("text") or "") and "recommended: rerun" in (b.get("text") or "")
+              and "/factory run FO-003" in (b.get("text") or "") and "cc-factory reject FO-003" in (b.get("text") or "")
+              and b.get("imgs") == 0 and b.get("pwn") is None, why(r) or (r.get("blockedMs"), b))
         check("robust: the project inspector opens with an order whose detail is null", r.get("openMs", -1) >= 0 and "An order with no detail" in (r.get("insp") or ""), why(r) or (r.get("openMs"), (r.get("insp") or "")[:200]))
         check("robust: every unique node renders and is listed (%d)" % R["n"], f.get("n") == R["n"] and len(set(r.get("items") or [])) == R["n"] == len(r.get("items") or []),
               why(r) or (f.get("n"), len(r.get("items") or [])))
@@ -3339,6 +3353,11 @@ def evaluate(steps, exp):
         check("limits: a poll changes them in place (same elements)", all((w.get("tag") == w.get("key")) for w in hi.get("ws") or []) and len(hi.get("ws") or []) == 2, hi.get("ws"))
         check("limits: a reading over an hour old is dimmed and the tooltip says what it misses",
               r.get("oldWaited") and all("dim" in w.get("cls", "") for w in old.get("ws") or []) and "is not in it" in (old.get("title") or ""), (r.get("oldWaited"), old.get("ws"), old.get("title")))
+        check("limits: an old reading shows its age on the band, not the time left, and the tooltip says only terminal sessions refresh it",
+              [w.get("left") for w in old.get("ws") or []] == ["2h ago", "2h ago"] and "only terminal (CLI) sessions record limits" in (old.get("title") or "")
+              and "VS Code and SDK sessions do not run the status line" in (old.get("title") or ""), (old.get("ws"), old.get("title")))
+        check("limits: a reset window's tooltip says a terminal session's next reply brings a reading",
+              "the next reply in a terminal (CLI) session brings one" in (gone.get("title") or ""), gone.get("title"))
         g5 = {w.get("key"): w for w in gone.get("ws") or []}.get("five_hour") or {}
         check("limits: a window past its reset shows no figure, an empty track and 'reset'; the tooltip says it waits for a reading",
               r.get("goneWaited") and g5.get("pct") == "\u2013" and g5.get("left") == "reset" and g5.get("fill") == 0 and "dim" in g5.get("cls", "") and "no reading since" in (gone.get("title") or ""), (r.get("goneWaited"), g5, gone.get("title")))

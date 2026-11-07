@@ -2094,6 +2094,96 @@ def test_n10_union_read():
           sorted(p for p, _w in unsafe) == sorted([gw, ln, big]), unsafe)
 
 
+def test_uncovered_projects_warning():
+    """cc-dash starts on the union of every project's terminals, but a gate reads one project's manifest:
+    a registered project whose own record lacks this terminal is reported, one that has it is not. So is one
+    whose record covers the terminal but that the gates refuse anyway: a stale code record (a cc_tool pull
+    since cc-setup ran) or a pin that does not name this checkout."""
+    from cc_dash import server as server_mod
+    state = os.path.join(BASE, "unc_state")
+    projs = {}
+    for name, hosts in (("covered", ["/usr/bin/mine"]), ("other", ["/usr/bin/else"]), ("stale", ["/usr/bin/mine"]),
+                        ("unpinned", ["/usr/bin/mine"])):
+        hooks = pinned_hooks("unc_" + name, terminals=[{"path": h} for h in hosts])
+        projs[name] = os.path.realpath(os.path.dirname(os.path.dirname(hooks)))
+    path = os.path.join(projs["stale"], ".claude", "hooks", "cc_dash_manifest.json")
+    with open(path) as fh:
+        m = json.load(fh)
+    rel = min(m["files"])
+    m["files"][rel] = "0" * 64
+    with open(path, "w") as fh:
+        json.dump(m, fh)
+    os.unlink(os.path.join(projs["unpinned"], ".claude", "hooks", "cc_tool_root"))
+    bare = os.path.join(BASE, "unc_bare")
+    os.makedirs(bare, exist_ok=True)
+    register(state, *projs.values(), bare)
+    real = server_mod.procs.terminal_problem
+
+    def fake(pid, proc="/proc", terminals=None, **kw):
+        return "" if any(t.get("path") == "/usr/bin/mine" for t in terminals or []) else "not one of your recorded terminals"
+    server_mod.procs.terminal_problem = fake
+    try:
+        got = server_mod.uncovered_projects(state, me=1)
+    finally:
+        server_mod.procs.terminal_problem = real
+    names = sorted(p for p, _w in got)
+    check("uncovered: only projects whose own record lacks this terminal or this code, or whose pin is not this "
+          "checkout, are listed",
+          names == sorted([projs["other"], projs["stale"], projs["unpinned"], os.path.realpath(bare)]), got)
+    why = dict(got)
+    check("uncovered: a stale code record says the code changed, naming the file",
+          "code changed" in why.get(projs["stale"], "") and rel in why.get(projs["stale"], ""), got)
+    check("uncovered: a missing pin says the project was not set up from this checkout",
+          "checkout" in why.get(projs["unpinned"], ""), got)
+
+
+def test_uncovered_startup_warning():
+    """The warning must reach the terminal (stderr is cc-dash.log under `ccdash`), before the control code, stay
+    compact, and carry no raw control character from a project path."""
+    import io
+    from cc_dash import server as server_mod
+    bad = "/tmp/evil\x1b[2J\nname"
+    items = [(bad, "x\x07y"), ("/p/two", "r"), ("/p/three", "r"), ("/p/four", "r"), ("/p/five", "r")]
+    short = server_mod.uncovered_notice(items)
+    full = server_mod.uncovered_notice(items, reasons=True)
+    check("uncovered notice: one line with a count, the first names and `+N more`",
+          "\n" not in short and short.startswith("cc-dash: warning: 5 registered projects do not") and "(+2 more)" in short
+          and "cc-update-project" in short and "/p/four" not in short, short)
+    check("uncovered notice: no control character from a path or reason, in either form",
+          not any(ord(c) < 32 and c != "\n" or ord(c) == 127 for c in short + full), repr(full))
+    shown, err, old_err = [], io.StringIO(), sys.stderr
+    names = ("tty_write", "own_process_group", "control_refusal", "uncovered_projects", "show_control_code")
+    saved = {n: getattr(server_mod, n) for n in names}
+    old_env = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "XDG_STATE_HOME")}
+    root = os.path.join(BASE, "unc_main")
+    os.makedirs(os.path.join(root, "claude", "projects"), exist_ok=True)
+    os.makedirs(os.path.join(root, "state"), mode=0o700, exist_ok=True)
+    server_mod.tty_write = lambda text, tty="/dev/tty": shown.append(text) or True
+    server_mod.own_process_group = lambda: None
+    server_mod.control_refusal = lambda *a, **k: ""
+    server_mod.uncovered_projects = lambda *a, **k: items
+    server_mod.show_control_code = lambda code, tty="/dev/tty": shown.append("CODE") or False   # ends main() right after
+    os.environ.update(CLAUDE_CONFIG_DIR=os.path.join(root, "claude"), XDG_STATE_HOME=os.path.join(root, "state"))
+    sys.stderr = err
+    try:
+        server_mod.main(["--control", "--no-open", "--port", "0"])
+    finally:
+        sys.stderr = old_err
+        for n, v in saved.items():
+            setattr(server_mod, n, v)
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    i = next((n for n, t in enumerate(shown) if "5 registered projects" in t), -1)
+    check("uncovered startup: main() writes the warning to the terminal, before the control code",
+          0 <= i < shown.index("CODE") and "\x1b[2J" not in shown[i], shown)
+    check("uncovered startup: ... and to stderr (the log) with each reason, sanitised",
+          "5 registered projects" in err.getvalue() and "/p/five: r" in err.getvalue() and "\x1b" not in err.getvalue(),
+          err.getvalue())
+
+
 def test_n12_inherited_holders():
     """A holder that inherited the master fd from your terminal (a shell some terminals start
     with their other tabs' masters) skipped the debug checks altogether. Now the environment
@@ -2338,7 +2428,7 @@ def main():
                    test_r3_code_manifest, test_r4_no_lib_on_path, test_n1_interpreter_identity, test_n1_detached_rules,
                    test_n3_lineage_fail_closed, test_n2_rewrite_in_place, test_p2_hook_socket, test_p3_hidden_holder, test_n5_terminal_holder,
                    test_n7_appimage_full_hash, test_n8_recording, test_p1_recording_gate, test_n9_debug_holder, test_n10_union_read,
-                   test_n12_inherited_holders,
+                   test_uncovered_projects_warning, test_uncovered_startup_warning, test_n12_inherited_holders,
                    test_no_proc_review):
             try:
                 fn()

@@ -16,6 +16,8 @@ StateGuard confirms the real projects.json is unchanged afterwards):
     .claude/no-factory and later plain runs and updates honour it; --factory clears it;
     a non-git project, a missing /proc (CC_SETUP_PROC_STATUS, test-only) skip with exit 0;
     an init failure warns in default mode and aborts under --factory; reruns change nothing
+  - under the marker with a kept factory/line.json, a rerun (also from a linked worktree) still
+    refreshes an older shipped factory-line.js and leaves a locally edited one alone
   - .cc-board/ is git-ignored once across setup and update
   - `cc-factory init <proj>` alone gives the same scaffold
 
@@ -392,6 +394,116 @@ def test_enclosing_repo():
           r.returncode == 0 and "routing stays on until you remove factory/line.json" in r.stdout, tail(r))
 
 
+def older_shipped_line_js():
+    """An earlier committed factory-line.js that differs from the current one, or None."""
+    log = run(["git", "-C", REPO, "log", "--format=%H", "--", ".claude/workflows/factory-line.js"])
+    cur = open(WORKFLOW_SRC, "rb").read()
+    for commit in log.stdout.split()[1:]:
+        r = subprocess.run(["git", "-C", REPO, "show", commit + ":.claude/workflows/factory-line.js"],
+                           capture_output=True, env=env())
+        if r.returncode == 0 and r.stdout != cur:
+            return r.stdout
+    return None
+
+
+def test_opt_out_keeps_workflow_fresh():
+    """With the marker but a kept factory/line.json, routing stays on, so reruns refresh factory-line.js."""
+    if shutil.which("git") is None:
+        return
+    old = older_shipped_line_js()
+    if old is None:
+        check("workflow refresh: an older shipped factory-line.js is in cc_tool's history", False)
+        return
+    cur = open(WORKFLOW_SRC, "rb").read()
+    proj = new_project("optout-refresh")
+    run([SETUP, proj])
+    r = run([SETUP, proj, "--no-factory"])
+    check("workflow refresh: --no-factory on a scaffolded project writes the marker",
+          r.returncode == 0 and os.path.isfile(os.path.join(proj, ".claude", "no-factory")), tail(r))
+    js = os.path.join(proj, ".claude", "workflows", "factory-line.js")
+    with open(js, "wb") as fh:
+        fh.write(old)
+    r = run([SETUP, proj])
+    check("workflow refresh: a plain rerun with the marker exits 0 and still skips the scaffold",
+          r.returncode == 0 and "factory skipped: .claude/no-factory exists" in r.stdout, tail(r))
+    check("workflow refresh: a plain rerun replaces an older shipped factory-line.js", open(js, "rb").read() == cur,
+          r.stdout[-400:])
+    # A locally edited copy is still left alone.
+    with open(js, "wb") as fh:
+        fh.write(cur + b"\n// local edit\n")
+    run([SETUP, proj])
+    check("workflow refresh: a locally edited factory-line.js is kept", open(js, "rb").read() == cur + b"\n// local edit\n")
+    # Only factory-line.js is touched: the rest of the scaffold and the ledger are not re-created.
+    os.remove(os.path.join(proj, "factory", "README.md"))
+    os.remove(os.path.join(proj, "factory", "order-template.md"))
+    shutil.rmtree(os.path.join(proj, ".git", "cc_tool", "factory"))
+    with open(js, "wb") as fh:
+        fh.write(old)
+    run([SETUP, proj])
+    check("workflow refresh: the rerun re-scaffolds nothing but factory-line.js",
+          open(js, "rb").read() == cur and not os.path.lexists(os.path.join(proj, "factory", "README.md"))
+          and not os.path.lexists(os.path.join(proj, "factory", "order-template.md"))
+          and not os.path.lexists(os.path.join(proj, ".git", "cc_tool", "factory")))
+    # A factory-line.js without factory/line.json is not driven by routing, so it is left alone.
+    nojson = new_project("optout-js-no-line")
+    run([SETUP, nojson, "--no-factory"])
+    nojson_js = os.path.join(nojson, ".claude", "workflows", "factory-line.js")
+    os.makedirs(os.path.dirname(nojson_js), exist_ok=True)
+    with open(nojson_js, "wb") as fh:
+        fh.write(old)
+    run([SETUP, nojson])
+    check("workflow refresh: without factory/line.json an opted-out factory-line.js is left alone",
+          open(nojson_js, "rb").read() == old)
+    # A package inside an enclosing repo: nothing is written above it, its own copy is not cc-factory's.
+    outer = new_project("optout-outer")
+    pkg = os.path.join(outer, "pkg")
+    os.makedirs(os.path.join(pkg, ".claude", "workflows"))
+    os.makedirs(os.path.join(pkg, "factory"))
+    open(os.path.join(pkg, ".claude", "no-factory"), "w").close()
+    shutil.copy(os.path.join(proj, "factory", "line.json"), os.path.join(pkg, "factory", "line.json"))
+    pkg_js = os.path.join(pkg, ".claude", "workflows", "factory-line.js")
+    with open(pkg_js, "wb") as fh:
+        fh.write(old)
+    r = run([SETUP, pkg])
+    check("workflow refresh: a package in an enclosing repo writes nothing in the enclosing repo",
+          r.returncode == 0 and not os.path.lexists(os.path.join(outer, ".claude", "workflows"))
+          and open(pkg_js, "rb").read() == old, r.stdout[-400:])
+    # Not even the enclosing repo's own older shipped copy is replaced.
+    outer_js = os.path.join(outer, ".claude", "workflows", "factory-line.js")
+    os.makedirs(os.path.dirname(outer_js))
+    with open(outer_js, "wb") as fh:
+        fh.write(old)
+    r = run([SETUP, pkg])
+    check("workflow refresh: a package in an enclosing repo leaves the enclosing repo's factory-line.js alone",
+          r.returncode == 0 and open(outer_js, "rb").read() == old and open(pkg_js, "rb").read() == old, r.stdout[-400:])
+    # --line-js-only replaces a shipped copy but never creates one.
+    lone = new_project("line-js-only-missing")
+    r = run([FACTORY, "init", lone, "--line-js-only"], timeout=120)
+    check("workflow refresh: init --line-js-only never creates a missing factory-line.js",
+          r.returncode == 0 and not os.path.lexists(os.path.join(lone, ".claude", "workflows", "factory-line.js"))
+          and not os.path.lexists(os.path.join(lone, "factory")), tail(r))
+    # Without factory/line.json nothing is created under the marker.
+    bare = new_project("optout-noscaffold")
+    run([SETUP, bare, "--no-factory"])
+    run([SETUP, bare])
+    check("workflow refresh: no factory-line.js appears in an opted-out project with no scaffold",
+          not os.path.lexists(os.path.join(bare, ".claude", "workflows", "factory-line.js")))
+    # A linked worktree under the main checkout's marker refreshes the main checkout's copy.
+    main_ = new_project("optout-refresh-main")
+    commit_empty(main_)
+    run([SETUP, main_])
+    run([SETUP, main_, "--no-factory"])
+    main_js = os.path.join(main_, ".claude", "workflows", "factory-line.js")
+    with open(main_js, "wb") as fh:
+        fh.write(old)
+    wt = os.path.join(BASE, "optout-refresh-wt")
+    run(["git", "-C", main_, "worktree", "add", "-q", "-b", "side", wt])
+    r = run([SETUP, wt])
+    check("workflow refresh: a linked worktree rerun refreshes the main checkout's factory-line.js",
+          r.returncode == 0 and "exists in the main checkout" in r.stdout and open(main_js, "rb").read() == cur,
+          r.stdout[-400:])
+
+
 def test_init_alone():
     if shutil.which("git") is None or not os.access(FACTORY, os.X_OK):
         return
@@ -407,7 +519,7 @@ def test_init_alone():
 
 def main():
     try:
-        for fn in (test_syntax_and_usage, test_rollout, test_default_on, test_opt_out, test_marker_symlinks, test_safe_skips, test_enclosing_repo, test_init_alone):
+        for fn in (test_syntax_and_usage, test_rollout, test_default_on, test_opt_out, test_marker_symlinks, test_safe_skips, test_enclosing_repo, test_opt_out_keeps_workflow_fresh, test_init_alone):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001

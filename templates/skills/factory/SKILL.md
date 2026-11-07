@@ -109,17 +109,23 @@ Run from the main checkout's session (the workflow's agents work in the lane by 
    and commits, the branch, and the human's next commands. Per-scenario verdicts go out as
    S-numbers with satisfied or not, never their reasons. Every station verdict, "tests
    passed" included, is a model's report that no code checked; say so.
-   - `blocked` for infra (an API error or a skipped station): rerun (it continues from the
+   - `blocked` for infra (an API error, a skipped station, or verify's own git failing with no
+     lane code run and no lane report): rerun (it continues from the
      lane's commits), or, in this same session, resume the workflow run with `resumeFromRunId`
      to reuse the stations that finished; a new session cannot resume it. Do not suggest
      sharpening the spec.
    - `needs-scenarios` (the order is at the merge gate, but the holdout was empty or the line
      has no verify station): tell the human no hidden scenario checked this change.
-   - `needs-human-check` (verify had no working bwrap sandbox, so it ran none of the lane's
-     code and judged by reading it): tell the human the verdicts are static and they should
-     run the change themselves before merging.
-   - `blocked` for `lane-tampered` (the lane worktree changed while verify ran lane code):
+   - `needs-human-check` (verify could not run the lane's code in its bwrap sandbox, for all
+     scenarios or for some of them, and judged those by reading it): tell the human the
+     verdicts are static and they should run the change themselves before merging.
+   - `blocked` for `lane-tampered` (a real HEAD or status change in the lane worktree, or an
+     unconfirmed copy removal after verify ran lane code; never a missing report after a git failure):
      tell the human to inspect the lane first and rewrite the scenarios before any rerun.
+   - `blocked` for `needs-deletion` (the build needs a file removed, and bash-guard asks a human
+     for every deletion): name the paths, tell the human to check the removal, run
+     `git -C <lane> rm -- <path>` and commit it in the lane themselves, then rerun. Never delete it
+     for them unasked, and never route around the guard.
    - "the spec changed since approval": the order body, its line or the threshold differs from
      what the human approved; the human re-reads it and runs `cc-factory approve ID` again.
 

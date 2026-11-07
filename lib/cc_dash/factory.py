@@ -134,6 +134,7 @@ _ORDER_FILE_RE = re.compile("FO-([0-9]{1,6})(-[^/\x00-\x1f\x7f-\x9f]*)?\\.md")
 _LEDGER_ORDER_RE = re.compile(r"FO-[0-9]{3,6}")
 _ID_IN_RE = re.compile(r"(?:[Ff][Oo]-)?([0-9]{1,12})")
 _STATION_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+_STATION_KINDS = ("plan", "build", "test", "verify", "review")   # the stations factory-line.js runs (its KNOWN)
 _LINE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}")
 _SHA_RE = re.compile(r"[0-9a-fA-F]{4,64}")
@@ -387,18 +388,24 @@ def main_checkout(root):
 
 # ── The line (factory/line.json) ──────────────────────────────────────────────
 def _norm_station(raw, seen):
+    """One station, or None when factory-line.js would skip it: a bad name, or no kind (plan, build, test,
+    verify, review; a holdout:true station of another name is the verify) or a kind the line already has."""
     if not isinstance(raw, dict):
         return None
     name = raw.get("name")
-    if not isinstance(name, str) or not _STATION_RE.fullmatch(name) or name in seen:
+    if not isinstance(name, str) or not _STATION_RE.fullmatch(name):
         return None
+    kind = name if name in _STATION_KINDS else "verify" if raw.get("holdout") is True else ""
+    if not kind or kind in seen:
+        return None
+    seen.add(kind)
     title = raw.get("title")
     title = _one_line(title, _STATION_TITLE_MAX) if isinstance(title, str) else ""
     model = raw.get("model")
     st = {"name": name,
           "title": title or name.capitalize(),
           "model": model if isinstance(model, str) and _MODEL_RE.fullmatch(model) else "",
-          "holdout": raw.get("holdout") is True}
+          "holdout": kind == "verify" and raw.get("holdout") is True}
     effort = raw.get("effort")
     if isinstance(effort, str) and effort in EFFORTS:
         st["effort"] = effort
@@ -413,7 +420,6 @@ def _norm_line(raw):
     for s in raw["stations"]:
         st = _norm_station(s, seen)
         if st is not None:
-            seen.add(st["name"])
             stations.append(st)
             if len(stations) == _MAX_STATIONS:
                 break
@@ -985,13 +991,14 @@ def _fold(order, events, line):
     status = fm if fm in SEED_STATUSES else "queued"  # a gate status only ever comes from the ledger
     run_id, lane, rework = "", None, 0
     fail_seen, last_station, last_gate = False, "", None
+    status_ev = None   # the event that set the current status: its note says why an order went off its path
 
     for e in evs:
         if e.get("run_id"):
             run_id = e["run_id"]
         s = e.get("status")
         if isinstance(s, str) and s in ALL_STATUSES:
-            status = s
+            status, status_ev = s, e
         kind, t = e.get("event"), e.get("t")
         if kind == "lane" and (e.get("branch") or e.get("worktree")):
             lane = {"branch": e.get("branch") or "", "worktree": e.get("worktree") or ""}
@@ -1072,7 +1079,17 @@ def _fold(order, events, line):
         "rework": rework,
         "events": len(evs),
         "line": order.get("line") or "default",
+        "why": _why(status_ev) if status in OFF_PATH else None,
     }
+
+
+def _why(e):
+    """{note, recommendation} of the event that set an off-path status, each "" when absent or invalid."""
+    e = e or {}
+    note = e.get("note")
+    rec = e.get("recommendation")
+    return {"note": clip(note, NOTE_MAX).strip() if isinstance(note, str) else "",
+            "recommendation": rec if rec in RECOMMENDATIONS else ""}
 
 
 def fold(order, events, line, now=None):
@@ -1085,7 +1102,8 @@ def fold(order, events, line, now=None):
     `fail` preceded, unless that fail's cause was infra), `done` skips what
     never ran, a human gate is waiting at
     status "spec" (line gates.spec == "human") or at "review" with no active
-    station. `now` is accepted for the caller's convenience and unused: the
+    station. `why` is the note and recommendation of the event that set an
+    OFF_PATH status, and None on the path. `now` is accepted for the caller's convenience and unused: the
     fold is a pure function of its inputs. The inputs are not modified."""
     try:
         return _fold(order, events, line)
@@ -1095,7 +1113,7 @@ def fold(order, events, line, now=None):
         return {"id": oid, "title": oid, "priority": "p2", "status": "queued", "path": "",
                 "created": None, "updated": None, "station": "",
                 "stations": [{"name": n, "title": ti, "status": "pending", "t": None} for n, ti in sts],
-                "gate": None, "lane": None, "run_id": "", "rework": 0, "events": 0, "line": "default"}
+                "gate": None, "lane": None, "run_id": "", "rework": 0, "events": 0, "line": "default", "why": None}
 
 
 def project_orders(root, now):

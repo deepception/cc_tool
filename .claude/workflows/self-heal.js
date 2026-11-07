@@ -674,7 +674,7 @@ const stagePropose = async (s) => {
   let retry = ''
   for (let attempt = 1; attempt <= 2; attempt++) {
     const r = await call('propose', `${c.key}${attempt > 1 ? ' retry' : ''}`, proposePrompt(c, s.rc, retry), PROPOSE_SCHEMA, 'Propose')
-    if (!r) { log(`propose ${c.key}: no result`); return finish(s, 'dropped', 'not proposed: the propose agent returned no result') }
+    if (!r) { log(`propose ${c.key}: no result`); return { ...finish(s, 'dropped', 'not proposed: the propose agent returned no result'), noResult: true } }
     if (r.change !== true) {
       log(`propose ${c.key}: no change`)
       return finish(s, 'dropped', `no change proposed: ${one(r.no_change_reason, 260) || 'the harness already covers it'}`)
@@ -698,7 +698,7 @@ const stageCheck = async (s) => {
   if (!s || s.done) return s
   const c = s.c, p = s.prop
   const v = await call('check', c.key, checkPrompt(c, p), CHECK_SCHEMA, 'Check')
-  if (!v) { log(`check ${c.key}: no result; dropped unverified`); return finish(s, 'dropped', 'not verified: the check agent returned no result') }
+  if (!v) { log(`check ${c.key}: no result; dropped unverified`); return { ...finish(s, 'dropped', 'not verified: the check agent returned no result'), noResult: true } }
   const why = one(v.reason, 240) || one(v.note, 240)
   const fails = [
     v.applies_cleanly !== true ? 'does not apply to the snapshot' : '',
@@ -733,14 +733,17 @@ const states = selected.map((c, i) => outcomes[i] || { c, done: true, outcome: '
 // ---- assemble: dedup, size cap, order, names ----------------------------------------
 const dropped = []          // {title, reason} for proposals.json
 const kept = []
-let failedAnalyses = 0, noCause = 0
+let failedAnalyses = 0, noCause = 0, unfinished = 0
 for (const s of states) {
   if (s.outcome === 'failed') { failedAnalyses++; continue }
   if (s.outcome === 'no-cause') { noCause++; continue }
   COUNT.rootCauses++
+  if (s.noResult) unfinished++
   if (s.outcome === 'kept' && s.prop) kept.push(s)
   else dropped.push({ title: one(s.prop ? s.prop.title : s.c.name, LEN.title), reason: one(s.reason || 'dropped', LEN.reason) })
 }
+// An agent that returned nothing (usage limit, overload) leaves evidence unread: cc-dash must not close the window.
+const partial = failedAnalyses > 0 || unfinished > 0 || failedProjects.length > 0
 // Identical patches from two failure modes: keep the higher-ranked one.
 const byPatch = new Map()
 const unique = []
@@ -794,7 +797,7 @@ for (const [k, ids] of Object.entries(byTarget)) if (ids.length > 1) overlaps.pu
 
 const notesText = one([
   `Analysed ${okProjects.length} of ${PROJECTS.length} project(s): ${allClusters.length} failure-mode cluster(s), ${ranked.length} significant, ${noise.length} noise.`,
-  selected.length ? `Root-caused the top ${selected.length} (cap ${MAX_RC}): ${COUNT.rootCauses} had a harness cause, ${noCause} did not${failedAnalyses ? `, ${failedAnalyses} could not be analysed (no agent result)` : ''}.` : 'Nothing significant enough to root-cause.',
+  selected.length ? `Root-caused the top ${selected.length} (cap ${MAX_RC}): ${COUNT.rootCauses} had a harness cause, ${noCause} did not${failedAnalyses ? `, ${failedAnalyses} could not be analysed (no agent result)` : ''}${unfinished ? `, ${unfinished} had no propose or check agent result` : ''}.` : 'Nothing significant enough to root-cause.',
   `${proposals.length} proposal(s), ${dropped.length} dropped.`,
   notAnalysed.length ? `${notAnalysed.length} significant cluster(s) below the top ${MAX_RC} were not root-caused: ${notAnalysed.slice(0, 6).map((c) => `${c.slug}: ${one(c.name, 60)}`).join('; ')}${notAnalysed.length > 6 ? `; and ${notAnalysed.length - 6} more` : ''}.` : '',
   failedProjects.length ? `No classify result, so not analysed: ${failedProjects.join(', ')}.` : '',
@@ -804,6 +807,7 @@ const notesText = one([
 // ---- compose the files (the writer is a dumb pipe) -----------------------------------
 const doc = {
   version: 1, run_id: RUN_ID,
+  ...(partial ? { partial: true } : {}),
   proposals,
   dropped: dropped.map((d) => ({ title: one(d.title, LEN.title), reason: one(d.reason, LEN.reason) })),
   notes: notesText,
@@ -870,7 +874,7 @@ When done, return the absolute paths you wrote, and any path you could not write
 ${FILES.map((f, k) => `FILE ${k + 1}: ${f.abs} (${f.content.split('\n').length - 1} lines)\n=====SELFHEAL-${tag} BEGIN ${k + 1}=====\n${f.content}=====SELFHEAL-${tag} END ${k + 1}=====`).join('\n\n')}`
 
 COUNT.dropped = dropped.length
-const status = selected.length ? 'done' : 'empty'
+const status = partial ? 'partial' : selected.length ? 'done' : 'empty'
 log(`assemble: ${proposals.length} proposal(s) (high ${BY_SEV.high}, medium ${BY_SEV.medium}, low ${BY_SEV.low}), ${dropped.length} dropped; writing ${FILES.length} file(s)`)
 
 // ---- Write ------------------------------------------------------------------------------

@@ -187,6 +187,8 @@ def print_report(sh, rec):
         n = rec.get("proposals") or 0
         sev = ", ".join(f"{k} {by.get(k, 0)}" for k in SEV_ORDER)
         print(f"{head}: {n} proposal(s) ({sev}), cost {money(rec.get('cost_usd'))}")
+        if rec.get("partial"):
+            print(f"PARTIAL: {safe(rec.get('error'), 300)}")
     else:
         print(f"{head}: {safe(rec.get('error'), 300) or 'no reason recorded'}; cost {money(rec.get('cost_usd'))}",
               file=sys.stderr)
@@ -217,7 +219,7 @@ def print_report(sh, rec):
             print(f"  - {safe(d.get('title'), 120)}: {safe(d.get('reason'), 300)}")
     if props or dropped:
         print(f"\nreport: {safe(view.get('markdown_path'), 300)}")
-    if status == "done" and not props:
+    if status == "done" and not props and not rec.get("partial"):
         print("no proposals: nothing in the window called for a harness change.")
     print(f"cost: {money(rec.get('cost_usd'))}")
 
