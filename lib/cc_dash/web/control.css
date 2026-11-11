@@ -38,6 +38,17 @@
 }
 .ctl-guard b { display: block; color: var(--warn); font-weight: 600; margin-bottom: var(--sp-0h); }
 .ctl-guard p { margin: 0; overflow-wrap: anywhere; }
+/* 'Do this outside ccdash' (gates.js outsideBox): the guard note's frame with steps and a Copy control; not an error, so no --bad, and nothing animates in */
+.ctl-next { display: flex; flex-direction: column; gap: var(--sp-1h); }
+.ctl-next > b { margin-bottom: 0; }
+.ctl-next p { margin: 0; }
+.ctl-next-where { color: var(--ink-2); }
+.ctl-next-steps { margin: 0; padding-left: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-1); }
+.ctl-next-cmd { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1); min-width: 0; }
+.ctl-next .ctl-next-cmd code { display: block; margin: 0; max-width: 100%; white-space: pre-wrap; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; font-family: var(--mono); }
+.ctl-next-details summary { cursor: pointer; width: max-content; font-size: var(--fs-11); color: var(--ink-3); }
+.ctl-next-details .ctl-plan-text { max-height: 160px; font-size: var(--fs-11); }
+.ctl-next-slot:empty { display: none; }
 .ctl-guard code, .ctl-note code { font-size: var(--fs-11); background: var(--sunk); padding: 1px var(--sp-1); border-radius: var(--r-xs); overflow-wrap: anywhere; }
 .ctl-acts { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
 .ctl-acts .btn { height: var(--h-ctl-s); }

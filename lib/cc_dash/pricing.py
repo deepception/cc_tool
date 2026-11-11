@@ -63,6 +63,34 @@ def normalize(model: str) -> str:
     return m
 
 
+# Context-window sizes, in tokens. Source: the Claude Code CLI's own model registry, read from the installed
+# binary (checked at 2.1.319). Re-check after a CLI update (same source as templates/hooks/context-usage.py):
+#   grep -ao '{id:"claude-[a-z0-9-]*",family[^}]*}[^}]*context:{[^}]*}' ~/.local/share/claude/versions/<version>
+# The 1M-option row is 200K unless the 1M option is on, which a transcript's model id rarely shows: it counts
+# as 1M only with a `[1m]` suffix or an observed context above 200K, else the window is unknown.
+# claude-opus-4 and claude-sonnet-4 are what the dated 4.0 ids (claude-sonnet-4-20250514) normalize to.
+CONTEXT_1M = frozenset({
+    "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-opus-5-5", "claude-sonnet-5",
+    "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5", "claude-fable-5-1", "claude-mythos-5",
+    "claude-mythos-5-1"})
+CONTEXT_1M_OPTION = frozenset({
+    "claude-sonnet-4-0", "claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-opus-4-6"})
+CONTEXT_200K = frozenset({
+    "claude-opus-4-0", "claude-opus-4", "claude-opus-4-1", "claude-opus-4-5", "claude-haiku-4-5"})
+
+
+def context_window(model: str, context: int = 0) -> int | None:
+    """The model's context window in tokens, or None when it is unknown."""
+    m = normalize(model)
+    if m in CONTEXT_1M:
+        return 1_000_000
+    if m in CONTEXT_1M_OPTION:
+        return 1_000_000 if "[1m]" in (model or "").lower() or (context or 0) > 200_000 else None
+    if m in CONTEXT_200K:
+        return 200_000
+    return None
+
+
 def family(model: str) -> str:
     m = normalize(model)
     for f in ("opus", "sonnet", "haiku", "fable"):

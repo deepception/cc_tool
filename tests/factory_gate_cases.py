@@ -23,6 +23,7 @@ Part of tests/test_factory.py (python3 tests/test_factory.py gates runs only thi
 python3 tests/factory_gate_cases.py runs it standalone).
 """
 import json
+import math
 import os
 import re
 import select
@@ -130,7 +131,7 @@ def at_merge(repo, title, approve_cli):
 
 def test_agent_like():
     d = X.mkrepo()
-    G.plant_record(d, G.REPO)        # the real record for the real checkout: every real check gets its turn
+    G.plant_record(d, G.REPO, state=X.STATE)        # the real record for the real checkout: every real check gets its turn
     a = at_spec(d, "An agent wants this approved")
     n0 = len(X.events(d))
     forged = good(a, "spec", "approve", hash_of(d, a))
@@ -206,7 +207,7 @@ def test_agent_like():
 
 def test_good_ticket():
     d = X.mkrepo()
-    G.plant_record(d, os.path.dirname(os.path.dirname(GATE_CLI)))
+    G.plant_record(d, os.path.dirname(os.path.dirname(GATE_CLI)), state=X.STATE)
     a = at_spec(d, "Passed from the dashboard")
     h = hash_of(d, a)
     r, asked = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=good(a, "spec", "approve", h, note="scope is right"))
@@ -244,9 +245,55 @@ def test_good_ticket():
     check("ticket: reject at the merge gate drops it", r.returncode == 0 and X.order_of(d, m3)["status"] == "rejected" and len(X.events(d)) > n, (r.returncode, r.stderr))
 
 
+def test_new_states():
+    """The spec-gate ticket reaches orders that are not at a gate: re-approve a changed spec, drop a queued, approved, failed or blocked
+    order. The CLI needed no change, and the ticket's value is the current spec hash."""
+    d = X.mkrepo()
+    G.plant_record(d, os.path.dirname(os.path.dirname(GATE_CLI)), state=X.STATE)
+
+    def approved(title):
+        a = at_spec(d, title)
+        r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=good(a, "spec", "approve", hash_of(d, a), tid=os.urandom(16).hex()))
+        assert r.returncode == 0, r.stderr
+        return a
+
+    def edit(oid):
+        with open(X.F.find_order(d, oid), "a") as fh:
+            fh.write("\nAn edit after approval.\n")
+
+    for status in ("approved", "failed", "blocked"):
+        a = approved("Changed then %s" % status)
+        if status != "approved":
+            X.cli(d, "mark", a, status)
+        edit(a)
+        old = X.events(d, a)[-1].get("spec_hash")
+        new = hash_of(d, a)
+        r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=good(a, "spec", "approve", old or "0" * 64, tid=os.urandom(16).hex()))
+        check("re-approve %s: a ticket carrying the old hash is refused" % status, r.returncode != 0 and X.order_of(d, a)["status"] == status, (r.returncode, r.stderr))
+        tid = os.urandom(16).hex()
+        r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=good(a, "spec", "approve", new, tid=tid))
+        e = X.events(d, a)[-1]
+        check("re-approve %s: the current hash passes: approved, a pass event via dashboard with the ticket and the new hash" % status,
+              r.returncode == 0 and X.order_of(d, a)["status"] == "approved" and e.get("state") == "pass" and e.get("via") == "dashboard"
+              and e.get("ticket") == tid and e.get("spec_hash") == new, (r.returncode, r.stderr, e))
+    for label, make in (("queued", lambda: X.new_order(d, "Dropped queued")), ("approved", lambda: approved("Dropped approved")),
+                        ("failed", lambda: (lambda a: (X.cli(d, "mark", a, "failed"), a)[1])(approved("Dropped failed"))),
+                        ("blocked", lambda: (lambda a: (X.cli(d, "mark", a, "blocked"), a)[1])(approved("Dropped blocked")))):
+        a = make()
+        tid = os.urandom(16).hex()
+        r, _ = as_child(GATE_CLI, d, "reject", a, "--gate", "spec", answer=good(a, "spec", "reject", hash_of(d, a), tid=tid))
+        e = X.events(d, a)[-1]
+        check("drop %s: a reject ticket on the current hash rejects it, via dashboard with the ticket" % label,
+              r.returncode == 0 and X.order_of(d, a)["status"] == "rejected" and e.get("state") == "fail" and e.get("via") == "dashboard" and e.get("ticket") == tid,
+              (r.returncode, r.stderr, e))
+    import inspect
+    check("procs.dashboard_problem takes no terminals (the live check replaced the recorded list)",
+          "terminals" not in inspect.signature(G.load_procs().dashboard_problem).parameters)
+
+
 def test_bad_tickets():
     d = X.mkrepo()
-    G.plant_record(d, os.path.dirname(os.path.dirname(GATE_CLI)))
+    G.plant_record(d, os.path.dirname(os.path.dirname(GATE_CLI)), state=X.STATE)
     a = at_spec(d, "Forged tickets")
     other = at_spec(d, "Another order")
     h = hash_of(d, a)
@@ -303,7 +350,7 @@ def test_bad_tickets():
 def test_fail_closed():
     d = X.mkrepo()
     tree = os.path.dirname(os.path.dirname(GATE_CLI))
-    G.plant_record(d, tree)
+    G.plant_record(d, tree, state=X.STATE)
     a = at_spec(d, "Fail closed")
     h = hash_of(d, a)
     n0 = len(X.events(d))
@@ -312,48 +359,57 @@ def test_fail_closed():
                                  ("answers None", 'def dashboard_problem(*a, **k):\n    return None\n', "gave no answer"),
                                  ("raises", 'def dashboard_problem(*a, **k):\n    raise OSError("cannot look")\n', "could not be read")):
         cli = G.make_tree(X.BASE, "dash-" + label.split()[0], G.PASS_AS_DASHBOARD + "\n\n" + extra)   # code_after_start says '': only this rule is left
-        G.plant_record(d, os.path.dirname(os.path.dirname(cli)))
+        G.plant_record(d, os.path.dirname(os.path.dirname(cli)), state=X.STATE)
         r, asked = as_child(cli, d, "approve", a, "--gate", "spec", answer=ticket)
         check("fail closed: a dashboard check that %s refuses, and no ticket is asked for" % label, X.blocked(r) and needle in r.stderr and asked == [], (r.returncode, r.stderr))
     for rule in ("peer_holder_problem", "control_mode_problem"):
         cli = G.make_tree(X.BASE, "dash-" + rule, G.PASS_AS_DASHBOARD + '\n\ndef %s(*a, **k):\n    return None\n' % rule)
-        G.plant_record(d, os.path.dirname(os.path.dirname(cli)))
+        G.plant_record(d, os.path.dirname(os.path.dirname(cli)), state=X.STATE)
         r, asked = as_child(cli, d, "approve", a, "--gate", "spec", answer=ticket)
         check("fail closed: %s answering None refuses, and no ticket is asked for" % rule, X.blocked(r) and "gave no answer" in r.stderr and asked == [], (r.returncode, r.stderr))
     noproc = G.make_tree(X.BASE, "gate-noproc", G.PASS_AS_DASHBOARD + '\n\ndef have_proc():\n    return False\n')
-    G.plant_record(d, os.path.dirname(os.path.dirname(noproc)))
+    G.plant_record(d, os.path.dirname(os.path.dirname(noproc)), state=X.STATE)
     r, asked = as_child(noproc, d, "approve", a, "--gate", "spec", answer=ticket)
     check("no /proc: the dashboard path refuses like the terminal path, before any ticket", X.blocked(r) and "has no /proc" in r.stderr and "Linux only" in r.stderr and asked == [], (r.returncode, r.stderr))
     broken = G.make_tree(X.BASE, "gate-broken", "\nraise RuntimeError('broken on purpose')\n")
     r, _ = as_child(broken, d, "approve", a, "--gate", "spec", answer=ticket)
     check("fail closed: a cc_procs that cannot be loaded refuses", X.blocked(r) and "could not be loaded" in r.stderr, (r.returncode, r.stderr))
 
-    G.plant_record(d, tree)
+    G.plant_record(d, tree, state=X.STATE)
     man = os.path.join(d, ".claude", "hooks", "cc_dash_manifest.json")
-    saved = X.read(man)
+    rec = os.path.join(X.STATE, "cc_tool", "cc_dash_code.json")
+    saved = X.read(rec)
+    # The per-project manifest is no longer judged: its absence, or a stale one, refuses nothing by itself.
     os.unlink(man)
-    r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=ticket)
-    check("record: no manifest beside the hooks refuses", X.blocked(r) and "cc_dash_manifest.json" in r.stderr, (r.returncode, r.stderr))
-    os.symlink(os.path.join(X.BASE, "nowhere.json"), man)
-    r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=ticket)
-    check("record: a symlinked manifest refuses", X.blocked(r) and "cc_dash_manifest.json" in r.stderr, (r.returncode, r.stderr))
-    os.unlink(man)
-    X.write(man, saved)
-    os.chmod(man, 0o666)
-    r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=ticket)
-    check("record: a manifest others can write refuses", X.blocked(r) and "cc_dash_manifest.json" in r.stderr, (r.returncode, r.stderr))
+    r, asked = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=lambda _q: None)
+    check("record: no per-project manifest does not refuse by itself", "code record" not in r.stderr and "cc_dash_manifest" not in r.stderr, (r.returncode, r.stderr))
+    X.write(man, "{}")
     os.chmod(man, 0o644)
+    r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=lambda _q: None)
+    check("record: a stale per-project manifest does not refuse by itself", "code record" not in r.stderr and "cc_dash_manifest" not in r.stderr, (r.returncode, r.stderr))
+    os.unlink(rec)
+    r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=ticket)
+    check("record: no user-wide record refuses, and names the one command", X.blocked(r) and "code record" in r.stderr and "cc-dash --record-code" in r.stderr, (r.returncode, r.stderr))
+    os.symlink(os.path.join(X.BASE, "nowhere.json"), rec)
+    r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=ticket)
+    check("record: a symlinked record refuses", X.blocked(r) and "code record" in r.stderr, (r.returncode, r.stderr))
+    os.unlink(rec)
+    X.write(rec, saved)
+    os.chmod(rec, 0o666)
+    r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=ticket)
+    check("record: a record others can write refuses", X.blocked(r) and "code record" in r.stderr, (r.returncode, r.stderr))
+    os.chmod(rec, 0o600)
     pin = os.path.join(d, ".claude", "hooks", "cc_tool_root")
     os.chmod(pin, 0o644)
     X.write(pin, "/somewhere/else\n")
     r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=ticket)
     check("record: a project pinned to another checkout refuses", X.blocked(r) and "not set up from the cc_tool checkout" in r.stderr, (r.returncode, r.stderr))
-    G.plant_record(d, tree)
+    G.plant_record(d, tree, state=X.STATE)
     code = os.path.join(tree, "lib", "cc_dash", "gates.py")
     with open(code, "a", encoding="utf-8") as fh:
         fh.write("\n# changed after cc-setup ran\n")
     r, _ = as_child(GATE_CLI, d, "approve", a, "--gate", "spec", answer=ticket)
-    check("record: cc-dash's code changed since the record was made refuses", X.blocked(r) and "changed since cc-setup ran" in r.stderr, (r.returncode, r.stderr))
+    check("record: cc-dash's code changed since the record was made refuses", X.blocked(r) and "not the code you approved" in r.stderr, (r.returncode, r.stderr))
     check("fail closed: none of those wrote anything", len(X.events(d)) == n0 and X.order_of(d, a)["status"] == "spec", (len(X.events(d)), n0))
 
 
@@ -435,7 +491,7 @@ def on_terminal(shell, typed, env, report):
 def test_real_launch():
     d = X.mkrepo()
     cli = G.make_tree(X.BASE, "gate-launch", G.PASS_AS_CC_DASH)     # the parent's identity is taken as read; control mode and the socket are not
-    G.plant_record(d, os.path.dirname(os.path.dirname(cli)))
+    G.plant_record(d, os.path.dirname(os.path.dirname(cli)), state=X.STATE)
     for shell in [s for s in SHELLS if shutil.which(s)]:
         a = at_spec(d, "Approved from %s" % shell)
         _script, env, report = plant_stand_in(shell, d, cli, ["approve", a, "--gate", "spec"], good(a, "spec", "approve", hash_of(d, a), tid=os.urandom(16).hex())(None))
@@ -478,6 +534,209 @@ def test_terminal_unchanged():
           and "this cc-factory was not started from your own terminal" in r.stderr, (r.returncode, r.stderr))
 
 
+def dashboard_merge(tree, head, t0):
+    """The merge cc-dash runs: --no-ff, its time just before the merge, rounded up to the next whole second, as the committer time."""
+    t = math.ceil(t0)
+    if t - time.time() < 2:
+        time.sleep(max(0.0, t - time.time()))
+    env = dict(X.env_for(), GIT_COMMITTER_DATE="@%d +0000" % t)
+    r = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "-m", "merge", head],
+                       cwd=tree, env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+
+
+def test_merge_delta():
+    """FO-004: a merge the dashboard approved re-records cc-dash's code, exactly the reviewed commit's files, and nothing else.
+    The project is the cc_tool tree itself (a git repository), as when cc_tool is developed with the factory."""
+    import hashlib
+    cli = G.make_tree(X.BASE, "delta")
+    tree = os.path.dirname(os.path.dirname(cli))
+    X.git(tree, "init", "-q")
+    X.git(tree, "add", "-A")
+    X.git(tree, "commit", "-q", "-m", "tree")
+    r = X.cli(tree, "init")
+    assert r.returncode == 0, r.stderr
+    X.git(tree, "add", "-A", "--", "factory", ".gitignore")
+    X.git(tree, "commit", "-q", "--allow-empty", "-m", "factory", rc=None)
+    rec = os.path.join(X.STATE, "cc_tool", "cc_dash_code.json")
+    graph = os.path.join(tree, "lib", "cc_dash", "graph.py")
+
+    def sha(path):
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+
+    def recorded():
+        doc = json.loads(X.read(rec))
+        return doc["checkouts"][tree]["files"]["lib/cc_dash/graph.py"]
+
+    def lane_with_change(title):
+        """An order at the merge gate whose lane changes lib/cc_dash/graph.py (the record is current first)."""
+        G.plant_record(tree, tree, state=X.STATE)
+        oid = at_spec(tree, title)
+        r, _ = as_child(cli, tree, "approve", oid, "--gate", "spec", answer=good(oid, "spec", "approve", hash_of(tree, oid), tid=os.urandom(16).hex()))
+        assert r.returncode == 0, r.stderr
+        r = X.cli(tree, "lane", oid)
+        assert r.returncode == 0, r.stderr
+        wt = r.stdout.rstrip("\n").splitlines()[-1]
+        with open(os.path.join(wt, "lib", "cc_dash", "graph.py"), "a", encoding="utf-8") as fh:
+            fh.write("\n# %s\n" % title)
+        X.git(wt, "commit", "-q", "-am", "%s: change graph" % oid)
+        head = X.git(wt, "rev-parse", "HEAD").stdout.strip()
+        X.append(tree, oid, "status", status="review", lane_head=head, briefing="what the review said")
+        return oid, head
+
+    def approve(oid, head):
+        return as_child(cli, tree, "approve", oid, "--gate", "merge", answer=good(oid, "merge", "approve", head, tid=os.urandom(16).hex()))[0]
+
+    m, head = lane_with_change("clean merge")
+    X.git(tree, "merge", "-q", "--no-ff", "-m", "merge", head)
+    r = approve(m, head)
+    check("delta: a clean merge of a reviewed lane that changes cc-dash's code is approved and re-recorded",
+          r.returncode == 0 and "re-recorded" in r.stdout and X.order_of(tree, m)["status"] == "done" and recorded() == sha(graph), (r.returncode, r.stdout, r.stderr))
+    check("delta: the record is still a private file", (os.stat(rec).st_mode & 0o777) == 0o600, oct(os.stat(rec).st_mode))
+
+    m, head = lane_with_change("merge plus hand edit")
+    X.git(tree, "merge", "-q", "--no-ff", "-m", "merge", head)
+    before, n0 = X.read(rec), len(X.events(tree, m))
+    gates_py = os.path.join(tree, "lib", "cc_dash", "gates.py")
+    with open(gates_py, "a", encoding="utf-8") as fh:
+        fh.write("\n# a hand edit\n")
+    r = approve(m, head)
+    check("delta: the merge plus a hand edit of another file is refused, with no event and the record unchanged",
+          X.blocked(r) and "gates.py" in r.stderr and len(X.events(tree, m)) == n0 and X.read(rec) == before and X.order_of(tree, m)["status"] == "review",
+          (r.returncode, r.stderr))
+    X.git(tree, "checkout", "--", "lib/cc_dash/gates.py")
+
+    m, head = lane_with_change("evil merge")
+    X.git(tree, "merge", "-q", "--no-ff", "--no-commit", head)
+    with open(graph, "a", encoding="utf-8") as fh:
+        fh.write("\n# smuggled in by the merge commit\n")
+    X.git(tree, "commit", "-q", "-a", "-m", "merge")
+    before, n0 = X.read(rec), len(X.events(tree, m))
+    r = approve(m, head)
+    check("delta: a merge commit whose file differs from the reviewed commit is refused, nothing recorded",
+          X.blocked(r) and "graph.py" in r.stderr and len(X.events(tree, m)) == n0 and X.read(rec) == before, (r.returncode, r.stderr))
+
+    m, head = lane_with_change("revert outside the lane")
+    gates_py = os.path.join(tree, "lib", "cc_dash", "gates.py")
+    with open(gates_py, "a", encoding="utf-8") as fh:
+        fh.write("\n# a change on the branch, outside the lane\n")
+    X.git(tree, "commit", "-q", "-am", "main change")
+    G.plant_record(tree, tree, state=X.STATE)
+    base = X.git(tree, "merge-base", "HEAD", head).stdout.strip()
+    X.git(tree, "merge", "-q", "--no-ff", "--no-commit", head)
+    X.git(tree, "checkout", base, "--", "lib/cc_dash/gates.py")
+    X.git(tree, "commit", "-q", "-m", "merge that reverts a path the lane never touched")
+    before, n0 = X.read(rec), len(X.events(tree, m))
+    r = approve(m, head)
+    check("delta: a hand-made merge that reverts a path the lane never touched is not re-recorded: refused, no event, record unchanged",
+          X.blocked(r) and len(X.events(tree, m)) == n0 and X.read(rec) == before and X.order_of(tree, m)["status"] == "review",
+          (r.returncode, r.stderr))
+    procs = G.load_procs()
+    saved = os.environ.get("XDG_STATE_HOME")
+    os.environ["XDG_STATE_HOME"] = X.STATE
+    try:
+        record, why = procs.read_code_record(tree)
+        why = why or procs.manifest_problem(tree, record)
+    finally:
+        if saved is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = saved
+    check("delta: ... and the disk then differs from the record, which is what the dashboard's record-code box is built from",
+          bool(why) and "gates.py" in why, why)
+    X.git(tree, "reset", "-q", "--hard", "HEAD~1")
+    X.git(tree, "reset", "-q", "--hard", "HEAD~1")
+    G.plant_record(tree, tree, state=X.STATE)
+
+    m, head = lane_with_change("fast forward")
+    X.git(tree, "merge", "-q", "--ff-only", head)
+    before, n0 = X.read(rec), len(X.events(tree, m))
+    r = approve(m, head)
+    check("delta: a fast-forward (a git pull) is no merge of the reviewed head: no delta, refused, nothing recorded",
+          X.blocked(r) and "graph.py" in r.stderr and len(X.events(tree, m)) == n0 and X.read(rec) == before, (r.returncode, r.stderr))
+
+
+def test_merge_delta_real_ctime():
+    """FO-004: with the real code_after_start (only the process start time is supplied), a merge whose lane changes
+    bin/cc-factory and a templates/hooks file as well as lib/ is approved: the merge bumps the change time of bin,
+    templates/hooks and lib/cc_dash, and none of them may refuse the dashboard that merged."""
+    start_file = os.path.join(X.BASE, "real-start.txt")
+    extra = (G.PASS_AS_DASHBOARD.split("\n\ndef code_after_start")[0] + "\n\ndef control_mode_problem(pid, proc=\"/proc\"):\n    return \"\"\n"
+             "\n\ndef process_start(pid, proc=\"/proc\"):\n    return float(open(%r).read())\n" % start_file)
+    cli = G.make_tree(X.BASE, "realctime", extra=extra)
+    tree = os.path.dirname(os.path.dirname(cli))
+    X.git(tree, "init", "-q")
+    X.git(tree, "add", "-A")
+    X.git(tree, "commit", "-q", "-m", "tree")
+    assert X.cli(tree, "init").returncode == 0
+    X.git(tree, "add", "-A", "--", "factory", ".gitignore")
+    X.git(tree, "commit", "-q", "--allow-empty", "-m", "factory", rc=None)
+    G.plant_record(tree, tree, state=X.STATE)
+    time.sleep(1.4)
+    with open(start_file, "w") as fh:
+        fh.write(repr(time.time()))
+    oid = at_spec(tree, "real ctime")
+    r, _ = as_child(cli, tree, "approve", oid, "--gate", "spec", answer=good(oid, "spec", "approve", hash_of(tree, oid), tid=os.urandom(16).hex()))
+    assert r.returncode == 0, r.stderr
+    r = X.cli(tree, "lane", oid)
+    assert r.returncode == 0, r.stderr
+    wt = r.stdout.rstrip("\n").splitlines()[-1]
+    for rel in ("lib/cc_dash/graph.py", "bin/cc-factory", "templates/hooks/other-hook.py"):
+        with open(os.path.join(wt, rel), "a", encoding="utf-8") as fh:
+            fh.write("\n# real ctime\n")
+    X.git(wt, "add", "-A")
+    X.git(wt, "commit", "-q", "-m", "%s: change three directories" % oid)
+    head = X.git(wt, "rev-parse", "HEAD").stdout.strip()
+    X.append(tree, oid, "status", status="review", lane_head=head, briefing="what the review said")
+    time.sleep(1.4)
+    with open(start_file, "w") as fh:
+        fh.write(repr(time.time()))
+    dashboard_merge(tree, head, time.time())     # as cc-dash does: its time just before the merge is the merge commit's time
+    r = as_child(cli, tree, "approve", oid, "--gate", "merge", answer=good(oid, "merge", "approve", head, tid=os.urandom(16).hex()))[0]
+    check("delta real ctime: a merge touching bin, templates/hooks and lib is approved by the real code_after_start",
+          r.returncode == 0 and "re-recorded" in r.stdout and X.order_of(tree, oid)["status"] == "done", (r.returncode, r.stdout, r.stderr))
+    # A change made after the dashboard started, outside the merge, is still caught by the same check.
+    time.sleep(0.2)
+    with open(os.path.join(tree, "lib", "cc_dash", "gates.py"), "a", encoding="utf-8") as fh:
+        fh.write("\n# hand edit after start\n")
+    procs = G.load_procs()
+    why = procs.code_after_start(os.getpid(), tree, os.path.join(X.STATE, "cc_tool", procs.CODE_RECORD_NAME), start=float(open(start_file).read()))
+    check("delta real ctime: the same check still sees a hand edit made after start", "gates.py" in why, why)
+    X.git(tree, "checkout", "--", "lib/cc_dash/gates.py")
+    # The exemption is bounded: a merge whose commit time is later than the changes it made exempts nothing.
+    G.plant_record(tree, tree, state=X.STATE)
+    time.sleep(1.4)
+    with open(start_file, "w") as fh:
+        fh.write(repr(time.time()))
+    oid2 = at_spec(tree, "bounded exemption")
+    r, _ = as_child(cli, tree, "approve", oid2, "--gate", "spec", answer=good(oid2, "spec", "approve", hash_of(tree, oid2), tid=os.urandom(16).hex()))
+    assert r.returncode == 0, r.stderr
+    r = X.cli(tree, "lane", oid2)
+    wt2 = r.stdout.rstrip("\n").splitlines()[-1]
+    with open(os.path.join(wt2, "lib", "cc_dash", "graph.py"), "a", encoding="utf-8") as fh:
+        fh.write("\n# bounded\n")
+    X.git(wt2, "commit", "-q", "-am", "%s: change graph" % oid2)
+    head2 = X.git(wt2, "rev-parse", "HEAD").stdout.strip()
+    X.append(tree, oid2, "status", status="review", lane_head=head2, briefing="what the review said")
+    dashboard_merge(tree, head2, time.time() + 3600)
+    n0 = len(X.events(tree, oid2))
+    r = as_child(cli, tree, "approve", oid2, "--gate", "merge", answer=good(oid2, "merge", "approve", head2, tid=os.urandom(16).hex()))[0]
+    check("delta real ctime: a change made before the merge's recorded time is not exempt: refused, no event",
+          X.blocked(r) and len(X.events(tree, oid2)) == n0, (r.returncode, r.stdout, r.stderr))
+    why = procs.code_after_start(os.getpid(), tree, os.path.join(X.STATE, "cc_tool", procs.CODE_RECORD_NAME), start=float(open(start_file).read()),
+                                 exempt=("lib/cc_dash/graph.py",), exempt_since=time.time() + 3600)
+    check("delta real ctime: code_after_start with exempt_since after the change refuses it", "graph.py" in why, why)
+    ctime = os.stat(os.path.join(tree, "lib", "cc_dash", "graph.py")).st_ctime_ns / 1e9  # code_after_start's own expression
+    why = procs.code_after_start(os.getpid(), tree, os.path.join(X.STATE, "cc_tool", procs.CODE_RECORD_NAME), start=float(open(start_file).read()),
+                                 exempt=("lib/cc_dash/graph.py",), exempt_since=ctime)
+    check("delta real ctime: ... and with exempt_since no later than the change, that path passes (others still count)",
+          "graph.py" not in why, why)
+    why = procs.code_after_start(os.getpid(), tree, os.path.join(X.STATE, "cc_tool", procs.CODE_RECORD_NAME), start=float(open(start_file).read()),
+                                 exempt=("lib/cc_dash/graph.py",))
+    check("delta real ctime: exempt entries with no exempt_since skip nothing (fail closed)", "graph.py" in why or "lib" in why, why)
+
+
 GATE_CLI = None
 
 
@@ -486,7 +745,7 @@ def main():
     try:
         X.make_trees()
         GATE_CLI = G.make_tree(X.BASE)
-        for fn in (test_agent_like, test_good_ticket, test_bad_tickets, test_fail_closed, test_real_launch, test_terminal_unchanged):
+        for fn in (test_agent_like, test_good_ticket, test_new_states, test_bad_tickets, test_fail_closed, test_merge_delta, test_merge_delta_real_ctime, test_real_launch, test_terminal_unchanged):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001

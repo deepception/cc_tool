@@ -15,6 +15,7 @@ outside the temp dir is read for state or written) and a fixed clock:
   gamma    a session from 3 h ago (in the window, not live) and one queued order.
   delta    a session from 3 h ago and no orders: a hub only with all_projects.
   epsilon  a session from 2 h ago, off the board, with an open hook alert.
+  (test_context uses a world of its own: context and context_window on session and agent nodes.)
 
 lib/cc_dash/factory.py is replaced by a stub (project_orders per project root,
 a mode that raises, a "module missing" mode), so the order half of the graph is
@@ -427,6 +428,7 @@ GUARD = {"deny": is_int, "ask": is_int, "warn": is_int}
 BURN = {"cost_min": is_num, "tok_min": is_int, "new_min": is_int, "out_min": is_int, "unpriced_min": is_int}
 CORE = {"id": is_str, "kind": is_str, "label": is_str, "parent": opt(is_str), "state": is_str, "needs": opt(is_str)}
 LIVE = {"model": is_str, "family": is_str, "effort": is_str, "effort_source": is_str, "cost": is_num, "tokens": is_int,
+        "context": is_int, "context_window": opt(is_int),
         "burn": sub(BURN), "errors": is_int, "tool": opt(is_str), "target": is_str, "last_text": is_str,
         "since": is_num, "start": is_num, "age": is_num, "spark": lambda x: isinstance(x, list) and len(x) == 15 and all(is_int(i) for i in x)}
 PROJECT = {**CORE, "cost": is_num, "tokens": is_int, "detail": sub({
@@ -452,7 +454,8 @@ ORDER = {**CORE, "detail": sub({
     "updated": opt(is_num), "station": is_str,
     "stations": lst(sub({"name": is_str, "title": is_str, "status": is_str, "t": opt(is_num)})),
     "gate": opt(sub({"name": is_str, "waiting": is_bool})), "lane": opt(sub({"branch": is_str, "worktree": is_str})),
-    "run_id": is_str, "rework": is_int, "events": is_int})}
+    "run_id": is_str, "rework": is_int, "events": is_int, "spec_changed": is_bool, "main": is_str,
+    "decide": opt(sub({"kind": is_str, "gate": is_str, "approve": is_bool, "reject": is_bool, "rework": is_bool}))})}
 SCHEMAS = {"project": PROJECT, "session": SESSION, "agent": AGENT, "workflow": WORKFLOW, "order": ORDER}
 BOARD = ("tool", "generating", "waiting", "idle", "done", "failed", "stalled")
 RUNNING = ("tool", "generating", "waiting")
@@ -1054,6 +1057,62 @@ def test_orders(st):
     check("orders: ORDERS_TTL caches a project's orders (60 s keeps the old answer, 0 reads the new)", (cached, fresh) == ("queued", "spec"), (cached, fresh))
 
 
+def dec(kind, **kw):
+    d = {"kind": kind, "gate": "merge" if kind == "merge" else "spec", "approve": kind in ("spec", "merge", "changed"),
+         "reject": True, "rework": kind == "merge"}
+    d.update(kw)
+    return d
+
+
+def test_order_needs(st):
+    """Orders that need a human: needs on the node, the Needs you count, the hub, an alert each, sanitised decide, main."""
+    graph.ORDERS_TTL = 0
+    table = [("FO-011", "spec", {"name": "spec", "waiting": True}, False, dec("spec"), "Spec gate"),
+             ("FO-012", "review", {"name": "merge", "waiting": True}, False, dec("merge"), "Merge gate"),
+             ("FO-013", "approved", None, True, dec("changed"), "Spec changed"),
+             ("FO-014", "failed", None, False, dec("drop"), "Failed"),
+             ("FO-015", "blocked", None, False, dec("drop"), "Blocked")]
+    quiet = [("FO-016", "queued", None, False, dec("drop")), ("FO-017", "approved", None, False, dec("drop")),
+             ("FO-018", "building", None, False, None), ("FO-019", "verifying", None, False, None), ("FO-020", "done", None, False, None)]
+    before = poll(st)
+    base_needs = before["kpis"]["needs"]
+    STUB["orders"][GAMMA] = [mk_order(o, "Order " + o, status, gate=g, spec_changed=ch, decide=d) for o, status, g, ch, d, _t in table] + \
+        [mk_order(o, "Order " + o, status, gate=g, spec_changed=ch, decide=d) for o, status, g, ch, d in quiet]
+    try:
+        p = poll(st)
+        nodes = by_id(p)
+        for o, status, _g, _ch, _d, title in table:
+            n = nodes[on("gamma", o)]
+            check("needs: %s (%s) gives its order node needs 'gate'" % (o, status), n["needs"] == "gate", n["needs"])
+        for o, status, *_ in quiet:
+            check("needs: %s (%s) gives its order node no needs" % (o, status), nodes[on("gamma", o)]["needs"] is None, nodes[on("gamma", o)]["needs"])
+        check("needs: Needs you counts those five orders", p["kpis"]["needs"] == base_needs + 5, (p["kpis"]["needs"], base_needs))
+        check("needs: their project hub shows needs", nodes["p:gamma"]["needs"] == "gate" and nodes["p:gamma"]["state"] == "needs", nodes["p:gamma"])
+        al = [a for a in p["alerts"] if a["kind"] == "gate"]
+        check("needs: one alert per order that needs you, on its node, with a title per reason",
+              sorted(a["node"] for a in al) == sorted(on("gamma", t[0]) for t in table)
+              and {a["node"]: a["title"] for a in al} == {on("gamma", t[0]): t[5] for t in table}, al)
+        check("needs: the alert ids are stable and unique and its text carries the order id and title",
+              len({a["id"] for a in al}) == 5 and all(a["id"] == next(x for x in poll(st)["alerts"] if x["node"] == a["node"])["id"] for a in al)
+              and all("Order FO-0" in a["message"] for a in al), al)
+        d = nodes[on("gamma", "FO-013")]["detail"]
+        check("needs: the order carries spec_changed, decide and main", d["spec_changed"] is True and d["decide"]["kind"] == "changed"
+              and nodes[on("gamma", "FO-016")]["detail"]["spec_changed"] is False and is_str(d["main"]) and d["main"] != "", d)
+        sig1 = p["sig"]
+        STUB["orders"][GAMMA][5]["decide"] = None
+        check("needs: the signature changes when an order stops needing you", poll(st)["sig"] != sig1)
+        test_integrity(p, " (order needs)")
+        STUB["orders"][GAMMA][0]["decide"] = {"kind": "evil", "gate": "spec", "approve": True, "reject": True, "rework": False, "extra": "x"}
+        nodes = by_id(poll(st))
+        check("needs: a decide with an unknown kind is dropped, and so are unknown keys",
+              nodes[on("gamma", "FO-011")]["detail"]["decide"] is None, nodes[on("gamma", "FO-011")]["detail"]["decide"])
+        STUB["orders"][GAMMA][1]["decide"] = dict(dec("merge"), extra="x", approve=1)
+        d = by_id(poll(st))[on("gamma", "FO-012")]["detail"]["decide"]
+        check("needs: decide keeps only its own keys, as booleans", set(d) == {"kind", "gate", "approve", "reject", "rework"} and d["approve"] is True, d)
+    finally:
+        set_orders()
+
+
 # ── 8. scope ─────────────────────────────────────────────────────────────────
 def test_scope(st):
     p = poll(st, project="alpha")
@@ -1438,6 +1497,64 @@ def test_series():
           (a5["start"], a5["agents"], a4["agents"]))
 
 
+CCFG = os.path.join(BASE, "claude-ctx")          # its own config root: one session, KX, in project cx
+C_NOW = [float(T)]
+IDKX = "c1c1c1c1-0000-0000-0000-0000000000c1"
+
+
+def test_context():
+    """Session and agent nodes carry context (the latest call's prompt tokens) and context_window (from the raw model id)."""
+    for d in ("projects", "sessions"):
+        os.makedirs(os.path.join(CCFG, d), exist_ok=True)
+    os.chmod(os.path.join(CCFG, "sessions"), 0o700)
+    now = C_NOW[0]
+
+    def reply(w, t, mid, model, inp, cread, agent=None):
+        return w.rec("assistant", t, agent, message={"id": mid, "model": model, "role": "assistant", "stop_reason": "end_turn",
+                                                     "content": [{"type": "text", "text": "ok"}],
+                                                     "usage": {"input_tokens": inp, "output_tokens": 5, "cache_read_input_tokens": cread}})
+    W = World("cx", IDKX, cfg=CCFG)
+    kinds = [("big", "claude-sonnet-4-6", 412_000), ("mid", "claude-sonnet-4-6", 150_000),
+             ("hk", "claude-haiku-4-5-20251001", 180_000), ("old", "claude-3-5-haiku-20241022", 5_000)]
+    main = [W.prompt(now - 60, "Go")]
+    for k, _, _ in kinds + [("none", "", 0)]:
+        main.append(W.tool(now - 50, "tu_" + k, "Agent", {"description": k, "subagent_type": "Explore", "prompt": k}))
+    main.append(reply(W, now - 5, "kx_main", "claude-opus-5-5", 10, 819_990))
+    W.write_main(main)
+    for k, model, ctx in kinds:
+        W.write_sub(k, [W.prompt(now - 40, k, agent=k), reply(W, now - 30, "kx_" + k, model, 10, ctx - 10, agent=k)],
+                    meta={"agentType": "Explore", "description": k, "toolUseId": "tu_" + k})
+    W.write_sub("none", [W.prompt(now - 40, "none", agent="none")],
+                meta={"agentType": "Explore", "description": "none", "toolUseId": "tu_none"})
+    st = Store(root=CCFG, days=1, clock=lambda: C_NOW[0])
+    st.refresh(force=True)
+    p = poll(st)
+    nodes = by_id(p)
+    sx = nodes.get(sn(IDKX))
+    check("context: the session takes its main thread's figures",
+          sx is not None and sx["context"] == 820_000 and sx["context_window"] == 1_000_000, sx and (sx["context"], sx["context_window"]))
+    rows = {r["key"]: r for r in st._board(now)["agents"]}
+    check("context: the session node equals its board row, not a sum over its rows",
+          rows[IDKX]["context"] == 820_000 and rows[IDKX]["context_window"] == 1_000_000)
+    want = {"big": (412_000, 1_000_000), "mid": (150_000, None), "hk": (180_000, 200_000), "old": (5_000, None), "none": (0, None)}
+    got = {k: (nodes[an(IDKX, k)]["context"], nodes[an(IDKX, k)]["context_window"]) if an(IDKX, k) in nodes else None for k in want}
+    check("context: agents carry their own context and window", got == want, got)
+    try:
+        json.dumps(p, allow_nan=False)
+        clean = True
+    except ValueError:
+        clean = False
+    check("context: the payload is JSON-clean", clean)
+
+
+def test_context_off_board(st, p):
+    so = by_id(p).get(sn(IDO))
+    acc = st.sessions[IDO].acc
+    check("context: an off-board session falls back to its accumulator",
+          so is not None and so["context"] == acc.context == 10 and so["context_window"] == 1_000_000,
+          so and (so["context"], so["context_window"], acc.context))
+
+
 def test_series_memory():
     """The minute buckets stay bounded on a long transcript, refuse what they pruned, and never go negative."""
     from cc_dash import parser as pm
@@ -1718,6 +1835,7 @@ def main():
             run(test_alerts, p)
         run(test_board, st)
         run(test_orders, st)
+        run(test_order_needs, st)
         run(test_scope, st)
         run(test_http, st)
         run(test_sig)
@@ -1725,6 +1843,9 @@ def main():
         run(test_rerun_link)
         run(test_series)
         run(test_series_memory)
+        run(test_context)
+        if p is not None:
+            run(test_context_off_board, st, p)
         run(test_usage_limits)
         run(test_latency)
         run(test_real_factory)

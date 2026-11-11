@@ -30,7 +30,9 @@ project=<label> keeps that project alone. A terminal order (done, rejected; a fa
 ORDER_LINGER_SECS after its last ledger event, always with all_projects.
 
 Session nodes carry the main thread's live fields (state, tool, last text) and the whole session's
-cost, tokens, errors, burn and spark (summed over its board rows). kpis.cost_window, guard and errors
+cost, tokens, errors, burn and spark (summed over its board rows). Session and agent nodes carry `context`
+(the latest call's prompt tokens: the main thread's for a session, the accumulator's off the board) and
+`context_window` (pricing.context_window from the raw model id, null when unknown). kpis.cost_window, guard and errors
 cover the window in scope (every project, or the filtered one) whatever all_projects says; the rest
 count the floor. `sig` hashes everything but `now`, with each clock-derived age (node age, agent
 stalled_for, alert age) replaced by the time it counts from: it holds still between polls while
@@ -85,6 +87,7 @@ _ORDER_LABEL = re.compile(r"^(FO-\d{1,9}):([A-Za-z0-9_.-]{1,40})")
 _WF_DONE = {"completed", "complete", "done", "success", "succeeded"}
 _WF_FAILED = {"failed", "error", "errored", "killed", "cancelled", "canceled", "aborted", "timeout"}
 _BURN = ("cost_min", "tok_min", "new_min", "out_min", "unpriced_min")
+DECIDE_KINDS = ("spec", "merge", "changed", "drop")
 _ALERT_RANK = {k: i for i, k in enumerate(attention.BLOCKING)}
 
 
@@ -158,6 +161,15 @@ def _factory():
     return factory
 
 
+def _outside(o):
+    """The "Do this outside ccdash" box for a stuck order (gates.order_outside), or None; never raises."""
+    try:
+        from . import gates
+        return gates.order_outside(o)
+    except Exception:  # noqa: BLE001 - a broken builder must not take the floor down
+        return None
+
+
 def _order(o):
     """One §5.5 order dict, re-shaped with every field typed and clipped; None when it has no valid id."""
     if not isinstance(o, dict) or not isinstance(o.get("id"), str) or not _ORDER_ID.match(o["id"]):
@@ -168,7 +180,9 @@ def _order(o):
             stations.append({"name": clip(st["name"], 40), "title": _text(st.get("title"), 80) or clip(st["name"], 80),
                              "status": st.get("status") if st.get("status") in STATION_STATUSES else "pending",
                              "t": _num(st.get("t"))})
-    g, ln, w = o.get("gate"), o.get("lane"), o.get("why")
+    g, ln, w, dc = o.get("gate"), o.get("lane"), o.get("why"), o.get("decide")
+    if not (isinstance(dc, dict) and dc.get("kind") in DECIDE_KINDS and dc.get("gate") in ("spec", "merge")):
+        dc = None
     return {"id": o["id"], "title": _text(o.get("title"), 200), "priority": _text(o.get("priority"), 8),
             "status": o.get("status") if o.get("status") in ORDER_STATUSES else "queued",
             "path": _text(o.get("path"), 300), "created": _num(o.get("created")), "updated": _num(o.get("updated")),
@@ -178,7 +192,9 @@ def _order(o):
                      "worktree": clip(tilde(ln.get("worktree")), 300) if isinstance(ln.get("worktree"), str) else ""}
             if isinstance(ln, dict) else None,
             "run_id": _text(o.get("run_id"), 100), "rework": _int(o.get("rework")), "events": _int(o.get("events")),
-            "line": _text(o.get("line"), 40),
+            "line": _text(o.get("line"), 40), "spec_changed": bool(o.get("spec_changed")),
+            "decide": {"kind": dc["kind"], "gate": dc["gate"], "approve": bool(dc.get("approve")),
+                       "reject": bool(dc.get("reject")), "rework": bool(dc.get("rework"))} if dc else None,
             "why": {"note": _text(w.get("note"), 500),
                     "recommendation": _text(w.get("recommendation"), 40)} if isinstance(w, dict) else None}
 
@@ -193,13 +209,16 @@ def _project_orders(store, fac, root, now):
     try:
         # Orders are committed in the main checkout; a linked worktree's tree may not have them yet.
         main = getattr(fac, "main_checkout", None)
-        raw = fac.project_orders(main(root) if main else root, now)
+        main_root = main(root) if main else root
+        raw = fac.project_orders(main_root, now)
     except Exception:  # noqa: BLE001 - a broken factory module must not take the floor down
-        raw = []
+        raw, main_root = [], root
     out, seen = [], set()
     for o in (raw if isinstance(raw, list) else [])[:MAX_ORDERS]:
         o = _order(o)
         if o is not None and o["id"] not in seen:
+            o["main"] = clip(tilde(main_root), 300) if isinstance(main_root, str) else ""
+            o["outside"] = _outside(o)
             seen.add(o["id"])
             out.append(o)
     if len(c) > 256:
@@ -345,6 +364,8 @@ def _live(row):
     tool = row.get("tool")
     return {"model": clip(row["model"], 80), "family": row["family"], "effort": row["effort"],
             "effort_source": row["effort_source"], "cost": row["cost"], "tokens": row["tokens"],
+            "context": max(0, _int(row.get("context"))),
+            "context_window": row["context_window"] if isinstance(row.get("context_window"), int) else None,
             "burn": {k: row["burn"].get(k, 0) for k in _BURN}, "errors": row["errors"],
             "tool": clip(tool["name"], 80) if tool else None, "target": _text(tool.get("target"), 200) if tool else "",
             "last_text": _text(row.get("last_text"), 600), "since": row["since"], "start": row["start"],
@@ -365,6 +386,8 @@ def _session_node(s, srow, rows, chip, now):
         a = s.acc
         n = {"model": clip(srow["model"], 80), "family": srow["family"], "effort": a.effort or "",
              "effort_source": "recorded" if a.effort else "", "cost": 0.0, "tokens": 0,
+             "context": a.context or 0,
+             "context_window": pricing.context_window(a.last_model or a.model_main(), a.context or 0),
              "burn": {k: 0 for k in _BURN}, "errors": 0, "tool": None, "target": "",
              "last_text": _text(a.last_text, 600), "since": s.last_write, "start": srow["start"],
              "age": round(now - s.last_write, 1), "spark": [0] * SPARK_MINS}
@@ -502,7 +525,7 @@ def _rank(kind):
 
 def _copy_order(o):
     """A per-poll copy: the live overlay must never write into the ORDERS_TTL cache."""
-    return dict(o, stations=[dict(st) for st in o["stations"]], gate=dict(o["gate"]) if o["gate"] else None,
+    return dict(o, decide=dict(o["decide"]) if o.get("decide") else None, stations=[dict(st) for st in o["stations"]], gate=dict(o["gate"]) if o["gate"] else None,
                 lane=dict(o["lane"]) if o["lane"] else None)
 
 
@@ -554,8 +577,10 @@ def _assemble(days, project, all_projects, now, board, stats, snodes, label_of, 
                        "guard": dict(st["guard"]), "errors": st["errors"],
                        "plans": list(plan_view["by_project"].get(label, [])), "orders": counts}}, label)
         for o in shown.get(label, []):
+            needs = "gate" if (o["decide"] and o["decide"]["kind"] in ("spec", "merge", "changed")) \
+                or o["status"] in ("failed", "blocked") else None
             on = add({"id": "o:%s/%s" % (label, o["id"]), "kind": "order", "label": o["title"] or o["id"],
-                      "parent": "p:" + label, "state": o["status"], "needs": None, "detail": o}, label)
+                      "parent": "p:" + label, "state": o["status"], "needs": needs, "detail": o}, label)
             edge(on["parent"], on["id"], "member")
 
     # Sessions, each followed by its agents and workflows in the board's tree order.
@@ -630,6 +655,18 @@ def _assemble(days, project, all_projects, now, board, stats, snodes, label_of, 
                            "tool": clip(al["tool"], 80) if isinstance(al.get("tool"), str) and al["tool"] else None,
                            "age": round(al.get("age") or 0.0, 1), "_t": al["since_ts"]})
 
+    # Orders that need a human: one alert each, so the band lists them beside the sessions' requests.
+    for nid, n in nodes.items():
+        if n["kind"] != "order" or n["needs"] != "gate":
+            continue
+        o = n["detail"]
+        dc = o["decide"]["kind"] if o["decide"] else ""
+        title = {"spec": "Spec gate", "merge": "Merge gate", "changed": "Spec changed"}.get(dc) or o["status"].capitalize()
+        t0 = o["updated"] or now
+        out_alerts.append({"id": "o-" + hashlib.sha1(nid.encode("utf-8", "replace")).hexdigest()[:16], "node": nid,
+                           "kind": "gate", "title": title, "message": _text("%s · %s" % (o["id"], o["title"]), 400),
+                           "tool": None, "age": round(max(0.0, now - t0), 1), "_t": t0})
+
     # Edge activity and rates: s/a burn; a workflow sums its agents, an order the targets it runs.
     rate, active = {}, {}
     for nid, n in nodes.items():
@@ -674,6 +711,7 @@ def _assemble(days, project, all_projects, now, board, stats, snodes, label_of, 
             kp["cost_live"] += n["cost"]
         elif n["kind"] == "order":
             kp["orders"][n["state"]] = kp["orders"].get(n["state"], 0) + 1
+            kp["needs"] += 1 if n["needs"] else 0
     for st in stats.values():
         kp["cost_window"] += st["cost"]
         kp["errors"] += st["errors"]

@@ -744,14 +744,17 @@ def _applied_view(entry):
             "backup": "" if committed or not isinstance(entry.get("backup"), str) else tilde(entry["backup"])}
 
 
-def _git(root, args, stdin=None, identity=None):
+def _git(root, args, stdin=None, identity=None, committer_date=None):
     """git -C root <GIT_SAFE_ARGS> <args>: (returncode, stdout, stderr), never through a shell; (127, '', why)
-    when git cannot run. `identity` is (name, email) for a commit: the global config is not read here."""
+    when git cannot run. `identity` is (name, email) for a commit: the global config is not read here.
+    `committer_date` (epoch seconds) sets the committer time of a commit."""
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.path.expanduser("~")}
     env.update(GIT_SAFE_ENV)
     if identity:
         env.update(GIT_AUTHOR_NAME=identity[0], GIT_AUTHOR_EMAIL=identity[1],
                    GIT_COMMITTER_NAME=identity[0], GIT_COMMITTER_EMAIL=identity[1])
+    if committer_date is not None:
+        env["GIT_COMMITTER_DATE"] = "@%d +0000" % int(committer_date)
     try:
         r = subprocess.run(["git"] + GIT_SAFE_ARGS + ["-C", root] + list(args), env=env, cwd=root,
                            input=stdin if stdin is not None else b"", capture_output=True, timeout=GIT_TIMEOUT)
@@ -760,15 +763,16 @@ def _git(root, args, stdin=None, identity=None):
     return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
 
 
-def _git_identity(root):
+def _git_identity(root, extra=()):
     """(name, email) git would commit as in root: user.name and user.email from the repo's, the global and
-    the system config, read with `git config --get` (reading config runs nothing); else None."""
+    the system config, read with `git config --get` (reading config runs nothing); else None. `extra` is global
+    options placed after -C, such as the merge path's --attr-source and -c submodule.recurse=false."""
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "XDG_CONFIG_HOME")}
     env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0")
     out = []
     for key in ("user.name", "user.email"):
         try:
-            r = subprocess.run(["git", "-C", root, "config", "--get", key], env=env, cwd=root, stdin=subprocess.DEVNULL,
+            r = subprocess.run(["git", "-C", root] + list(extra) + ["config", "--get", key], env=env, cwd=root, stdin=subprocess.DEVNULL,
                                capture_output=True, timeout=GIT_TIMEOUT)
         except (OSError, subprocess.SubprocessError):
             return None

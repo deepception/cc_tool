@@ -175,6 +175,7 @@ import bisect
 import fnmatch
 import json
 import os
+import posixpath
 import re
 import shlex
 import signal
@@ -3624,9 +3625,454 @@ def check_cc_dash_launch(tokens, cmd: str) -> None:
 
 def check_cc_dash_launch_raw(cmd: str) -> None:
     """The unparseable-command fallback: the raw text scan."""
+    _code_record_backstop(cmd, None)
+    # Matched as written and with its quotes and backslashes removed (`cc_dash_code''.json`, `--record""-code`).
+    for text in (cmd, _unquote(cmd)):
+        check_code_record(text)
+        if _unreadable_record_code(text):
+            _deny_code_record("--record-code beside a program word bash-guard cannot read")
     hit = _raw_launch(cmd)
     if hit:
         _deny_launch(hit)
+
+
+# The user-wide record of the cc-dash code you approved (cc_dash_code.json in cc_tool's state directory) is what
+# every dashboard decision is judged against, so it is yours to record, from your terminal (`cc-dash --record-code`,
+# which also refuses under Claude Code; write-guard denies Edit and Write on the file). The rule fails closed: any
+# command that names the file is denied unless it only reads it (an allowlisted reader, no output redirect, no tee in
+# its pipeline) or names it in a `git commit` message. `--record-code` beside a cc-dash/ccdash token is denied however
+# it is started (`python3 bin/cc-dash --record-code`, `env X=1 cc-dash --record-code`), and beside a word bash-guard
+# cannot read (`$(…)`, a backtick, a `$` variable) unless the segment is an allowlisted read or a commit message. Text
+# that becomes code (a nested shell, eval, xargs or an inline interpreter, or a heredoc or pipe feeding one) is scanned
+# raw, and a pipeline with xargs, parallel or a stdin runner is denied when its text holds `--record-code` beside a
+# cc-dash token or an unreadable word. A command substitution is never a read: its body is found by a scanner that
+# tracks single quotes, double quotes and backslashes (a substitution inside real single quotes is text) and is matched
+# after its quotes and backslashes are removed, so `cc_dash_code''.json` and `--record""-code` are seen; when the
+# scanner cannot finish (an unbalanced quote, an unclosed substitution) the whole command is scanned that way.
+# A word of a command that is not a read-only use, or a redirect target, whose basename read as a pattern (a `$name`,
+# `${…}`, `$(…)`, backtick or `{…}` counts as `*`, shell globs stay) can match cc_dash_code.json is denied when its
+# directory is cc_tool's state directory (written literally, with `~`, `$HOME` or `$XDG_STATE_HOME`) or the basename
+# holds `cc_dash`; so is a non-read command naming the state directory itself (`rm -rf ~/.local/state/cc_tool`).
+# A raw-text backstop runs first, on the command with quotes and backslashes removed and `//` and `/./` collapsed: when
+# that text names the record or a pattern for it, the state directory, or `--record-code` beside cc-dash or a `$`, and
+# also holds a `$`, a backtick, a process substitution or (for a name) a glob, the command is denied unless it holds no
+# substitution and is only allowlisted reads, cd, pwd, true or test. xargs or parallel running cc-dash is denied outright.
+# Single-quoted text and an escaped `$` or backtick count as text only when every command in the line prints or reads
+# its arguments (the readers, cd, pwd, true, test, echo, printf, git commit) and the line has no substitution; with any
+# other command they stay live. `--record-code` beside a cc-dash token needs nothing dynamic: it is denied unless every
+# command in the line is on that list.
+# This matches names and is not a boundary. A name built where bash-guard cannot see it (a relative write after `cd`
+# into the state directory, a script given by path, a copy of a whole directory tree from elsewhere) is outside it and
+# falls under the same-user limit in the lib/cc_dash/gates.py docstring.
+_CODE_RECORD_RE = re.compile(r"cc_dash_code\.json|(?<![\w.-])(?:cc-dash|ccdash)(?![\w-])[^\n]{0,400}?(?<![\w-])--record-code(?![\w-])", re.S)
+_RECORD_FILE = "cc_dash_code.json"
+
+
+def _state_dir_pattern() -> "re.Pattern":
+    """Matches cc_tool's state directory as a command word names it, the directory cc_procs.cc_state_dir gives."""
+    home = re.escape(os.path.expanduser("~"))
+    bases = [r"(?:~|\$HOME|\$\{HOME\}|" + home + r")/\.local/state", r"\$XDG_STATE_HOME", r"\$\{XDG_STATE_HOME[^}]*\}"]
+    xdg = os.environ.get("XDG_STATE_HOME") or ""
+    if os.path.isabs(xdg):
+        bases.append(re.escape(xdg.rstrip("/")))
+    return re.compile("^(?:" + "|".join(bases) + ")/cc_tool$")
+
+
+_STATE_DIR_RE = _state_dir_pattern()
+# The raw-text backstop's triggers: the record's name or a pattern for it, the state directory anywhere in the text,
+# and `--record-code` beside a cc-dash token or a `$`/backtick.
+_BACKSTOP_T1_RE = re.compile(r"(?<![\w-])cc_dash[^\s/]*?(?:json|[*?\[{$`])")
+_BACKSTOP_T2_RE = re.compile(_STATE_DIR_RE.pattern[len("^"):-len("$")])
+_RECORD_CODE_WORD_RE = re.compile(r"(?<![\w-])--record-code(?![\w-])")
+_CC_DASH_WORD_RE = re.compile(r"(?<![\w.-])(?:cc-dash|ccdash)(?![\w-])")
+_LIVE_SUBST_RE = re.compile(r"\$\(|`|<\(|>\(")
+_BACKSTOP_DYN_RE = re.compile(r"[$`]|<\(|>\(")
+_NAME_HOLE_RE = re.compile(r"\$\{[^}]*\}?|\$\([^)]*\)?|`[^`]*`?|\$[A-Za-z_]\w*|\$[0-9@*#?$!-]|\{[^}]*\}?")
+
+
+def _is_state_dir(d: str) -> bool:
+    """True when d is cc_tool's state directory, written literally (~, $HOME, $XDG_STATE_HOME or absolute)."""
+    if not d:
+        return False
+    prev = None
+    while prev != d:
+        prev = d
+        d = d.rstrip("/") if d != "/" else d
+        if d.endswith("/."):
+            d = d[:-2]
+    return bool(d) and bool(_STATE_DIR_RE.match(posixpath.normpath(d)))
+
+
+def _names_record(word: str) -> bool:
+    """True when the word's basename, with run-time parts and globs as wildcards, can be the code record in the
+    state directory, or holds `cc_dash` anywhere."""
+    dirpart, _sep, base = word.rpartition("/")
+    if not base:
+        return False
+    pattern = _NAME_HOLE_RE.sub("*", base)
+    return fnmatch.fnmatchcase(_RECORD_FILE, pattern) and (_is_state_dir(dirpart) or "cc_dash" in base)
+_RECORD_REDIRECT_RE = re.compile(r"^(?:>>?\|?|&>>?|<>|>&|<&?|<<<?)$")
+_RECORD_READERS = {"ls", "stat", "cat", "head", "tail", "wc", "file", "grep", "egrep", "fgrep", "rg", "jq"}
+_RECORD_GIT_READS = {"log", "show", "diff", "grep"}
+_RECORD_MSG_FLAGS = ("-m", "--message", "-F", "--file")
+_RECORD_RUNNERS = _NESTED_SHELLS | {"eval", "xargs", "parallel", "script", "source", "."}
+
+
+def _deny_code_record(what: str) -> None:
+    deny(f"recording or touching cc-dash's code record from an agent ('{what[:60]}'): the record says which code "
+         "you approved, so it is yours to make",
+         "ask the user to run `cc-dash --record-code` in their own terminal, or to press Approve merge in the dashboard")
+
+
+def _unreadable_record_code(text: str) -> bool:
+    """True when the text holds a `--record-code` word and a `$` or backtick (a program word it cannot read)."""
+    return bool(re.search(r"(?<![\w-])--record-code(?![\w-])", text) and re.search(r"[$`]", text))
+
+
+def check_code_record(cmd: str) -> None:
+    m = _CODE_RECORD_RE.search(cmd)
+    if m:
+        _deny_code_record(m.group(0))
+
+
+def _record_commands(tokens):
+    """[(words, redirects [(op, target)], pipeline group)]: simple commands that keep their redirects (split_commands
+    would make a redirect target a command of its own)."""
+    out = []
+    words: list = []
+    reds: list = []
+    group = 0
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if _RECORD_REDIRECT_RE.match(tok):
+            reds.append((tok, tokens[i + 1] if i + 1 < len(tokens) else ""))
+            i += 2
+            continue
+        if _is_op(tok):
+            if words or reds:
+                out.append((words, reds, group))
+                words, reds = [], []
+            if tok not in _PIPE_TOKENS:
+                group += 1
+        else:
+            words.append(tok)
+        i += 1
+    if words or reds:
+        out.append((words, reds, group))
+    return out
+
+
+def _stdin_feeder(name: str, args) -> bool:
+    """True for a command that runs what it reads: xargs, parallel, or a shell or interpreter reading stdin."""
+    if name in ("xargs", "parallel"):
+        return True
+    runner = name in _RECORD_RUNNERS or name in ("python3", "python", "node", "ruby", "perl", "php")
+    return runner and (not [a for a in args if not a.startswith("-")] or "-" in args)
+
+
+def _record_read_only(name: str, args) -> bool:
+    """True when `name args` can only read what it names (and, for git commit, names the record only in a message)."""
+    if name in ("ls", "stat", "cat", "head", "tail", "wc", "file", "grep", "egrep", "fgrep"):
+        return True
+    if name == "rg":
+        return not any(a == "--pre" or a.startswith("--pre=") or a.startswith("--pre-glob") for a in args)
+    if name == "jq":
+        return not any(a == "-o" or a.startswith("--output") for a in args)
+    if name == "git" and args and args[0] in _RECORD_GIT_READS:
+        return not any(a.startswith(("--output", "-O", "--open-files-in-pager")) for a in args[1:])
+    if name == "git" and args and args[0] == "commit":
+        for k, a in enumerate(args):
+            if _RECORD_FILE in a and not (k and args[k - 1] in _RECORD_MSG_FLAGS or a.startswith(("-m", "-F", "--message=", "--file="))):
+                return False
+        return True
+    return False
+
+
+def _record_literal_cmd(name: str, args) -> bool:
+    """True for a command that prints or reads its arguments and never runs them."""
+    return name in ("cd", "pwd", "true", "test", "[", "echo", "printf") or _record_read_only(name, args)
+
+
+def _wrapper_runs_shell(prefix) -> bool:
+    """True when the wrapper words stripped from a command hold `sudo` or `doas` with a shell flag (`-s`, `-i`,
+    `--shell`, `--login`): the command and its arguments are then run by a shell, not exec'd."""
+    cur, value = "", False
+    for w in prefix:
+        if value:
+            value = False
+        elif not w.startswith("-"):
+            cur = _cmd_name(w)
+        elif cur in ("sudo", "doas") and (w in ("--shell", "--login") or set(_short_flags(w)) & {"s", "i"}):
+            return True
+        else:
+            value = w in _WRAPPER_VALUE_FLAGS.get(cur, set())
+    return False
+
+
+_SUBST_OPEN_RE = re.compile(r"\$\(|<\(|>\(|`")
+_CASE_WORD_RE = re.compile(r"(?<![\w-])case(?![\w-])")
+_ESAC_WORD_RE = re.compile(r"(?<![\w-])esac(?![\w-])")
+
+
+def _outer_substitutions(cmd: str):
+    """Bodies of the outermost substitutions in cmd, or None when a quote or a substitution is left open."""
+    out: list = []
+    n = len(cmd)
+    i = 0
+    dq = False
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            i += 2
+            continue
+        if not dq and c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                return None
+            i = j + 1
+            continue
+        if c == '"':
+            dq = not dq
+            i += 1
+            continue
+        if c == "`":
+            j = i + 1
+            while j < n and cmd[j] != "`":
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= n:
+                return None
+            out.append(cmd[i + 1:j])
+            i = j + 1
+            continue
+        if (c == "$" or (not dq and c in "<>")) and i + 1 < n and cmd[i + 1] == "(":
+            j, depth, inner_dq = i + 2, 0, False
+            while j < n:
+                d = cmd[j]
+                if d == "\\":
+                    j += 2
+                    continue
+                if not inner_dq and d == "'":
+                    k = cmd.find("'", j + 1)
+                    if k < 0:
+                        return None
+                    j = k + 1
+                    continue
+                if d == '"':
+                    inner_dq = not inner_dq
+                elif not inner_dq and d == "(":
+                    depth += 1
+                elif not inner_dq and d == ")":
+                    if depth == 0:
+                        # A `)` that closes a `case … in x)` pattern is not the end of the substitution.
+                        so_far = cmd[i + 2:j]
+                        if len(_CASE_WORD_RE.findall(so_far)) <= len(_ESAC_WORD_RE.findall(so_far)):
+                            break
+                    else:
+                        depth -= 1
+                j += 1
+            if j >= n:
+                return None
+            out.append(cmd[i + 2:j])
+            i = j + 1
+            continue
+        i += 1
+    return None if dq else out
+
+
+def _substitution_spans(cmd: str):
+    """The body of every command substitution (`$(…)`, `<(…)`, `>(…)`, backticks), nested ones too, found while
+    tracking single quotes, double quotes and backslashes (a `'` opens a literal string only outside double quotes
+    and when not escaped). None when the scanner cannot finish: an unbalanced quote or an unclosed substitution."""
+    bodies: list = []
+    work = [cmd]
+    while work:
+        found = _outer_substitutions(work.pop())
+        if found is None:
+            return None
+        bodies.extend(found)
+        work.extend(found)
+    return bodies
+
+
+def _unquote(text: str) -> str:
+    """The text with its quotes and backslashes removed, as bash joins `cc_dash_code''.json` into one word."""
+    return re.sub(r"[\"'\\]", "", text)
+
+
+def _neutralize_single_quoted(cmd: str) -> str:
+    """cmd with every `$`, backtick, glob and `<>` character inside a real single-quoted string replaced by `_`
+    (a `'` opens a literal string only outside double quotes and when not escaped). An unclosed `'` changes nothing."""
+    out = []
+    i, n, dq = 0, len(cmd), False
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            # An escaped `$` or backtick is text, not a substitution.
+            out.append("\\_" if cmd[i + 1:i + 2] in ("$", "`") else cmd[i:i + 2])
+            i += 2
+            continue
+        if not dq and c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                out.append(cmd[i:])
+                break
+            out.append("'" + re.sub(r"[$`*?\[{<>]", "_", cmd[i + 1:j]) + "'")
+            i = j + 1
+            continue
+        if c == '"':
+            dq = not dq
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _backstop_text(cmd: str, neutralize: bool) -> str:
+    """cmd with quotes and backslashes removed and `//` and `/./` collapsed; with neutralize, text inside real single
+    quotes is made inert first."""
+    text = _unquote(_neutralize_single_quoted(cmd) if neutralize else cmd)
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r"/\.?/", "/", text)
+    return text
+
+
+def _code_record_backstop(cmd: str, tokens) -> None:
+    """A coarse check on the raw text that does not depend on the tokenizer: a command whose text names the record (or a
+    pattern for it), the state directory, or `--record-code` beside cc-dash or a `$`, and that is also dynamic, is denied
+    unless it only reads (no substitution, allowlisted readers, cd, pwd, true, test). tokens is None for an unparseable
+    command, where no exemption applies."""
+    cmds = []
+    shell_wrapper = False
+    if tokens is not None:
+        for raw, reds, group in _record_commands(tokens):
+            words, _seen = _strip_wrappers(raw)
+            shell_wrapper = shell_wrapper or _wrapper_runs_shell(raw[:len(raw) - len(words)])
+            cmds.append((_cmd_name(words[0]) if words else "", words[1:], reds, group))
+    # Single-quoted text and an escaped `$` are inert only when every command in the line prints or reads its
+    # arguments; any other program (ssh, flock -c, find -exec, su -c) may hand them to a shell. Commands inside a
+    # substitution are not in cmds, so a substitution makes the text live too. So does `sudo -s` / `sudo -i`, which
+    # hands the rest of the line to a shell.
+    literal = (tokens is not None and bool(cmds) and all(_record_literal_cmd(n, a) for n, a, _r, _g in cmds)
+               and not shell_wrapper and _substitution_spans(cmd) == [])
+    text = _backstop_text(cmd, literal)
+    dyn = bool(_BACKSTOP_DYN_RE.search(text))
+    chunks = [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+    t12 = None
+    for rx in (_BACKSTOP_T1_RE, _BACKSTOP_T2_RE):
+        for m in rx.finditer(text):
+            chunk = next((text[a:b] for a, b in chunks if a <= m.start() < b), "")
+            if dyn or re.search(r"[*?\[{]", chunk):
+                t12 = t12 or m.group(0)
+    t3 = bool(dyn and _RECORD_CODE_WORD_RE.search(text) and (_CC_DASH_WORD_RE.search(text) or re.search(r"[$`]", text)))
+    t3_lit = bool(not dyn and _RECORD_CODE_WORD_RE.search(text) and _CC_DASH_WORD_RE.search(text) and not literal)
+    if not t12 and not t3 and not t3_lit:
+        return
+    if tokens is not None and not _LIVE_SUBST_RE.search(text):
+        def quiet(reds) -> bool:
+            return all(op.startswith("<") or tg == "/dev/null" or (op == ">&" and (tg.isdigit() or tg == "-"))
+                       for op, tg in reds)
+        if all(n in ("cd", "pwd", "true", "test", "[")
+               or (_record_read_only(n, a) and not (n == "git" and a[:1] == ["commit"]) and quiet(r)
+                   and not any(n2 == "tee" for n2, _a2, _r2, g2 in cmds if g2 == g))
+               for n, a, r, g in cmds):
+            return
+    # A commit message that mentions `--record-code` and `cc-dash` and whose substitutions do not run it (kept from
+    # the row `git commit -m "Run cc-dash --record-code, never $(which cc-dash) --record-code"`).
+    if not t12 and tokens is not None and cmds and all(n == "git" and a[:1] == ["commit"] for n, a, _r, _g in cmds):
+        spans = _substitution_spans(cmd)
+        if spans is not None and not any(_RECORD_CODE_WORD_RE.search(_backstop_text(sp, False)) for sp in spans):
+            return
+    _deny_code_record(t12 or "--record-code beside cc-dash or a program word bash-guard cannot read")
+
+
+def check_code_record_tokens(tokens, cmd: str) -> None:
+    """Deny any command that names the code record unless it only reads it, and `--record-code` beside a cc-dash token."""
+    _code_record_backstop(cmd, tokens)
+    # A substitution runs a program, so it is never a read: scan what it runs, even inside an allowlisted reader's
+    # arguments or a commit message (shlex keeps a double-quoted `$(…)` as one word).
+    # When the scanner cannot finish (an unbalanced quote, an unclosed substitution) the whole command is scanned.
+    spans = _substitution_spans(cmd)
+    for span in [cmd] if spans is None else spans:
+        bare = _unquote(span)
+        check_code_record(bare)
+        if _unreadable_record_code(bare):
+            _deny_code_record("--record-code beside a program word bash-guard cannot read")
+    cmds = []
+    for words, reds, group in _record_commands(tokens):
+        words, _seen = _strip_wrappers(words)
+        cmds.append((_cmd_name(words[0]) if words else "", words[1:], words, reds, group))
+    for name, args, words, reds, group in cmds:
+        # bash-guard cannot see the arguments xargs or parallel feeds to cc-dash.
+        if name in ("xargs", "parallel") and any(_cmd_name(a) in ("cc-dash", "ccdash") for a in args):
+            _deny_code_record(name + " cc-dash")
+        read_only = _record_read_only(name, args) and not any(_SUBST_OPEN_RE.search(w) for w in words)
+        if any(_RECORD_FILE in w for w in words) or any(_RECORD_FILE in tg for _op, tg in reds):
+            quiet = all(op.startswith("<") or tg == "/dev/null" or (op == ">&" and (tg.isdigit() or tg == "-")) for op, tg in reds)
+            tee = any(n == "tee" for n, _a, _w, _r, g in cmds if g == group)
+            if not (read_only and quiet and not tee):
+                _deny_code_record((name + " " + _RECORD_FILE) if name else _RECORD_FILE)
+        if not read_only and any(a == "--record-code" or a.startswith("--record-code=") for a in words) \
+                and any(_cmd_name(w) in ("cc-dash", "ccdash") for w in words):
+            _deny_code_record("cc-dash --record-code")
+        # A glob or a run-time-built name that can land on the record, or the state directory itself.
+        if not read_only:
+            for w in words:
+                if _names_record(w) or _is_state_dir(w):
+                    _deny_code_record(name + " " + w)
+        for op, tg in reds:
+            if _names_record(tg) and (not read_only or not op.startswith("<") or op == "<>"):
+                _deny_code_record(name + " " + tg)
+    # `--record-code` fed to cc-dash (or a program bash-guard cannot read) through a pipeline into xargs, parallel
+    # or a runner reading code from stdin.
+    for gid in {c[4] for c in cmds}:
+        grp = [c for c in cmds if c[4] == gid]
+        if len(grp) < 2 or not any(_stdin_feeder(c[0], c[1]) for c in grp):
+            continue
+        gwords = [w for c in grp for w in c[2]] + [tg for c in grp for _op, tg in c[3]]
+        gtext = " ".join(gwords)
+        if re.search(r"(?<![\w-])--record-code(?![\w-])", gtext) and (
+                re.search(r"(?<![\w.-])(?:cc-dash|ccdash)(?![\w-])", gtext) or any(re.search(r"[$`]", w) for w in gwords)):
+            _deny_code_record("--record-code fed to a program through a pipeline")
+    # A program word bash-guard cannot read (`$(which cc-dash)`, a backtick, a `$` variable) may be cc-dash.
+    seg: list = []
+    for t in list(tokens) + [";"]:
+        if _is_op(t) and not _RECORD_REDIRECT_RE.match(t) and any(c in t for c in ";|&\n"):
+            if any(a == "--record-code" or a.startswith("--record-code=") for a in seg) \
+                    and any(("$" in a or "`" in a) and not _is_op(a) for a in seg):
+                lead: list = []
+                for a in seg:
+                    if _is_op(a):
+                        break
+                    lead.append(a)
+                lead, _seen = _strip_wrappers(lead)
+                if not (lead and "$" not in lead[0] and "`" not in lead[0]
+                        and _record_read_only(_cmd_name(lead[0]), lead[1:])):
+                    _deny_code_record("--record-code beside a program word bash-guard cannot read")
+            seg = []
+        else:
+            seg.append(t)
+    code_runners = []
+    for seg, _g in split_commands(tokens):
+        seg, _seen = _strip_wrappers(seg)
+        if not seg:
+            continue
+        name, args = _cmd_name(seg[0]), seg[1:]
+        inline = name in _INLINE_INTERP and any(a in ("-c", "-e", "-E") for a in args)
+        if name in _RECORD_RUNNERS or inline or name in ("python3", "python", "node", "ruby", "perl", "php") and "-" in args:
+            m = _CODE_RECORD_RE.search(" ".join(args))
+            if m:
+                _deny_code_record(m.group(0))
+            if _unreadable_record_code(" ".join(args)):
+                _deny_code_record("--record-code beside a program word bash-guard cannot read")
+            code_runners.append((name, args))
+    # Text fed to a runner on stdin (a heredoc, `echo ... | sh`) is not in its arguments: scan the raw text then.
+    if any(n == "xargs" or not [a for a in args if not a.startswith("-")] or "-" in args for n, args in code_runners) \
+            and (_HEREDOC_ANY_RE.search(cmd) or any(t in _PIPE_TOKENS for t in tokens)):
+        check_code_record(cmd)
+    elif code_runners and _HEREDOC_ANY_RE.search(cmd):
+        check_code_record(cmd)
 
 
 # ── Project rules (.claude/guard-rules.json) ──────────────────────────────────
@@ -3732,6 +4178,7 @@ def check_command(cmd: str) -> None:
         return
 
     check_secret_read(tokens)
+    check_code_record_tokens(tokens, cmd)
     check_cc_dash_launch(tokens, cmd)
     if any(_cmd_name(t) == "git" for t in tokens):  # cheap gate before the invocation walk
         check_git(tokens)

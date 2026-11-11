@@ -1,7 +1,7 @@
 export const meta = {
   name: 'factory-line',
   description: 'Runs one software-factory work order down its line: plan, then build, test, holdout verify and review in the order\'s own lane worktree, reworking on failure, and stops at the human merge gate with a merge-gate summary.',
-  whenToUse: 'Driven by the /factory skill for one approved work order: pass the args OBJECT printed by `cc-factory run-args FO-NNN` ({order, title, spec, root, worktree, branch, base, holdout, stations, retries, line}, optional threshold, planDoc, orderPath, run and test), then record the returned object (contract 2) with `cc-factory record FO-NNN --workflow-run <runId>`. Station models, efforts and retries come from the order\'s line in factory/line.json. It never merges, pushes or deletes the lane: a human merges at the merge gate.',
+  whenToUse: 'Driven by the /factory skill for one approved work order: pass the args OBJECT printed by `cc-factory run-args FO-NNN` ({order, title, spec, root, worktree, branch, base, holdout, stations, retries, line}, optional threshold, planDoc, orderPath, subPackages, run and test), then record the returned object (contract 2) with `cc-factory record FO-NNN --workflow-run <runId>`. Station models, efforts and retries come from the order\'s line in factory/line.json. It never merges, pushes or deletes the lane: a human merges at the merge gate.',
   phases: [
     { title: 'Plan', detail: 'Read-only planner grounds a file-level plan in the lane worktree and maps acceptance criteria to steps, or rules the spec infeasible' },
     { title: 'Build', detail: 'Implements the plan inside the lane worktree only and commits on the lane branch; on rework it gets the failing station\'s feedback, and from attempt 3 it runs on Opus' },
@@ -48,6 +48,17 @@ const BRANCH = str(cfg.branch)
 const BASE = str(cfg.base)
 const HOLDOUT_IN = str(cfg.holdout).replace(/(.)\/+$/, '$1')
 const LINE = str(cfg.line) || 'default'
+// Top-level sub-directories of the main checkout with their own .venv or node_modules (cc-factory run-args lists
+// them: this script cannot list directories). Absent means none; a malformed value blocks the run as args.
+const SUB_IN = cfg.subPackages == null ? [] : cfg.subPackages
+const SUB_BAD = []
+const SUBPKGS = []
+if (!Array.isArray(SUB_IN)) SUB_BAD.push(null)
+else for (const x of SUB_IN) {
+  const v = typeof x === 'string' ? x.trim().replace(/(.)\/+$/, '$1') : ''
+  if (!v || v === '.' || v.includes('/') || v.includes('..') || /[\u0000-\u001f]/.test(v)) SUB_BAD.push(x)
+  else if (!SUBPKGS.includes(v)) SUBPKGS.push(v)
+}
 // The plan document (contract A): a root-relative path the build station writes in the lane. Anything
 // that is not the expected shape is dropped, so a bad arg means no plan-file instruction, never a stray write.
 const PLAN_DOC_RE = /^docs\/superpowers\/plans\/\d{4}-\d{2}-\d{2}-fo-\d{3,6}-[A-Za-z0-9][A-Za-z0-9_-]*\.md$/
@@ -228,6 +239,7 @@ if (!Array.isArray(rawStations) || !rawStations.length) problems.push('no statio
 else if (!LOOP.length) problems.push('the line has no build, test, verify or review station this workflow can run')
 if (!SPEC) problems.push('no spec (args.spec, the order body)')
 if (ROOT && !isAbs(ROOT)) problems.push('args.root is not an absolute path')
+for (const x of SUB_BAD) problems.push(x === null ? 'args.subPackages is not a list' : `args.subPackages entry '${one(x, 60)}' is not a top-level sub-directory of the main checkout (relative, no '..', one level deep)`)
 if (ROOT && WORKTREE && ROOT === WORKTREE) problems.push('the lane worktree is the main checkout')
 // A leading '-' would reach the git commands below as an option (--output=...), so it is never a base.
 if (BASE && !/^[A-Za-z0-9._\/~^][A-Za-z0-9._\/~^-]{0,199}$/.test(BASE)) problems.push('args.base is not a commit or ref')
@@ -302,8 +314,13 @@ const TEST_SCHEMA = {
       note: { type: 'string' },
     }, required: ['criterion', 'covered', 'note'] } },
     failures: { type: 'array', items: { type: 'string' }, description: 'failing cases with the assertion that failed' },
+    flaky: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
+      file: { type: 'string', description: 'the test file' },
+      firstRun: { type: 'string', description: 'the result line of the run where it failed, e.g. "8442 passed, 1 failed"' },
+      rerun: { type: 'string', description: 'the result line of that file rerun once on its own, where it passed' },
+    }, required: ['file', 'firstRun', 'rerun'] }, description: 'test files that failed and then passed when rerun alone; not failures' },
   },
-  required: ['ran', 'passed', 'command', 'evidence', 'testsAdded', 'committed', 'coverageOfAcceptance', 'failures'],
+  required: ['ran', 'passed', 'command', 'evidence', 'testsAdded', 'committed', 'coverageOfAcceptance', 'failures', 'flaky'],
 }
 
 // Verify returns no free text for build: only per-scenario verdicts, the numbers
@@ -331,11 +348,11 @@ const VERIFY_SCHEMA = {
       reason: { type: 'string', description: 'your evidence, for the human at the merge gate only; never shown to another station' },
       static: { type: 'boolean', description: 'false only when you observed this scenario by running lane code through the lane-code wrapper; true when you judged it by reading the code' },
     }, required: ['id', 'satisfied', 'criteria', 'category', 'reason', 'static'] } },
-    lane: { type: 'object', additionalProperties: false, description: 'the lane worktree as you observed it, before you made the throwaway copy and after you deleted it', properties: {
+    lane: { type: 'object', additionalProperties: false, description: 'the lane worktree as you observed it, before you ran any scenario and after the last one, before deleting the throwaway copy', properties: {
       headBefore: { type: 'string', description: 'git -C <worktree> rev-parse HEAD, first thing' },
       statusBefore: { type: 'string', description: 'git -C <worktree> status --porcelain, first thing (empty string when clean)' },
-      headAfter: { type: 'string', description: 'git -C <worktree> rev-parse HEAD, last thing' },
-      statusAfter: { type: 'string', description: 'git -C <worktree> status --porcelain, last thing (empty string when clean)' },
+      headAfter: { type: 'string', description: 'git -C <worktree> rev-parse HEAD, after the last scenario and before deleting the throwaway copy' },
+      statusAfter: { type: 'string', description: 'git -C <worktree> status --porcelain, after the last scenario and before deleting the throwaway copy (empty string when clean)' },
       copyRemoved: { type: 'boolean', description: 'true only if you deleted your throwaway directory (or never made one) and checked it is gone' },
     }, required: ['headBefore', 'statusBefore', 'headAfter', 'statusAfter', 'copyRemoved'] },
     sandbox: { type: 'string', enum: ['ok', 'missing', 'failed'], description: 'ok = bwrap is installed and the wrapper probe exited 0; missing = no bwrap; failed = the probe did not exit 0' },
@@ -432,14 +449,16 @@ const SANDBOX = (attempt) => [...SANDBOX_HEAD(attempt), ...SANDBOX_TAIL(attempt)
 // PATH never names a dir under the copy or the main checkout's path: where main has no .venv or node_modules, that
 // dir is the lane's own, and a lane-committed .venv/bin/python3 would stand in for the interpreter (the
 // installed-copy check's too). A third mount of each, under the sandbox's fresh /tmp, holds only main's dirs.
+// Each top-level sub-package's .venv and node_modules that run-args lists (args.subPackages) is mounted the same
+// three ways, but not put on PATH: its code runs with <copy>/<dir>/.venv/bin/python or `uv run` in <copy>/<dir>.
 const DEPS_DIR = '/tmp/cc-factory-deps'
 const LANE_SANDBOX = (attempt) => {
   const C = COPY(attempt)
-  const deps = ['.venv', 'node_modules'].map((d) => [sq(`${ROOT}/${d}`), d])
+  const deps = ['.venv', 'node_modules', ...SUBPKGS.flatMap((d) => [`${d}/.venv`, `${d}/node_modules`])].map((rel) => [sq(`${ROOT}/${rel}`), rel])
   return [
     ...SANDBOX_HEAD(attempt),
-    ...(ROOT ? [...deps.map(([src, d]) => `--ro-bind-try ${src} ${C}/${d}`), `--bind ${C} ${sq(ROOT)}`, ...deps.map(([src]) => `--ro-bind-try ${src} ${src}`),
-      ...deps.map(([src, d]) => `--ro-bind-try ${src} ${DEPS_DIR}/${d}`)] : []),
+    ...(ROOT ? [...deps.map(([src, d]) => `--ro-bind-try ${src} ${sq(`${C}/${d}`)}`), `--bind ${C} ${sq(ROOT)}`, ...deps.map(([src]) => `--ro-bind-try ${src} ${src}`),
+      ...deps.map(([src, d]) => `--ro-bind-try ${src} ${sq(`${DEPS_DIR}/${d}`)}`)] : []),
     `--setenv UV_OFFLINE 1 --setenv UV_NO_SYNC 1 --setenv UV_CACHE_DIR ${C}/.cache/uv --setenv npm_config_cache ${C}/.cache/npm`,
     `--setenv PYTHONDONTWRITEBYTECODE 1 --setenv PYTHONPATH ${C}/src:${C}`,
     `--setenv PATH "${DEPS_DIR}/.venv/bin:${DEPS_DIR}/node_modules/.bin:$PATH"`,
@@ -460,6 +479,8 @@ const VGIT = (attempt, op) => `cc-factory${ROOT ? ' -C ' + sq(ROOT) : ''} verify
 // and that some sys.path entry, the user site or a meta-path finder provides outside the copy. Node: each package.json
 // name in the copy that node_modules holds at any depth (pnpm's .pnpm store too) as anything but a link back into the
 // copy. "In the copy" is by inode, as the main checkout's path is a bind of it, and the dependency mounts are not.
+// Sub-package mounts are found by listing the dependency dir inside the sandbox; their .venv site-packages and
+// node_modules are searched too.
 // Names miss shapes (a namespace package, an npm alias key, a package_dir mapping), so it also prints every
 // dependency file outside the copy whose bytes equal a copy source file of 256 bytes or more (or a package.json
 // with a name; a bare {"type":"module"} marker matches dozens), when it looks installed rather than vendored: the
@@ -468,23 +489,24 @@ const VGIT = (attempt, op) => `cc-factory${ROOT ? ' -C ' + sq(ROOT) : ''} verify
 // and a one-file Python package installed under another directory name escape.
 // It runs isolated (-I), so no copy file is on its path; any error exits non-zero, which verify reads as static.
 const INSTALLED_CHECK = [
-  "os,sys,site,json=map(__import__,('os','sys','site','json'));U=__import__('importlib.util').util;Mc=__import__('importlib.machinery').machinery",
+  "os,sys,site,json,glob=map(__import__,('os','sys','site','json','glob'));U=__import__('importlib.util').util;Mc=__import__('importlib.machinery').machinery",
   "C=os.getcwd();X={'.git','.venv','node_modules','.cache','__pycache__'};b=os.path.basename",
+  `D='${DEPS_DIR}';SP=sorted(d for d in (os.listdir(D) if os.path.isdir(D) else []) if d not in ('.venv','node_modules'))`,
   'K=lambda q:(os.stat(q).st_dev,os.stat(q).st_ino)',
   "A=lambda q:[q] if q=='/' else [q]+A(os.path.dirname(q))",
-  "c=K(C);B={K(C+'/'+x) for x in X if os.path.isdir(C+'/'+x)}",
+  "c=K(C);B={K(C+'/'+x) for x in X if os.path.isdir(C+'/'+x)}|{K(C+'/'+d+'/'+x) for d in SP for x in ('.venv','node_modules') if os.path.isdir(C+'/'+d+'/'+x)}",
   'I=lambda p:(lambda a:c in a and not B&set(a))([K(q) for q in A(os.path.realpath(p))])',
   'W=[(d,fs) for d,ds,fs in os.walk(C) if not ds.__setitem__(slice(None),[x for x in ds if x not in X])]',
   "S=set(getattr(sys,'stdlib_module_names',()))|set(sys.builtin_module_names)",
   "Q={f[:-3] for d,fs in W for f in fs if f.endswith('.py')}|{b(d) for d,fs in W if [f for f in fs if f.endswith('.py')]}",
   "Q=sorted(n for n in Q if n.isidentifier() and not n.startswith('__') and n not in S)",
   'F=Mc.PathFinder.find_spec;L=lambda s:(([s.origin] if s.has_location else [])+list(s.submodule_search_locations or [])) if s else []',
-  'E=[e for e in sys.path if e and os.path.exists(e) and not I(e)]+[site.getusersitepackages()]',
+  "E=[e for e in sys.path if e and os.path.exists(e) and not I(e)]+[site.getusersitepackages()]+sorted(p for d in SP for p in glob.glob(D+'/'+d+'/.venv/lib/python*/site-packages'))",
   "ok=lambda m:(lambda s:bool(s) and s.has_location)(F(m,[C,C+'/src']))",
   'py=[m for m in Q if not ok(m) and [p for s in [F(m,[e]) for e in E]+[U.find_spec(m)] for p in L(s) if not I(p)]]',
   "Nn={json.load(open(d+'/package.json')).get('name') for d,fs in W if 'package.json' in fs}",
   "T=lambda d:'' if b(d)=='node_modules' else b(d)+'/' if b(d)[:1]=='@' and b(os.path.dirname(d))=='node_modules' else None",
-  "nm=sorted({T(d)+y for d,ds,fs in os.walk(C+'/node_modules') if T(d) is not None for y in ds+fs if T(d)+y in Nn and not I(d+'/'+y)})",
+  "nm=sorted({T(d)+y for r in [C+'/node_modules']+[C+'/'+q+'/node_modules' for q in SP] for d,ds,fs in os.walk(r) if T(d) is not None for y in ds+fs if T(d)+y in Nn and not I(d+'/'+y)})",
   "Z={};[Z.setdefault((f,os.path.getsize(q)),[]).append(q) for d,fs in W for f in fs for q in [d+'/'+f] if os.path.isfile(q) and (f=='package.json' and (chr(34)+'name'+chr(34)).encode() in open(q,'rb').read() or f.endswith(('.py','.js','.mjs','.cjs','.ts','.tsx','.jsx')) and os.path.getsize(q)>=256)];Zn={k[0] for k in Z}",
   `R={os.path.realpath(r) for r in ['${DEPS_DIR}',site.getusersitepackages()]+E if os.path.isdir(r)};R=[r for r in R if not [q for q in R if r.startswith(q+'/')]]`,
   "rd=lambda p:open(p,'rb').read();dn=os.path.dirname",
@@ -510,6 +532,9 @@ const VCMD = (attempt) => {
     staticDiff: `${VGIT(attempt, 'diff')} --static`,
   }
 }
+const SUB_ENV = () => SUBPKGS.length
+  ? `the sub-package environments of ${SUBPKGS.map((d) => '`' + d + '`').join(', ')} (each one's .venv and node_modules where the main checkout has them, mounted the same way at <copy>/<dir>/.venv and <copy>/<dir>/node_modules; run a sub-package's code from <copy>/<dir> with <copy>/<dir>/.venv/bin/python or \`uv run\` there: they are not on PATH)`
+  : 'no sub-package environments (no top-level sub-directory of the main checkout has its own .venv or node_modules)'
 const verifyRules = (attempt) => {
   const c = VCMD(attempt)
   return `THROWAWAY COPY, SANDBOX AND GIT (hard). Run the commands below exactly as written: never change, shorten, reorder or retype them, and run no git command at all except these \`cc-factory verify-git\` ones (the lane's git config is the build station's; they switch off everything in it that can run a program and run git inside the sandbox).
@@ -524,9 +549,9 @@ WITH A WORKING SANDBOX (the probe exits 0):
 - A local package installed by value (not editable or linked) keeps a copy of the main checkout's code in the .venv, the user site or node_modules, and a run would test that instead of the lane. The next command names each Python module and Node package the copy defines that would load from outside the copy. If it prints a name or does not exit 0, run no lane code that could load it: report executed=false and static=true on every scenario it could reach. Installed-copy check: \`${c.installed}\`
 - That check covers Python and Node only. Lane code in any other language (Java, Kotlin, Rust, Go, .NET, Ruby, PHP and so on) counts as run from the copy only when you can show its build compiles the project's own modules from the copy's sources, not from a store outside it (~/.m2, a Gradle or Cargo cache, GOPATH, a gem or Composer path); if you cannot show that, report executed=false and static=true on every scenario it could reach.
 - The lane's diff, if you need it: \`${c.diff}\`
-- Every run of the lane's code (its tests, its build, the program, each scenario trajectory) goes through the lane-code wrapper: \`<LANE-CODE WRAPPER> <command>\`, for example \`<LANE-CODE WRAPPER> make test\`; its dependencies are the main checkout's installed .venv and node_modules, read-only and offline (bare \`pytest\` and \`npm test\` resolve there). Never run lane code without it, never in the lane worktree. Report executed=true and sandbox 'ok' only if you ran lane code that way. Give static=false only on a scenario you observed in such a run.
-- ENVIRONMENT LIMITS: the sandbox has no network and only the main checkout's installed dependencies (a module installed in a sub-directory, or a dependency the lane added, is absent). A missing third-party module, a missing command or a network or read-only-filesystem error says nothing about the lane: do not fail a scenario on that error. Judge that scenario by reading the code, set static=true and say so in its reason; the line then ends the order needs-human-check. A wrong reference to the lane's own code (a typoed module name, a file it never added) is the lane's failure: fail the scenario as usual.
-- When done: \`${c.cleanup}\`, check it is gone (lane.copyRemoved), then \`${c.head}\` (lane.headAfter) and \`${c.status}\` (lane.statusAfter).
+- Every run of the lane's code (its tests, its build, the program, each scenario trajectory) goes through the lane-code wrapper: \`<LANE-CODE WRAPPER> <command>\`, for example \`<LANE-CODE WRAPPER> make test\`; its dependencies are the main checkout's installed .venv and node_modules, plus ${SUB_ENV()}, all read-only and offline (bare \`pytest\` and \`npm test\` resolve there). Never run lane code without it, never in the lane worktree. Report executed=true and sandbox 'ok' only if you ran lane code that way. Give static=false only on a scenario you observed in such a run.
+- ENVIRONMENT LIMITS: the sandbox has no network and only the main checkout's installed dependencies: the root .venv and node_modules and ${SUB_ENV()} (a module installed deeper than one sub-directory, or a dependency the lane added, is absent). A missing third-party module, a missing command or a network or read-only-filesystem error says nothing about the lane: do not fail a scenario on that error. Judge that scenario by reading the code, set static=true and say so in its reason; the line then ends the order needs-human-check. A wrong reference to the lane's own code (a typoed module name, a file it never added) is the lane's failure: fail the scenario as usual.
+- When done, in this order (these two git reads need the throwaway copy, so run them before deleting it): \`${c.head}\` (lane.headAfter) and \`${c.status}\` (lane.statusAfter), then \`${c.cleanup}\` and check it is gone (lane.copyRemoved).
 WITHOUT ONE (no bwrap: sandbox 'missing'; the probe did not exit 0: sandbox 'failed'): run NO lane code and none of the commands above except the two Prepare commands and the cleanup. Judge every scenario by reading the code with your Read, Grep and Glob tools only, static=true on each; the only git you may run is \`${c.staticHead}\` (lane.headBefore first, lane.headAfter last) and \`${c.staticDiff}\`. Report lane.statusBefore and lane.statusAfter as "not-run", executed=false, and remove the prepared directory (\`${c.cleanup}\`, lane.copyRemoved).
 GIT FAILURES: these commands can fetch nothing. If one fails because an object is missing ("missing", "bad object", "could not read", "unable to fetch"), never fetch it or retry another way: report git 'objects-missing' and judge statically (executed=false, static=true). Any other git failure: git 'failed'. Otherwise git 'ok'.
 - Either way, write nothing anywhere else: no notes, copies or output files, in no scratchpad, temp directory or the worktree, and never change git state. Read files with your Read, Grep and Glob tools; what you learn goes into your structured answer only.
@@ -747,15 +772,20 @@ METHOD:
 - Run the build's howToTest command, the tests you added, and the existing suite where it is cheap enough.
 - Do not change product code: a defect you find is a failure to report (the build station fixes it on rework), not to fix.
 - Commit only the tests you add, with a message starting \`${ORDER}:\`.
-- ran=true and passed=true only with real output in evidence; never assume green. Map each criterion to covered true/false; list concrete failures with the assertion that failed.
+- A failed test: before you believe it, rerun that test file once on its own, with nothing else running (no other test command alongside). If it passes alone, it is flaky: list it in flaky (the file, the first run's result line, the rerun's result line) and not in failures; it does not fail the station. If it fails again alone, it is a failure as now: list it in failures.
+- ran=true and passed=true only with real output in evidence; never assume green. Map each criterion to covered true/false; list concrete failures with the assertion that failed (a flaky file goes in flaky, not failures).
 Return the structured test report.`, TEST_SCHEMA)
   if (!t) return INFRA_OUT
   lastTest = t
   const failures = arr(t.failures).map((f) => one(f, 300))
   const added = arr(t.testsAdded)
-  let pass = t.ran === true && t.passed === true && failures.length === 0
+  const flaky = arr(t.flaky).map((f) => f && typeof f === 'object' ? { file: one(f.file, 200), firstRun: one(f.firstRun, 200), rerun: one(f.rerun, 200) } : { file: one(f, 200), firstRun: '', rerun: '' })
+  const halfFlaky = flaky.filter((f) => !f.firstRun || !f.rerun)
+  const flakyText = flaky.map((f) => `${f.file} (first run: ${f.firstRun || '-'}; rerun alone: ${f.rerun || '-'})`).join('; ')
+  let pass = t.ran === true && t.passed === true && failures.length === 0 && halfFlaky.length === 0
   let note = t.ran !== true ? 'tests were not run'
-    : pass ? `tests ran and passed: ${bare(t.command, 160)}`
+    : pass ? `tests ran and passed: ${bare(t.command, 160)}${flaky.length ? `; flaky (failed, then passed rerun alone): ${flakyText}` : ''}`
+    : !failures.length && halfFlaky.length && t.passed === true ? `tests failed: flaky entry without both result lines (${halfFlaky.map((f) => f.file).join(', ')}): a failure not shown to pass when rerun alone`
     : `tests failed: ${failures.slice(0, 3).join('; ') || bare(t.evidence, 200) || 'see evidence'}`
   if (pass && added.length && t.committed !== true) { pass = false; note = `tests pass but ${added.length} added test file(s) are uncommitted` }
   settle(st, attempt, pass, note, t)
@@ -763,7 +793,7 @@ Return the structured test report.`, TEST_SCHEMA)
   return { pass, note, text: pass ? '' : `TEST STATION REPORT: ran=${t.ran}, passed=${t.passed}, command: ${one(t.command, 300)}.
 Failures:
 ${failures.length ? failures.map((f) => `- ${f}`).join('\n') : '- (none listed; see the evidence)'}
-${uncovered.length ? `Acceptance criteria without passing coverage:\n${uncovered.map((u) => `- ${u}`).join('\n')}\n` : ''}${added.length && t.committed !== true ? 'The test station left its added tests uncommitted: commit them with your fix.\n' : ''}Evidence (tail):
+${halfFlaky.length ? `Flaky entries missing a result line (count as failures): ${halfFlaky.map((f) => `${f.file} (first run: ${f.firstRun || '-'}; rerun alone: ${f.rerun || '-'})`).join('; ')}\n` : ''}${uncovered.length ? `Acceptance criteria without passing coverage:\n${uncovered.map((u) => `- ${u}`).join('\n')}\n` : ''}${added.length && t.committed !== true ? 'The test station left its added tests uncommitted: commit them with your fix.\n' : ''}Evidence (tail):
 ${clip(t.evidence, 2000)}` }
 }
 
@@ -1003,7 +1033,8 @@ const testText = () => {
   else if (!lastTest) parts.push('the test station did not run')
   else {
     const tail = tail2(lastTest.evidence)
-    parts.push(`test station ${lastTest.ran === true && lastTest.passed === true ? 'ran and passed' : `ran=${lastTest.ran}, passed=${lastTest.passed}`}: ${bare(lastTest.command, 160)}${tail ? ` (${tail})` : ''}, ${arr(lastTest.testsAdded).length} test file(s) added`)
+    const flk = arr(lastTest.flaky).filter((f) => f && typeof f === 'object')
+    parts.push(`test station ${lastTest.ran === true && lastTest.passed === true ? 'ran and passed' : `ran=${lastTest.ran}, passed=${lastTest.passed}`}: ${bare(lastTest.command, 160)}${tail ? ` (${tail})` : ''}, ${arr(lastTest.testsAdded).length} test file(s) added${flk.length ? `, flaky (passed rerun alone): ${flk.map((f) => `${bare(f.file, 120)} (first run ${bare(f.firstRun, 100)}; rerun ${bare(f.rerun, 100)})`).join(', ')}` : ''}`)
   }
   if (ST.review) {
     const tr = lastReview && lastReview.testRun && typeof lastReview.testRun === 'object' ? lastReview.testRun : null

@@ -170,6 +170,7 @@ CASES = [
     ("C09", "ccdash", ROOT, "NotebookEdit", {"notebook_path": os.path.join(ROOT, "nb.ipynb"), "new_source": "x"}, "s", A),  # notebooks: location checks only
     # every path-like field is checked, not the first one present (a decoy must not stand in)
     ("C15", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "projects.json"), "content": "{}"}, "s", D),  # cc-dash's project registry
+    ("C15b", "ccdash", ROOT, "Write", {"file_path": os.path.join(CC_STATE, "cc_dash_code.json"), "content": "{}"}, "s", D),  # FO-004: the code record
     ("C10", "ccdash", ROOT, "NotebookEdit", {"file_path": A_TS, "notebook_path": os.path.join(CC_STATE, "control", "lease"), "new_source": "x"}, "s", D),
     ("C11", "ccdash", ROOT, "NotebookEdit", {"file_path": os.path.join(CC_STATE, "control", "lease"), "notebook_path": os.path.join(ROOT, "nb.ipynb"), "new_source": "x"}, "s", D),
     ("C12", "ccdash", ROOT, "Write", {"file_path": A_TS, "path": os.path.join(CC_STATE, "control", "dec", "1-a.json"), "content": "x"}, "s", D),

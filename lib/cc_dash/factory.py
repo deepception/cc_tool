@@ -991,6 +991,7 @@ def _fold(order, events, line):
     status = fm if fm in SEED_STATUSES else "queued"  # a gate status only ever comes from the ledger
     run_id, lane, rework = "", None, 0
     fail_seen, last_station, last_gate = False, "", None
+    last_spec = None   # (state, spec_hash) of the latest pass/fail spec-gate event
     status_ev = None   # the event that set the current status: its note says why an order went off its path
 
     for e in evs:
@@ -1034,6 +1035,8 @@ def _fold(order, events, line):
                 g = e.get("station")
             if g in GATES:
                 last_gate = (g, state)
+                if g == "spec" and state in ("pass", "fail"):
+                    last_spec = (state, e.get("spec_hash"))
 
     if status == "done":
         st_status = ["done" if s == "active" else "skipped" if s == "pending" else s for s in st_status]
@@ -1054,6 +1057,14 @@ def _fold(order, events, line):
     else:
         gate = None
 
+    spec_changed = False
+    if status in CHANGEABLE and ((line or {}).get("gates") or {}).get("spec", "human") == "human":
+        if last_spec is not None and last_spec[0] == "pass":
+            try:
+                spec_changed = not last_spec[1] or last_spec[1] != spec_hash(order.get("body") or "", line)
+            except Exception:  # noqa: BLE001 - an unhashable spec is not provably unchanged
+                spec_changed = True
+
     created = next((e.get("t") for e in evs if e.get("event") == "created"), None)
     if created is None:
         created = _date_to_time(order.get("created_date"))
@@ -1062,7 +1073,7 @@ def _fold(order, events, line):
         mt = order.get("mtime")
         updated = float(mt) if isinstance(mt, (int, float)) and not isinstance(mt, bool) else None
 
-    return {
+    result = {
         "id": oid,
         "title": order.get("title") or oid,
         "priority": order.get("priority") or "p2",
@@ -1080,7 +1091,35 @@ def _fold(order, events, line):
         "events": len(evs),
         "line": order.get("line") or "default",
         "why": _why(status_ev) if status in OFF_PATH else None,
+        "spec_changed": spec_changed,
     }
+    result["decide"] = decisions(result)
+    return result
+
+
+CHANGEABLE = ("approved", "failed", "blocked")
+DROPPABLE = ("queued", "approved", "failed", "blocked")
+
+
+def decisions(o):
+    """The one rule for which human decision the dashboard may take on an order (a fold dict), or None.
+    {"kind": spec|merge|changed|drop, "gate": spec|merge, "approve", "reject", "rework"}. First match wins:
+    spec gate waiting (approve, reject); merge gate waiting (approve, reject, rework); an approved, failed or
+    blocked order whose spec changed since approval (re-approve, drop); a queued, approved, failed or blocked
+    order (drop only). Never approve for a queued order, never anything for building/verifying."""
+    try:
+        g, st = o.get("gate"), o.get("status")
+        if isinstance(g, dict) and g.get("waiting") and g.get("name") == "spec":
+            return {"kind": "spec", "gate": "spec", "approve": True, "reject": True, "rework": False}
+        if isinstance(g, dict) and g.get("waiting") and g.get("name") == "merge":
+            return {"kind": "merge", "gate": "merge", "approve": True, "reject": True, "rework": True}
+        if st in CHANGEABLE and o.get("spec_changed"):
+            return {"kind": "changed", "gate": "spec", "approve": True, "reject": True, "rework": False}
+        if st in DROPPABLE:
+            return {"kind": "drop", "gate": "spec", "approve": False, "reject": True, "rework": False}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def _why(e):
@@ -1103,7 +1142,9 @@ def fold(order, events, line, now=None):
     never ran, a human gate is waiting at
     status "spec" (line gates.spec == "human") or at "review" with no active
     station. `why` is the note and recommendation of the event that set an
-    OFF_PATH status, and None on the path. `now` is accepted for the caller's convenience and unused: the
+    OFF_PATH status, and None on the path. `spec_changed` is True for an approved, failed or blocked order
+    on a human spec line whose latest spec-gate pass has no hash or another hash than the current body,
+    line and threshold; `decide` is decisions() of the result. `now` is accepted for the caller's convenience and unused: the
     fold is a pure function of its inputs. The inputs are not modified."""
     try:
         return _fold(order, events, line)
@@ -1113,7 +1154,9 @@ def fold(order, events, line, now=None):
         return {"id": oid, "title": oid, "priority": "p2", "status": "queued", "path": "",
                 "created": None, "updated": None, "station": "",
                 "stations": [{"name": n, "title": ti, "status": "pending", "t": None} for n, ti in sts],
-                "gate": None, "lane": None, "run_id": "", "rework": 0, "events": 0, "line": "default", "why": None}
+                "gate": None, "lane": None, "run_id": "", "rework": 0, "events": 0, "line": "default", "why": None,
+                "spec_changed": False, "decide": {"kind": "drop", "gate": "spec", "approve": False,
+                                                  "reject": True, "rework": False}}
 
 
 def project_orders(root, now):

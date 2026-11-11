@@ -468,7 +468,7 @@ def test_launch_refusals():
             if pid == 60:                  # the terminal emulator holds the master of /dev/pts/0 (tty_nr 34816)
                 fake_master(os.path.join(lp, str(pid)), 0)
         plant_lease(sleeper.pid)
-        why = server_mod.control_refusal(d, proc=lp, env={}, ancestors=[], terminals=FAKE_TERMINALS)
+        why = server_mod.control_refusal(d, proc=lp, env={}, ancestors=[])
         check("a live lease held by a real cc-dash of this checkout: takeover refused", "holds the control lease" in why, why)
     finally:
         sleeper.kill()
@@ -515,27 +515,27 @@ def test_launch_refusals():
         proc(300, "bash", 200, 300, 200, 34816, ["bash"], "/usr/bin/bash")
         proc(400, "python3", me_ppid, me_pgrp, me_sid, me_tty, ["python3", "cc-dash", "--control"], "/usr/bin/python3")
     build(sid_leader_parent=100)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
     check("fake /proc: a clean parent chain but a session leader that descends from claude: refused",
           "session leader descends from process 100" in why, why)
     build(sid_leader_parent=110, me_sid=400, me_pgrp=300)
     proc(300, "bash", 100, 300, 300, 34816, ["bash"], "/usr/bin/bash")
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
     check("fake /proc: a process-group leader that descends from claude: refused", "process-group leader descends" in why, why)
     build(sid_leader_parent=110, me_tty=0, me_sid=400, me_pgrp=400)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
     check("fake /proc: re-parented to the user manager with no controlling terminal: refused",
           "must be started from your own terminal" in why, why)
     # What `ccdash` really does (measured): own process group, the shell's session,
     # re-parented to the user manager, the terminal still open.
     build(sid_leader_parent=110, me_sid=200, me_pgrp=400)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
     check("fake /proc: detached into its own process group, shell's session, terminal open (what `ccdash` does): allowed", why == "", why)
     build(sid_leader_parent=110, me_sid=400, me_pgrp=400)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
     check("fake /proc: leads a fresh session (setsid) and was re-parented: refused", "leads a fresh session" in why, why)
     build(sid_leader_parent=110, me_ppid=300)
-    why = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
+    why = server_mod.control_refusal(d, env={}, proc=fp, me=400)
     check("fake /proc: started from a terminal shell, leaders clean: allowed", why == "", why)
 
 
@@ -837,7 +837,7 @@ def test_real_process_code_never_on_disk():
         time.sleep(0.1)
     out = open(log2, "rb").read()
     check("no terminal: cc-dash --control refuses to start (says why)", not _alive(pid2) and (b"needs a terminal" in out or b"was detached" in out
-                                                                                     or b"fresh session" in out), out[-200:])
+                                                                                     or b"fresh session" in out or b"no controlling pseudo-terminal" in out), out[-200:])
     check("no terminal: nothing that looks like a code was printed", not CODE_RE.search(out.decode("utf-8", "replace")))
 
 

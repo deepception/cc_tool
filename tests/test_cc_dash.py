@@ -166,6 +166,17 @@ def test_pricing():
     check("pricing: haiku 5.5 long-context tier", abs(lo - 0.005) < 1e-9 and abs(hi - 0.075) < 1e-9, f"{lo} {hi}")
     check("pricing: unknown model is unpriced", pricing.message_cost("claude-mystery-9", 1, 1, 0, 0, 0) is None)
     check("pricing: fast mode doubles", abs(pricing.message_cost("claude-opus-5-5", 0, 1_000_000, 0, 0, 0, speed="fast") - 40.0) < 1e-9)
+    cw = pricing.context_window
+    check("pricing: context window per table row",
+          cw("claude-opus-5-5") == 1_000_000 and cw("claude-opus-4-1") == 200_000
+          and cw("claude-sonnet-4-6") is None and cw("claude-3-5-haiku") is None)
+    check("pricing: context window, dated, dated 4.0 alias and prefixed ids",
+          cw("claude-haiku-4-5-20251001") == 200_000 and cw("claude-sonnet-4-20250514") is None
+          and cw("us.anthropic.claude-opus-5-5") == 1_000_000)
+    check("pricing: context window, 1M option by [1m] or by context above 200K",
+          cw("claude-sonnet-4-6[1m]") == 1_000_000 and cw("claude-opus-4-6", 250_000) == 1_000_000
+          and cw("claude-opus-4-6", 200_000) is None)
+    check("pricing: context window of an unknown id", cw("claude-mystery-9") is None and cw("") is None)
     check("pricing: display names", pricing.display_name("claude-opus-5-5") == "Opus 5.5" and pricing.display_name("claude-3-5-haiku") == "Haiku 3.5")
 
 

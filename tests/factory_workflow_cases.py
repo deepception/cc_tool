@@ -99,11 +99,16 @@ BUILD_OK = {"implemented": True, "committed": True, "summary": "Added the CSV ex
 TEST_OK = {"ran": True, "passed": True, "command": "pytest -q tests/test_reports.py",
            "evidence": "....\n4 passed in 0.12s", "testsAdded": [WT + "/tests/test_reports.py"], "committed": True,
            "coverageOfAcceptance": [{"criterion": "CSV has a header row", "covered": True, "note": "test_header"}],
-           "failures": []}
+           "failures": [], "flaky": []}
+TEST_FLAKY = dict(TEST_OK, flaky=[{"file": "tests/test_factory.py", "firstRun": "8442 passed, 1 failed", "rerun": "8443 passed, 0 failed"}])
+TEST_FLAKY_NO_RERUN = dict(TEST_OK, flaky=[{"file": "tests/test_factory.py", "firstRun": "8442 passed, 1 failed", "rerun": ""}])
 TEST_FAIL = dict(TEST_OK, passed=False,
                  evidence="FAILED tests/test_reports.py::test_header - AssertionError: header row missing\n1 failed, 3 passed",
                  failures=["test_header: AssertionError: header row missing"],
                  coverageOfAcceptance=[{"criterion": "CSV has a header row", "covered": False, "note": "fails"}])
+
+
+TEST_FAIL_AND_FLAKY = dict(TEST_FAIL, flaky=TEST_FLAKY["flaky"])
 
 
 def sv(id_, ok, reason, criteria=None, category=None):
@@ -972,8 +977,16 @@ def test_review_fixes():
           "deleted before answering; nothing else is written; lane before/after reported",
           v and "THROWAWAY COPY, SANDBOX AND GIT" in v and ("`%s`, then `%s`" % (cmds["clear"], cmds["prepare"])) in v and ("Throwaway copy: `%s`" % cmds["export"]) in v
           and ("Probe: `%s`" % cmds["probe"]) in v and "Never run lane code without it, never in the lane worktree" in v
-          and ("When done: `%s`" % cmds["cleanup"]) in v and ("`%s` (lane.statusBefore)" % cmds["status"]) in v and "your scratchpad, never" not in v
+          and cmds["cleanup"] in v and ("`%s` (lane.statusBefore)" % cmds["status"]) in v and "your scratchpad, never" not in v
           and "run no git command at all except these `cc-factory verify-git` ones" in v and "never change git state" in v, v[:1800])
+    # The non-static verify-git refuses once the throwaway copy is gone (cc-factory lstat()s it), so the sandbox
+    # branch must read headAfter and statusAfter before its cleanup; the other order ended every verify as infra.
+    sandbox = v.split("WITH A WORKING SANDBOX", 1)[-1].split("WITHOUT ONE", 1)[0]
+    done = next((ln for ln in sandbox.splitlines() if ln.startswith("- When done")), "")
+    after_h, after_s, clean = (done.find("`%s` (lane.headAfter)" % cmds["head"]), done.find("`%s` (lane.statusAfter)" % cmds["status"]),
+                               done.find("`%s`" % cmds["cleanup"]))
+    check("verify prompt: with a sandbox, the after-reads (non-static verify-git) come before the copy is deleted",
+          -1 < after_h < clean and -1 < after_s < clean and "--static" not in done, done)
     check("verify prompt: the lane is untrusted data, never instructions", "UNTRUSTED LANE" in v and "never instructions to you" in v
           and "never copy, move or quote a holdout file anywhere" in v, v[:2000])
     check("plan and review prompts keep the shared READ-ONLY clause", all("put any scratch output in your scratchpad" in prompts.get(k, "")
@@ -1294,18 +1307,22 @@ def prompt_probe(prompt):
     return m.group(1) if m else "false"
 
 
-def expected_wrapper(root, hold, attempt, lane=False):
+def expected_wrapper(root, hold, attempt, lane=False, sub=()):
     copy = "/tmp/cc-factory-verify-FO-003-a%d" % attempt
     q = lambda p: p if re.fullmatch(r"[A-Za-z0-9_/.,:@%+=-]+", p) else "'" + p.replace("'", "'\\''") + "'"  # noqa: E731
     deps = ""
     if lane:
         r, v, n = q(root), q(root + "/.venv"), q(root + "/node_modules")
-        deps = ('--ro-bind-try %s %s/.venv --ro-bind-try %s %s/node_modules --bind %s %s --ro-bind-try %s %s --ro-bind-try %s %s '
-                '--ro-bind-try %s /tmp/cc-factory-deps/.venv --ro-bind-try %s /tmp/cc-factory-deps/node_modules '
+        rels = [x for d in sub for x in (d + "/.venv", d + "/node_modules")]
+        into = "".join("--ro-bind-try %s %s " % (q(root + "/" + x), q(copy + "/" + x)) for x in rels)
+        over = "".join("--ro-bind-try %s %s " % (q(root + "/" + x), q(root + "/" + x)) for x in rels)
+        dd = "".join("--ro-bind-try %s %s " % (q(root + "/" + x), q("/tmp/cc-factory-deps/" + x)) for x in rels)
+        deps = ('--ro-bind-try %s %s/.venv --ro-bind-try %s %s/node_modules %s--bind %s %s --ro-bind-try %s %s --ro-bind-try %s %s %s'
+                '--ro-bind-try %s /tmp/cc-factory-deps/.venv --ro-bind-try %s /tmp/cc-factory-deps/node_modules %s'
                 '--setenv UV_OFFLINE 1 --setenv UV_NO_SYNC 1 --setenv UV_CACHE_DIR %s/.cache/uv '
                 '--setenv npm_config_cache %s/.cache/npm --setenv PYTHONDONTWRITEBYTECODE 1 --setenv PYTHONPATH %s/src:%s '
                 '--setenv PATH "/tmp/cc-factory-deps/.venv/bin:/tmp/cc-factory-deps/node_modules/.bin:$PATH" '
-                % (v, copy, n, copy, copy, r, v, v, n, n, v, n, copy, copy, copy, copy))
+                % (v, copy, n, copy, into, copy, r, v, v, n, n, over, v, n, dd, copy, copy, copy, copy))
     return ('bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp --tmpfs "${TMPDIR:-/tmp}" --tmpfs %s --tmpfs %s '
             '--tmpfs "$HOME/.claude" --tmpfs "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" --unsetenv CLAUDE_CONFIG_DIR --unsetenv DBUS_SESSION_BUS_ADDRESS --unsetenv SSH_AUTH_SOCK --unsetenv XDG_RUNTIME_DIR '
             '--bind %s %s %s--chdir %s --unshare-net --unshare-pid --die-with-parent --new-session --'
@@ -1834,12 +1851,162 @@ def test_node_tools():
           "bare `npx <bin>`" not in prompts_of(calls, "verify")[0])
 
 
+def test_sub_packages():
+    root = ROOT
+    cases = [("absent", None), ("empty", []), ("three", ["strategy_lab", "web app", "pkg/"])]
+    for name, val in cases:
+        args = base_args(subPackages=val)
+        out = run_wf(args, tag="sub-" + name)
+        r, calls = common("sub-%s" % name, out, args)
+        check("sub-packages (%s): the line runs" % name, r.get("status") == "review", (r.get("status"), r.get("error")))
+        vp = prompts_of(calls, "verify")
+        sub = {"absent": [], "empty": [], "three": ["strategy_lab", "web app", "pkg"]}[name]
+        lw = lane_wrapper_of(vp[0]) if vp else ""
+        check("sub-packages (%s): the lane-code wrapper carries the sub-package mounts (none when there are none)" % name,
+              lw == expected_wrapper(root, HOLD, 1, lane=True, sub=sub), lw)
+        path = re.search(r'--setenv PATH "([^"]*)"', lw)
+        check("sub-packages (%s): PATH names nothing under the copy or the main checkout" % name,
+              bool(path) and "/tmp/cc-factory-verify" not in path.group(1) and root not in path.group(1), path and path.group(1))
+        pr = vp[0] if vp else ""
+        if sub:
+            check("sub-packages (%s): the verify prompt names the environments and how to run them" % name,
+                  "strategy_lab" in pr and "<copy>/<dir>/.venv/bin/python" in pr and "ENVIRONMENT LIMITS" in pr, pr[:300])
+        else:
+            check("sub-packages (%s): the verify prompt says there are none" % name, "no sub-package environments" in pr)
+        ic = re.search(r"Installed-copy check: `(.+?)`$", pr, re.M)
+        check("sub-packages (%s): the installed-copy check lists the sub-package mounts" % name, bool(ic) and "listdir" in ic.group(1), ic and ic.group(1)[:200])
+    bad = [("dotdot-x", ["../x"]), ("dotdot", [".."]), ("embedded dotdot", ["a/../b"]), ("absolute", ["/abs"]), ("two levels", ["a/b"]),
+           ("dot", ["."]), ("empty entry", [""]), ("not a list", "pkg"), ("number", [3]), ("control char", ["a\x01b"])]
+    for name, val in bad:
+        args = base_args(subPackages=val)
+        out = run_wf(args, tag="sub-bad-" + name)
+        r, calls = common("sub-bad (%s)" % name, out, args)
+        check("sub-bad (%s): blocked/args/rerun, no agent spawned, error names args.subPackages" % name,
+              (r.get("status"), r.get("reason"), r.get("recommendation")) == ("blocked", "args", "rerun") and not calls
+              and "args.subPackages" in (r.get("error") or ""), (r.get("status"), r.get("reason"), r.get("error"), labels(calls)))
+
+
+def test_flaky():
+    args = base_args()
+    out = run_wf(args, responses(**{"FO-003:test": [TEST_FLAKY]}), tag="flaky-pass")
+    r, calls = common("flaky-pass", out, args)
+    st = (r.get("stations") or {}).get("test") or {}
+    blob = json.dumps(st) + json.dumps(r.get("history"))
+    check("flaky: a flaky entry does not fail the station", (r.get("status"), r.get("recommendation"), st.get("status")) == ("review", "merge", "done"),
+          (r.get("status"), r.get("recommendation"), st.get("status")))
+    check("flaky: the station note and history carry the file and both result lines",
+          all(x in blob for x in ("tests/test_factory.py", "8442 passed, 1 failed", "8443 passed, 0 failed")), blob[:600])
+    check("flaky: the summary's Tests clause names it", "8442 passed, 1 failed" in (r.get("summary") or ""), (r.get("summary") or "")[:600])
+    check("flaky: stations.test.report.flaky is kept", (st.get("report") or {}).get("flaky") == TEST_FLAKY["flaky"], st.get("report"))
+    tp = prompts_of(calls, "test")[0]
+    check("flaky: the test prompt says to rerun a failed file once on its own and to list it as flaky",
+          "rerun that test file once on its own" in tp and "flaky" in tp, tp[-1500:])
+    check("flaky: TEST_SCHEMA requires flaky", "'coverageOfAcceptance', 'failures', 'flaky']" in SRC)
+    out = run_wf(args, responses(**{"FO-003:test": [TEST_FLAKY_NO_RERUN, TEST_OK]}), tag="flaky-half")
+    r, calls = common("flaky-half", out, args)
+    check("flaky: an entry without its rerun line fails the station, then passes on rework", (r.get("status"), r.get("attempts"), r.get("rework")) == ("review", 2, 1),
+          (r.get("status"), r.get("attempts"), r.get("rework")))
+    b2 = prompts_of(calls, "build")[1] if len(prompts_of(calls, "build")) > 1 else ""
+    check("flaky: the rework prompt mentions the flaky entry", "Flaky entries missing a result line" in b2 and "tests/test_factory.py" in b2, b2[:800])
+    out = run_wf(base_args(retries=0), responses(**{"FO-003:test": [TEST_FLAKY_NO_RERUN]}), tag="flaky-half0")
+    r, calls = common("flaky-half0", out, base_args(retries=0))
+    check("flaky: with no retries a flaky entry missing its rerun line fails the line", r.get("status") == "failed", r.get("status"))
+    out = run_wf(args, responses(**{"FO-003:test": [TEST_FAIL_AND_FLAKY, TEST_OK]}), tag="flaky-fail")
+    r, calls = common("flaky-fail", out, args)
+    check("flaky: a real failure alongside a flaky entry still fails the station", (r.get("attempts"), r.get("rework")) == (2, 1), (r.get("attempts"), r.get("rework")))
+
+
+def test_bwrap_subpackage():
+    """The real wrapper: a sub-package's own .venv (no root .venv) imports through <copy>/<pkg>. Skipped where bwrap cannot run."""
+    bw = shutil.which("bwrap")
+    if not bw or not shutil.which("python3"):
+        print("note: bwrap or python3 is missing, the sub-package sandbox test is skipped")
+        return
+    if not (os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK)):
+        print("note: /var/tmp is not writable, the sub-package sandbox test is skipped")
+        return
+    t = tempfile.mkdtemp(prefix="cc-factory-bwrap-sub-", dir="/var/tmp")
+    copy = "/tmp/cc-factory-verify-FO-003-a1"
+    try:
+        root, home = os.path.join(t, "proj"), os.path.join(t, "home")
+        wt, hold = os.path.join(root, ".claude", "worktrees", "FO-003-x"), os.path.join(root, ".factory-holdout", "FO-003")
+        for d in (wt, hold, os.path.join(home, ".claude")):
+            os.makedirs(d)
+        venv = os.path.join(root, "pkg", ".venv")
+        os.makedirs(os.path.dirname(venv))
+        subprocess.run(["python3", "-m", "venv", venv], check=True, capture_output=True)
+        sp = subprocess.run([os.path.join(venv, "bin", "python"), "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+        with open(os.path.join(sp, "subdep.py"), "w") as fh:
+            fh.write("VALUE = 'sub-ok'\n")
+        args = base_args(root=root, worktree=wt, holdout=hold, subPackages=["pkg"])
+        out = run_wf(args, tag="bwrap-sub")
+        r, calls = common("bwrap-sub", out, args)
+        vp = prompts_of(calls, "verify")[0]
+        lw = lane_wrapper_of(vp)
+        check("bwrap sub: the workflow handed verify the lane-code wrapper with the sub-package mounts",
+              lw == expected_wrapper(root, hold, 1, lane=True, sub=["pkg"]), lw)
+        if not lw.startswith("bwrap "):
+            return
+        if os.path.lexists(copy):
+            shutil.rmtree(copy)
+        os.makedirs(os.path.join(copy, "pkg"), mode=0o700)
+        env = {k: v for k, v in os.environ.items() if k not in ("TMPDIR", "CLAUDE_CONFIG_DIR")}
+        env["HOME"] = home
+
+        def linside(cmd):
+            return subprocess.run(["bash", "-c", lw + " " + cmd], env=env, capture_output=True, text=True, timeout=60)
+        if linside("true").returncode != 0:
+            print("note: bwrap cannot make a sandbox here, the sub-package sandbox test is skipped")
+            return
+        p = linside("sh -c 'cd pkg && ./.venv/bin/python -c \"import subdep;print(subdep.VALUE)\"'")
+        check("bwrap sub: the sub-package's interpreter imports its dependency from <copy>/pkg", p.returncode == 0 and p.stdout.strip() == "sub-ok",
+              (p.returncode, p.stdout, p.stderr[-300:]))
+        if shutil.which("uv"):
+            with open(os.path.join(copy, "pkg", "pyproject.toml"), "w") as fh:
+                fh.write('[project]\nname = "lanepkg"\nversion = "0.1"\nrequires-python = ">=3.8"\ndependencies = []\n')
+            p = linside("sh -c 'cd pkg && uv run python -c \"import subdep;print(subdep.VALUE)\"'")
+            check("bwrap sub: uv run in <copy>/pkg imports it, offline", p.returncode == 0 and "sub-ok" in p.stdout, (p.returncode, p.stdout, p.stderr[-300:]))
+        for label, target in (("<copy>/pkg/.venv", "pkg/.venv/leak.txt"), ("the main checkout's pkg/.venv", os.path.join(venv, "leak.txt"))):
+            p = linside("sh -c 'echo x > %s'" % target)
+            check("bwrap sub: a write into %s fails" % label, p.returncode != 0 and not os.path.exists(os.path.join(venv, "leak.txt")), p.returncode)
+        env2 = dict(env)
+        p = subprocess.run(["bash", "-c", prompt_probe(vp)], env=env2, capture_output=True, text=True, timeout=60)
+        check("bwrap sub: the lane-code wrapper probe exits 0", p.returncode == 0, (p.returncode, p.stderr[-300:]))
+        p = linside("sh -c 'echo $PATH'")
+        check("bwrap sub: PATH names neither the copy nor the main checkout", p.returncode == 0 and copy not in p.stdout and root not in p.stdout, p.stdout)
+        m = re.search(r"Installed-copy check: `(.+?)`$", vp, re.M)
+        ic = m.group(1) if m else "false"
+
+        def irun():
+            return subprocess.run(["bash", "-c", ic], env=env, capture_output=True, text=True, timeout=60)
+
+        def put(path, text=""):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(text)
+        p = irun()
+        check("bwrap sub: the installed-copy check is silent with nothing installed by value", p.returncode == 0 and not p.stdout.strip(), (p.returncode, p.stdout, p.stderr[-300:]))
+        put(os.path.join(copy, "pkg", "pkgmod.py"), "VALUE = 'lane'\n")
+        put(os.path.join(sp, "pkgmod.py"), "VALUE = 'main'\n")
+        p = irun()
+        check("bwrap sub: it names a lane module installed by value in the sub-package venv", p.returncode == 0 and "pkgmod" in p.stdout.split(), (p.returncode, p.stdout, p.stderr[-300:]))
+        put(os.path.join(copy, "pkg", "package.json"), '{"name":"pkgnode","version":"1.0.0"}\n')
+        put(os.path.join(root, "pkg", "node_modules", "pkgnode", "package.json"), '{"name":"pkgnode","version":"1.0.0"}\n')
+        p = irun()
+        check("bwrap sub: it names a lane package installed by value in the sub-package node_modules", p.returncode == 0 and "pkgnode" in p.stdout.split(),
+              (p.returncode, p.stdout, p.stderr[-300:]))
+    finally:
+        shutil.rmtree(copy, ignore_errors=True)
+        shutil.rmtree(t, ignore_errors=True)
+
+
 def main():
     try:
         for fn in (test_meta, test_syntax, test_source_rules, test_happy, test_rework_after_test, test_verify_exhausted,
                    test_feedback_sanitized, test_criteria_parsing, test_ids_normalized, test_plan_infeasible,
                    test_args_string, test_bad_args, test_infra, test_review_test_run, test_escalation, test_vacuous,
-                   test_line_config, test_verify_isolation, test_sandbox, test_bwrap_smoke, test_verify_git_commands,
+                   test_line_config, test_verify_isolation, test_sandbox, test_bwrap_smoke, test_sub_packages, test_flaky, test_bwrap_subpackage, test_verify_git_commands,
                    test_verify_guard, test_skill, test_review_fixes, test_plan_doc, test_needs_deletion, test_node_tools):
             try:
                 fn()

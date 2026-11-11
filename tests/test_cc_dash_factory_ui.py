@@ -22,6 +22,7 @@ returns without reloading the page:
   noseries poll 1 without `series` (an older server)
 Every variant but noseries carries `series` (the last-hour buckets); `empty` a zero one, `robust` one with junk in it.
   visuals poll 1 with the same ids: A91 failed, FO-002 and FO-003 sent back, S1 and E9 newer in their states
+  ctx     poll 1 with context on S1 (82%), A91 (95%), A2 (60%), B3 (45%), S6 (412K, window unknown), E9 (120K, unknown)
 
 Control mode is stubbed the same way (GET /__test/ctl?mode=off|on|read&alerts=0|1): /api/meta,
 /api/control/state (a flagged Bash permission for B3, a question for S1's main thread), a recording
@@ -91,6 +92,7 @@ os.makedirs(os.environ["CLAUDE_CONFIG_DIR"], exist_ok=True)
 # and an empty state dir: /api/alerts otherwise tails your real attention.jsonl, and live toasts cover graph nodes
 os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "state")
 sys.path.insert(0, os.path.join(REPO, "lib"))
+from cc_dash import gates  # noqa: E402
 from cc_dash import server as server_mod  # noqa: E402
 from cc_dash.auth import Auth  # noqa: E402
 from cc_dash.store import Store  # noqa: E402
@@ -120,13 +122,13 @@ for _path, _entry in NEW_ASSETS.items():
     server_mod.ASSETS.setdefault(_path, _entry)
 
 TIME_KEYS = {"now", "since", "start", "t", "created", "updated"}
-VARIANTS = ("1", "2", "states", "big", "empty", "long", "cycles", "robust", "garbage", "objnodes", "rates", "noseries", "visuals")
+VARIANTS = ("1", "2", "states", "big", "empty", "long", "cycles", "robust", "garbage", "objnodes", "rates", "noseries", "visuals", "ctx", "decide")
 STATE = {"n": "1"}
 # Control mode, stubbed (GET /__test/ctl?mode=off|on|read&alerts=0|1): /api/meta says control is enabled
 # (scope 'control' for on, 'read' for read: the control code not typed yet), /api/control/state serves
 # CTL_REQS, POST /api/control/decide is recorded in CTL["posts"], and /api/alerts serves the toast for
 # B3's request while alerts=1. Off (the default for every step) leaves the real handler in charge.
-CTL = {"mode": "off", "alerts": True, "posts": [], "status": {}}
+CTL = {"mode": "off", "alerts": True, "posts": [], "status": {}, "refuse": "none"}
 
 
 def _load(n):
@@ -264,6 +266,63 @@ def robust_variant():
     return d
 
 
+DECIDE_ORDERS = [
+    # id, status, gate, spec_changed, decide kind, needs, word
+    ("FO-101", "spec", {"name": "spec", "waiting": True}, False, "spec", "gate", "Spec gate: waiting for you"),
+    ("FO-102", "review", {"name": "merge", "waiting": True}, False, "merge", "gate", "Merge gate: waiting for you"),
+    ("FO-103", "approved", None, True, "changed", "gate", "Spec changed since approval: re-approve"),
+    ("FO-104", "failed", None, False, "drop", "gate", "Failed: rerun or drop"),
+    ("FO-105", "blocked", None, False, "drop", "gate", "Blocked: rerun or drop"),
+    ("FO-106", "queued", None, False, "drop", None, None),
+    ("FO-107", "verifying", None, False, None, None, None),
+]
+DECIDE = {"ids": ["o:reports-app/" + r[0] for r in DECIDE_ORDERS], "needy": ["o:reports-app/" + r[0] for r in DECIDE_ORDERS if r[5]],
+          "quiet": ["o:reports-app/" + r[0] for r in DECIDE_ORDERS if not r[5]]}
+
+
+def decide_variant():
+    """Poll 1 plus one order per state of the decision table, each with its decide, spec_changed and main, and a gate alert for each that needs you."""
+    d = copy.deepcopy(POLL1)
+    proto = next(n for n in d["nodes"] if n["id"] == ORDER3)
+    edge = next(e for e in d["edges"] if e["target"] == ORDER3 and e["kind"] == "member")
+    for oid, status, gate, changed, kind, needs, word in DECIDE_ORDERS:
+        n = copy.deepcopy(proto)
+        nid = "o:reports-app/" + oid
+        dec = {"kind": kind, "gate": "merge" if kind == "merge" else "spec", "approve": kind in ("spec", "merge", "changed"),
+               "reject": True, "rework": kind == "merge"} if kind else None
+        n.update(id=nid, label="Order " + oid, state=status, needs=needs)
+        n["detail"].update(id=oid, title="Order " + oid, status=status, gate=gate, lane=None, run_id="", spec_changed=changed, decide=dec,
+                           main="~/Files/work/reports-app", why={"note": "the run stopped", "recommendation": "rerun"} if status in ("failed", "blocked") else None)
+        d["nodes"].append(n)
+        d["edges"].append(dict(edge, id="p:reports-app>" + nid, target=nid, active=False, rate=0))
+        if needs:
+            title = {"spec": "Spec gate", "merge": "Merge gate", "changed": "Spec changed"}.get(kind) or status.capitalize()
+            d["alerts"].append({"id": "o-" + oid.lower(), "node": nid, "kind": "gate", "title": title, "message": oid + " · Order " + oid, "tool": None, "age": 60.0})
+            d["kpis"]["needs"] += 1
+    hub = next(n for n in d["nodes"] if n["id"] == "p:reports-app")
+    hub.update(needs=hub["needs"] or "gate", state="needs")
+    d["sig"] = "decide"
+    return d
+
+
+def gate_card(q):
+    """A /api/control/gate card for an order of DECIDE_ORDERS, shaped as gates.py's view() answers."""
+    row = next((r for r in DECIDE_ORDERS if r[0] == q.get("order")), None)
+    if row is None or row[4] is None:
+        return 409, {"error": "%s has no decision for you on the dashboard." % q.get("order")}
+    oid, status, _g, changed, kind = row[:5]
+    gate = "merge" if kind == "merge" else "spec"
+    v = {"project": q.get("project"), "root": "~/Files/work/reports-app", "order": oid, "title": "Order " + oid, "priority": "p2", "line": "default", "status": status,
+         "rework": 0, "gate": gate, "kind": kind, "view": "f" * 32, "retries": 1, "threshold": 1.0, "commands": {}, "stations": [], "spec_changed": changed,
+         "decisions": {"approve": kind in ("spec", "merge", "changed"), "reject": True, "rework": kind == "merge"}}
+    if gate == "spec":
+        v.update(spec_hash="a" * 64, body="# Order %s\nThe whole current body.\n" % oid, path="factory/orders/%s-x.md" % oid)
+    else:
+        v.update(lane_head="b" * 40, briefing="Review passed.", branch="factory/%s-x" % oid, moved=False, merge_command="git merge --no-ff " + "b" * 40,
+                 recommendation="merge", run_id="", into={"branch": "main", "checkout": "~/Files/work/reports-app"}, merged=False, merge_blocked="")
+    return 200, v
+
+
 def objnodes_variant():
     d = copy.deepcopy(POLL1)
     d.update(nodes={}, sig="objnodes")
@@ -352,6 +411,26 @@ def visuals_variant():
     return d
 
 
+CTX_FIELDS = {S1: (820000, 1000000), A91: (950000, 1000000), A2: (600000, 1000000), B3: (450000, 1000000),
+              S6: (412000, None), E9: (120000, None),
+              # band edges: exactly 50% draws a meter, 89% is still the middle amber band
+              FAILED: (500000, 1000000), STALLED: (899999, 1000000)}
+
+
+CTX_IDS = set(CTX_FIELDS)
+
+
+def ctx_variant():
+    """Poll 1, same ids, with context on six nodes: S1 82% (high), A91 95% (full), A2 60% (mid), B3 45% (no meter),
+    S6 412K of an unknown window (raw count), E9 120K of an unknown window (nothing)."""
+    d = copy.deepcopy(POLL1)
+    for n in d["nodes"]:
+        if n["id"] in CTX_FIELDS:
+            n["context"], n["context_window"] = CTX_FIELDS[n["id"]]
+    d["sig"] = "ctx"
+    return d
+
+
 def compact(n):
     """app.js compact() below a million."""
     a = abs(n)
@@ -429,7 +508,7 @@ def usage_limits(now):
 def variant(n):
     return {"1": lambda: copy.deepcopy(POLL1), "2": lambda: copy.deepcopy(POLL2), "states": states_variant,
             "big": big_variant, "empty": empty_variant, "long": long_variant, "cycles": cycles_variant,
-            "robust": robust_variant, "objnodes": objnodes_variant, "rates": rates_variant, "noseries": noseries_variant, "visuals": visuals_variant}[n]()
+            "robust": robust_variant, "objnodes": objnodes_variant, "rates": rates_variant, "noseries": noseries_variant, "visuals": visuals_variant, "ctx": ctx_variant, "decide": decide_variant}[n]()
 
 
 def shift(o, delta):
@@ -490,7 +569,12 @@ class FxHandler(server_mod.Handler):
                 CTL.update(mode=q["mode"], posts=[], status={})
             if q.get("alerts") in ("0", "1"):
                 CTL["alerts"] = q["alerts"] == "1"
+            if q.get("refuse") in ("dirty", "stale", "unknown", "none"):
+                CTL["refuse"] = q["refuse"]
             return self._json(200, {"mode": CTL["mode"], "alerts": CTL["alerts"], "posts": CTL["posts"]})
+        if CTL["mode"] != "off" and parts.path == "/api/control/gate":
+            code, body = gate_card(q)
+            return self._json(code, body)
         if CTL["mode"] != "off" and parts.path in ("/api/meta", "/api/control/state", "/api/alerts"):
             if self.server.auth.session(self.headers) is None:
                 return self._json(401, {"error": "Not paired.", "repair": True})
@@ -514,6 +598,9 @@ class FxHandler(server_mod.Handler):
                 self.wfile.write(body)
                 return None
             d = variant(STATE["n"])
+            for n in (d.get("nodes") or []) if isinstance(d, dict) else []:      # what graph.py attaches, through the real builder
+                if isinstance(n, dict) and isinstance(n.get("detail"), dict) and str(n["detail"].get("id", "")).startswith("FO-"):
+                    n["detail"]["outside"] = gates.order_outside(n["detail"])
             d = shift(d, time.time() - d["now"])
             d = scoped(d, q.get("project", ""), q.get("all") == "1")
             if isinstance(d, dict):
@@ -523,6 +610,21 @@ class FxHandler(server_mod.Handler):
 
     def do_POST(self):  # noqa: N802
         path = urlsplit(self.path).path
+        if path == "/api/control/gate":
+            n = int(self.headers.get("Content-Length") or 0)
+            CTL["posts"].append({"gate": json.loads(self.rfile.read(n) or b"{}")})
+            if CTL["refuse"] == "dirty":
+                raw = "~/Files/work/reports-app has uncommitted changes to tracked files: commit or stash them, so the merge cannot touch them."
+                box = gates.outside("dirty-checkout", "~/Files/work/reports-app has uncommitted changes to tracked files.",
+                                    gates.where_("terminal", "~/Files/work/reports-app"), [{"command": "git status --short --untracked-files=no"}, {"command": "git stash push"}],
+                                    "Then reload this card and press Approve merge again.")
+                return self._json(409, {"error": raw, "refused": True, "outside": box})
+            if CTL["refuse"] == "stale":
+                return self._json(409, {"error": "This card is out of date or was already used. Reload it.", "reload": True})
+            if CTL["refuse"] == "unknown":
+                raw = "BLOCKED: the moon is full. Suggestion: wait."
+                return self._json(409, {"error": raw, "refused": True, "blocked": gates.blocked_parts(raw)})
+            return self._json(200, {"ok": True, "result": "recorded"})
         if path == "/api/control/decide" and CTL["mode"] != "off":
             if not self._host_ok():
                 return self._deny(421, "no")
@@ -1644,6 +1746,68 @@ async function clickInPlace(page, id) {
     });
   });
 
+  // 12n2. Orders that need a human: tile cue, alerts band, inspector, and the card in control mode -------------------------
+  await step('decide', async (r) => {
+    await withPage({ poll: 'decide' }, r, async (page) => {
+      await waitFx(page, X.poll1.ids.length + X.decide.ids.length); await settle(page, 3000);
+      r.faces = await page.evaluate((ids) => Object.fromEntries(ids.map((id) => [id, __t.face(id)])), X.decide.ids);
+      r.labels = await page.evaluate((ids) => Object.fromEntries(ids.map((id) => [id, (__t.q(id) || {getAttribute: () => ''}).getAttribute('aria-label')])), X.decide.ids);
+      r.band = await page.evaluate(() => [...document.querySelectorAll('.fx-alert')].filter((b) => b.dataset.node.startsWith('o:')).map((b) => b.dataset.node));
+      r.needs = await page.evaluate(() => { const k = document.querySelector('.fx-hud .fx-kpi[data-k="needs"]'); return k ? k.textContent.replace(/\s+/g, ' ').trim() : null; });
+      r.hub = await page.evaluate(() => { const f = __t.face('p:reports-app'); return f && f.needs; });
+      r.offButtons = await page.evaluate(() => document.querySelectorAll('[data-ctl-gate]').length);
+      r.inspOff = {};
+      for (const id of ['o:reports-app/FO-103', 'o:reports-app/FO-104', 'o:reports-app/FO-106', 'o:reports-app/FO-107']) {
+        await clickNode(page, id);
+        await waitInsp(page, 3000);
+        r.inspOff[id] = await page.evaluate(() => ({ text: __t.insp().text, kinds: [...document.querySelectorAll('aside.fx-inspector .ctl-next')].map((b) => b.dataset.outside), copies: [...document.querySelectorAll('aside.fx-inspector [data-copy]')].map((b) => b.dataset.copy) }));
+        await page.keyboard.press('Escape');
+      }
+      r.phone = await page.evaluate(() => [document.documentElement.scrollWidth, document.documentElement.clientWidth]);
+    });
+    await withPage({ poll: 'decide', ctl: 'on', alerts: false }, r.on = {}, async (page) => {
+      await waitFx(page, X.poll1.ids.length + X.decide.ids.length); await settle(page, 3000);
+      r.on.band = await page.evaluate(() => [...document.querySelectorAll('.fx-alert-w [data-ctl-gate]')].map((b) => b.dataset.ctlOrder + ':' + b.dataset.ctlGate + ':' + b.textContent));
+      await clickNode(page, 'o:reports-app/FO-103');
+      await waitInsp(page, 3000);
+      r.on.insp = await page.evaluate(() => [...document.querySelectorAll('aside.fx-inspector [data-ctl-gate]')].map((b) => b.dataset.ctlOrder + ':' + b.dataset.ctlGate + ':' + b.textContent));
+      await page.click('aside.fx-inspector [data-ctl-gate]');
+      await page.waitForSelector('dialog.ctl-review[open] .k-gate');
+      r.on.card = await page.evaluate(() => document.querySelector('dialog.ctl-review').textContent.replace(/\s+/g, ' '));
+      r.on.buttons = await page.evaluate(() => [...document.querySelectorAll('dialog.ctl-review .ctl-acts .btn')].map((b) => b.textContent));
+      r.on.posts = await (await fetch(BASE + '/__test/ctl')).json();
+      await page.keyboard.press('Escape');
+      await clickNode(page, 'o:reports-app/FO-102');
+      await waitInsp(page, 3000);
+      await page.click('aside.fx-inspector [data-ctl-gate]');
+      await page.waitForSelector('dialog.ctl-review[open] .k-gate');
+      r.on.merge = await page.evaluate(() => document.querySelector('dialog.ctl-review').textContent.replace(/\s+/g, ' '));
+      await page.keyboard.press('Escape');
+      // A refused Approve merge: the outside box, Reload alone, or the labelled cc-factory refusal.
+      r.on.refusals = {};
+      for (const mode of ['dirty', 'stale', 'unknown']) {
+        await fetch(BASE + '/__test/ctl?refuse=' + mode);      // the FO-102 inspector is still open behind the dialog
+        await page.click('aside.fx-inspector [data-ctl-gate]');
+        await page.waitForSelector('dialog.ctl-review[open] .k-gate');
+        await page.waitForTimeout(800);
+        await page.click('dialog.ctl-review .ctl-acts .btn.primary');
+        await page.fill('dialog.ctl-review .ctl-other', 'approve');
+        await page.click('dialog.ctl-review .warn-solid');
+        await page.waitForFunction(() => document.querySelector('dialog.ctl-review .ctl-next-slot').children.length || !document.querySelector('dialog.ctl-review .k-gate > .ctl-err').hidden, null, { timeout: 4000 });
+        r.on.refusals[mode] = await page.evaluate(() => {
+          const d = document.querySelector('dialog.ctl-review'), box = d.querySelector('.ctl-next');
+          const det = d.querySelector('.ctl-next-details');
+          return { kind: box ? box.dataset.outside : null, text: box ? box.textContent.replace(/\s+/g, ' ') : '', copies: d.querySelectorAll('[data-copy]').length,
+            detailsOpen: det ? det.open : null, errHidden: d.querySelector('.k-gate > .ctl-err').hidden, errText: d.querySelector('.k-gate > .ctl-err').textContent,
+            labels: [...d.querySelectorAll('.ctl-next p > b')].map((b) => b.textContent),
+            reload: [...d.querySelectorAll('.btn')].filter((b) => b.textContent === 'Reload').length };
+        });
+        await page.keyboard.press('Escape');
+      }
+      await fetch(BASE + '/__test/ctl?refuse=none');
+    });
+  });
+
   // 12o. Short viewports: the stage and its zoom buttons fit above the fold --------------------------------------------
   await step('shortview', async (r) => {
     r.cases = {};
@@ -2142,6 +2306,51 @@ async function clickInPlace(page, id) {
     });
   });
 
+  // 13c2. Context on the tiles: the meter from 50% (bands, colours, place), the raw count for an unknown window,
+  // the title and accessible name, the inspector's Context row; order, workflow and project faces untouched.
+  const ctxRead = (page) => page.evaluate((ids) => {
+    const R = (e) => e.getBoundingClientRect();
+    const tok = Object.fromEntries(['--ink-4', '--warn-dot', '--bad', '--fx-track'].map((v) => { const x = document.createElement('span'); x.style.color = 'var(' + v + ')'; document.body.append(x); const c = getComputedStyle(x).color; x.remove(); return [v, c]; }));
+    const nodes = {};
+    for (const el of document.querySelectorAll('.gx-node[data-id]')) {
+      const id = el.dataset.id, f = el.querySelector('.fx-node'), m = f && f.querySelector('.fx-ctx');
+      const o = { has: !!m, aria: el.getAttribute('aria-label'), title: f && f.getAttribute('title'), text: f ? f.textContent.replace(/\s+/g, ' ').trim() : '', cls: f ? String(f.className) : '' };
+      if (m) {
+        const fill = m.querySelector('i'), fr = R(f), mr = R(m), ms = getComputedStyle(f, '::before');
+        const lines = [...f.querySelectorAll('.fx-l1, .fx-l2, .fx-l3')].filter((x) => __t.vis(x)).map((x) => R(x).bottom);
+        Object.assign(o, { vis: __t.vis(m), band: m.dataset.band, ratio: 100 * R(fill).width / R(m).width, fillBg: getComputedStyle(fill).backgroundColor, trackBg: getComputedStyle(m).backgroundColor,
+          trans: [getComputedStyle(m).transitionDuration, getComputedStyle(fill).transitionDuration], anims: m.getAnimations().length + fill.getAnimations().length,
+          left: mr.left, stripRight: fr.left + (parseFloat(ms.left) + parseFloat(ms.width)) * fr.width / f.offsetWidth, top: mr.top, textBottom: lines.length ? Math.max(...lines) : null });
+      }
+      nodes[id] = o;
+    }
+    return { lod: document.querySelector('.gx').dataset.lod, tok, nodes };
+  });
+  await step('ctx', async (r) => {
+    await withPage({ poll: 'ctx' }, r, async (page) => {
+      await waitFx(page, 32); await settle(page, 4000);
+      for (const [key, k] of [['near', 1], ['mid', 0.6], ['far', 0.3]]) {
+        await visZoom(page, k); await page.waitForTimeout(250);
+        r[key] = await ctxRead(page);
+      }
+      await visZoom(page, 1); await page.waitForTimeout(250);
+      r.insp = {};
+      for (const [key, id] of [['s1', X.ids.session], ['s6', X.ids.s6], ['edge', X.ids.edge]]) {
+        await clickNode(page, id); await waitInsp(page, 3000); await page.waitForTimeout(300);
+        r.insp[key] = await page.evaluate(() => __t.insp().text);
+      }
+    });
+    await withPage({ poll: 'ctx', scheme: 'dark' }, r, async (page) => {
+      await waitFx(page, 32); await settle(page, 4000);
+      await visZoom(page, 1); await page.waitForTimeout(250);
+      r.dark = await ctxRead(page);
+    });
+    await withPage({ poll: '1' }, r, async (page) => {
+      await waitFx(page, 32); await settle(page, 4000);
+      r.base = await page.evaluate(() => Object.fromEntries([...document.querySelectorAll('.gx-node[data-id]')].map((el) => { const f = el.querySelector('.fx-node'); return [el.dataset.id, f ? { text: f.textContent.replace(/\s+/g, ' ').trim(), cls: String(f.className), has: !!f.querySelector('.fx-ctx') } : null]; })));
+    });
+  });
+
   // 13d. Usage limits in the band (payload.usage_limits): what it says for each window, the tooltip and the
   // accessible name, amber and red, dimmed when old or reset, hidden without a reading (or a junk one), changed
   // in place by a poll, the time left giving way below 1100 px, nothing at phone width, the Activity toggle kept
@@ -2323,7 +2532,7 @@ def expectations():
                   "feed8": feed8(POLL1), "feedKeys": [x["key"] for x in feed8(POLL1)],
                   "ticks": {n["id"]: n["target"] for n in POLL1["nodes"] if len(n.get("target") or "") > 3}},
         "gone": {"id": gone, "parent": p1[gone]["parent"], "parentSurvives": p1[gone]["parent"] in p2},
-        "cycles": list(CYCLES), "robust": dict(ROBUST, dup=S6, reports="p:reports-app", blocked=ORDER3, n=len(POLL1["nodes"]) + 3),
+        "decide": DECIDE, "cycles": list(CYCLES), "robust": dict(ROBUST, dup=S6, reports="p:reports-app", blocked=ORDER3, n=len(POLL1["nodes"]) + 3),
         "poll2": {"ids": [n["id"] for n in POLL2["nodes"]], "added": added, "removed": removed,
                   "parentOf": {i: p2[i]["parent"] for i in added}, "feed": feed(POLL2),
                   "feed8": feed8(POLL2), "feedKeys": [x["key"] for x in feed8(POLL2)], "alert": POLL2["alerts"][0]["node"]},
@@ -2887,6 +3096,65 @@ def evaluate(steps, exp):
               (r.get("named") or 0) >= 1 and w.get("display") != "none" and (w.get("w") or 9) <= 1.5 and (r.get("scrollWidth") or 999) <= 390, why(r) or (r.get("named"), w, r.get("scrollWidth")))
         no_errors("phone list", r)
 
+    # ── 12n2. orders that need you ──
+    if ran("decide"):
+        r = S("decide")
+        note("decide: needy faces %r" % {k: (v or {}).get("needs") for k, v in (r.get("faces") or {}).items()})
+        needy = [i for i, row in zip(DECIDE["ids"], DECIDE_ORDERS) if row[5]]
+        quiet = [i for i in DECIDE["ids"] if i not in needy]
+        f = r.get("faces") or {}
+        check("decide: every order that needs a human has the needs cue and a halo on its tile; the others do not",
+              all((f.get(i) or {}).get("needs") and (f.get(i) or {}).get("halo") for i in needy) and not any((f.get(i) or {}).get("needs") for i in quiet), why(r) or f)
+        check("decide: each tile says what it needs in words, and its accessible name says it needs you",
+              all(row[6] in ((f.get(i) or {}).get("text") or "") and "needs you" in ((r.get("labels") or {}).get(i) or "") for i, row in zip(DECIDE["ids"], DECIDE_ORDERS) if row[5]), (f, r.get("labels")))
+        check("decide: the alerts band has one entry per order that needs you", sorted(r.get("band") or []) == sorted(needy), why(r) or r.get("band"))
+        check("decide: the Needs you figure counts them and the project hub shows needs", str(len(needy) + 1) in (r.get("needs") or "") and r.get("hub"), (r.get("needs"), r.get("hub")))
+        check("decide: control off draws no decision button", r.get("offButtons") == 0, r.get("offButtons"))
+        io = r.get("inspOff") or {}
+        check("decide: control off: a spec changed since approval says so in its inspector and shows the terminal commands",
+              "spec changed since approval: re-approve" in (io.get("o:reports-app/FO-103") or {}).get("text", "").lower()
+              and "cc-factory approve FO-103 --gate spec" in (io.get("o:reports-app/FO-103") or {}).get("text", ""), io.get("o:reports-app/FO-103"))
+        fo = io.get("o:reports-app/FO-104") or {}
+        check("decide: a failed order's inspector shows /factory run, where to run it, a Copy control and the drop command",
+              "/factory run FO-104" in fo.get("text", "") and "~/Files/work/reports-app" in fo.get("text", "") and "/factory run FO-104" in (fo.get("copies") or [])
+              and "cc-factory reject FO-104 --gate spec" in fo.get("text", ""), fo)
+        check("decide: control off: a spec gate shows the 'Do this outside ccdash' box to start control mode, with a Copy control",
+              "no-control" in (io.get("o:reports-app/FO-103") or {}).get("kinds", []) and "Do this outside ccdash" in (io.get("o:reports-app/FO-103") or {}).get("text", "")
+              and "ccdash --control" in (io.get("o:reports-app/FO-103") or {}).get("copies", []), io.get("o:reports-app/FO-103"))
+        check("decide: a failed order's inspector holds a rerun box and a verifying one a dead-run box",
+              (io.get("o:reports-app/FO-104") or {}).get("kinds") == ["rerun"] and (io.get("o:reports-app/FO-107") or {}).get("kinds") == ["dead-run"],
+              (io.get("o:reports-app/FO-104"), io.get("o:reports-app/FO-107")))
+        check("decide: a queued order offers only the drop command", "cc-factory reject FO-106 --gate spec" in (io.get("o:reports-app/FO-106") or {}).get("text", "")
+              and "cc-factory approve FO-106" not in (io.get("o:reports-app/FO-106") or {}).get("text", ""), io.get("o:reports-app/FO-106"))
+        fv = io.get("o:reports-app/FO-107") or {}
+        check("decide: a verifying order shows the mark-failed command and the only-when-dead line, no decision",
+              'cc-factory mark FO-107 failed --note "run died"' in fv.get("text", "") and "only when the run is dead" in fv.get("text", "").lower()
+              and "cc-factory reject FO-107" not in fv.get("text", ""), fv)
+        check("decide: phone width has no horizontal scroll", (r.get("phone") or [0, 1])[0] <= (r.get("phone") or [0, 1])[1], r.get("phone"))
+        on = r.get("on") or {}
+        check("decide: control on: the alerts band carries a button per order that needs you",
+              sorted((on.get("band") or [])) == sorted("%s:%s:%s" % (i.split("/")[1], "merge" if row[4] == "merge" else "spec",
+                                                                       {"spec": "Review spec gate", "merge": "Review merge gate", "changed": "Re-approve spec", "drop": "Drop order"}[row[4]])
+                                                       for i, row in zip(DECIDE["ids"], DECIDE_ORDERS) if row[5]), on.get("band"))
+        check("decide: control on: the inspector carries the same button, and it opens the card with the whole current body and only the allowed buttons",
+              on.get("insp") == ["FO-103:spec:Re-approve spec"] and "Spec changed since approval" in (on.get("card") or "") and "The whole current body." in (on.get("card") or "")
+              and "Re-approve spec…" in (on.get("buttons") or []) and "Reject…" in (on.get("buttons") or []), (on.get("insp"), on.get("buttons")))
+        check("decide: the merge card names the branch and checkout and says Approve merge merges",
+              "git merge --no-ff into" in (on.get("merge") or "") and "main" in (on.get("merge") or "") and "~/Files/work/reports-app" in (on.get("merge") or ""), on.get("merge"))
+        rf = on.get("refusals") or {}
+        dr = rf.get("dirty") or {}
+        check("decide: a refused merge shows one outside box (where, a Copy per step), Details collapsed and the error line hidden",
+              dr.get("kind") == "dirty-checkout" and "Do this outside ccdash" in dr.get("text", "") and "a terminal in ~/Files/work/reports-app" in dr.get("text", "")
+              and dr.get("copies") == 2 and dr.get("detailsOpen") is False and dr.get("errHidden") is True, dr)
+        sr = rf.get("stale") or {}
+        check("decide: a stale card offers Reload and no command", sr.get("kind") is None and sr.get("copies") == 0 and sr.get("reload", 0) >= 1
+              and "out of date" in sr.get("errText", ""), sr)
+        ur = rf.get("unknown") or {}
+        check("decide: an unrecognised cc-factory refusal shows Blocked and Suggestion as two labelled parts",
+              ur.get("labels") == ["Blocked: ", "Suggestion: "] and "the moon is full." in ur.get("text", "") and ur.get("detailsOpen") is False, ur)
+        check("decide: nothing was POSTed before a word was typed", (on.get("posts") or {}).get("posts") == [], on.get("posts"))
+        no_errors("decide", r)
+
     # ── 12n. robustness ──
     if ran("robust"):
         r = S("robust")
@@ -2899,9 +3167,9 @@ def evaluate(steps, exp):
         check("robust: a duplicate node id keeps the first node, on the floor and in the list", f.get("dupCount") == 1 and "DUPLICATE" not in ((f.get("dup") or {}).get("text") or "")
               and "DUPLICATE" not in (r.get("dupRow") or "") and r.get("dupRow"), why(r) or (f.get("dup"), r.get("dupRow")))
         b = r.get("blocked") or {}
-        check("robust: a blocked order's inspector shows Why (the note as text, the recommendation) and Next (rerun or reject)",
+        check("robust: a blocked order's inspector shows Why (the note as text, the recommendation) and Next (rerun, where to run it, a Copy control)",
               r.get("blockedMs", -1) >= 0 and "the spec changed <img src=x" in (b.get("text") or "") and "recommended: rerun" in (b.get("text") or "")
-              and "/factory run FO-003" in (b.get("text") or "") and "cc-factory reject FO-003" in (b.get("text") or "")
+              and "/factory run FO-003" in (b.get("text") or "") and "Claude Code session" in (b.get("text") or "") and "Copy" in (b.get("text") or "")
               and b.get("imgs") == 0 and b.get("pwn") is None, why(r) or (r.get("blockedMs"), b))
         check("robust: the project inspector opens with an order whose detail is null", r.get("openMs", -1) >= 0 and "An order with no detail" in (r.get("insp") or ""), why(r) or (r.get("openMs"), (r.get("insp") or "")[:200]))
         check("robust: every unique node renders and is listed (%d)" % R["n"], f.get("n") == R["n"] and len(set(r.get("items") or [])) == R["n"] == len(r.get("items") or []),
@@ -3257,6 +3525,51 @@ def evaluate(steps, exp):
             v = (r.get("v") or {}).get(name) or {}
             check("sidestates (%s): the feed still shows its 8 rows" % name, v.get("rows") == 8 and not (v.get("none") or {}).get("visible"), v.get("error") or why(r) or (v.get("rows"), v.get("none")))
     # ── 13c. the floor's extra visuals ──
+    if ran("ctx"):
+        r = S("ctx")
+        I = exp["ids"]
+        no_errors("ctx", r)
+        near, mid, far, dark = (r.get(k) or {} for k in ("near", "mid", "far", "dark"))
+        nn, nd = near.get("nodes") or {}, dark.get("nodes") or {}
+        want = {I["session"]: ("high", 82), I["agent"]: ("full", 95), I["a2"]: ("mid", 60),
+                I["failed"]: ("mid", 50), I["stalled"]: ("high", 89)}
+        has = sorted(i for i, o in nn.items() if o.get("has"))
+        check("ctx: meters exactly on S1, A91, A2 and the 50% and 89% edge nodes", has == sorted(want), why(r) or has)
+        check("ctx: the bands are high, full and mid", all((nn.get(i) or {}).get("band") == b for i, (b, _) in want.items()), why(r) or {i: (nn.get(i) or {}).get("band") for i in want})
+        check("ctx: the fill is 82%, 95% and 60% of the track", all(abs((nn.get(i) or {}).get("ratio", -99) - pc) <= 2 for i, (_, pc) in want.items()), why(r) or {i: (nn.get(i) or {}).get("ratio") for i in want})
+        for nm, d_, ns in (("light", near, nn), ("dark", dark, nd)):
+            tk = d_.get("tok") or {}
+            fills = {i: (ns.get(i) or {}).get("fillBg") for i in want}
+            ok = (fills.get(I["session"]) == tk.get("--warn-dot") and fills.get(I["agent"]) == tk.get("--bad") and fills.get(I["a2"]) == tk.get("--ink-4")
+                  and all((ns.get(i) or {}).get("trackBg") == tk.get("--fx-track") for i in want))
+            check("ctx: fill colours are --warn-dot, --bad and --ink-4 and the track --fx-track (%s)" % nm, ok, why(r) or (fills, tk))
+        check("ctx: in dark the fill differs from the track", all((nd.get(i) or {}).get("fillBg") != (nd.get(i) or {}).get("trackBg") for i in want), why(r) or nd.get(I["a2"]))
+        quiet = [i for i in (I["b3"], I["s6"], I["e9"], I["project"], I["order"]) if (nn.get(i) or {}).get("has")]
+        check("ctx: no meter below 50%, for an unknown window or on project, order and workflow tiles",
+              not quiet and not any(o.get("has") for i, o in nn.items() if i not in want), why(r) or quiet)
+        s1 = nn.get(I["session"]) or {}
+        check("ctx: S1's accessible name and title say 'context 82% full'", "context 82% full" in (s1.get("aria") or "") and "82% full" in (s1.get("title") or ""), why(r) or (s1.get("aria"), s1.get("title")))
+        check("ctx: B3 (45%) has no context in its name or title", "context" not in ((nn.get(I["b3"]) or {}).get("aria") or "").lower() and not (nn.get(I["b3"]) or {}).get("title"), why(r) or nn.get(I["b3"]))
+        s6 = nn.get(I["s6"]) or {}
+        check("ctx: an unknown window above 150K shows '412K ctx' and no percentage",
+              "412K ctx" in (s6.get("text") or "") and "%" not in (s6.get("text") or "") and "%" not in (s6.get("aria") or "") and "%" not in (s6.get("title") or ""), why(r) or s6)
+        check("ctx: an unknown window below 150K shows nothing", "ctx" not in ((nn.get(I["e9"]) or {}).get("text") or ""), why(r) or nn.get(I["e9"]))
+        for nm, d_ in (("near", near), ("mid", mid)):
+            ns = d_.get("nodes") or {}
+            bad = {i: (ns.get(i) or {}).get(k) for i in want for k in ("left", "stripRight", "top", "textBottom")
+                   if ((k == "left" and (ns.get(i) or {}).get("left", 0) < (ns.get(i) or {}).get("stripRight", 1)) or
+                       (k == "top" and (ns.get(i) or {}).get("top", 0) < (ns.get(i) or {}).get("textBottom", 1)))}
+            check("ctx: the meter clears the model strip and the text lines (%s)" % nm, all((ns.get(i) or {}).get("vis") for i in want) and not bad, why(r) or {i: ns.get(i) for i in want})
+        check("ctx: the meter is not visible at far", not any((o or {}).get("vis") for o in (far.get("nodes") or {}).values()), why(r) or far.get("lod"))
+        check("ctx: no transition and no animation on the meter", all((nn.get(i) or {}).get("trans") == ["0s", "0s"] and (nn.get(i) or {}).get("anims") == 0 for i in want), why(r) or {i: nn.get(i) for i in want})
+        base = r.get("base") or {}
+        same = [i for i, o in nn.items() if i not in CTX_IDS and (base.get(i) or {}).get("text") != o.get("text")]
+        check("ctx: every tile without context data reads as it did in poll 1", base and not same, why(r) or same[:4])
+        iv = r.get("insp") or {}
+        check("ctx: the inspector says 'Context 820K of 1M (82%)' for S1", re.search(r"Context\s*820K of 1M \(82%\)", iv.get("s1") or ""), why(r) or iv.get("s1"))
+        check("ctx: the inspector says '412K tokens (window unknown)' for S6", re.search(r"Context\s*412K tokens \(window unknown\)", iv.get("s6") or ""), why(r) or iv.get("s6"))
+        check("ctx: a node without context has no Context row", "Context" not in (iv.get("edge") or ""), why(r) or iv.get("edge"))
+
     if ran("visuals"):
         r = S("visuals")
         I = exp["ids"]

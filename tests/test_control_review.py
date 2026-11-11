@@ -70,6 +70,7 @@ from state_guard import StateGuard  # noqa: E402  (tests/state_guard.py)
 STATE_GUARD = StateGuard()         # the real projects.json, before anything here runs cc-setup
 TIMINGS = {}
 BASE = tempfile.mkdtemp(prefix="cc-control-review-")
+os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "xdg-default")   # in-process checks read the user-wide code record from here, never the real state
 SID = "cccccccc-1111-2222-3333-444444444444"
 
 
@@ -457,7 +458,7 @@ def test_f4a_code_in_text():
 
 
 # ── F4b: only a real hook's request is shown ───────────────────────────────
-def pinned_hooks(name, root=REPO, loose=False, terminals=None):
+def pinned_hooks(name, root=REPO, loose=False, terminals=None, state=None):
     """A hooks directory as cc-setup leaves it, <BASE>/<name>/.claude/hooks (the hooks,
     cc_procs.py and a 0600 cc_tool_root); loose=True: the same files in a plain directory."""
     d = os.path.join(BASE, name) if loose else os.path.join(BASE, name, ".claude", "hooks")
@@ -468,12 +469,13 @@ def pinned_hooks(name, root=REPO, loose=False, terminals=None):
     fd = os.open(os.path.join(d, "cc_tool_root"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.write(fd, (root + "\n").encode())
     os.close(fd)
-    write_manifest(d, root, terminals)
+    write_manifest(d, root, terminals, state)
     return d
 
 
-def write_manifest(hooks_dir, root, terminals=None):
-    """cc_dash_manifest.json for `root`, as cc-setup writes it (cc_procs.build_manifest)."""
+def write_manifest(hooks_dir, root, terminals=None, state=None):
+    """cc_dash_manifest.json for `root`, as cc-setup writes it (cc_procs.build_manifest), and the user-wide code record
+    (<state>/cc_tool/cc_dash_code.json, default $XDG_STATE_HOME) that the hook and cc-dash judge the code by."""
     import importlib.util
     path = os.path.join(REPO, "templates", "hooks", "cc_procs.py")
     if not os.path.exists(path):
@@ -485,8 +487,11 @@ def write_manifest(hooks_dir, root, terminals=None):
         return
     fd = os.open(os.path.join(hooks_dir, "cc_dash_manifest.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     kw = tkw(mod.build_manifest, terminals) if terminals is not None else {}
-    os.write(fd, json.dumps(mod.build_manifest(root, **kw)).encode())
+    manifest = mod.build_manifest(root, **kw)
+    os.write(fd, json.dumps(manifest).encode())
     os.close(fd)
+    if hasattr(mod, "write_code_record"):
+        mod.write_code_record(root, manifest, path=os.path.join(state or os.environ["XDG_STATE_HOME"], "cc_tool", "cc_dash_code.json"))
 
 
 def record_terminals(state, *paths):
@@ -536,7 +541,7 @@ def test_f4b_planted_request():
     write_json(os.path.join(ctl.dir, "lease"), {"v": 1, "pid": os.getpid(), "launch": "t", "port": srv.port, "key": ctl.key, "sock": ctl.hook_sock,
                                                 "expires": time.time() + 600, "wait": 30})
     os.environ["CC_DASH_LEASE_ANY_PROGRAM"] = "1"
-    installed = pinned_hooks("f4b-proj")
+    installed = pinned_hooks("f4b-proj", state=state)
     project = os.path.dirname(os.path.dirname(installed))
     other = os.path.join(BASE, "f4b-other")
     os.makedirs(other, exist_ok=True)
@@ -607,7 +612,7 @@ def test_n2_rewrite_in_place():
     the hook holds open) before cc-dash reads it. The card must still show the real call."""
     ctl, _store, state, _cfg = new_control("n2", hook_check=True)
     srv = serve(ctl)
-    installed = pinned_hooks("n2-proj")
+    installed = pinned_hooks("n2-proj", state=state)
     project = os.path.dirname(os.path.dirname(installed))
     register(os.path.dirname(ctl.dir), project)
     write_json(os.path.join(ctl.dir, "lease"), {"v": 1, "pid": os.getpid(), "launch": "t", "port": srv.port, "key": ctl.key, "sock": ctl.hook_sock,
@@ -678,7 +683,7 @@ def test_p2_hook_socket():
           (who, oct(st.st_mode), procs.socket_file_problem(sock_path)))
     planted.close()
     check("P2: the lease names the hook socket", json.load(open(os.path.join(ctl.dir, "lease"))).get("sock") == sock_path)
-    installed = pinned_hooks("p2-proj")
+    installed = pinned_hooks("p2-proj", state=state)
     project = os.path.dirname(os.path.dirname(installed))
     register(os.path.dirname(ctl.dir), project)
     write_lease(ctl)
@@ -790,9 +795,9 @@ def test_p3_hidden_holder():
         else:
             os.chmod(os.path.join(fp, "500", "fd"), 0)
         try:
-            a = procs.terminal_problem(400, proc=fp, terminals=FAKE_TERMINALS)
-            b = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
-            h = procs.dashboard_problem(400, REPO, proc=fp, terminals=FAKE_TERMINALS, **kw)
+            a = procs.terminal_problem(400, proc=fp)
+            b = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+            h = procs.dashboard_problem(400, REPO, proc=fp, **kw)
             skipped = []
             det = procs.detect_terminals(400, proc=fp, skipped=skipped)
             socks = procs.socket_holders("12345", proc=fp) if hasattr(procs, "socket_holders") else None
@@ -821,8 +826,7 @@ def test_p3_hidden_holder():
     host, child, _out = pty_host("p3", ["/bin/sleep", "60"], env, relay=relay)
     hider = None
     try:
-        terms = [{"path": os.path.realpath(relay)}]
-        before = procs.terminal_problem(child, terminals=terms)
+        before = procs.terminal_problem(child)
         ready = os.path.join(BASE, "p3ready")
         code = ("import ctypes, os, sys, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); "
                 "fd = os.open('/dev/ptmx', os.O_RDWR | os.O_NOCTTY); open(sys.argv[1], 'w').close(); time.sleep(60)")
@@ -832,13 +836,13 @@ def test_p3_hidden_holder():
         while time.time() < end and not os.path.exists(ready):
             time.sleep(0.05)
         time.sleep(0.2)
-        during = procs.terminal_problem(child, terminals=terms)
+        during = procs.terminal_problem(child)
         os.killpg(hider.pid, 9)
         hider.wait()
         hider = None
         time.sleep(0.2)
-        after = procs.terminal_problem(child, terminals=terms)
-        check("P3 live: a terminal held by your recorded terminal passes", before == "", before)
+        after = procs.terminal_problem(child)
+        check("P3 live: a terminal held by a terminal program passes live", before == "", before)
         check("P3 live: while a non-dumpable process under `claude` holds a pty master, the terminal is refused",
               "hidden process descending from Claude Code" in during, during)
         check("P3 live: once it is gone, the terminal passes again", after == "", after)
@@ -851,6 +855,210 @@ def test_p3_hidden_holder():
                 os.kill(p, 9)
             except OSError:
                 pass
+
+
+def test_p4_exiting_not_hidden():
+    """A process under Claude Code whose fds cannot be read for a moment because it is
+    exiting (a headless `claude -p`) is not hidden: the scans re-check it for up to
+    200 ms and skip one that is gone or a zombie. One that stays alive and unreadable
+    is still hidden."""
+    import threading
+    procs = load_procs("cc_procs_p4")
+    fp = os.path.join(BASE, "p4proc")
+    claude = (450, "claude", 50, 450, 450, 0, ["claude"], "/usr/bin/claude")
+    under = (500, "agent-host", 450, 450, 450, 0, ["agent-host"], "/usr/bin/agent-host")
+
+    def scenario(how, what):
+        fake_proc(fp, terminal_rows() + [claude, under], masters={110: [0], 500: [0]})
+        sub = "fdinfo" if what == "fdinfo" else "fd"
+        os.chmod(os.path.join(fp, "500", sub), 0)
+        zombie = open(os.path.join(fp, "500", "stat")).read().replace(") S ", ") Z ", 1)
+
+        def zombify():
+            tmp = os.path.join(fp, "500", ".stat.new")
+            with open(tmp, "w") as fh:
+                fh.write(zombie)
+            os.replace(tmp, os.path.join(fp, "500", "stat"))
+
+        timer = None
+        if how == "exits":
+            timer = threading.Timer(0.05, lambda: os.rename(os.path.join(fp, "500"), os.path.join(fp, ".gone500")))
+        elif how == "zombie":
+            timer = threading.Timer(0.05, zombify)
+        elif how == "zombie-first":
+            zombify()
+        t0 = time.time()
+        try:
+            if timer:
+                timer.start()
+            res = (procs.pty_master_scan(0, proc=fp) if what != "socket" else procs.socket_holders("12345", proc=fp))
+            if timer:
+                timer.join()
+        finally:
+            d = os.path.join(fp, "500") if os.path.isdir(os.path.join(fp, "500")) else os.path.join(fp, ".gone500")
+            for x in ("fd", "fdinfo"):
+                if os.path.isdir(os.path.join(d, x)):
+                    os.chmod(os.path.join(d, x), 0o755)
+        return res, time.time() - t0
+
+    for what in ("fd", "socket"):
+        for how in ("exits", "zombie", "zombie-first"):
+            (holders, hidden), dt = scenario(how, what)
+            check("P4: %s unreadable, then %s: not hidden, not a holder (%s scan)" % (what, how, what),
+                  hidden == [] and 500 not in holders, (holders, hidden))
+            if how == "zombie-first":
+                check("P4: an already-zombie process is skipped at once", dt < 0.1, dt)
+        (holders, hidden), dt = scenario("stays", what)
+        check("P4: %s unreadable and alive to the end: still hidden, after the settle window (%s scan)" % (what, what),
+              hidden == [500] and 0.19 <= dt < 1.0, (hidden, dt))
+        why = procs.hidden_problem(hidden, "the terminal", fp)
+        check("P4: ... and hidden_problem names it", "hidden process descending from Claude Code" in why, why)
+    (holders, hidden), dt = scenario("stays", "fdinfo")
+    check("P4: an unreadable ptmx fdinfo that stays is hidden", hidden == [500], (holders, hidden))
+    (holders, hidden), dt = scenario("exits", "fdinfo")
+    check("P4: an unreadable ptmx fdinfo that exits is not", hidden == [], (holders, hidden))
+    fake_proc(fp, terminal_rows() + [claude, under], masters={110: [0], 500: [0]})
+    os.chmod(os.path.join(fp, "500", "fd"), 0)
+    try:
+        threading.Timer(0.05, lambda: os.rename(os.path.join(fp, "500"), os.path.join(fp, ".gone500"))).start()
+        check("P4: terminal_problem passes when the unreadable process exits meanwhile",
+              procs.terminal_problem(400, proc=fp) == "")
+    finally:
+        time.sleep(0.1)
+        for d in (os.path.join(fp, "500"), os.path.join(fp, ".gone500")):
+            if os.path.isdir(os.path.join(d, "fd")):
+                os.chmod(os.path.join(d, "fd"), 0o755)
+
+
+def test_p5_handoff():
+    """FO-005: a hidden process that forks a child after the first listing of /proc and exits leaves a child
+    the first listing never held. When a pending pid is dropped as gone, the scan lists /proc once more: a new
+    unreadable Claude-descended pid is hidden at once (no second settle window), a new readable one is judged."""
+    procs = load_procs("cc_procs_p5")
+    fp = os.path.join(BASE, "p5proc")
+    stage = os.path.join(BASE, "p5stage")
+    claude = (450, "claude", 50, 450, 450, 0, ["claude"], "/usr/bin/claude")
+    under = (500, "agent-host", 450, 450, 450, 0, ["agent-host"], "/usr/bin/agent-host")
+    real_gone = procs._gone
+
+    def scenario(what, new):
+        """new: None, 'hidden' (unreadable pid 501) or 'holder' (readable pid 502 that holds the master or socket)."""
+        fake_proc(fp, terminal_rows() + [claude, under], masters={110: [0], 500: [0]})
+        os.chmod(os.path.join(fp, "500", "fd"), 0)
+        done = []
+
+        def swap(pid, proc):
+            if pid == 500 and not done:
+                done.append(1)
+                if new:
+                    n = 501 if new == "hidden" else 502
+                    row = (n, "agent-child", 450, 450, 450, 0, ["agent-child"], "/usr/bin/agent-child")
+                    fake_proc(stage, [row], masters={n: [0]} if new == "holder" and what != "socket" else {})
+                    if new == "holder" and what == "socket":
+                        os.symlink("socket:[12345]", os.path.join(stage, str(n), "fd", "5"))
+                    if new == "hidden":
+                        os.chmod(os.path.join(stage, str(n), "fd"), 0)
+                    os.rename(os.path.join(stage, str(n)), os.path.join(fp, str(n)))
+                os.rename(os.path.join(fp, "500"), os.path.join(fp, ".gone500"))
+            return real_gone(pid, proc)
+
+        procs._gone = swap
+        t0 = time.time()
+        try:
+            res = procs.pty_master_scan(0, proc=fp) if what != "socket" else procs.socket_holders("12345", proc=fp)
+        finally:
+            procs._gone = real_gone
+            for d in (os.path.join(fp, x) for x in ("500", ".gone500", "501")):
+                if os.path.isdir(os.path.join(d, "fd")):
+                    os.chmod(os.path.join(d, "fd"), 0o755)
+        return res, time.time() - t0
+
+    for what in ("fd", "socket"):
+        (holders, hidden), dt = scenario(what, "hidden")
+        check("P5: a pending pid vanishes and a new unreadable Claude-descended pid appears: hidden at once (%s scan)" % what,
+              hidden == [501] and 500 not in holders and dt < procs.HIDDEN_SETTLE, (holders, hidden, dt))
+        (holders, hidden), dt = scenario(what, None)
+        check("P5: a pending pid vanishes and nothing new appears: passes (%s scan)" % what,
+              hidden == [] and 500 not in holders and 501 not in holders and 502 not in holders, (holders, hidden))
+        (holders, hidden), dt = scenario(what, "holder")
+        check("P5: a pending pid vanishes and a new readable holder appears: listed as a holder (%s scan)" % what,
+              hidden == [] and 502 in holders and 500 not in holders, (holders, hidden))
+
+
+def test_p5_handoff_retry():
+    """FO-005: when the only hidden pids came from the /proc relist, peer_holder_problem and terminal_problem scan
+    once more; anything else hidden refuses."""
+    import socket
+    procs = load_procs("cc_procs_p5r")
+    fp = os.path.join(BASE, "p5rproc")
+    fake_proc(fp, terminal_rows())
+    # _settle fills `late` with the relist-found pids only
+    scen = os.path.join(BASE, "p5rscan")
+    claude = (450, "claude", 50, 450, 450, 0, ["claude"], "/usr/bin/claude")
+    under = (500, "agent-host", 450, 450, 450, 0, ["agent-host"], "/usr/bin/agent-host")
+    fake_proc(scen, terminal_rows() + [claude, under], masters={110: [0], 500: [0]})
+    os.chmod(os.path.join(scen, "500", "fd"), 0)
+    real_gone = procs._gone
+    done = []
+
+    def swap(pid, proc):
+        if pid == 500 and not done:
+            done.append(1)
+            row = (501, "agent-child", 450, 450, 450, 0, ["agent-child"], "/usr/bin/agent-child")
+            fake_proc(os.path.join(BASE, "p5rstage"), [row])
+            os.chmod(os.path.join(BASE, "p5rstage", "501", "fd"), 0)
+            os.rename(os.path.join(BASE, "p5rstage", "501"), os.path.join(scen, "501"))
+            os.rename(os.path.join(scen, "500"), os.path.join(scen, ".gone500"))
+        return real_gone(pid, proc)
+
+    procs._gone = swap
+    late = []
+    try:
+        _, hidden = procs.pty_master_scan(0, proc=scen, late=late)
+    finally:
+        procs._gone = real_gone
+        for d in ("500", ".gone500", "501"):
+            if os.path.isdir(os.path.join(scen, d, "fd")):
+                os.chmod(os.path.join(scen, d, "fd"), 0o755)
+    check("P5r: _settle reports the relist-found hidden pid in late", hidden == [501] and late == [501], (hidden, late))
+
+    real_sh, real_ps, real_jh = procs.socket_holders, procs.pty_master_scan, procs._judge_holders
+    a, b = socket.socketpair()
+    me = os.getpid()
+    script = []
+    calls = []
+
+    def fake_scan(*args, late=None, **kw):
+        calls.append(1)
+        holders, hidden, lt = script[len(calls) - 1]
+        if late is not None:
+            late.extend(lt)
+        return holders, hidden
+
+    procs.socket_holders = fake_scan
+    procs.pty_master_scan = fake_scan
+    procs._judge_holders = lambda *a_, **k_: ("", False)
+    try:
+        cases = [
+            ("relist-hidden then clean passes", [([me], [501], [501]), ([me], [], [])], True, 2),
+            ("relist-hidden twice refuses", [([me], [501], [501]), ([me], [502], [502])], False, 2),
+            ("hidden again from the first listing refuses", [([me], [501], [501]), ([me], [501], [])], False, 2),
+            ("hidden from the first listing refuses at once", [([me], [500], [])], False, 1),
+            ("mixed hidden refuses at once", [([me], [500, 501], [501])], False, 1),
+        ]
+        for name, sc, ok, n in cases:
+            for what in ("peer", "terminal"):
+                script[:] = sc
+                del calls[:]
+                if what == "peer":
+                    why = procs.peer_holder_problem(a, me, proc=fp)
+                else:
+                    why = procs.terminal_problem(400, proc=fp)
+                check("P5r: %s (%s)" % (name, what), ((why == "") if ok else bool(why)) and len(calls) == n, (why, len(calls)))
+    finally:
+        procs.socket_holders, procs.pty_master_scan, procs._judge_holders = real_sh, real_ps, real_jh
+        a.close()
+        b.close()
 
 
 class Served:
@@ -957,9 +1165,9 @@ srv.serve_forever()
 
 
 def test_f6_fake_checkout():
-    hooks = pinned_hooks("f6-hooks")
     state = os.path.join(BASE, "f6", "state")
     os.makedirs(state, mode=0o700)
+    hooks = pinned_hooks("f6-hooks", state=state)
     fake = os.path.join(BASE, "f6", "fake")
     os.makedirs(os.path.join(fake, "bin"))
     os.makedirs(os.path.join(fake, "lib", "cc_dash"))
@@ -1058,9 +1266,9 @@ def test_r3_code_manifest():
                        check=True)                     # one byte, through a subprocess, as Bash would
         why = code(copy)
         check("R3: one changed byte in lib/ is refused with the re-record hint",
-              why.startswith("cc-dash's code changed since cc-setup ran; run cc-update-project to re-record it if you changed it yourself")
+              why.startswith("cc-dash's code is not the code you approved")
               and "control.py" in why, why)
-        check("R3: the dashboard check refuses on it too", "code changed" in mod.dashboard_problem(os.getpid()), mod.dashboard_problem(os.getpid()))
+        check("R3: the dashboard check refuses on it too", "not the code you approved" in mod.dashboard_problem(os.getpid()), mod.dashboard_problem(os.getpid()))
         write_manifest(hooks, copy)                    # re-record, as cc-update-project does
         check("R3: re-recorded, trusted again", code(copy) == "", code(copy))
         open(os.path.join(copy, "lib", "cc_dash", "extra.py"), "w").write("x = 1\n")
@@ -1094,7 +1302,7 @@ def test_r3_code_manifest():
         check("R3: a changed bin/cc-dash is refused", "bin/cc-dash" in code(copy), code(copy))
         # R5: the hashes match, but the running process started before the code last changed.
         write_manifest(hooks, copy)
-        manifest = os.path.join(hooks, "cc_dash_manifest.json")
+        manifest = os.path.join(os.environ["XDG_STATE_HOME"], "cc_tool", "cc_dash_code.json")
         after = getattr(load_hook(os.path.join(hooks, "cc_procs.py"), "cc_procs_r5"), "code_after_start", None)
         if after is None:
             check("R5: the hook binds trust to the dashboard process's start time", False, "no code_after_start")
@@ -1447,7 +1655,7 @@ def test_n1_detached_rules():
         if "python" in inspect.signature(procs.dashboard_problem).parameters else {}
     fake_proc(fp, terminal_rows(me_ppid=50, me_tty=0))
     why = procs.dashboard_problem(400, REPO, proc=fp, **kw)
-    check("N1: re-parented to the user manager with no controlling terminal: the hook refuses it", "no controlling terminal" in why, why)
+    check("N1: re-parented to the user manager with no controlling terminal: the hook refuses it", "no controlling" in why or "not running on a terminal" in why, why)
     fake_proc(fp, terminal_rows(me_ppid=50, me_sid=400, me_pgrp=400))
     why = procs.dashboard_problem(400, REPO, proc=fp, **kw)
     check("N1: leads a fresh session after a re-parent: the hook refuses it", "fresh session" in why, why)
@@ -1573,7 +1781,7 @@ def test_n5_terminal_holder():
          {"masters": {300: [0]}}, True),
         ("a human's terminal emulator holds it (its environment has CLAUDE_CODE_SSE_PORT, as an IDE terminal's does)",
          terminal_rows(), {"envs": {110: {"CLAUDE_CODE_SSE_PORT": "1234"}}}, True),
-        ("a virtual console (no pty master to hold)", terminal_rows(me_tty=(4 << 8) | 2), {"masters": {}}, True),
+        ("a virtual console (no pseudo-terminal of its own)", terminal_rows(me_tty=(4 << 8) | 2), {"masters": {}}, False),
     )
     for label, rows, fk, ok in cases:
         a, b = both(rows, **fk)
@@ -1582,42 +1790,40 @@ def test_n5_terminal_holder():
         else:
             check("N5: %s: the hook refuses the dashboard" % label, "terminal" in a and a != "", a)
             check("N5: %s: cc-dash --control refuses to start" % label, "terminal" in b and b != "", b)
-    # N6: the recorded-terminal rule. A clean pty.spawn host that is not recorded is refused;
-    # the same host once recorded passes (the signals above still apply to it).
+    # N6: the live terminal rule. A clean pty.spawn host is a generic interpreter and is refused;
+    # a terminal program that is no interpreter passes with nothing recorded (the signals above still apply to it).
     hosted_clean = hosted[:-1] + [host] + hosted[-1:]
     a, b = both(hosted_clean, masters={300: [0]})
-    check("N6: a clean, detached python pty.spawn host holding its terminal, not a recorded terminal: the hook refuses",
-          "not one of your recorded terminals" in a, a)
-    check("N6: ... and cc-dash --control refuses to start", "not one of your recorded terminals" in b, b)
+    check("N6: a clean, detached python pty.spawn host holding its terminal: the hook refuses (a generic interpreter)",
+          "generic interpreter" in a or "a copy of" in a, a)
+    check("N6: ... and the control-mode launch refuses to start", "generic interpreter" in b or "a copy of" in b, b)
     hostterm = os.path.join(BASE, "n6host", "hostterm")       # a terminal program that is no interpreter
     os.makedirs(os.path.dirname(hostterm), exist_ok=True)
     shutil.copy("/bin/true", hostterm)
     hosted_term = hosted[:-1] + [(300, "hostterm", 50, 300, 300, 0, [hostterm], hostterm)] + hosted[-1:]
     fake_proc(fp, hosted_term, masters={300: [0]})
-    rec = FAKE_TERMINALS + [{"path": hostterm}]
-    a = procs.dashboard_problem(400, REPO, proc=fp, **tkw(procs.dashboard_problem, rec), **kw)
-    b = server_mod.control_refusal(d, env={}, proc=fp, me=400, **tkw(server_mod.control_refusal, rec))
-    check("N6: a pty host recorded as a terminal: passes on both sides", a == "" and b == "", (a, b))
+    a = procs.dashboard_problem(400, REPO, proc=fp, **kw)
+    b = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    check("N6: a pty host that is no interpreter passes on both sides, with no record of it", a == "" and b == "", (a, b))
     # N11: an interpreter is refused as a terminal host by content, under any name, even if recorded.
     myterm = os.path.join(BASE, "x", "myterm")                # a copy of python3, renamed
     os.makedirs(os.path.dirname(myterm), exist_ok=True)
     shutil.copy(PY, myterm)
-    for label, exe in (("python itself, recorded", PY), ("a copy of python3 renamed myterm, recorded", myterm)):
+    for label, exe in (("python itself", PY), ("a copy of python3 renamed myterm", myterm)):
         rows = hosted[:-1] + [(300, os.path.basename(exe)[:15], 50, 300, 300, 0, [exe, "host.py"], exe)] + hosted[-1:]
         fake_proc(fp, rows, masters={300: [0]})
-        rec = FAKE_TERMINALS + [{"path": exe}]
-        a = procs.dashboard_problem(400, REPO, proc=fp, **tkw(procs.dashboard_problem, rec), **kw)
-        b = server_mod.control_refusal(d, env={}, proc=fp, me=400, **tkw(server_mod.control_refusal, rec))
-        check("N11: %s, holding the terminal: refused on both sides (a copy of an interpreter)" % label,
-              "a copy of %s" % PY in a and "a copy of %s" % PY in b, (a, b))
+        a = procs.dashboard_problem(400, REPO, proc=fp, **kw)
+        b = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+        gen = "generic interpreter" if exe == PY else "a copy of %s" % PY
+        check("N11: %s, holding the terminal: refused on both sides (an interpreter, or a copy of one)" % label,
+              gen in a and gen in b, (a, b))
         skipped = []
         det = procs.detect_terminals(400, proc=fp, skipped=skipped) if hasattr(procs, "detect_terminals") else None
         check("N11: %s: never recorded" % label, det == [] and any("copy of" in w or "never recorded" in w for _p, w in skipped),
               (det, skipped))
     fake_proc(fp, terminal_rows())
-    check("N6: with no terminal recorded at all (cc-setup ran without one): refused, with how to fix it",
-          "run cc-update-project from your terminal" in procs.dashboard_problem(400, REPO, proc=fp, **tkw(procs.dashboard_problem, []), **kw),
-          procs.dashboard_problem(400, REPO, proc=fp, **tkw(procs.dashboard_problem, []), **kw))
+    check("N6: with no terminal recorded at all (cc-setup ran without one): nothing is refused for it",
+          procs.dashboard_problem(400, REPO, proc=fp, **kw) == "", procs.dashboard_problem(400, REPO, proc=fp, **kw))
     # Live: the user's own terminals on this machine, when one runs from an AppImage (Cursor's, here):
     # recorded from it, a terminal of it passes, also after a restart moves its mount directory.
     sample = None
@@ -1635,15 +1841,9 @@ def test_n5_terminal_holder():
                 break
     if sample:
         pid, det = sample
-        rec = procs.merge_terminals([], det)
-        moved = [dict(e, path=procs.APPIMAGE_RE.sub(lambda m: m.group(1)[:-6] + "ZZZZZZ/" + m.group(3), e["path"])) for e in rec]
-        check("N6 (live): a terminal of an AppImage terminal host on this machine (%s) passes once recorded" % det,
-              procs.terminal_problem(pid, terminals=rec) == "", procs.terminal_problem(pid, terminals=rec))
-        check("N6 (live): ... and still after a restart moved its mount directory (name, path inside, size, full sha256)",
-              procs.terminal_problem(pid, terminals=moved) == "", procs.terminal_problem(pid, terminals=moved))
-        bad = [dict(e, appimage=dict(e["appimage"], sha256="0" * 64)) for e in moved if "appimage" in e]
-        check("N6 (live): ... but not when the program inside differs (full sha256)",
-              "not one of your recorded terminals" in procs.terminal_problem(pid, terminals=bad), procs.terminal_problem(pid, terminals=bad))
+        why = procs.terminal_problem(pid)
+        check("N6 (live): a terminal of an AppImage terminal host on this machine (%s) passes live, nothing recorded "
+              "(a terminal that Claude Code itself holds is refused, rightly)" % det, why == "" or "claude" in why.lower(), why)
     else:
         check("N6 (live): no AppImage-hosted terminal is open on this machine; skipped", True)
     # Live: cc-dash under a Python pty host. The host holds the master; its environment and whether
@@ -1688,16 +1888,15 @@ def test_n5_terminal_holder():
                 why = mod_py.dashboard_problem(cp)
                 check("N6 (live): and the hook whose manifest records that host trusts the dashboard", why == "", why)
                 why = mod_none.dashboard_problem(cp)
-                check("N6 (live): a hook whose manifest records no terminal refuses the same dashboard",
-                      "not one of your recorded terminals" in why, why)
+                check("N6 (live): a hook whose manifest records no terminal trusts the same dashboard (no record is needed)", why == "", why)
             elif tag == "unrecorded":
-                check("N6 (live): cc-dash --control on a pty held by a clean python pty.spawn host that is not a recorded "
-                      "terminal is refused, no code shown (it was accepted before)",
-                      "not one of your recorded terminals" in text and "control code:" not in text, text[-400:])
+                check("N6 (live): control mode on a pty held by a clean python pty.spawn host (a generic interpreter) "
+                      "is refused, no code shown",
+                      "generic interpreter" in text and "control code:" not in text, text[-400:])
             elif tag == "unrecorded-ro":
                 why = mod_none.dashboard_problem(cp)
-                check("N6 (live): the hook refuses a dashboard on a pty held by an unrecorded python pty.spawn host",
-                      "not one of your recorded terminals" in why, why)
+                check("N6 (live): the hook refuses a dashboard on a pty held by a python pty.spawn host",
+                      "generic interpreter" in why, why)
             else:
                 check("N5 (live): cc-dash --control on a pty held by a recorded host that carries CLAUDECODE is refused, no "
                       "code shown", "holds its terminal" in text and "CLAUDECODE" in text and "control code:" not in text,
@@ -1713,72 +1912,33 @@ def test_n5_terminal_holder():
 
 
 def test_n7_appimage_full_hash():
-    """An AppImage terminal host was matched by size and a sample (first and last MiB): a
-    binary with the same size, head and tail but another middle passed. Now the full sha256,
-    cached in process memory only, by inode, size, mtime, ctime and mount."""
+    """The terminal is judged live, with no recorded list: a terminal program running from an AppImage's FUSE
+    mount (Cursor's, say) passes by what it is, wherever the mount is, and an interpreter or a copy of one
+    does not, even from a mount."""
     procs = load_procs("cc_procs_n7")
     tag = os.urandom(3).hex()
-    mounts = ["/tmp/.mount_CcTest%s%s" % (tag, x) for x in ("AAAAAA", "BBBBBB")]
-    real, other = (os.path.join(m, "usr", "bin", "term") for m in mounts)
+    mount = "/tmp/.mount_CcTest%sAAAAAA" % tag
+    term = os.path.join(mount, "usr", "bin", "term")
+    pyc = os.path.join(mount, "usr", "bin", "python3")
     try:
-        head, middle, tail = os.urandom(1 << 20), os.urandom(1 << 20), os.urandom(1 << 20)
-        for path, mid in ((real, middle), (other, bytes(len(middle)))):
-            os.makedirs(os.path.dirname(path))
-            with open(path, "wb") as fh:
-                fh.write(head + mid + tail)
-            os.chmod(path, 0o755)
-        mi = os.path.join(BASE, "n7.mountinfo")
-        with open(mi, "w") as fh:
-            for n, m in enumerate(mounts):
-                fh.write("%d 25 0:%d / %s ro,nosuid,nodev,relatime shared:1 - fuse.CcTest CcTest ro,user_id=1000\n" % (900 + n, 90 + n, m))
-        entry = procs.terminal_entry(real)
-        rec = [dict(entry, path=real.replace(mounts[0], mounts[0][:-6] + "ZZZZZZ"))]     # recorded during an earlier launch
+        os.makedirs(os.path.dirname(term))
+        shutil.copy("/bin/true", term)
+        shutil.copy(PY, pyc)
         fp = os.path.join(BASE, "n7proc")
 
-        def judge(exe, cache=None):
+        def judge(exe):
             fake_proc(fp, [r if r[0] != 110 else (110, "term", 50, 110, 110, 0, [exe], exe) for r in terminal_rows()])
-            kw = {"cache": cache} if cache is not None and "cache" in inspect.signature(procs.terminal_problem).parameters else {}
-            return procs.terminal_problem(400, proc=fp, terminals=rec, mountinfo=mi, **kw)
-        check("N7: the recorded AppImage terminal host, on its FUSE mount of another launch: passes", judge(real) == "", judge(real))
-        why = judge(other)
-        check("N7: same size, same first and last MiB, another middle: refused (the full sha256 differs)",
-              "not one of your recorded terminals" in why, why)
-        why = procs.terminal_problem(400, proc=fp, terminals=rec, mountinfo=os.devnull)
-        check("N7: the same program in a directory that is not a FUSE mount: refused", "not one of your recorded terminals" in why, why)
-        # The hash cache lives in process memory only. A cache file beside the hooks (as 7492753 kept
-        # one) could be forged with one Bash write: an entry for the other program's key naming the
-        # recorded sha256. On disk, it must change nothing.
-        cache_cls = getattr(procs, "TerminalCache", None)
-        cf = os.path.join(BASE, "n7cache", "cc_terminal_cache.json")
-        os.makedirs(os.path.dirname(cf), exist_ok=True)
-        st = os.stat(other)
-        m_other = "%s %s" % (procs._fuse_mount(mounts[1], mi) if hasattr(procs, "_fuse_mount") else "", mounts[1])
-        with os.fdopen(os.open(cf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
-            json.dump({"v": 1, "entries": [{"key": [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, m_other],
-                                             "sha256": entry["appimage"].get("sha256") or ""}]}, fh)
-        try:
-            c = cache_cls(cf) if cache_cls is not None else None       # 7492753 read the file given
-        except TypeError:
-            c = cache_cls() if cache_cls is not None else None         # memory only: there is no file to give
-        why = judge(other, c)
-        check("N7: a forged hash-cache file on disk has no effect: the other program is still refused",
-              "not one of your recorded terminals" in why, why)
+            return procs.terminal_problem(400, proc=fp)
+        check("N7: a terminal program of an AppImage mount passes live, with nothing recorded", judge(term) == "", judge(term))
+        why = judge(pyc)
+        check("N7: a python from an AppImage mount is refused: a generic interpreter never counts as a terminal",
+              "generic interpreter" in why, why)
         hooks_src = open(os.path.join(HOOKS, "dash-control.py")).read() + open(os.path.join(HOOKS, "cc_procs.py")).read()
         check("N7: neither the hook nor cc_procs reads or writes a hash-cache file", "cc_terminal_cache" not in hooks_src
               and "TERMINAL_CACHE_NAME" not in hooks_src)
-        if cache_cls is None or "path" in inspect.signature(cache_cls).parameters:
-            check("N7: the in-process cache hashes the recorded program once for repeated checks", False, "file-backed cache")
-            return
-        c1 = cache_cls()
-        first, second = judge(real, c1), judge(real, c1)
-        check("N7: in one process (one hook run), repeated checks hash the program once",
-              first == "" and second == "" and c1.hashed == 1, (first, second, c1.hashed))
-        os.chmod(real, 0o755)              # the same bytes, but its ctime moves
-        third = judge(real, c1)
-        check("N7: a changed ctime misses the in-memory cache and rehashes", third == "" and c1.hashed == 2, c1.hashed)
+        check("N7: the recorded-list matchers are gone", not hasattr(procs, "terminal_host_ok") and not hasattr(procs, "_fuse_mount"))
     finally:
-        for m in mounts:
-            shutil.rmtree(m, ignore_errors=True)
+        shutil.rmtree(mount, ignore_errors=True)
 
 
 from pty_relay import build_relay  # noqa: E402
@@ -1987,8 +2147,8 @@ def test_p1_recording_gate():
             ("no controlling terminal", terminal_rows(me_tty=0), "")):
         fake_proc(fp, rows)
         rec = procs.recording_problem(400, proc=fp, env={})
-        launch = server_mod.control_refusal(d, env={}, proc=fp, me=400, terminals=FAKE_TERMINALS)
-        hook = procs.dashboard_problem(400, REPO, proc=fp, terminals=FAKE_TERMINALS, **kw)
+        launch = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+        hook = procs.dashboard_problem(400, REPO, proc=fp, **kw)
         if word:
             check("P1: fake /proc, %s: cc-setup records nothing, cc-dash --control and the hook refuse, for the same reason"
                   % label, word in rec and word in launch and word in hook, (rec, launch, hook))
@@ -2046,7 +2206,7 @@ def test_n9_debug_holder():
             ("an unrelated ELECTRON_* variable (ELECTRON_ENABLE_LOGGING)", {110: {"ELECTRON_ENABLE_LOGGING": "1"}}, [term], True)):
         rows = [r if r[0] != 110 else (110, "gnome-terminal-", 50, 110, 110, 0, argv, term) for r in terminal_rows()]
         fake_proc(fp, rows, envs=envs)
-        a = procs.terminal_problem(400, proc=fp, terminals=FAKE_TERMINALS)
+        a = procs.terminal_problem(400, proc=fp)
         b = server_mod.control_refusal(d, env={}, proc=fp, me=400, **tkw(server_mod.control_refusal, FAKE_TERMINALS))
         det = procs.detect_terminals(400, proc=fp) if hasattr(procs, "detect_terminals") else None
         if ok:
@@ -2058,47 +2218,27 @@ def test_n9_debug_holder():
 
 
 def test_n10_union_read():
-    """cc-dash's union of the recorded terminals reads each project manifest as the hook
-    does (no symlink, a plain file of yours, not writable by others, size cap); an unsafe
-    one is skipped and reported for the audit log."""
+    """The terminal list in a project manifest is read by no check: an empty, missing or foreign list changes
+    neither the control-mode launch check nor the hook's judgement of the dashboard, and the union reader is gone."""
     from cc_dash import server as server_mod
-    state = os.path.join(BASE, "n10state", "cc_tool")
-    projs = []
-
-    def manifest(name, hosts, mode=0o600, link=False):
-        proj = os.path.join(BASE, "n10", name)
-        hooks = os.path.join(proj, ".claude", "hooks")
-        os.makedirs(hooks, exist_ok=True)
-        path = os.path.join(hooks, "cc_dash_manifest.json")
-        target = path + ".real" if link else path
-        with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
-            json.dump({"terminal_hosts": [{"path": h} for h in hosts]}, fh)
-        os.chmod(target, mode)
-        if link:
-            os.symlink(target, path)
-        projs.append(proj)
-        return path
-
-    manifest("good", ["/usr/bin/good-term"])
-    gw = manifest("groupwritable", ["/usr/bin/evil1"], mode=0o620)
-    ln = manifest("symlinked", ["/usr/bin/evil2"], link=True)
-    big = manifest("big", ["/usr/bin/evil3"])
-    with open(big, "a") as fh:
-        fh.write(" " * (1 << 20))
-    register(state, *projs)
-    unsafe = []
-    hosts = [h.get("path") for h in server_mod.recorded_terminals(state, unsafe)] if "unsafe" in inspect.signature(
-        server_mod.recorded_terminals).parameters else [h.get("path") for h in server_mod.recorded_terminals(state)]
-    check("N10: only the safe project manifest counts for cc-dash's recorded terminals", hosts == ["/usr/bin/good-term"], hosts)
-    check("N10: each unsafe manifest (group-writable, a symlink, too large) is reported for the audit log",
-          sorted(p for p, _w in unsafe) == sorted([gw, ln, big]), unsafe)
+    check("N10: server.recorded_terminals is gone (no check reads the recorded list)", not hasattr(server_mod, "recorded_terminals"))
+    fp = os.path.join(BASE, "n10proc")
+    fake_proc(fp, terminal_rows())
+    d = os.path.join(BASE, "n10ctl")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    base = server_mod.control_refusal(d, env={}, proc=fp, me=400)
+    check("N10: dashboard_problem and the launch check take no terminals",
+          "terminals" not in inspect.signature(server_mod.procs.dashboard_problem).parameters
+          and "terminals" not in inspect.signature(server_mod.control_refusal).parameters)
+    for n, hosts in enumerate(([], [{"path": "/usr/bin/else"}])):
+        pinned_hooks("n10_%d" % n, terminals=hosts)
+        check("N10: a manifest listing %r changes nothing for the launch check" % (hosts,),
+              server_mod.control_refusal(d, env={}, proc=fp, me=400) == base, base)
 
 
 def test_uncovered_projects_warning():
-    """cc-dash starts on the union of every project's terminals, but a gate reads one project's manifest:
-    a registered project whose own record lacks this terminal is reported, one that has it is not. So is one
-    whose record covers the terminal but that the gates refuse anyway: a stale code record (a cc_tool pull
-    since cc-setup ran) or a pin that does not name this checkout."""
+    """The code record is one user-wide file (code_notice: one line, one command, no project list); a registered project is
+    still reported when its pin does not name this checkout, which the gates refuse. A stale per-project manifest alone is not."""
     from cc_dash import server as server_mod
     state = os.path.join(BASE, "unc_state")
     projs = {}
@@ -2109,32 +2249,23 @@ def test_uncovered_projects_warning():
     path = os.path.join(projs["stale"], ".claude", "hooks", "cc_dash_manifest.json")
     with open(path) as fh:
         m = json.load(fh)
-    rel = min(m["files"])
-    m["files"][rel] = "0" * 64
+    m["files"][min(m["files"])] = "0" * 64
     with open(path, "w") as fh:
         json.dump(m, fh)
     os.unlink(os.path.join(projs["unpinned"], ".claude", "hooks", "cc_tool_root"))
     bare = os.path.join(BASE, "unc_bare")
     os.makedirs(bare, exist_ok=True)
     register(state, *projs.values(), bare)
-    real = server_mod.procs.terminal_problem
-
-    def fake(pid, proc="/proc", terminals=None, **kw):
-        return "" if any(t.get("path") == "/usr/bin/mine" for t in terminals or []) else "not one of your recorded terminals"
-    server_mod.procs.terminal_problem = fake
-    try:
-        got = server_mod.uncovered_projects(state, me=1)
-    finally:
-        server_mod.procs.terminal_problem = real
+    got = server_mod.uncovered_projects(state, me=1)
     names = sorted(p for p, _w in got)
-    check("uncovered: only projects whose own record lacks this terminal or this code, or whose pin is not this "
-          "checkout, are listed",
-          names == sorted([projs["other"], projs["stale"], projs["unpinned"], os.path.realpath(bare)]), got)
-    why = dict(got)
-    check("uncovered: a stale code record says the code changed, naming the file",
-          "code changed" in why.get(projs["stale"], "") and rel in why.get(projs["stale"], ""), got)
+    check("uncovered: only projects whose pin is not this checkout are listed (a stale per-project manifest and the terminal need no record)",
+          names == sorted([projs["unpinned"], os.path.realpath(bare)]), got)
     check("uncovered: a missing pin says the project was not set up from this checkout",
-          "checkout" in why.get(projs["unpinned"], ""), got)
+          "checkout" in dict(got).get(projs["unpinned"], ""), got)
+    check("code notice: code that is the recorded code says nothing", server_mod.code_notice() == "", server_mod.code_notice())
+    one = server_mod.code_notice(os.path.join(BASE, "no-such-checkout"))
+    check("code notice: unrecorded code is one line naming the one command and the restart, no project list",
+          "\n" not in one and "cc-dash --record-code" in one and "ccdash --control" in one and "unc_" not in one and "cc-update-project" not in one, one)
 
 
 def test_uncovered_startup_warning():
@@ -2147,7 +2278,7 @@ def test_uncovered_startup_warning():
     short = server_mod.uncovered_notice(items)
     full = server_mod.uncovered_notice(items, reasons=True)
     check("uncovered notice: one line with a count, the first names and `+N more`",
-          "\n" not in short and short.startswith("cc-dash: warning: 5 registered projects do not") and "(+2 more)" in short
+          "\n" not in short and short.startswith("cc-dash: warning: 5 registered projects were not") and "(+2 more)" in short
           and "cc-update-project" in short and "/p/four" not in short, short)
     check("uncovered notice: no control character from a path or reason, in either form",
           not any(ord(c) < 32 and c != "\n" or ord(c) == 127 for c in short + full), repr(full))
@@ -2211,7 +2342,7 @@ def test_n12_inherited_holders():
     for label, exe, argv, extra_env, ok in cases:
         rows = terminal_rows() + [(320, os.path.basename(argv[0])[:15], 110, 320, 320, 0, argv, exe)]
         fake_proc(fp, rows, masters={110: [0], 320: [0]}, envs={320: extra_env})
-        a = procs.terminal_problem(400, proc=fp, terminals=FAKE_TERMINALS)
+        a = procs.terminal_problem(400, proc=fp)
         b = server_mod.control_refusal(d, env={}, proc=fp, me=400, **tkw(server_mod.control_refusal, FAKE_TERMINALS))
         if ok:
             check("N12: %s: passes on both sides" % label, a == "" and b == "", (a, b))
@@ -2426,7 +2557,7 @@ def main():
                    test_f3_truncated, test_f4a_code_in_text, test_f4b_planted_request, test_f5_planted_lease, test_f6_fake_checkout,
                    test_f6_write_guard, test_f6_pin_setup, test_markers_gone, test_gh_api_guard_asked, test_h1_no_checkout_code, test_h3_ld_env,
                    test_r3_code_manifest, test_r4_no_lib_on_path, test_n1_interpreter_identity, test_n1_detached_rules,
-                   test_n3_lineage_fail_closed, test_n2_rewrite_in_place, test_p2_hook_socket, test_p3_hidden_holder, test_n5_terminal_holder,
+                   test_n3_lineage_fail_closed, test_n2_rewrite_in_place, test_p2_hook_socket, test_p3_hidden_holder, test_p4_exiting_not_hidden, test_p5_handoff, test_p5_handoff_retry, test_n5_terminal_holder,
                    test_n7_appimage_full_hash, test_n8_recording, test_p1_recording_gate, test_n9_debug_holder, test_n10_union_read,
                    test_uncovered_projects_warning, test_uncovered_startup_warning, test_n12_inherited_holders,
                    test_no_proc_review):

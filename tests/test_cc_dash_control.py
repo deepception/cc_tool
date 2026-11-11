@@ -26,6 +26,7 @@ Run:  python3 tests/test_cc_dash_control.py
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -765,6 +766,8 @@ class Shop:
         os.makedirs(self.repo)
         git(s, self.repo, "init", "-q")
         git(s, self.repo, "commit", "-q", "--allow-empty", "-m", "initial")
+        git(s, self.repo, "config", "user.name", "t")
+        git(s, self.repo, "config", "user.email", "t@t")
         factory(s, self.repo, "init")
         now = time.time()
         transcript(s.cfg, GATE_SID, self.repo, [{"type": "user", "timestamp": iso(now - 30), "sessionId": GATE_SID, "cwd": self.repo, "uuid": "g1",
@@ -774,6 +777,7 @@ class Shop:
         cli = tree_cli or GATE_CLI
         gate_fixture.plant_record(self.repo, os.path.dirname(os.path.dirname(cli)))
         s.srv.gates.cli = cli
+        s.srv.gates.start = time.time() + 2     # this process "started" after the record (the dashboard's own code-age check)
 
     def at_spec(self, title="Add CSV export"):
         oid = factory(self.s, self.repo, "new", title).split()[0]
@@ -882,18 +886,19 @@ def test_gates_end_to_end():
 
         m, wt, head = shop.at_merge("Merge me")
         st, c = shop.card(m)
-        check("gate card: the merge gate shows the stored briefing, the reviewed head and the exact merge command",
-              st == 200 and c["gate"] == "merge" and "Review passed." in c["briefing"] and c["lane_head"] == head and c["merge_command"] == "git merge --no-ff %s" % head
-              and c["moved"] is False, c)
-        st, out = shop.decide(m)
-        check("merge gate: approve before the merge is refused with the exact command, and the order stays in review",
-              st == 409 and ("git merge --no-ff %s" % head) in out.get("error", "") and shop.status(m) == "review", (st, out))
-        check("merge gate: nothing was merged by anyone", git(s, shop.repo, "rev-list", "--count", "HEAD") == "1")
-        git(s, shop.repo, "merge", "-q", "--no-ff", "-m", "merge", head)
+        branch = git(s, shop.repo, "symbolic-ref", "--short", "HEAD")
+        check("gate card: the merge gate shows the briefing, the reviewed head, the branch and checkout it would merge into",
+              st == 200 and c["gate"] == "merge" and c["kind"] == "merge" and "Review passed." in c["briefing"] and c["lane_head"] == head
+              and c["moved"] is False and c["into"]["branch"] == branch and c["into"]["checkout"].endswith("sklep-żółć") and c["merged"] is False
+              and c["merge_blocked"] == "" and c["decisions"] == {"approve": True, "reject": True, "rework": True}, c)
+        before = git(s, shop.repo, "rev-parse", "HEAD")
         st, out = shop.decide(m)
         e = gate_events(shop, m)[-1]
-        check("merge gate: approve after the human's merge: done, with the merge sha and the reviewed head", st == 200 and shop.status(m) == "done" and e.get("merge_sha")
-              and e.get("lane_head") == head and e.get("via") == "dashboard", (st, out, e))
+        after = git(s, shop.repo, "rev-parse", "HEAD")
+        check("merge gate: Approve merge merges exactly the reviewed head with --no-ff, then records it: done, via dashboard",
+              st == 200 and shop.status(m) == "done" and git(s, shop.repo, "rev-parse", "HEAD^2") == head and git(s, shop.repo, "rev-parse", "HEAD^1") == before
+              and after != before and e.get("lane_head") == head and e.get("via") == "dashboard" and e.get("merge_sha") == after, (st, out, e))
+        check("merge gate: the lane branch and worktree are untouched and nothing was pushed", os.path.isdir(wt) and git(s, wt, "rev-parse", "HEAD") == head)
         r, _wt, _h = shop.at_merge("Send me back")
         st, out = shop.decide(r, "reject", rework=True, note="ignores filters")
         check("merge gate: reject with rework goes back to approved", st == 200 and shop.status(r) == "approved" and gate_events(shop, r)[-1]["note"] == "ignores filters", (st, out))
@@ -901,7 +906,7 @@ def test_gates_end_to_end():
         st, out = shop.decide(d, "reject")
         check("merge gate: reject drops the order", st == 200 and shop.status(d) == "rejected", (st, out))
         st, out = shop.card(d)
-        check("gate card: an order at no gate has no card", st == 409 and "not waiting at a gate" in out.get("error", ""), (st, out))
+        check("gate card: a rejected order has no card", st == 409 and "no decision for you" in out.get("error", ""), (st, out))
     finally:
         s.close()
 
@@ -1011,7 +1016,7 @@ def test_gate_refusals():
         st, c = shop.card(w)
         factory(s, shop.repo, "mark", w, "blocked")
         st, out = s.post("/api/control/gate", shop.body(c))
-        check("refused: an order that left its gate after the card was read, no ticket", st == 409 and "not waiting at the spec gate" in out.get("error", "")
+        check("refused: an order that left its gate after the card was read, no ticket", st == 409 and "does not allow that decision" in out.get("error", "")
               and shop.status(w) == "blocked" and gate_events(shop, w) == [], (st, out))
 
         # Odd ids.
@@ -1117,6 +1122,7 @@ def test_gate_child():
         with open(probe, "w") as fh:
             fh.write(PROBE)
         s.srv.gates.cli = probe
+        s.srv.gates._code_outside = lambda main="": None      # the probe is no cc_tool tree, so it has no code record to be judged by
         a = shop.at_spec()
         st, c = shop.card(a)
         os.environ.update(PYTHONPATH="/evil", CLAUDECODE="1", ANTHROPIC_API_KEY="sk-not-for-the-child", HOME=s.root, GIT_DIR="/evil/.git")
@@ -1180,6 +1186,7 @@ def test_gate_child():
 
         # Past its time: the real CLI gets a refusal from the server.
         s.srv.gates.cli = GATE_CLI
+        del s.srv.gates._code_outside
         s.srv.gates.ticket_ttl = -1
         st, out = shop.decide(a)
         check("ticket: expired, the server hands nothing over and the CLI refuses", st == 409 and "expired" in out.get("error", "") and gate_events(shop, a) == [], (st, out))
@@ -1187,6 +1194,7 @@ def test_gate_child():
         # The real CLI from a server that is no real dashboard: this very test process. This refusal comes after the
         # socket check, so reaching it also shows that the socket _run makes is held by the server alone.
         gate_fixture.plant_record(shop.repo, REPO)
+        s.srv.gates.start = time.time() + 2
         s.srv.gates.cli = CLI
         st, out = shop.decide(a)
         check("the real CLI refuses a parent that is not cc-dash, whatever the server says: BLOCKED, nothing written",
@@ -1256,14 +1264,12 @@ const ok = (name, cond, detail) => results.push([name, !!cond, String(detail ===
   await page.waitForSelector('dialog.ctl-review[open] .k-gate');
   const b = await page.textContent('dialog.ctl-review .ctl-plan-text');
   ok('card: the merge gate shows the stored briefing', b.includes('Review passed.'), b);
-  ok('card: and the exact merge command', (await page.textContent('dialog.ctl-review .ctl-more code')).startsWith('git merge --no-ff '));
+  const into = await page.textContent('dialog.ctl-review .ctl-more');
+  ok('card: names the merge it would run, the branch and the checkout', into.includes('git merge --no-ff into') && into.includes('sklep'), into);
   await page.click('text=Approve merge…');
-  await page.fill('dialog.ctl-review .ctl-confirm input', 'approve');
-  await go.click();
-  await page.waitForSelector('dialog.ctl-review .k-gate > .ctl-err:not([hidden])');
-  const refused = await page.textContent('dialog.ctl-review .k-gate > .ctl-err');
-  ok('merge: approve before merging shows the refusal with the command', refused.includes('git merge --no-ff '), refused);
-  await shot('gate-merge-refused');
+  ok('merge: the confirm says it merges, naming the branch and the checkout', (await page.textContent('dialog.ctl-review .ctl-confirm p')).includes('runs git merge --no-ff'), '');
+  await page.click('dialog.ctl-review .ctl-confirm .btn.quiet');
+  await shot('gate-merge-confirm');
   await page.setViewportSize({ width: 390, height: 844 });
   await shot('gate-merge-phone');
   ok('phone: no horizontal scroll', await page.evaluate(() => document.querySelector('dialog.ctl-review').scrollWidth <= window.innerWidth && document.documentElement.scrollWidth <= window.innerWidth));
@@ -1326,13 +1332,1015 @@ def test_gate_ui():
         s.close()
 
 
+def order_file(shop, oid):
+    d = os.path.join(shop.repo, "factory", "orders")
+    return os.path.join(d, next(n for n in os.listdir(d) if n.startswith(oid)))
+
+
+def edit_order(shop, oid, text="\nAn edit made after approval.\n"):
+    with open(order_file(shop, oid), "a") as fh:
+        fh.write(text)
+
+
+def order_in(shop, title, state):
+    """An order in `state`: queued, approved, approved+changed, failed, blocked, failed+changed, building, verifying."""
+    oid = factory(shop.s, shop.repo, "new", title).split()[0]
+    if state == "queued":
+        return oid
+    factory(shop.s, shop.repo, "mark", oid, "spec", "--no-holdout")
+    st, out = shop.decide(oid)
+    assert st == 200, out
+    base = state.split("+")[0]
+    if base != "approved":
+        factory(shop.s, shop.repo, "mark", oid, base)
+    if state.endswith("+changed"):
+        edit_order(shop, oid)
+    return oid
+
+
+def test_gate_new_states():
+    """Every state of the factory table has a card and a decision path; building and verifying have none."""
+    s = gate_srv()
+    calls = []
+    try:
+        shop = Shop(s)
+        real_run = s.srv.gates._run
+        s.srv.gates._run = lambda t: calls.append(t) or real_run(t)
+        sentinel = "SENTINEL-HOLDOUT-NEVER-SHOWN"
+
+        def plant(oid):
+            h = os.path.join(shop.repo, ".factory-holdout", oid)
+            os.makedirs(h, mode=0o700, exist_ok=True)
+            with open(os.path.join(h, "S01-x.md"), "w") as fh:
+                fh.write(sentinel + "\n")
+
+        def leak(oid):
+            bodies = []
+            for path in ("/api/graph", "/api/plans", "/api/control/gate?project=%s&order=%s" % (quote(shop.label), oid)):
+                bodies.append(s.req("GET", path)[2])
+            return any(sentinel.encode() in (b if isinstance(b, bytes) else str(b).encode()) for b in bodies)
+
+        # kind, decisions on the card
+        for state, kind, dec in (("queued", "drop", (False, True)), ("approved", "drop", (False, True)), ("failed", "drop", (False, True)), ("blocked", "drop", (False, True)),
+                                 ("approved+changed", "changed", (True, True)), ("failed+changed", "changed", (True, True)), ("blocked+changed", "changed", (True, True))):
+            oid = order_in(shop, "State %s" % state, state)
+            plant(oid)
+            st, c = shop.card(oid)
+            check("card %s: kind %s, approve %s, reject %s, gate spec" % (state, kind, dec[0], dec[1]),
+                  st == 200 and c["kind"] == kind and (c["decisions"]["approve"], c["decisions"]["reject"]) == dec and c["gate"] == "spec"
+                  and c["spec_changed"] == state.endswith("+changed") and len(c["spec_hash"]) == 64, c)
+            if kind == "changed":
+                check("card %s: the whole current order body" % state, "An edit made after approval." in c["body"], c.get("body", "")[-80:])
+            check("holdout: %s: the sentinel is in no graph, plans or card response" % state, not leak(oid))
+            if dec[0]:
+                st, out = shop.decide(oid)
+                e = gate_events(shop, oid)[-1]
+                check("re-approve %s: 200, approved, a pass event with via dashboard, a ticket and the new spec hash" % state,
+                      st == 200 and shop.status(oid) == "approved" and e["state"] == "pass" and e["via"] == "dashboard" and len(e["ticket"]) == 32
+                      and e["spec_hash"] == c["spec_hash"], (st, out, e))
+                st, c2 = shop.card(oid)
+                check("re-approve %s: afterwards only a drop remains" % state, st == 200 and c2["kind"] == "drop", c2)
+            else:
+                n0 = len(calls)
+                st, out = s.post("/api/control/gate", shop.body(c, "approve"))
+                check("drop-only %s: a hand-built approve is refused, no ticket" % state, st == 409 and len(calls) == n0, (st, out))
+                st, out = shop.decide(oid, "reject")
+                e = gate_events(shop, oid)[-1]
+                check("drop %s: 200, rejected, a fail event with via dashboard and a ticket" % state,
+                      st == 200 and shop.status(oid) == "rejected" and e["state"] == "fail" and e["via"] == "dashboard" and len(e["ticket"]) == 32, (st, out, e))
+        for state in ("building", "verifying"):
+            oid = order_in(shop, "Running %s" % state, "approved")
+            factory(s, shop.repo, "mark", oid, state)
+            plant(oid)
+            st, c = shop.card(oid)
+            check("card %s: no decision on the dashboard (409)" % state, st == 409 and "no decision for you" in c.get("error", ""), (st, c))
+            before = len(calls)
+            fake = {"project": shop.label, "order": oid, "gate": "spec", "decision": "reject", "confirm": "reject", "view": "a" * 32, "spec_hash": "0" * 64}
+            st, out = s.post("/api/control/gate", fake)
+            check("hand-built POST for %s: 409, no ticket" % state, st == 409 and len(calls) == before, (st, out))
+            check("holdout: %s: the sentinel is in no response" % state, not leak(oid))
+        # A decision whose order changed state between the card and the POST.
+        a = order_in(shop, "Moves under the card", "approved+changed")
+        st, c = shop.card(a)
+        factory(s, shop.repo, "mark", a, "building")
+        before = len(calls)
+        st, out = s.post("/api/control/gate", shop.body(c))
+        check("refused: an order that went building after the card, 409, no ticket", st == 409 and len(calls) == before and shop.status(a) == "building", (st, out))
+        q = order_in(shop, "Queued under the card", "approved")
+        st, c = shop.card(q)
+        factory(s, shop.repo, "mark", q, "queued")
+        before = len(calls)
+        st, out = s.post("/api/control/gate", shop.body(c, "approve"))
+        check("refused: an approve built from a drop card for an order that is queued now", st == 409 and len(calls) == before, (st, out))
+    finally:
+        s.close()
+
+
+def test_gate_new_state_refusals():
+    """The refusal matrix of test_gate_refusals, for each new state."""
+    s = gate_srv()
+    calls = []
+    try:
+        shop = Shop(s)
+        real_run = s.srv.gates._run
+        s.srv.gates._run = lambda t: calls.append(t) or real_run(t)
+        token = s.token
+        for state in ("queued", "approved", "failed", "blocked", "approved+changed", "failed+changed", "blocked+changed"):
+            oid = order_in(shop, "Refusals %s" % state, state)
+            dec = "approve" if state.endswith("+changed") else "reject"
+            st, c = shop.card(oid)
+            other = order_in(shop, "Other %s" % state, state)
+            st5, oc = shop.card(other)
+            st, c = shop.card(oid)
+            n, evs = len(calls), len(gate_events(shop, oid))
+            s.token = s.read_token
+            st1, out = s.post("/api/control/gate", shop.body(c, dec))
+            s.token = None
+            st2, _ = s.post("/api/control/gate", shop.body(c, dec), token=False)
+            s.token = token
+            check("refused %s: a read-only token (403) and no token (401)" % state, st1 == 403 and st2 == 401, (st1, st2))
+            st3, out = s.post("/api/control/gate", shop.body(c, dec, confirm="yes"))
+            check("refused %s: without the typed word (428)" % state, st3 == 428, (st3, out))
+            st4, out = s.post("/api/control/gate", shop.body(c, dec, view="f" * 32))
+            check("refused %s: another view id (409)" % state, st4 == 409, (st4, out))
+            st6, out = s.post("/api/control/gate", dict(shop.body(c, dec), view=oc["view"]))
+            check("refused %s: another order's view id (409)" % state, st6 == 409, (st6, out))
+            st, c = shop.card(oid)
+            edit_order(shop, oid, "\nChanged after the card.\n")
+            st7, out = s.post("/api/control/gate", shop.body(c, dec))
+            check("refused %s: a changed spec hash (409)" % state, st7 == 409 and len(calls) == n, (st7, out))
+            st, c = shop.card(oid)
+            st8, out = s.post("/api/control/gate", shop.body(c, dec))
+            if st8 == 200:
+                body = shop.body(c, dec)
+                st9, out = s.post("/api/control/gate", body)
+                check("refused %s: a spent view id (409)" % state, st9 == 409, (st9, out))
+            check("refused %s: nothing but the final decision reached a ticket" % state, len(calls) == n + 1 and len(gate_events(shop, oid)) == evs + 1, (len(calls) - n, state))
+    finally:
+        s.close()
+
+
+def merge_fixture(s, title="Merge case"):
+    shop = Shop(s)
+    oid, wt, head = shop.at_merge(title)
+    return shop, oid, wt, head
+
+
+def test_approve_merge():
+    """Approve merge runs the merge itself, in fixture repositories only, and refuses where it must."""
+    s = gate_srv()
+    calls = []
+    try:
+        shop = Shop(s)
+        real_run = s.srv.gates._run
+        s.srv.gates._run = lambda t: calls.append(t) or real_run(t)
+        tracked = os.path.join(shop.repo, "tracked.txt")
+        with open(tracked, "w") as fh:
+            fh.write("one\n")
+        git(s, shop.repo, "add", "tracked.txt")
+        git(s, shop.repo, "commit", "-q", "-m", "track")
+
+        def refused(oid, why, label, expect):
+            st, c = shop.card(oid)
+            head0 = git(s, shop.repo, "rev-parse", "HEAD")
+            n = len(calls)
+            st2, out = s.post("/api/control/gate", shop.body(c)) if c.get("decisions", {}).get("approve") and not c.get("merge_blocked") else shop.decide(oid)
+            if st2 == 200:
+                check(label, False, (st2, out))
+                return
+            check(label, st2 == 409 and expect in out.get("error", "") and len(calls) == n and shop.status(oid) == "review"
+                  and git(s, shop.repo, "rev-parse", "HEAD") == head0, (st2, out))
+
+        # dirty tracked file
+        m, wt, head = shop.at_merge("Dirty")
+        with open(tracked, "a") as fh:
+            fh.write("uncommitted\n")
+        st, c = shop.card(m)
+        check("merge card: a dirty tracked file shows merge_blocked", st == 200 and "uncommitted changes" in c["merge_blocked"], c)
+        refused(m, "dirty", "merge refused: uncommitted tracked changes, HEAD unchanged, nothing written", "uncommitted")
+        check("merge refused: the file is as the human left it", open(tracked).read() == "one\nuncommitted\n")
+        git(s, shop.repo, "checkout", "-q", "--", "tracked.txt")
+        # merge in progress
+        gd = git(s, shop.repo, "rev-parse", "--absolute-git-dir")
+        open(os.path.join(gd, "MERGE_HEAD"), "w").write(head + "\n")
+        refused(m, "busy", "merge refused: a merge already in progress", "middle of a merge")
+        os.unlink(os.path.join(gd, "MERGE_HEAD"))
+        os.makedirs(os.path.join(gd, "rebase-merge"))
+        refused(m, "rebase", "merge refused: a rebase in progress", "middle of a rebase")
+        os.rmdir(os.path.join(gd, "rebase-merge"))
+        # detached HEAD
+        main_branch = git(s, shop.repo, "symbolic-ref", "--short", "HEAD")
+        git(s, shop.repo, "checkout", "-q", "--detach")
+        refused(m, "detached", "merge refused: HEAD is detached", "detached")
+        git(s, shop.repo, "checkout", "-q", main_branch)
+        # a filter driver in the repository config
+        git(s, shop.repo, "config", "filter.evil.clean", "touch /tmp/never")
+        refused(m, "filter", "merge refused: a filter defined in the repository config", "filter or merge driver")
+        git(s, shop.repo, "config", "--unset", "filter.evil.clean")
+        # drivers a narrow pattern missed: dotted subsections, includes, attributes naming a driver, info/attributes
+        md, wtd, _h = shop.at_merge("Drivers")
+        for name, text in ((".gitattributes", "a.dat filter=a.b\ni.dat filter=inc\np.dat filter=plain\nm.dat merge=mdrv\n"),
+                           ("a.dat", "a\n"), ("i.dat", "i\n"), ("p.dat", "p\n"), ("m.dat", "m\n")):
+            with open(os.path.join(wtd, name), "w") as fh:
+                fh.write(text)
+        git(s, wtd, "add", ".")
+        git(s, wtd, "commit", "-q", "-m", "attributes")
+        rec = {"t": time.time(), "order": md, "event": "status", "status": "review", "lane_head": git(s, wtd, "rev-parse", "HEAD"),
+               "recommendation": "merge", "briefing": "Review passed.\nHoldout: S01 satisfied.", "by": "cc-factory"}
+        with open(os.path.join(shop.repo, ".git", "cc_tool", "factory", "ledger.jsonl"), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        gitdir = os.path.join(shop.repo, ".git")
+        markers = [os.path.join(BASE, "marker-%s" % n) for n in ("dotted", "include", "includeif", "driver", "attrs")]
+        porcelain0 = git(s, shop.repo, "status", "--porcelain", "--untracked-files=no")
+
+        def driver_case(label, expect, mk):
+            check("driver: %s: _merge_problem names it" % label, expect in s.srv.gates._merge_problem(shop.repo))
+            refused(md, "driver", "merge refused: %s" % label, expect)
+            check("driver: %s: no marker, tree untouched" % label,
+                  not os.path.exists(mk) and git(s, shop.repo, "status", "--porcelain", "--untracked-files=no") == porcelain0)
+
+        git(s, shop.repo, "config", "filter.a.b.smudge", "touch %s; cat" % markers[0])
+        git(s, shop.repo, "config", "filter.a.b.clean", "cat")
+        driver_case("a filter in a dotted subsection", "filter or merge driver", markers[0])
+        git(s, shop.repo, "config", "--remove-section", "filter.a.b")
+        with open(os.path.join(gitdir, "drv.inc"), "w") as fh:
+            fh.write('[filter "inc"]\n\tsmudge = touch %s; cat\n' % markers[1])
+        git(s, shop.repo, "config", "include.path", "drv.inc")
+        driver_case("a filter reached through include.path", "filter or merge driver", markers[1])
+        git(s, shop.repo, "config", "--unset", "include.path")
+        incond = "includeIf.gitdir:%s.path" % os.path.join(shop.repo, ".git")
+        git(s, shop.repo, "config", incond, "drv.inc")
+        driver_case("a filter reached through includeIf", "filter or merge driver", markers[1])
+        git(s, shop.repo, "config", "--unset", incond)
+        os.unlink(os.path.join(gitdir, "drv.inc"))
+        git(s, shop.repo, "config", "merge.mdrv.driver", "touch %s; false" % markers[3])
+        driver_case("a merge driver named in .gitattributes with its program in config", "filter or merge driver", markers[3])
+        git(s, shop.repo, "config", "--unset", "merge.mdrv.driver")
+        os.makedirs(os.path.join(gitdir, "info"), exist_ok=True)
+        with open(os.path.join(gitdir, "info", "attributes"), "w") as fh:
+            fh.write("p.dat filter=plain\n")
+        driver_case("attributes in info/attributes", "info/attributes", markers[4])
+        os.unlink(os.path.join(gitdir, "info", "attributes"))
+        check("driver: with everything undone, _merge_problem is empty", s.srv.gates._merge_problem(shop.repo) == "", s.srv.gates._merge_problem(shop.repo))
+        st, out = shop.decide(md)
+        check("driver: the positive control merges the reviewed head and no marker exists",
+              st == 200 and git(s, shop.repo, "rev-parse", "HEAD^2") == git(s, wtd, "rev-parse", "HEAD") and not any(os.path.exists(m) for m in markers), (st, out))
+        # a conflict is aborted
+        with open(os.path.join(wt, "tracked.txt"), "w") as fh:
+            fh.write("lane side\n")
+        git(s, wt, "add", "tracked.txt")
+        git(s, wt, "commit", "-q", "-m", "lane edit")
+        lane_head = git(s, wt, "rev-parse", "HEAD")
+        rec = {"t": time.time(), "order": m, "event": "status", "status": "review", "lane_head": lane_head, "recommendation": "merge",
+               "briefing": "Review passed.\nHoldout: S01 satisfied.", "by": "cc-factory"}
+        with open(os.path.join(shop.repo, ".git", "cc_tool", "factory", "ledger.jsonl"), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        with open(tracked, "w") as fh:
+            fh.write("main side\n")
+        git(s, shop.repo, "commit", "-q", "-am", "main edit")
+        head1 = git(s, shop.repo, "rev-parse", "HEAD")
+        st, out = shop.decide(m)
+        check("merge conflict: 409, says it aborted and the checkout is as it was; HEAD, tree and MERGE_HEAD clean; no event",
+              st == 409 and "aborted" in out.get("error", "") and "as it was" in out.get("error", "") and git(s, shop.repo, "rev-parse", "HEAD") == head1
+              and git(s, shop.repo, "status", "--porcelain", "--untracked-files=no") == "" and not os.path.exists(os.path.join(gd, "MERGE_HEAD"))
+              and shop.status(m) == "review", (st, out))
+        # already merged: only records
+        m2, wt2, head2 = shop.at_merge("Already merged")
+        git(s, shop.repo, "merge", "-q", "--no-ff", "-m", "by hand", head2)
+        tip = git(s, shop.repo, "rev-parse", "HEAD")
+        st, c = shop.card(m2)
+        check("merge card: an already-merged head says so", st == 200 and c["merged"] is True, c)
+        st, out = shop.decide(m2)
+        check("already merged: records without a new commit", st == 200 and shop.status(m2) == "done" and git(s, shop.repo, "rev-parse", "HEAD") == tip, (st, out))
+        # the lane moved
+        m3, wt3, head3 = shop.at_merge("Moved lane")
+        git(s, wt3, "commit", "-q", "--allow-empty", "-m", "more")
+        tip = git(s, shop.repo, "rev-parse", "HEAD")
+        st, out = shop.decide(m3)
+        check("lane moved: refused as before, nothing merged", st == 409 and "moved after the review" in out.get("error", "") and git(s, shop.repo, "rev-parse", "HEAD") == tip, (st, out))
+        # a merge that succeeded but whose record is refused says how to record it
+        m4, wt4, head4 = shop.at_merge("Record refused")
+        real = s.srv.gates._run
+        s.srv.gates._run = lambda t: (1, "", "cc-factory said no")
+        st, out = shop.decide(m4)
+        s.srv.gates._run = real
+        check("merge made but not recorded: the 409 says the merge exists and the terminal command that records it",
+              st == 409 and "Merged" in out.get("error", "") and "cc-factory approve %s --gate merge" % m4 in out.get("error", "") and git(s, shop.repo, "rev-parse", "HEAD^2") == head4, (st, out))
+        check("the dashboard never pushed or touched the lanes", all(os.path.isdir(w) for w in (wt, wt2, wt3, wt4)))
+    finally:
+        s.close()
+
+
+def test_gate_stress():
+    """20 decisions while short-lived processes named `claude` start and exit beside them: none is refused as a hidden process."""
+    s = gate_srv()
+    try:
+        shop = Shop(s)
+        specs = [shop.at_spec("Stress spec %d" % i) for i in range(10)]
+        queued = [factory(s, shop.repo, "new", "Stress queued %d" % i).split()[0] for i in range(10)]
+        results = []
+        with gate_fixture.claude_churn(os.path.join(BASE, "churn")) as churn:
+            for oid in specs:
+                results.append((oid, "approve") + shop.decide(oid))
+            for oid in queued:
+                results.append((oid, "reject") + shop.decide(oid, "reject"))
+        ok = 0
+        for oid, dec, st, out in results:
+            es = gate_events(shop, oid)
+            if st == 200 and es and es[-1].get("via") == "dashboard" and len(es[-1].get("ticket", "")) == 32:
+                ok += 1
+        check("stress: 20 decisions under churn, all 200 with a dashboard gate event and a ticket", len(results) == 20 and ok == 20,
+              [(o, d, st, str(out)[:120]) for o, d, st, out in results if st != 200][:3])
+        check("stress: no response mentions a hidden process", not any("hidden process" in json.dumps(r[3]) for r in results))
+        check("stress: the churn really ran (more than 20 processes started)", churn.started > 20, churn.started)
+    finally:
+        s.close()
+
+
+def test_outside_kinds():
+    """gates.order_outside and blocked_parts: the next step a stuck order needs, built from facts, with nothing run."""
+    from cc_dash import gates
+    key = {"kind", "why", "where", "steps", "then"}
+
+    def box(**kw):
+        o = {"id": "FO-007", "status": "queued", "main": "~/p", "lane": None, "why": None}
+        o.update(kw)
+        return gates.order_outside(o)
+    x = box(status="verifying")
+    check("outside: a verifying order gets dead-run: mark failed, then rerun in a Claude Code session",
+          x and x["kind"] == "dead-run" and x["steps"][0]["command"] == 'cc-factory mark FO-007 failed --note "run died"'
+          and x["steps"][1]["command"] == "/factory run FO-007" and x["steps"][1]["where"]["app"] == "claude"
+          and x["where"] == {"app": "terminal", "path": "~/p"} and "Only when the run is dead" in x["why"], x)
+    lane = "~/p/.claude/worktrees/FO-009-x"
+    x = box(id="FO-009", status="blocked", lane={"worktree": lane}, why={"note": "needs-deletion: app/old.py, docs/x y.md"})
+    cmds = [st["command"] for st in x["steps"]] if x else []
+    check("outside: needs-deletion: git rm per path in the lane, a commit, then the rerun",
+          x and x["kind"] == "needs-deletion" and cmds == ["git -C %s rm -- app/old.py" % lane, "git -C %s rm -- 'docs/x y.md'" % lane,
+                                                           "git -C %s commit -m 'FO-009: remove app/old.py, docs/x y.md'" % lane, "/factory run FO-009"], cmds)
+    x = box(id="FO-009", status="blocked", lane={"worktree": lane}, why={"note": "needs-deletion: x; rm -rf ~, ../../etc/passwd, -rf, /abs, ok.txt"})
+    cmds = [st["command"] for st in x["steps"]] if x else []
+    check("outside: hostile paths are shell-quoted or dropped", x and "git -C %s rm -- 'x; rm -rf ~'" % lane in cmds
+          and not any("passwd" in c or "-- -rf" in c or "/abs" in c for c in cmds) and "git -C %s rm -- ok.txt" % lane in cmds, cmds)
+    x = box(status="blocked", why={"note": "lane-tampered: HEAD moved"}, lane={"worktree": lane})
+    check("outside: lane-tampered: status and diff of the lane, then rewrite the scenarios",
+          x and x["kind"] == "lane-tampered" and [st["command"] for st in x["steps"]] == ["git -C %s status" % lane, "git -C %s diff" % lane]
+          and "scenarios" in x["then"], x)
+    x = box(status="failed")
+    check("outside: a failed order gets rerun in a Claude Code session in the main checkout",
+          x and x["kind"] == "rerun" and x["steps"][0]["command"] == "/factory run FO-007" and x["steps"][0]["where"] == {"app": "claude", "path": "~/p"}, x)
+    check("outside: no main means an empty path", box(status="failed", main="")["where"]["path"] == "")
+    check("outside: queued, review and done orders have none; a bad id has none",
+          all(box(status=t) is None for t in ("queued", "approved", "review", "done", "rejected")) and gates.order_outside({"id": "x; rm", "status": "failed"}) is None)
+    boxes = [box(status="verifying"), box(status="failed"), box(status="blocked", lane={"worktree": lane}, why={"note": "needs-deletion: a.py"}),
+             box(status="blocked", why={"note": "lane-tampered: x"})]
+    check("outside: every box has exactly the contract's keys, every step a command and where",
+          all(set(b) == key and all(set(st) == {"command", "where"} for st in b["steps"]) for b in boxes), boxes)
+    check("outside: blocked_parts splits the reason and the suggestion; other text is None",
+          gates.blocked_parts("BLOCKED: odd thing. Suggestion: do this.") == {"reason": "odd thing.", "suggestion": "do this."}
+          and gates.blocked_parts("nope") is None and gates.blocked_parts("BLOCKED: only.") == {"reason": "only.", "suggestion": ""})
+
+
+def test_outside_refusals():
+    """Refusals at the gates carry a structured next step (or Reload), and error keeps the raw text."""
+    from cc_dash import procs
+    from cc_dash.parser import tilde
+    s = gate_srv()
+    seen = []
+    try:
+        shop = Shop(s)
+        gates = s.srv.gates
+        real_run = gates._run
+        tracked = os.path.join(shop.repo, "tracked.txt")
+        with open(tracked, "w") as fh:
+            fh.write("one\n")
+        git(s, shop.repo, "add", "tracked.txt")
+        git(s, shop.repo, "commit", "-q", "-m", "track")
+        m, wt, head = shop.at_merge("Dirty then conflict")
+        with open(tracked, "a") as fh:
+            fh.write("uncommitted\n")
+        st, c = shop.card(m)
+        mo = c.get("merge_outside") or {}
+        seen.append(mo)
+        cmds = [x["command"] for x in mo.get("steps", [])]
+        check("outside: a dirty checkout: the card has a dirty-checkout box in a terminal in the main checkout",
+              st == 200 and mo.get("kind") == "dirty-checkout" and mo["where"] == {"app": "terminal", "path": tilde(shop.repo)}
+              and "git stash push" in cmds and "Approve merge" in mo["then"] and "uncommitted" in c["merge_blocked"], c)
+        st, out = s.post("/api/control/gate", shop.body(shop.card(m)[1]))
+        check("outside: ...and the POST's 409 carries it, with the raw text in error", st == 409 and out.get("outside", {}).get("kind") == "dirty-checkout"
+              and "uncommitted" in out.get("error", ""), (st, out))
+        git(s, shop.repo, "checkout", "-q", "--", "tracked.txt")
+        gd = git(s, shop.repo, "rev-parse", "--absolute-git-dir")
+        open(os.path.join(gd, "MERGE_HEAD"), "w").write(head + "\n")
+        mo = shop.card(m)[1].get("merge_outside") or {}
+        seen.append(mo)
+        check("outside: a merge in progress: git-busy with git merge --abort", mo.get("kind") == "git-busy" and "git merge --abort" in [x["command"] for x in mo["steps"]], mo)
+        os.unlink(os.path.join(gd, "MERGE_HEAD"))
+        os.makedirs(os.path.join(gd, "rebase-merge"))
+        mo = shop.card(m)[1].get("merge_outside") or {}
+        seen.append(mo)
+        check("outside: a rebase in progress: git-busy with git rebase --abort", mo.get("kind") == "git-busy" and "git rebase --abort" in [x["command"] for x in mo["steps"]], mo)
+        os.rmdir(os.path.join(gd, "rebase-merge"))
+        check("outside: a clean checkout has no merge_outside", shop.card(m)[1].get("merge_outside") is None)
+        # a conflict is aborted
+        with open(os.path.join(wt, "tracked.txt"), "w") as fh:
+            fh.write("lane side\n")
+        git(s, wt, "add", "tracked.txt")
+        git(s, wt, "commit", "-q", "-m", "lane edit")
+        lane_head = git(s, wt, "rev-parse", "HEAD")
+        rec = {"t": time.time(), "order": m, "event": "status", "status": "review", "lane_head": lane_head, "recommendation": "merge",
+               "briefing": "Review passed.\nHoldout: S01 satisfied.", "by": "cc-factory"}
+        with open(os.path.join(shop.repo, ".git", "cc_tool", "factory", "ledger.jsonl"), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        with open(tracked, "w") as fh:
+            fh.write("main side\n")
+        git(s, shop.repo, "commit", "-q", "-am", "main edit")
+        st, out = shop.decide(m)
+        o = out.get("outside") or {}
+        seen.append(o)
+        check("outside: a merge conflict (aborted): merge-conflict, first step git merge --no-ff <reviewed head>, error still says aborted",
+              st == 409 and o.get("kind") == "merge-conflict" and o["steps"][0]["command"] == "git merge --no-ff " + lane_head and "aborted" in out.get("error", ""), (st, out))
+        # merged, but the record is refused
+        r, _wt, _rh = shop.at_merge("Record refused")
+        gates._run = lambda t: (1, "", "cc-factory said no")
+        st, out = shop.decide(r)
+        o = out.get("outside") or {}
+        seen.append(o)
+        check("outside: merged but cc-factory refused the record: record-merge with cc-factory approve <id> --gate merge",
+              st == 409 and o.get("kind") == "record-merge" and o["steps"][0]["command"] == "cc-factory approve %s --gate merge" % r and "Merged" in out.get("error", ""), (st, out))
+        # ticket refused at the spec gate: the command is built from the order
+        a = shop.at_spec("Ticket refused")
+        gates._run = lambda t: (2, "", "BLOCKED: approve is a human's decision, and this cc-factory has no valid ticket from your dashboard (x). "
+                                       "Suggestion: run it from your own terminal: cc-factory approve FO-1 --gate spec.")
+        st, out = shop.decide(a)
+        o = out.get("outside") or {}
+        seen.append(o)
+        check("outside: a refused ticket: decide-in-terminal, the command built from the order, raw text kept",
+              st == 409 and o.get("kind") == "decide-in-terminal" and o["steps"][0]["command"] == "cc-factory approve %s --gate spec" % a and "no valid ticket" in out.get("error", ""), (st, out))
+        # an unknown refusal: two labelled parts
+        b = shop.at_spec("Unknown refusal")
+        moon = "BLOCKED: the moon is full. Suggestion: wait."
+        gates._run = lambda t: (2, "", moon)
+        st, c = shop.card(b)
+        body = shop.body(c)
+        st, out = s.post("/api/control/gate", body)
+        check("outside: an unrecognised BLOCKED refusal: reason and suggestion as parts, no outside box",
+              st == 409 and out.get("blocked") == {"reason": "the moon is full.", "suggestion": "wait."} and "outside" not in out and "the moon" in out["error"], (st, out))
+        # what the dashboard can resolve itself: Reload and no command
+        st, out = s.post("/api/control/gate", body)
+        check("outside: a spent view id: reload, no outside, no blocked", st == 409 and out.get("reload") is True and "outside" not in out and "blocked" not in out, (st, out))
+        gates._run = real_run
+        st, c = shop.card(b)
+        path = next(n for n in os.listdir(os.path.join(shop.repo, "factory", "orders")) if n.startswith(b))
+        with open(os.path.join(shop.repo, "factory", "orders", path), "a") as fh:
+            fh.write("\nedited after reading\n")
+        st, out = s.post("/api/control/gate", shop.body(c))
+        check("outside: a spec edited after reading: reload, no outside", st == 409 and out.get("reload") is True and "outside" not in out and "changed" in out.get("error", ""), (st, out))
+        # no /proc
+        real = procs.have_proc
+        a2 = shop.at_spec("No proc")
+        st, c = shop.card(a2)
+        procs.have_proc = lambda: False
+        try:
+            st, out = s.post("/api/control/gate", shop.body(c))
+        finally:
+            procs.have_proc = real
+        o = out.get("outside") or {}
+        seen.append(o)
+        check("outside: no /proc: 403, no-proc box that says how to start control mode", st == 403 and o.get("kind") == "no-proc"
+              and [x["command"] for x in o["steps"]] == ["ccdash --control"] and "/proc" in out.get("error", ""), (st, out))
+        check("outside: no command in any box has a newline", seen and all("\n" not in st_["command"] for o in seen for st_ in o.get("steps", [])), seen)
+    finally:
+        s.close()
+
+
+# ── FO-004: the code record, the restart, IDE terminals ──────────────────────
+def test_code_box():
+    """Code that is not what you approved shows one box on the card before a decision is tried, and a decision is refused
+    with no ticket and no event; code that only changed after the dashboard started asks for a restart."""
+    s = gate_srv()
+    f = os.path.join(os.path.dirname(os.path.dirname(GATE_CLI)), "lib", "cc_dash", "graph.py")
+    with open(f, encoding="utf-8") as fh:
+        original = fh.read()
+    try:
+        shop = Shop(s)
+        a = shop.at_spec()
+        st, c = shop.card(a)
+        check("code box: code that matches the record shows no box", st == 200 and c.get("code_outside") is None, c.get("code_outside"))
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write("\n# edited by hand\n")
+        st, c = shop.card(a)
+        box = c.get("code_outside") or {}
+        cmds = [x["command"] for x in box.get("steps", [])]
+        check("code box: edited code shows ONE box: record it once for all projects, then restart, no per-project command",
+              st == 200 and box.get("kind") == "record-code" and cmds == ["cc-dash --record-code", "ccdash --control"]
+              and "cc-update-project" not in json.dumps(box), box)
+        n = len(shop.ledger(a))
+        st, out = s.post("/api/control/gate", shop.body(c))
+        check("code box: a decision is refused with the same box, and nothing is written",
+              st == 409 and (out.get("outside") or {}).get("kind") == "record-code" and len(shop.ledger(a)) == n and shop.status(a) == "spec", (st, out))
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        s.srv.gates.start = time.time() + 2     # the restore just set a new ctime; a slow run must not outlive the +2 s set at start
+        st, c = shop.card(a)
+        check("code box: with the code back as recorded, the box is gone", st == 200 and c.get("code_outside") is None, c.get("code_outside"))
+        rec = os.path.join(os.environ["XDG_STATE_HOME"], "cc_tool", "cc_dash_code.json")
+        s.srv.gates.start = os.path.getctime(rec) - 5
+        st, c = shop.card(a)
+        box = c.get("code_outside") or {}
+        check("code box: code that matches but is newer than this dashboard asks for a restart (a button, one command)",
+              box.get("kind") == "restart" and box.get("restart") is True and [x["command"] for x in box["steps"]] == ["ccdash --control"], box)
+    finally:
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        s.close()
+
+
+def test_restart_endpoint():
+    from cc_dash import server as server_mod
+    s = gate_srv()
+    f = os.path.join(os.path.dirname(os.path.dirname(GATE_CLI)), "lib", "cc_dash", "graph.py")
+    with open(f, encoding="utf-8") as fh:
+        original = fh.read()
+    try:
+        Shop(s)
+        control = s.token
+        s.token = s.read_token
+        st, _out = s.post("/api/control/restart", {})
+        check("restart: a read-only token is refused", st == 403 and not s.srv.restart_requested, st)
+        s.token = control
+        st, out = s.post("/api/control/restart", {})
+        check("restart: with nothing to restart for, 409 and no restart", st == 409 and not s.srv.restart_requested, (st, out))
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write("\n# edited by hand\n")
+        st, out = s.post("/api/control/restart", {})
+        check("restart: while the code is not the recorded code, 409: a restart would pass nothing", st == 409 and not s.srv.restart_requested, (st, out))
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        s.srv.gates.start = os.path.getctime(os.path.join(os.environ["XDG_STATE_HOME"], "cc_tool", "cc_dash_code.json")) - 5
+        st, out = s.post("/api/control/restart", {})
+        check("restart: recorded code newer than the dashboard: 200, and the server was asked to restart", st == 200 and s.srv.restart_requested is True, (st, out))
+        check("restart: the new process is started without --ready-fd",
+              server_mod.restart_argv(["--control", "--ready-fd", "5", "--no-open"]) == ["--control", "--no-open"]
+              and server_mod.restart_argv(["--ready-fd=7", "--port", "1"]) == ["--port", "1"])
+    finally:
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(original)
+        s.close()
+
+
+def ide_proc(fp, claude_flags="02104002", scope="1", extra=(), holders_extra=None):
+    """A fake /proc for an IDE terminal. Cursor's pty host (110) holds the masters of two tabs and leaks them into the shells it
+    starts (zsh 200, this dashboard's); a sibling tab's zsh (250) runs a claude (300) that inherited the master of pts 0 from 110
+    (descriptor flags `claude_flags`). `scope` is kernel.yama.ptrace_scope ('' for no such file)."""
+    shutil.rmtree(fp, ignore_errors=True)
+    rows = [(50, "systemd", 1, 50, 50, 0, ["/usr/lib/systemd/systemd"], "/usr/lib/systemd/systemd"),
+            (110, "cursor", 50, 110, 110, 0, ["/usr/share/cursor/cursor"], "/usr/share/cursor/cursor"),
+            (200, "zsh", 110, 200, 200, 34816, ["zsh", "-i"], "/usr/bin/zsh"),
+            (250, "zsh", 110, 250, 250, 34817, ["zsh", "-i"], "/usr/bin/zsh"),
+            (300, "claude", 250, 250, 250, 34817, ["claude"], "/usr/local/bin/claude"),
+            (400, "python3", 200, 400, 200, 34816, [PY, "-I", "/x/bin/cc-dash", "--control"], PY)] + list(extra)
+    holders = {110: [(0, "0100002"), (5, "0100002")], 200: [(0, "0100002"), (5, "0100002")], 300: [(0, claude_flags)]}
+    holders.update(holders_extra or {})
+    for pid, comm, ppid, pgrp, sid, tty, argv, exe in rows:
+        d = os.path.join(fp, str(pid))
+        os.makedirs(os.path.join(d, "fd"))
+        os.makedirs(os.path.join(d, "fdinfo"))
+        with open(os.path.join(d, "stat"), "w") as fh:
+            fh.write("%d (%s) S %d %d %d %d -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n" % (pid, comm, ppid, pgrp, sid, tty))
+        with open(os.path.join(d, "cmdline"), "wb") as fh:
+            fh.write(b"\0".join(a.encode() for a in argv) + b"\0")
+        with open(os.path.join(d, "status"), "w") as fh:
+            fh.write("Name:\t%s\nUid:\t%d\t%d\t%d\t%d\n" % ((comm,) + (os.getuid(),) * 4))
+        with open(os.path.join(d, "environ"), "wb") as fh:
+            fh.write(b"HOME=/h\0PATH=/usr/bin\0")
+        os.symlink(exe, os.path.join(d, "exe"))
+        for i, (index, flags) in enumerate(holders.get(pid, ())):
+            os.symlink("/dev/ptmx", os.path.join(d, "fd", str(10 + i)))
+            with open(os.path.join(d, "fdinfo", str(10 + i)), "w") as fh:
+                fh.write("pos:\t0\nflags:\t%s\nmnt_id:\t29\nino:\t90\ntty-index:\t%d\n" % (flags, index))
+    if scope:
+        os.makedirs(os.path.join(fp, "sys", "kernel", "yama"))
+        with open(os.path.join(fp, "sys", "kernel", "yama", "ptrace_scope"), "w") as fh:
+            fh.write(scope + "\n")
+    return fp
+
+
+def test_ide_terminal():
+    procs = gate_fixture.load_procs()
+    fp = os.path.join(BASE, "ideproc")
+    ide_proc(fp)
+    why = procs.terminal_problem(400, proc=fp)
+    check("IDE: a claude in a sibling tab that inherited the master with O_CLOEXEC (ptrace_scope 1) passes", why == "", why)
+    ide_proc(fp, scope="2")
+    check("IDE: ... and under ptrace_scope 2", procs.terminal_problem(400, proc=fp) == "")
+    ide_proc(fp, claude_flags="0100002")
+    why = procs.terminal_problem(400, proc=fp)
+    check("IDE: a claude holder whose master descriptor lacks O_CLOEXEC is refused, naming claude", "claude" in why and "process 300" in why, why)
+    ide_proc(fp, scope="0")
+    why = procs.terminal_problem(400, proc=fp)
+    check("IDE: ptrace_scope 0 refuses the same claude", "claude" in why and "process 300" in why, why)
+    ide_proc(fp, scope="")
+    check("IDE: no ptrace_scope file (no Yama) refuses it too (fail closed)", "claude" in procs.terminal_problem(400, proc=fp))
+    ide_proc(fp, extra=[(310, "node", 300, 250, 250, 34817, ["node", "x.js"], "/usr/bin/node")], holders_extra={310: [(0, "02104002")]})
+    why = procs.terminal_problem(400, proc=fp)
+    check("IDE: a descendant of claude holding the master is still refused, even with O_CLOEXEC", "descends from" in why and "process 310" in why, why)
+    ide_proc(fp, extra=[(320, "claude", 1, 320, 320, 0, ["claude"], "/usr/local/bin/claude")], holders_extra={320: [(0, "02104002")]})
+    why = procs.terminal_problem(400, proc=fp)
+    check("IDE: a claude that did not inherit from a terminal host (it IS the holder) is refused", "claude" in why and "process 320" in why, why)
+
+    # A helper (cpuUsage.sh's sed) holds the master at scan time and is gone when it is read.
+    ide_proc(fp)
+    real, calls = procs.pty_master_scan, []
+
+    def scan(index, proc="/proc", late=None):
+        calls.append(index)
+        found = real(index, proc, late=late)
+        return (sorted(found[0] + [777]) if len(calls) == 1 else found[0], found[1])
+    procs.pty_master_scan = scan
+    try:
+        why = procs.terminal_problem(400, proc=fp)
+        check("IDE: a holder that vanished during the scan is rescanned once, and the terminal passes", why == "" and len(calls) == 2, (why, calls))
+        ide_proc(fp, extra=[(778, "helper", 999, 778, 778, 0, ["helper"], "/usr/bin/helper")], holders_extra={778: [(0, "0100002")]})
+        calls.clear()
+        why = procs.terminal_problem(400, proc=fp)
+        check("IDE: a holder that is still there with an unreadable parent chain is never assumed gone: refused", "parent chain" in why and "process 778" in why, why)
+    finally:
+        procs.pty_master_scan = real
+    # A holder that vanishes on the rescan as well is never assumed gone.
+    ide_proc(fp)
+    calls.clear()
+
+    def scan_twice(index, proc="/proc", late=None):
+        calls.append(index)
+        found = real(index, proc, late=late)
+        return (sorted(found[0] + [777]), found[1])
+    procs.pty_master_scan = scan_twice
+    try:
+        why = procs.terminal_problem(400, proc=fp)
+        check("IDE: a holder that vanishes on both scans refuses (kept changing), never read as gone",
+              "kept changing" in why and len(calls) == 2, (why, calls))
+    finally:
+        procs.pty_master_scan = real
+
+
+def test_control_refusal_fix():
+    """Every refusal to start control mode ends with one plain sentence saying what to do, and none points at cc-update-project."""
+    from cc_dash import server as server_mod
+    d = os.path.join(BASE, "refusal-fix", "control")
+    os.makedirs(d, mode=0o700)
+    fp = os.path.join(BASE, "refproc")
+    ide_proc(fp, claude_flags="0100002")
+    cases = [("Claude env", dict(env={"CLAUDECODE": "1"}, ancestors=[]), "where Claude Code is not running"),
+             ("Claude parent", dict(env={}, ancestors=[(9, "claude", "/usr/local/bin/claude", ["claude"])]), "where Claude Code is not running"),
+             ("IDE holder", dict(env={}, proc=fp, me=400), "outside the IDE")]
+    for label, kw, fix in cases:
+        why = server_mod.control_refusal(d, note=lambda _t: None, **kw)
+        check("refusal: %s ends with one fix sentence" % label, why.endswith(".") and fix in why.rsplit(". ", 1)[-1] and "cc-update-project" not in why, why)
+    for text in ("a hidden process descending from Claude Code could hold this terminal", "the parent chain of process 4 cannot be read",
+                 "process 5 is detached", "the terminal showing the control code (/dev/pts/0) is held by /usr/bin/sed (process 2)"):
+        fix = server_mod._fix_for(text)
+        check("refusal: a fix sentence for %r" % text[:40], fix.endswith(".") and fix[0].isupper() and "cc-update-project" not in fix, fix)
+
+
+def _write_review(shop, oid, head, briefing="Review passed.\nHoldout: S01 satisfied."):
+    rec = {"t": time.time(), "order": oid, "event": "status", "status": "review", "lane_head": head, "recommendation": "merge",
+           "briefing": briefing, "by": "cc-factory"}
+    with open(os.path.join(shop.repo, ".git", "cc_tool", "factory", "ledger.jsonl"), "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+
+
+def test_merge_attr_window():
+    """FO-005: a filter driver added to the repository config between _merge_block and the merge is not run through the
+    tree's .gitattributes (the merge takes attributes from the empty tree), and the merge turns submodule recursion off."""
+    from cc_dash import gates as gates_mod
+    s = gate_srv()
+    real_git = gates_mod.selfheal._git
+    try:
+        shop = Shop(s)
+        m, wt, _h = shop.at_merge("Attr window")
+        marker = os.path.join(BASE, "marker-window")
+        with open(os.path.join(wt, ".gitattributes"), "w") as fh:
+            fh.write("*.txt filter=evil merge=evilm\n")
+        with open(os.path.join(wt, "w.txt"), "w") as fh:
+            fh.write("window\n")
+        git(s, wt, "add", ".")
+        git(s, wt, "commit", "-q", "-m", "attributes")
+        head = git(s, wt, "rev-parse", "HEAD")
+        _write_review(shop, m, head)
+        st, c = shop.card(m)
+        body = shop.body(c)
+        armed, ran, argvs, at_run = [], [], [], []
+        real_block = gates_mod.Gates._merge_block
+
+        def block(main):
+            res = real_block(main)
+            if armed and res == ("", "") and not ran:
+                def writer():
+                    for k, v in (("filter.evil.smudge", "touch %s; cat" % marker), ("filter.evil.clean", "cat"),
+                                 ("merge.evilm.driver", "touch %s; false" % marker)):
+                        subprocess.run(["git", "config", k, v], cwd=shop.repo, check=True)
+                th = threading.Thread(target=writer)
+                th.start()
+                th.join()
+                ran.append(1)
+            return res
+
+        def spy(root, args, *a, **kw):
+            argvs.append(list(args))
+            return real_git(root, args, *a, **kw)
+        s.srv.gates._merge_block = block
+        gates_mod.selfheal._git = spy
+        real_run = s.srv.gates._run
+        s.srv.gates._run = lambda t: at_run.append(os.path.exists(marker)) or (1, "", "stub")
+        armed.append(1)
+        st, out = s.post("/api/control/gate", body)
+        s.srv.gates._run = real_run
+        gates_mod.selfheal._git = real_git
+        merge_argv = next((a for a in argvs if "merge" in a and "--no-ff" in a), [])
+        check("merge window: the driver was added between the check and the merge, and the merge still made the commit",
+              ran and git(s, shop.repo, "rev-parse", "HEAD^2") == head, (st, out, ran))
+        check("merge window: no marker file after the merge (attributes come from the empty tree)", at_run == [False] and not os.path.exists(marker), at_run)
+        check("merge window: the merge ran with submodule.recurse=false and an empty --attr-source",
+              "-c" in merge_argv and "submodule.recurse=false" in merge_argv and any(a.startswith("--attr-source=") for a in merge_argv), merge_argv)
+    finally:
+        gates_mod.selfheal._git = real_git
+        s.close()
+
+
+def test_merge_clock_bound():
+    """FO-005: the merge clock rounds up, so a code file changed in the same second as cc-dash's timestamp, before it,
+    is not exempt (the real code_after_start, not the gate_fixture stub)."""
+    from cc_dash import gates as gates_mod
+    procs = gate_fixture.load_procs()
+    cli = gate_fixture.make_tree(BASE, "clock")
+    tree = os.path.dirname(os.path.dirname(cli))
+    gate_fixture.plant_record(tree, tree)
+    manifest = os.path.join(os.environ["XDG_STATE_HOME"], "cc_tool", procs.CODE_RECORD_NAME)
+    target = os.path.join(tree, "lib", "cc_dash", "graph.py")
+    time.sleep(0.1)  # the tree and the record predate the change by more than the margin below
+    for _ in range(40):
+        if time.time() % 1 < 0.3:
+            break
+        time.sleep(0.05)
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write("\n# clock\n")
+    ts = time.time()
+    c = os.stat(target).st_ctime_ns / 1e9
+    since = gates_mod.merge_clock()
+    check("merge clock: the bound is no earlier than the timestamp and the second has begun", since >= ts and time.time() >= since, (since, ts))
+    exempt = ("lib/cc_dash/graph.py", "lib/cc_dash", "lib")
+    why = procs.code_after_start(os.getpid(), tree, manifest, start=c + procs.START_MARGIN - 0.01, exempt=exempt, exempt_since=since)
+    check("merge clock: a code file changed in the same second as the timestamp, before it, is still refused", "graph.py" in why, why)
+    if int(c) == int(ts):
+        why = procs.code_after_start(os.getpid(), tree, manifest, start=c + procs.START_MARGIN - 0.01, exempt=exempt, exempt_since=int(ts))
+        check("merge clock: control: the old floored bound would have exempted it", "graph.py" not in why, why)
+
+
+def test_merge_commit_time():
+    """FO-005: the merge commit's committer time is the rounded-up clock, taken no earlier than just before the
+    merge, and every file the merge writes is no older than it."""
+    s = gate_srv()
+    try:
+        shop = Shop(s)
+        m, wt, _h = shop.at_merge("Commit time")
+        with open(os.path.join(wt, "m.txt"), "w") as fh:
+            fh.write("m\n")
+        git(s, wt, "add", ".")
+        git(s, wt, "commit", "-q", "-m", "m")
+        head = git(s, wt, "rev-parse", "HEAD")
+        _write_review(shop, m, head)
+        st, c = shop.card(m)
+        body = shop.body(c)
+        real_run = s.srv.gates._run
+        s.srv.gates._run = lambda t: (1, "", "stub")
+        try:
+            before = time.time()
+            st, out = s.post("/api/control/gate", body)
+        finally:
+            s.srv.gates._run = real_run
+        ct = int(git(s, shop.repo, "show", "-s", "--format=%ct", "HEAD"))
+        check("merge commit time: the merge happened", git(s, shop.repo, "rev-parse", "HEAD^2") == head, (st, out))
+        check("merge commit time: rounded-up clock, within 2 s of the request", ct >= before and ct - before < 2, (ct, before))
+        check("merge commit time: the merged file is no older than the commit time",
+              os.stat(os.path.join(shop.repo, "m.txt")).st_ctime >= ct, ct)
+    finally:
+        s.close()
+
+
+def test_merge_submodule():
+    """FO-005: with submodule.recurse=true and a submodule whose own config names a filter driver, the merge writes no marker."""
+    s = gate_srv()
+    try:
+        shop = Shop(s)
+        sub = os.path.join(s.root, "subsrc")
+        os.makedirs(sub)
+        git(s, sub, "init", "-q")
+        git(s, sub, "commit", "-q", "--allow-empty", "-m", "sub initial")
+        git(s, shop.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "sub")
+        git(s, shop.repo, "commit", "-q", "-m", "add submodule")
+        git(s, shop.repo, "config", "submodule.recurse", "true")
+        marker = os.path.join(BASE, "marker-submodule")
+        git(s, os.path.join(shop.repo, "sub"), "config", "filter.evil.smudge", "touch %s; cat" % marker)
+        git(s, os.path.join(shop.repo, "sub"), "config", "filter.evil.clean", "cat")
+        with open(os.path.join(sub, ".gitattributes"), "w") as fh:
+            fh.write("*.txt filter=evil\n")
+        with open(os.path.join(sub, "s.txt"), "w") as fh:
+            fh.write("sub\n")
+        git(s, sub, "add", ".")
+        git(s, sub, "commit", "-q", "-m", "attributes")
+        newsub = git(s, sub, "rev-parse", "HEAD")
+        m, wt, _h = shop.at_merge("Submodule")
+        git(s, os.path.join(shop.repo, "sub"), "fetch", "-q", sub)
+        git(s, wt, "update-index", "--add", "--cacheinfo", "160000,%s,sub" % newsub)
+        git(s, wt, "commit", "-q", "-m", "bump submodule")
+        _write_review(shop, m, git(s, wt, "rev-parse", "HEAD"))
+        real_run = s.srv.gates._run
+        at_run = []
+        s.srv.gates._run = lambda t: at_run.append(os.path.exists(marker)) or (1, "", "stub")
+        st, out = shop.decide(m)
+        s.srv.gates._run = real_run
+        check("merge submodule: recurse=true and a filter in the submodule's own config: no marker file, merged or refused",
+              not os.path.exists(marker) and at_run in ([], [False]), (st, out, at_run))
+    finally:
+        s.close()
+
+
+def test_merge_abort_window():
+    """FO-005: the git merge --abort after a conflict runs with the same protections as the merge: a filter added to the
+    config after the check is not run by the abort's checkout."""
+    from cc_dash import gates as gates_mod
+    s = gate_srv()
+    real_git = gates_mod.selfheal._git
+    try:
+        shop = Shop(s)
+        m, wt, _h = shop.at_merge("Abort window")
+        marker = os.path.join(BASE, "marker-abort")
+        with open(os.path.join(wt, ".gitattributes"), "w") as fh:
+            fh.write("*.txt filter=evil merge=evilm\n")
+        with open(os.path.join(wt, "clash.txt"), "w") as fh:
+            fh.write("lane side\n")
+        git(s, wt, "add", ".")
+        git(s, wt, "commit", "-q", "-m", "lane clash")
+        head = git(s, wt, "rev-parse", "HEAD")
+        _write_review(shop, m, head)
+        st, c = shop.card(m)
+        body = shop.body(c)
+        with open(os.path.join(shop.repo, "clash.txt"), "w") as fh:
+            fh.write("main side\n")
+        git(s, shop.repo, "add", "clash.txt")
+        git(s, shop.repo, "commit", "-q", "-m", "main clash")
+        before = git(s, shop.repo, "rev-parse", "HEAD")
+        armed, ran, argvs, at_run = [], [], [], []
+        real_block = gates_mod.Gates._merge_block
+
+        def block(main):
+            res = real_block(main)
+            if armed and res == ("", "") and not ran:
+                def writer():
+                    for k, v in (("filter.evil.smudge", "touch %s; cat" % marker), ("filter.evil.clean", "cat"),
+                                 ("merge.evilm.driver", "touch %s; false" % marker)):
+                        subprocess.run(["git", "config", k, v], cwd=shop.repo, check=True)
+                th = threading.Thread(target=writer)
+                th.start()
+                th.join()
+                ran.append(1)
+            return res
+
+        def spy(root, args, *a, **kw):
+            argvs.append(list(args))
+            return real_git(root, args, *a, **kw)
+        s.srv.gates._merge_block = block
+        gates_mod.selfheal._git = spy
+        real_run = s.srv.gates._run
+        s.srv.gates._run = lambda t: at_run.append(1) or (1, "", "stub")
+        armed.append(1)
+        st, out = s.post("/api/control/gate", body)
+        s.srv.gates._run = real_run
+        gates_mod.selfheal._git = real_git
+        marker_now = os.path.exists(marker)
+        for sec in ("filter.evil", "merge.evilm"):
+            subprocess.run(["git", "config", "--remove-section", sec], cwd=shop.repo)
+        err = (out or {}).get("error", "") if isinstance(out, dict) else str(out)
+        check("merge abort: the driver was added after the check and the merge was refused", ran and st == 409 and "aborted" in err and "as it was" in err, (st, out, ran))
+        check("merge abort: no marker file after the abort", not marker_now and not os.path.exists(marker), marker_now)
+        check("merge abort: no ticket child ran", at_run == [], at_run)
+        check("merge abort: the checkout is as it was",
+              git(s, shop.repo, "rev-parse", "HEAD") == before and git(s, shop.repo, "status", "--porcelain", "--untracked-files=no") == ""
+              and not os.path.exists(os.path.join(shop.repo, ".git", "MERGE_HEAD")), before)
+        abort_argv = next((a for a in argvs if "merge" in a and "--abort" in a), [])
+        check("merge abort: the abort ran with submodule.recurse=false and an empty --attr-source",
+              "submodule.recurse=false" in abort_argv and any(a.startswith("--attr-source=") for a in abort_argv), abort_argv)
+        first = next(i for i, v in enumerate(argvs) if "hash-object" in v)  # the merge path starts at its bootstrap
+        rest = [v for v in argvs[first:] if "hash-object" not in v]
+        check("merge abort: every git call besides the empty-tree bootstrap carries --attr-source",
+              rest and all(any(a.startswith("--attr-source=") for a in v) for v in rest), [v for v in rest if not any(a.startswith("--attr-source=") for a in v)])
+    finally:
+        gates_mod.selfheal._git = real_git
+        s.close()
+
+
+def test_merge_no_head_box():
+    """FO-005: an order at the merge gate whose review recorded no lane head never shows a git merge without a commit."""
+    s = gate_srv()
+    try:
+        shop = Shop(s)
+        m, _wt, _h = shop.at_merge("No head")
+        _write_review(shop, m, "")
+        st, c = shop.card(m)
+        box = c.get("merge_outside") or {}
+        cmds = [x["command"] for x in box.get("steps", [])]
+        check("no head: the card's box tells you to send the order back", st == 200 and box.get("kind") == "send-back"
+              and any(x.startswith("cc-factory reject %s --gate merge --rework" % m) for x in cmds), (st, box))
+        st2, out = s.post("/api/control/gate", shop.body(c))
+        cmds2 = cmds + [x["command"] for x in (out.get("outside") or {}).get("steps", [])]
+        check("no head: the refusal is 409 with the same box, and no step is a git merge without a commit",
+              st2 == 409 and (out.get("outside") or {}).get("kind") == "send-back"
+              and not any(re.match(r"git merge --no-ff\s*$", x) for x in cmds2) and not c.get("merge_command"), (st2, out))
+    finally:
+        s.close()
+
+
+def fake_rows(fp, rows):
+    """A minimal fake /proc at fp from (pid, comm, ppid, pgrp, sid, tty, argv, exe) rows."""
+    for pid, comm, ppid, pgrp, sid, tty, argv, exe in rows:
+        d = os.path.join(fp, str(pid))
+        os.makedirs(os.path.join(d, "fd"))
+        with open(os.path.join(d, "stat"), "w") as fh:
+            fh.write("%d (%s) S %d %d %d %d -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n" % (pid, comm, ppid, pgrp, sid, tty))
+        with open(os.path.join(d, "cmdline"), "wb") as fh:
+            fh.write(b"\0".join(a.encode() for a in argv) + b"\0")
+        with open(os.path.join(d, "status"), "w") as fh:
+            fh.write("Name:\t%s\nUid:\t%d\t%d\t%d\t%d\n" % ((comm,) + (os.getuid(),) * 4))
+        os.symlink(exe, os.path.join(d, "exe"))
+    return fp
+
+
+def test_restart_group_leader():
+    """FO-005: Restart starts the new dashboard as its own process-group leader in the same session, so claude_lineage does not
+    see a group whose leader is gone (a dashboard started directly from a shell leads its own group)."""
+    procs = gate_fixture.load_procs()
+    script = os.path.join(BASE, "restart-parent.py")
+    with open(script, "w") as fh:
+        fh.write("import contextlib, io, subprocess, sys\n"
+                 "sys.path.insert(0, %r)\n"
+                 "from cc_dash import server\n"
+                 "server.RESTART_WAIT = 0\n"
+                 "orig = subprocess.Popen\n"
+                 "kids = []\n"
+                 "def spy(argv, **kw):\n"
+                 "    kw.update(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                 "    p = orig([sys.executable, '-c', 'import time; time.sleep(30)'], **kw)\n"
+                 "    kids.append(p.pid)\n"
+                 "    return p\n"
+                 "subprocess.Popen = spy\n"
+                 "with contextlib.redirect_stdout(io.StringIO()):\n"
+                 "    server.restart_dashboard([])\n"
+                 "print(kids[0], flush=True)\n" % os.path.join(REPO, "lib"))
+    parent = subprocess.run([sys.executable, "-I", script], capture_output=True, text=True, timeout=60, process_group=0)
+    child = int(parent.stdout.strip().splitlines()[-1]) if parent.stdout.strip() else 0
+    try:
+        check("restart group: the parent started the child", child > 0, (parent.stdout, parent.stderr[-300:]))
+        with open("/proc/%d/stat" % child) as fh:
+            rest = fh.read().rsplit(")", 1)[1].split()
+        pgrp, sid = int(rest[2]), int(rest[3])
+        check("restart group: the child leads its own process group and shares the session (no new session)",
+              pgrp == child and sid == os.getsid(0) and sid != child, (child, pgrp, sid, os.getsid(0)))
+        fp = os.path.join(BASE, "restartproc")
+
+        def tree(pg):
+            shutil.rmtree(fp, ignore_errors=True)
+            rows = [(50, "systemd", 1, 50, 50, 0, ["/usr/lib/systemd/systemd", "--user"], "/usr/lib/systemd/systemd"),
+                    (110, "gnome-terminal-", 50, 110, 110, 0, ["/usr/libexec/gnome-terminal-server"], "/usr/libexec/gnome-terminal-server"),
+                    (200, "zsh", 110, 200, 200, 34816, ["zsh"], "/usr/bin/zsh"),
+                    (child, "python3", 50, pg, 200, 34816, ["python3", "-I", "dashboard"], PY)]
+            return fake_rows(fp, rows)
+        check("restart group: claude_lineage of a child that leads its own group is ''", procs.claude_lineage(child, proc=tree(child)) == "")
+        why = procs.claude_lineage(child, proc=tree(4242))
+        check("restart group: control: a group whose leader is gone is refused (the failure this avoids)", why != "", why)
+        if not os.environ.get("CLAUDECODE"):
+            check("restart group: the real claude_lineage of the child is ''", procs.claude_lineage(child) == "", procs.claude_lineage(child))
+    finally:
+        if child:
+            try:
+                os.kill(child, 9)
+            except OSError:
+                pass
+
+
 def main():
     global GATE_CLI
+    # The ticket child gets XDG_STATE_HOME (gates.CHILD_ENV_KEEP) and the dashboard's code check reads the user-wide
+    # record from it: a fixture directory, never the real state.
+    saved_state = os.environ.get("XDG_STATE_HOME")
+    os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "xdg-state")
     try:
         GATE_CLI = gate_fixture.make_tree(BASE)
         for fn in (test_pairing, test_write_checks, test_decide, test_messages_and_stop, test_socket_transport,
                    test_agents_release_and_annotate, test_round_trip_with_hook, test_refusal_on_terminal, test_no_proc_refused,
-                   test_stop_cleans_lease, test_gates_end_to_end, test_gate_refusals, test_gate_child, test_gate_ui):
+                   test_stop_cleans_lease, test_gates_end_to_end, test_gate_refusals, test_gate_new_states, test_gate_new_state_refusals, test_gate_stress,
+                   test_approve_merge, test_outside_kinds, test_outside_refusals, test_gate_child, test_gate_ui, test_code_box, test_restart_endpoint, test_ide_terminal,
+                   test_control_refusal_fix, test_merge_attr_window, test_merge_submodule, test_merge_abort_window, test_merge_no_head_box, test_restart_group_leader,
+                   test_merge_clock_bound, test_merge_commit_time):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
@@ -1340,6 +2348,10 @@ def main():
                 traceback.print_exc()
                 check(fn.__name__ + " raised", False, f"{type(e).__name__}: {e}")
     finally:
+        if saved_state is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = saved_state
         shutil.rmtree(BASE, ignore_errors=True)
     fails = [r for r in RESULTS if not r[1]]
     print("total=%d  pass=%d  fail=%d" % (len(RESULTS), len(RESULTS) - len(fails), len(fails)))

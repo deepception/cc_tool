@@ -823,7 +823,7 @@ def test_fold():
           and o["rework"] == 0 and o["lane"] is None and o["run_id"] == "", str(o))
     check("fold: the dict has exactly the contract keys", set(o) == {
         "id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane", "run_id",
-        "rework", "events", "line", "why"}, str(sorted(o)))
+        "rework", "events", "line", "why", "spec_changed", "decide"}, str(sorted(o)))
     check("fold: identity fields come from the order", o["id"] == "FO-003" and o["title"] == "T FO-003" and o["priority"] == "p2"
           and o["path"] == "factory/orders/FO-003-x.md" and o["line"] == "default")
     check("fold: stations are {name,title,status,t} in line order", o["stations"][0] == {"name": "plan", "title": "Plan", "status": "pending", "t": None}
@@ -919,6 +919,41 @@ def test_fold():
     check("fold rejected: gate None", o["status"] == "rejected" and o["gate"] is None and o["station"] == "")
     o = run_fold([st("plan", "pass", 10), ev("FO-003", "status", 12.0, status="queued")])
     check("fold queued after activity: station empty", o["station"] == "")
+
+    # spec_changed and decisions(): the one rule for which decision a human may take on the dashboard
+    cur = F.spec_hash(mkorder()["body"], DEFAULT)
+    ap = lambda h=None, **k: ev("FO-003", "gate", 20.0, gate="spec", state="pass", status="approved", **({"spec_hash": h} if h else {}), **k)
+    o = run_fold([ap(cur)])
+    check("fold: approved with the current hash is not changed; drop only",
+          o["spec_changed"] is False and o["decide"] == {"kind": "drop", "gate": "spec", "approve": False, "reject": True, "rework": False}, str(o["decide"]))
+    o = run_fold([ap()])
+    check("fold: an approval with no hash counts as changed", o["spec_changed"] is True and o["decide"]["kind"] == "changed" and o["decide"]["approve"])
+    o = run_fold([ap(cur)], order=dict(mkorder(), body=mkorder()["body"] + "\nedited"))
+    check("fold: a body edited after approval is changed", o["spec_changed"] is True and o["decide"]["gate"] == "spec")
+    o = run_fold([ap(cur)], line=dict(DEFAULT, threshold=0.5))
+    check("fold: a changed threshold is changed", o["spec_changed"] is True)
+    o = run_fold([ap(cur)], line=dict(DEFAULT, gates=dict(DEFAULT["gates"], spec="auto")))
+    check("fold: an auto spec line is never spec_changed", o["spec_changed"] is False)
+    o = run_fold([ap(cur), ev("FO-003", "gate", 21.0, gate="spec", state="fail", status="rejected")])
+    check("fold: the latest spec gate being a fail is not changed; rejected has no decision", o["spec_changed"] is False and o["decide"] is None)
+    for status in ("failed", "blocked"):
+        o = run_fold([ap(cur), ev("FO-003", "status", 22.0, status=status)], order=dict(mkorder(), body="edited body"))
+        check("decisions: %s with a changed spec is re-approve or drop" % status, o["decide"] == {"kind": "changed", "gate": "spec", "approve": True, "reject": True, "rework": False})
+        o = run_fold([ap(cur), ev("FO-003", "status", 22.0, status=status)])
+        check("decisions: %s with an unchanged spec is drop only" % status, o["decide"]["kind"] == "drop" and not o["decide"]["approve"])
+    for status in ("building", "verifying"):
+        o = run_fold([ap(cur), ev("FO-003", "status", 22.0, status=status)], order=dict(mkorder(), body="edited body"))
+        check("decisions: %s offers nothing, changed or not" % status, o["decide"] is None)
+    o = run_fold([])
+    check("decisions: queued is drop only, never approve", o["decide"]["kind"] == "drop" and o["decide"]["approve"] is False)
+    o = run_fold([ev("FO-003", "status", 12.0, status="spec")], order=dict(mkorder(), status="spec"))
+    check("decisions: spec waiting is approve and reject", o["decide"] == {"kind": "spec", "gate": "spec", "approve": True, "reject": True, "rework": False}, str(o["decide"]))
+    o = run_fold([ev("FO-003", "status", 12.0, status="review")])
+    check("decisions: merge waiting adds rework", o["decide"] == {"kind": "merge", "gate": "merge", "approve": True, "reject": True, "rework": True}, str(o["decide"]))
+    o = run_fold([st("build", "start", 11), ev("FO-003", "status", 12.0, status="review")])
+    check("decisions: review with an active station offers nothing", o["decide"] is None, str(o["decide"]))
+    o = run_fold([ev("FO-003", "status", 12.0, status="done")])
+    check("decisions: done offers nothing", o["decide"] is None)
 
     o = run_fold(base + [ev("FO-003", "gate", 105.0, gate="merge", state="waiting")])
     check("fold explicit gate waiting event", o["gate"] == {"name": "merge", "waiting": True} and o["status"] == "queued")
@@ -1205,8 +1240,14 @@ def test_project_orders():
     check("factory/ without orders/ -> []", F.project_orders(root, 1.0) == [])
     os.makedirs(os.path.join(root, "factory", "orders"))
     check("empty orders/ -> []", F.project_orders(root, 1.0) == [])
-    for junk in [None, "", 5, "/nonexistent", "a\x00b"]:
-        check("project_orders(%r) -> []" % (junk,), F.project_orders(junk, 1.0) == [])
+    # "" is the current directory: run from one without orders, since this checkout may hold its own.
+    cwd = os.getcwd()
+    os.chdir(base)
+    try:
+        for junk in [None, "", 5, "/nonexistent", "a\x00b"]:
+            check("project_orders(%r) -> []" % (junk,), F.project_orders(junk, 1.0) == [])
+    finally:
+        os.chdir(cwd)
 
     # symlinks
     real = os.path.join(base, "elsewhere")
@@ -1284,7 +1325,7 @@ def test_project_orders():
     got = F.project_orders(r6, 2000.0)
     byid = {o["id"]: o for o in got}
     check("project_orders: ids come from the file names", [o["id"] for o in got] == ["FO-003", "FO-004", "FO-005"], str([o["id"] for o in got]))
-    keys = {"id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane", "run_id", "rework", "events", "line", "why"}
+    keys = {"id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane", "run_id", "rework", "events", "line", "why", "spec_changed", "decide"}
     check("project_orders: exactly the contract keys (plus line and why)", all(set(o) == keys for o in got), str(sorted(got[0])))
     a = byid["FO-003"]
     check("project_orders: FO-003 folded from the ledger", a["status"] == "building" and a["station"] == "plan" and a["run_id"] == "wf_x"
@@ -1418,7 +1459,7 @@ def test_fuzz():
             got = F.project_orders(root, 1.7e9)
             for o in got:
                 if set(o) != {"id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane",
-                              "run_id", "rework", "events", "line", "why"} or o["status"] not in F.ALL_STATUSES or o["priority"] not in F.PRIORITIES:
+                              "run_id", "rework", "events", "line", "why", "spec_changed", "decide"} or o["status"] not in F.ALL_STATUSES or o["priority"] not in F.PRIORITIES:
                     ok, why = False, "bad shape: %s" % o
                 try:
                     json.dumps(o, ensure_ascii=False).encode("utf-8")

@@ -1182,7 +1182,8 @@ class Store:
             "waiting_on": n["waiting_on"], "stalled_for": n["stalled_for"],
             "start": n["start"], "last_write": n["mtime"], "age": now - n["mtime"],
             "tokens": tot["tokens"], "cache_read": tot["cache_read"], "output_estimated": tot["output_estimated"],
-            "cost": round(tot["cost"], 4), "burn": self._burn(a, now),
+            "cost": round(tot["cost"], 4), "context": a.context, "context_window": pricing.context_window(m, a.context),
+            "burn": self._burn(a, now),
             "tool_calls": a.tool_calls, "errors": a.tool_errors + a.api_errors,
             **self._spark(a, now), "last_tool": a.last_tool, "last_text": a.last_text,
         }

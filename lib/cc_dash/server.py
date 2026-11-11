@@ -33,6 +33,9 @@ show its state and a run's validated proposals to any paired token.
 
 /api/control/gate (gates.py): GET shows a work order's gate card, POST takes a human's
 decision at that gate, after a typed confirm, and hands it to the cc-factory it starts.
+POST /api/control/restart (control token): after a merge you approved re-recorded cc-dash's own code, the
+dashboard restarts itself in the same terminal (only when that, and nothing else, is the problem:
+gates.Gates.restart). `cc-dash --record-code` records the code you approved for every project (your own terminal).
 """
 import argparse
 import errno
@@ -401,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
         self._deny(405, "cc-dash is read-only.")
 
     POSTS = ("/api/control/decide", "/api/control/message", "/api/control/cancel", "/api/control/stop",
-             "/api/control/selfheal", "/api/control/selfheal/apply", "/api/control/gate")
+             "/api/control/selfheal", "/api/control/selfheal/apply", "/api/control/gate", "/api/control/restart")
 
     def do_POST(self):
         if getattr(self.server, "hook_channel", False):
@@ -437,8 +440,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "That text contains your control code. The code only goes into the unlock "
                                              "field; nothing else on this page or from an agent should ever ask for it. "
                                              "Nothing was sent.", "code_in_text": True})
+        restart = False
         try:
-            if path == "/api/control/decide":
+            if path == "/api/control/restart":
+                code, out = self.server.gates.restart()
+                restart = code == 200
+            elif path == "/api/control/decide":
                 code, out = ctl.decide(client, body)
             elif path == "/api/control/message":
                 code, out = ctl.message(client, body)
@@ -456,7 +463,9 @@ class Handler(BaseHTTPRequestHandler):
                 code, out = ctl.cancel(client, body)
         except Exception as e:  # noqa: BLE001 - report, never take the server down
             code, out = 500, {"error": f"{type(e).__name__}: {e}"}
-        return self._json(code, out)
+        self._json(code, out)
+        if restart:
+            self.server.request_restart()
 
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _no_body
 
@@ -481,11 +490,17 @@ class DashServer(ThreadingHTTPServer):
         self.verbose = verbose
         self.selfheal = selfheal.SelfHeal(store, budget=budget, writable=False)
         self.control = None
+        self.restart_requested = False
         real = self.server_address[1]
         self.port = real
         self.allowed_hosts = {f"127.0.0.1:{real}", f"localhost:{real}"}
         self.auth = Auth(real)
         self.docs = Docs(store)
+
+    def request_restart(self):
+        """Stop serving; main() then starts a fresh cc-dash in this terminal (restart_argv)."""
+        self.restart_requested = True
+        threading.Thread(target=self.shutdown, daemon=True).start()
 
     @property
     def control(self):
@@ -573,6 +588,9 @@ def parse_args(argv):
     p.add_argument("--selfheal-budget", type=float, default=selfheal.DEFAULT_BUDGET, metavar="USD",
                    help="control mode: the spending cap of one self-heal run (default %g, %g-%g)"
                         % (selfheal.DEFAULT_BUDGET, selfheal.BUDGET_MIN, selfheal.BUDGET_MAX))
+    p.add_argument("--record-code", action="store_true",
+                   help="record the cc-dash code you approved, for every project, then exit (run it in your own "
+                        "terminal, never from an agent)")
     p.add_argument("--ready-fd", type=int, default=None, metavar="FD", help=argparse.SUPPRESS)
     a = p.parse_args(argv)
     if not (5 <= a.control_wait <= 590):
@@ -662,63 +680,20 @@ def read_manifest(path, limit=1 << 20):
     return (m, "") if isinstance(m, dict) else (None, "is not a JSON object")
 
 
-def recorded_terminals(state=None, unsafe=None):
-    """The terminal hosts cc-setup recorded for any project it registered (the
-    terminal_hosts of each <project>/.claude/hooks/cc_dash_manifest.json listed
-    in projects.json): you run cc-dash from one terminal for many projects, and
-    cc-dash itself belongs to none of them. Each manifest is read as the hook
-    reads its own (read_manifest); an unsafe one is skipped and (path, why) is
-    appended to `unsafe`. Each project's hook checks its own protected record,
-    which is what binds; this is cc-dash's own first look."""
-    from .control import read_json
-    state = state or attention.state_dir()
-    reg = read_json(os.path.join(state, "projects.json"), 1 << 20) or {}
-    out = []
-    for proj in reg.get("projects") or []:
-        if not isinstance(proj, str) or not os.path.isabs(proj):
-            continue
-        path = os.path.join(proj, ".claude", "hooks", procs.MANIFEST_NAME)
-        m, why = read_manifest(path)
-        if m is None:
-            if why and unsafe is not None:
-                unsafe.append((path, why))
-            continue
-        hosts = m.get("terminal_hosts")
-        out += [h for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else []
-    return procs.merge_terminals(out, [])
-
-
 def uncovered_projects(state=None, me=None, proc="/proc"):
-    """Registered projects whose own manifest does not cover this process's terminal, or whose pin or code record
-    would refuse every gate anyway (a stale record after a cc_tool pull). cc-dash starts on the union
-    of every project's record, but a project's hook and `cc-factory` gates read only that project's record, so
-    the dashboard looks healthy while that project refuses every gate. Returns [(project, why)]; the records
-    are not shared or widened, this only reports. Meant for after control_refusal passed on the union."""
+    """Registered projects that were not set up from the cc_tool checkout cc-dash runs from (their pin), which
+    refuses every gate there. The code record is user-wide (code_notice) and the terminal a live check, so
+    neither is reported per project. Returns [(project, why)]; this only reports."""
     from .control import read_json
     state = state or attention.state_dir()
-    me = os.getpid() if me is None else me
     reg = read_json(os.path.join(state, "projects.json"), 1 << 20) or {}
     out = []
     for proj in reg.get("projects") or []:
         if not isinstance(proj, str) or not os.path.isabs(proj):
             continue
-        hooks = os.path.join(proj, ".claude", "hooks")
-        m, why = read_manifest(os.path.join(hooks, procs.MANIFEST_NAME))
-        hosts = m.get("terminal_hosts") if m else None
-        hosts = [h for h in hosts if isinstance(h, dict)] if isinstance(hosts, list) else []
-        if m is None:
-            out.append((proj, why or "has no cc_dash_manifest.json"))
-            continue
-        # The pin and code checks bin/cc-factory's dashboard_problem runs before the terminal one: after a cc_tool
-        # pull every record is stale while its terminals still match.
-        pin = procs.read_pin(hooks)
+        pin = procs.read_pin(os.path.join(proj, ".claude", "hooks"))
         if not pin or os.path.realpath(pin) != os.path.realpath(CC_TOOL_DIR):
             out.append((proj, "was not set up from the cc_tool checkout cc-dash runs from"))
-            continue
-        why = procs.manifest_problem(CC_TOOL_DIR, m) or procs.terminal_problem(
-            me, proc, terminals=procs.merge_terminals(hosts, []))
-        if why:
-            out.append((proj, why))
     return out
 
 
@@ -731,23 +706,92 @@ def _plain(text):
 
 def uncovered_notice(items, names=3, reasons=False):
     """One compact warning for uncovered_projects(): a count and the first few names, so it does not bury the
-    control code. With reasons (the log) every project follows on its own line. '' when there is nothing to say."""
+    control code, with no command per project. With reasons (the log) every project follows on its own line."""
     if not items:
         return ""
     shown = ", ".join(_plain(tilde(p)) for p, _w in items[:names])
     more = len(items) - names
-    text = ("cc-dash: warning: %d registered project%s do%s not record this terminal or this cc-dash code, so their "
-            "gates and approvals "
-            "will be refused: %s%s. In each, run `cc-update-project` from this terminal."
-            % (len(items), "" if len(items) == 1 else "s", "es" if len(items) == 1 else "", shown,
-               " (+%d more)" % more if more > 0 else ""))
+    text = ("cc-dash: warning: %d registered project%s %s not set up from this cc_tool checkout, so gates there "
+            "will be refused until cc-update-project has run in %s: %s%s."
+            % (len(items), "" if len(items) == 1 else "s", "was" if len(items) == 1 else "were",
+               "it" if len(items) == 1 else "them", shown, " (+%d more)" % more if more > 0 else ""))
     if reasons:
         text += "".join("\n  %s: %s" % (_plain(p), _plain(w)) for p, w in items)
     return text
 
 
-def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=None, root=None, note=None, terminals=None,
-                    unsafe=None):
+def code_notice(root=None):
+    """One line when cc-dash's code on disk is not the code you recorded (one user-wide record, for every
+    project), naming the one command that fixes it and the restart; '' when it matches."""
+    root = root or CC_TOOL_DIR
+    record, why = procs.read_code_record(root)
+    why = why or procs.manifest_problem(root, record)
+    if not why:
+        return ""
+    return ("cc-dash: warning: %s. Decisions in every project are refused until you run `%s` in this terminal, "
+            "then `ccdash --control`." % (_plain(why).rstrip("."), procs.RECORD_COMMAND))
+
+
+def record_code():
+    """`cc-dash --record-code`: record this checkout's cc-dash code as the one you approve, for every project.
+    Refused (exit 2) anywhere but your own terminal, by the rules control mode starts by."""
+    if not procs.have_proc():
+        print("cc-dash: recording needs /proc to tell your terminal from an agent's, so it works on Linux only.", file=sys.stderr)
+        return 2
+    why = procs.recording_problem()
+    if why:
+        print("cc-dash: the code record is yours to make from your own terminal, and this was not started from one (%s). "
+              "Run cc-dash --record-code in a terminal where Claude Code is not running." % _plain(why).rstrip("."), file=sys.stderr)
+        return 2
+    try:
+        path = procs.write_code_record(CC_TOOL_DIR, procs.build_manifest(CC_TOOL_DIR, procs.python_record(), []))
+    except (ValueError, OSError) as e:
+        print("cc-dash: the code could not be recorded (%s)." % _plain(e), file=sys.stderr)
+        return 2
+    print("cc-dash: recorded the code you approved for every project (%s); restart it: ccdash --control" % tilde(path))
+    return 0
+
+
+RESTART_WAIT = 5.0
+
+
+def restart_argv(argv):
+    """argv without --ready-fd (its descriptor is closed by now: the terminal already has the code)."""
+    out, skip = [], False
+    for x in argv:
+        if skip:
+            skip = False
+        elif x == "--ready-fd":
+            skip = True
+        elif not x.startswith("--ready-fd="):
+            out.append(x)
+    return out
+
+
+def restart_dashboard(argv):
+    """Start a fresh cc-dash the way bin/cc-dash starts itself, in this terminal and session, once the code and
+    the record are older than START_MARGIN (a process counts as started after a change it is not older than). A
+    new process rather than exec: the start time that code_after_start compares survives an exec. A cc-dash
+    started directly from a shell leads its own process group; the restarted one does too (process_group=0, no new
+    session), so it is not left in a group whose leader has exited, which claude_lineage refuses."""
+    import subprocess
+    entries = []
+    try:
+        files, dirs, _bad = procs.scan_code(CC_TOOL_DIR)
+        entries = [st for st in list(files.values()) + list(dirs.values())] + [os.lstat(procs.code_record_path())]
+    except OSError:
+        pass
+    newest = max((st.st_ctime for st in entries), default=0)
+    deadline = time.time() + RESTART_WAIT
+    while time.time() < min(newest + procs.START_MARGIN + 0.1, deadline):
+        time.sleep(0.1)
+    exe = os.path.realpath("/proc/self/exe") if os.path.exists("/proc/self/exe") else sys.executable
+    print("cc-dash: restarting")
+    subprocess.Popen([exe, "-I", os.path.join(CC_TOOL_DIR, "bin", "cc-dash")] + restart_argv(argv), close_fds=True,
+                     process_group=0)
+
+
+def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=None, root=None, note=None):
     """Why control mode must not start here, or ''.
 
     Control mode is how the human approves agents, so it refuses (1) to take
@@ -770,8 +814,6 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
         return NO_PROC
     env = os.environ if env is None else env
     d = ctl_dir or os.path.join(attention.state_dir(), "control")
-    # The terminals the holder of this process's terminal may be (procs.terminal_problem).
-    terminals = recorded_terminals(os.path.dirname(d), unsafe) if terminals is None else terminals
     lease_path = os.path.join(d, "lease")
     lease = read_json(lease_path, 4096)
     if lease is not None and isinstance(lease.get("expires"), (int, float)) and lease["expires"] > time.time():
@@ -786,7 +828,7 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
             except OSError:
                 alive = False
         if alive:
-            why = procs.dashboard_problem(pid, root or CC_TOOL_DIR, proc, terminals=terminals)
+            why = procs.dashboard_problem(pid, root or CC_TOOL_DIR, proc)
             if not why:
                 return ("another cc-dash --control (pid %d) is running and holds the control lease. Stop it first "
                         "(Ctrl-C in its terminal; `ccdash --control` does this for you)." % pid)
@@ -802,27 +844,39 @@ def control_refusal(ctl_dir=None, env=None, ancestors=None, proc="/proc", me=Non
         why = procs.claude_env(env) or next(("process %d, %s, is among its parents" % (p, comm)
                                              for p, comm, exe, argv in ancestors or [] if _is_claude(comm, exe, argv)), "")
         return (INSIDE_CLAUDE + " (%s)." % why) if why else \
-            "cc-dash --control must be started from your own terminal: its own process (%d) cannot be inspected." % me
+            "cc-dash --control must be started from your own terminal: its own process (%d) cannot be inspected. " \
+            "Start it directly from your terminal's shell." % me
     if ancestors is None:
         ancestors, complete = procs.chain(st["ppid"], proc=proc)
         if not complete:
             return ("cc-dash --control must be started from your own terminal: its parent chain cannot be read "
-                    "to the end (a process on the way is gone or hidden).")
+                    "to the end (a process on the way is gone or hidden). Wait a few seconds and start it again.")
     # The rules the hook applies to the dashboard and cc-setup to a terminal it records
     # (procs.origin_problem), in the same order: Claude Code's variables; the claude CLI
     # among its parents or its session and process-group leaders' parents (they outlive
     # a double fork; one that cannot be inspected counts); a terminal driver (script,
     # expect ...) that was itself detached; then whoever holds the master side of this
-    # terminal, who reads the control code: one of your recorded terminals, and not
-    # Claude Code or something it started; a fresh session after a re-parent; detached
+    # terminal, who reads the control code, judged live (no recorded list: a
+    # pseudo-terminal of its own, a holder that is no generic interpreter or driver, and not
+    # Claude Code or something it started); a fresh session after a re-parent; detached
     # with no controlling terminal left.
     inside, why = procs.origin_problem(me, proc, env=env, parents=ancestors,
-                                       terminal=lambda: procs.terminal_problem(me, proc, terminals=terminals))
+                                       terminal=lambda: procs.pty_problem(st) or procs.terminal_problem(me, proc))
     if inside:
-        return INSIDE_CLAUDE + " (%s)." % why
+        return INSIDE_CLAUDE + " (%s). Run ccdash --control in a terminal tab where Claude Code is not running." % why
     if why:
-        return "cc-dash --control must be started from your own terminal: %s." % why
+        return "cc-dash --control must be started from your own terminal: %s. %s" % (why.rstrip("."), _fix_for(why))
     return ""
+
+
+def _fix_for(why):
+    """The one sentence that says what to do about a refusal to start control mode, chosen by what the refusal names."""
+    low = why.lower()
+    if "hidden" in low or "cannot be read" in low or "cannot be inspected" in low or "nobody visible" in low:
+        return "Wait a few seconds and start it again; if it repeats, start it in a terminal outside the IDE."
+    if "holds its terminal" in low or "holds the master" in low or "terminal showing" in low or "is held by" in low:
+        return "Start it in a terminal outside the IDE (a standalone terminal window)."
+    return "Start it directly from your terminal's shell, in a tab of its own."
 
 
 def own_process_group():
@@ -911,6 +965,8 @@ def main(argv=None):
     except (AttributeError, ValueError):
         pass
     a = parse_args(sys.argv[1:] if argv is None else argv)
+    if a.record_code:
+        return record_code()
     close_inherited_fds({a.ready_fd} if a.ready_fd is not None else ())
     if not a.control:
         _ready(a)                   # nothing to show on the terminal
@@ -930,19 +986,17 @@ def main(argv=None):
         print(f"cc-dash: port {a.port} is busy, using {srv.port}.")
     if a.control:
         own_process_group()
-        unsafe = []           # project manifests skipped for the terminal list: noted now, audited once control starts
-        why = control_refusal(note=lambda text: print(text, file=sys.stderr), unsafe=unsafe)
-        for path, reason in unsafe:
-            print("cc-dash: ignored %s for the recorded terminals: it %s." % (tilde(path), reason), file=sys.stderr)
+        why = control_refusal(note=lambda text: print(text, file=sys.stderr))
         if why:
             refuse_control(a, "cc-dash: " + why)
             srv.server_close()
             return 1
-        uncovered = uncovered_projects()
-        if uncovered:
+        code, uncovered = code_notice(), uncovered_projects()
+        shown = [x for x in (code, uncovered_notice(uncovered)) if x]
+        if shown:
             # Both: stderr is the log with `ccdash`, so the terminal is the only place the human sees it.
-            print(uncovered_notice(uncovered, reasons=True), file=sys.stderr)
-            tty_write("\r\n  %s\r\n" % uncovered_notice(uncovered), "/dev/tty")
+            print("\n".join(x for x in (code, uncovered_notice(uncovered, reasons=True)) if x), file=sys.stderr)
+            tty_write("\r\n  %s\r\n" % "\r\n  ".join(shown), "/dev/tty")
         # The control code goes to the terminal only. Without one there is no way
         # to hand it to the human, so there is no control mode.
         if not show_control_code(srv.auth.enable_control()):
@@ -956,9 +1010,6 @@ def main(argv=None):
                                   sockets=os.environ.get("CC_DASH_CONTROL_TRANSPORT") != "hook")
             hook_srv = start_hook_channel(srv.control)
             srv.control.start()
-            for path, reason in unsafe:
-                srv.control.log(None, "refused", kind="manifest", item=path,
-                                result="a project manifest was ignored for the recorded terminals: it %s" % reason)
         except OSError as e:
             refuse_control(a, f"cc-dash: cannot start control mode: {e}")
             srv.server_close()
@@ -1018,6 +1069,8 @@ def main(argv=None):
             hook_srv.shutdown()
             hook_srv.server_close()
         srv.server_close()
+    if srv.restart_requested:
+        restart_dashboard(sys.argv[1:] if argv is None else argv)
     return 0
 
 

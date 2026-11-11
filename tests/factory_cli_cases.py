@@ -603,7 +603,7 @@ def test_list_show():
     arr = json.loads(r.stdout)
     check("list --json: every order (done included), the library's dict shape", [o["id"] for o in arr] == [a, b, c]
           and set(arr[0]) == {"id", "title", "priority", "status", "path", "created", "updated", "station", "stations", "gate", "lane",
-                              "run_id", "rework", "events", "line", "why"}, arr[0] if arr else r.stdout)
+                              "run_id", "rework", "events", "line", "why", "spec_changed", "decide"}, arr[0] if arr else r.stdout)
     check("list --json equals project_orders", [o["status"] for o in arr] == [o["status"] for o in F.project_orders(d, time.time())])
 
     r = cli(d, "show", b)
@@ -1261,7 +1261,15 @@ def test_run_args():
     check("run-args: name and scriptPath (the project's copy wins)", j["name"] == "factory-line" and j["scriptPath"] == script and set(j) == {"name", "scriptPath", "args"}, j.get("scriptPath"))
     check("run-args: args has exactly the contract keys (threshold: the line's, default 1)", set(args) == {
         "order", "title", "spec", "root", "worktree", "branch", "base", "holdout", "stations", "retries", "line", "threshold",
-        "planDoc", "orderPath"} and args["threshold"] == 1, sorted(args))
+        "planDoc", "orderPath", "subPackages"} and args["threshold"] == 1, sorted(args))
+    check("run-args: subPackages is an empty list when no sub-directory has its own environment", args["subPackages"] == [], args["subPackages"])
+    for rel in ("strategy_lab/.venv", "web/node_modules", ".hidden/.venv", "factory/.venv", "plain", "deep/a/.venv", "node_modules/.venv"):
+        os.makedirs(os.path.join(d, rel), exist_ok=True)
+    os.symlink("strategy_lab", os.path.join(d, "linked"))
+    sub = json.loads(cli(d, "run-args", a).stdout)["args"]["subPackages"]
+    check("run-args: subPackages lists the top-level dirs with their own .venv or node_modules (hidden, factory, node_modules, deeper, plain "
+          "and symlinked dirs skipped)", sub == ["strategy_lab", "web"], sub)
+    os.unlink(os.path.join(d, "linked"))
     check("run-args: planDoc and orderPath follow contract A (created date, lower-case id, the order file's slug)",
           args["orderPath"] == "factory/orders/%s-args-order.md" % a
           and args["planDoc"] == "docs/superpowers/plans/%s-%s-args-order.md" % (time.strftime("%Y-%m-%d"), a.lower()), (args["planDoc"], args["orderPath"]))
@@ -1648,6 +1656,15 @@ def test_record():
     check("record briefing: review's own observed test run (command, the output's last lines)",
           "Review's own test run: ran and passed: make test" in out and "25 passed" in out and "earlier lines of output" in out, out[-2500:])
     check("record briefing: the line's summary, whole (the old 1500-character clip is gone)", "END-OF-LINE-SUMMARY" in out)
+    f, flane = ready(d, "Flaky order", n_commits=1)
+    fres = v2_result(f, flane)
+    fres["stations"]["test"] = {"name": "test", "title": "Test", "status": "done", "report": {"flaky": [
+        {"file": "tests/test_factory.py", "firstRun": "8442 passed, 1 failed", "rerun": "8443 passed, 0 failed"}]}}
+    r = record_saved(d, f, fres)
+    check("record briefing: a flaky test file is listed with both result lines, and stored in the briefing",
+          r.returncode == 0 and "1 flaky test file" in r.stdout and "tests/test_factory.py" in r.stdout and "8442 passed, 1 failed" in r.stdout
+          and "8443 passed, 0 failed" in r.stdout and "8443 passed, 0 failed" in json.dumps(order_of(d, f).get("briefing") or events(d, f)[-1]),
+          (r.returncode, r.stdout[-800:], r.stderr))
     check("record: prints the human's next commands, the merge against the reviewed sha", ("git merge --no-ff %s" % head) in out
           and lane["branch"] in out and ("cc-factory approve %s --gate merge" % a) in out
           and ("cc-factory reject %s --gate merge --rework" % a) in out, out[-600:])

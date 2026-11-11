@@ -63,11 +63,20 @@ The one other way a gate decision reaches `approve` and `reject` is cc-dash in c
 script itself, with a socket on --ticket-fd, a flag only that child has any use for. It proves
 nothing by being passed: the kernel must name the socket's other end as this process's parent
 (SO_PEERCRED and getppid, never a path or a lease) and as held by it alone (peer_holder_problem),
-that parent must pass the rules the control hook applies to a dashboard (the project's
-cc_dash_manifest.json, dashboard_problem, code_after_start) and be in control mode
+that parent must pass the rules the control hook applies to a dashboard (the user-wide code
+record, cc_dash_code.json under cc_tool's state directory, one for every project: dashboard_problem,
+code_after_start) and be in control mode
 (control_mode_problem: --control and a controlling terminal), and the single-use ticket it hands
 over must name exactly this order, gate, decision and spec hash or reviewed head. Anything else
 refuses, and an agent's tool call has no such parent. See dashboard_ticket().
+
+The code record moves in two ways only: `cc-dash --record-code` (cc-setup, cc-update-project) from your own
+terminal, and here. When the dashboard merges a reviewed lane into the cc_tool checkout itself, the child's
+`approve --gate merge` finds cc-dash's code changed (the merge just did that), so it computes from git what the
+merge changed (merge_code_delta): only the files whose content equals the reviewed commit's, in a two-parent merge
+of exactly the reviewed head whose tree equals a clean merge-tree of its two parents. It counts only paths the lane
+changed since the merge-base. It judges its parent against the record plus that delta, and after writing the
+ledger event re-records exactly those files. A hand edit, a `git pull` or an agent's write is never in the delta.
 """
 import os
 import sys
@@ -1129,48 +1138,159 @@ TICKET_TIMEOUT = 15          # seconds for cc-dash to answer on the ticket socke
 MAX_TICKET_BYTES = 16 * 1024
 
 
-def read_manifest(path):
-    """The dict in cc_dash_manifest.json, read as the control hook reads it (a plain file of ours that nobody
-    else can write, not through a symlink), or None."""
+CODE_SCOPE = ("bin/cc-dash", "templates/hooks/cc_procs.py", "lib")   # cc_procs.scan_code's scope, as git paths
+
+
+def _git_bytes(args, cwd, extra_env=None):
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_VARS}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.update(extra_env or {})
     try:
-        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | _NONBLOCK | _CLOEXEC)
-    except OSError:
+        r = subprocess.run(["git"] + list(args), cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
         return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _scope_tree(main, rev_):
+    """{path: (mode, oid)} for the plain files of cc-dash's code in commit `rev_`, or None when git cannot say."""
+    out = _git_bytes(["ls-tree", "-r", "-z", rev_, "--"] + list(CODE_SCOPE), main)
+    if out is None:
+        return None
+    tree = {}
+    for ent in out.split(b"\0"):
+        meta, _tab, path = ent.partition(b"\t")
+        parts = meta.split()
+        if len(parts) != 3 or parts[1] != b"blob" or parts[0] not in (b"100644", b"100755"):
+            continue
+        name = path.decode("utf-8", "replace")
+        if "__pycache__" not in name.split("/"):
+            tree[name] = (parts[0].decode("ascii"), parts[2].decode("ascii"))
+    return tree
+
+
+def _blob_sha256(main, entry):
+    if entry is None:
+        return None
+    data = _git_bytes(["cat-file", "blob", entry[1]], main)
+    return hashlib.sha256(data).hexdigest() if data is not None else False
+
+
+def merge_code_delta(main, events):
+    """What a dashboard-approved merge of a reviewed lane did to cc-dash's code, computed from git alone: {"paths": {path:
+    {"new": sha256 or None, "base": sha256 or None}}, "dirs": [directories the merge touched], "since": HEAD's committer time (cc-dash's pre-merge timestamp rounded up to the next whole second)
+    (cc-dash's pre-merge timestamp)}, or None when there is no such merge. A path counts only when
+    the project is the cc_tool checkout this script runs from, HEAD is a two-parent merge whose second parent is
+    the reviewed lane head the ledger recorded and whose tree equals the tree of a clean `git merge-tree --write-tree`
+    of its parents (so a hand-made merge that reverted something differs), the path is in cc-dash's code, the lane
+    changed it (it differs between merge-base(first parent, reviewed) and the reviewed commit), its content in HEAD differs from
+    HEAD's first parent and is exactly its content in the reviewed commit (so the merge brought it in unchanged: a
+    conflict resolution or an evil merge edit differs from the reviewed commit and is not counted). `base` is
+    the first parent's content: the record is moved only from there."""
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022 or st.st_size >= (1 << 20):
+        if os.path.realpath(main) != os.path.realpath(CC_TOOL_DIR):
             return None
-        data = os.read(fd, 1 << 20)
-    except OSError:
+        ev = next((e for e in reversed(events) if e.get("event") == "status" and e.get("status") == "review"), None)
+        reviewed = (ev or {}).get("lane_head")
+        if not (isinstance(reviewed, str) and SHA_RE.fullmatch(reviewed)):
+            return None
+        out = _git_bytes(["rev-list", "--parents", "-n", "1", "HEAD"], main)
+        parts = out.decode("ascii", "replace").split() if out else []
+        if len(parts) != 3 or parts[2] != reviewed:
+            return None
+        out = _git_bytes(["merge-base", parts[1], reviewed], main)
+        base = out.decode("ascii", "replace").strip() if out else ""
+        if not SHA_RE.fullmatch(base):
+            return None
+        empty = _git_bytes(["hash-object", "-t", "tree", "--stdin"], main)
+        empty = empty.decode("ascii", "replace").strip() if empty else ""
+        if not SHA_RE.fullmatch(empty):
+            return None
+        # The same empty attribute source cc-dash's merge used, so the two trees agree.
+        mt = _git_bytes(["--attr-source=" + empty, "-c", "core.attributesFile=/dev/null", "merge-tree", "--write-tree",
+                         parts[1], reviewed], main, extra_env={"GIT_ATTR_NOSYSTEM": "1"})
+        tree = _git_bytes(["rev-parse", "HEAD^{tree}"], main)
+        if not mt or not tree or mt.split(b"\n", 1)[0].strip() != tree.strip():
+            return None
+        head, first, rev_, base_tree = (_scope_tree(main, r) for r in ("HEAD", parts[1], reviewed, base))
+        if head is None or first is None or rev_ is None or base_tree is None:
+            return None
+        delta = {}
+        for path in sorted(set(head) | set(first) | set(rev_)):
+            if head.get(path) == first.get(path) or head.get(path) != rev_.get(path) or base_tree.get(path) == rev_.get(path):
+                continue
+            new, base = _blob_sha256(main, head.get(path)), _blob_sha256(main, first.get(path))
+            if new is False or base is False:
+                return None
+            delta[path] = {"new": new, "base": base}
+        # The merge also rewrote every other file it changed, which bumps the change time of the directories they sit
+        # in (bin, templates, lib/...), whether or not cc-dash's code is among them: exempt those directories too.
+        changed = _git_bytes(["diff", "--name-only", "-z", parts[1], "HEAD"], main)
+        if changed is None:
+            return None
+        dirs = set()
+        for name in changed.decode("utf-8", "replace").split("\0"):
+            bits = name.split("/")
+            dirs.update("/".join(bits[:i]) for i in range(1, len(bits)))
+        ct = _git_bytes(["show", "-s", "--format=%ct", "HEAD"], main)
+        since = int(ct.decode("ascii", "replace").strip()) if ct else None
+        return {"paths": delta, "dirs": sorted(dirs), "since": since}
+    except Exception:  # noqa: BLE001 - no delta is the safe answer
         return None
-    finally:
-        os.close(fd)
-    try:
-        doc = json.loads(data)
-    except ValueError:
-        return None
-    return doc if isinstance(doc, dict) else None
 
 
-def dashboard_problem(procs, main, pid):
+def apply_delta(record, delta):
+    """(manifest, exempt): the record moved by the delta paths whose recorded content is the content before the merge
+    (base), and the paths and their directories whose change time is the merge's (code_after_start skips them).
+    With no delta, the record itself and nothing exempt."""
+    if not delta:
+        return record, ()
+    files, dirs, exempt, deleted = dict(record.get("files") or {}), set(record.get("dirs") or []), set(delta["dirs"]), []
+    for rel, d in sorted(delta["paths"].items()):
+        if files.get(rel) != d["base"]:
+            continue
+        if d["new"] is None:
+            files.pop(rel, None)
+            deleted.append(rel)
+        else:
+            files[rel] = d["new"]
+        bits = rel.split("/")
+        for i in range(1, len(bits)):
+            exempt.add("/".join(bits[:i]))
+            if bits[0] == "lib":
+                dirs.add("/".join(bits[:i]))
+        exempt.add(rel)
+    for rel in deleted:
+        bits = rel.split("/")
+        for i in range(len(bits) - 1, 1, -1):
+            d = "/".join(bits[:i])
+            if bits[0] == "lib" and not any(f.startswith(d + "/") for f in files):
+                dirs.discard(d)
+    return dict(record, files=files, dirs=sorted(dirs)), tuple(sorted(exempt))
+
+
+def dashboard_problem(procs, main, pid, delta=None):
     """'' when pid is the cc-dash the project's control hook would trust and it is in control mode, else why
-    not: the hook's three checks, in the same order, from the record cc-setup wrote beside the hook (its code,
-    its interpreter, its terminals), for the checkout this script runs from, then control_mode_problem."""
+    not: the hook's three checks, in the same order, against the ONE user-wide record of the code you approved
+    (procs.read_code_record: its code, its interpreter; its terminal is judged live, no recorded list), for the
+    checkout this script runs from, then control_mode_problem. `delta` (merge_code_delta) is the one thing that may
+    move that record: the files a dashboard-approved merge brought in from the reviewed commit are judged against
+    the record as it will be re-recorded, so the dashboard that just merged is not refused for the code it merged."""
     hooks = os.path.join(main, ".claude", "hooks")
     if not (real_dir(os.path.dirname(hooks)) and real_dir(hooks)):
         return "this project has no .claude/hooks directory (run cc-update-project)"
     pin = procs.read_pin(hooks)
     if not pin or os.path.realpath(pin) != os.path.realpath(CC_TOOL_DIR):
         return "this project was not set up from the cc_tool checkout cc-dash runs from (run cc-update-project)"
-    path = os.path.join(hooks, procs.MANIFEST_NAME)
-    manifest = read_manifest(path)
-    if manifest is None:
-        return "there is no usable %s beside the project's hooks (run cc-update-project)" % procs.MANIFEST_NAME
-    terminals = manifest.get("terminal_hosts") if isinstance(manifest.get("terminal_hosts"), list) else []
+    record, why = procs.read_code_record(CC_TOOL_DIR)
+    if record is None:
+        return why
+    expected, exempt = apply_delta(record, delta)
     # Each must answer exactly '': a None from one must not fall through to the next and read as a pass.
-    for check in (lambda: procs.manifest_problem(CC_TOOL_DIR, manifest),
-                  lambda: procs.dashboard_problem(pid, CC_TOOL_DIR, python=manifest.get("python"), terminals=terminals),
-                  lambda: procs.code_after_start(pid, CC_TOOL_DIR, path),
+    for check in (lambda: procs.manifest_problem(CC_TOOL_DIR, expected),
+                  lambda: procs.dashboard_problem(pid, CC_TOOL_DIR, python=record.get("python")),
+                  lambda: procs.code_after_start(pid, CC_TOOL_DIR, procs.code_record_path(), exempt=exempt,
+                                                       exempt_since=(delta or {}).get("since")),
                   lambda: procs.control_mode_problem(pid)):
         why = check()
         if why != "":
@@ -1195,7 +1315,7 @@ def read_ticket(sock, ask):
     return doc if isinstance(doc, dict) else None
 
 
-def ticket_from_parent(fd, main, ask):
+def ticket_from_parent(fd, main, ask, delta=None):
     """(the ticket's dict, '') from the dashboard that started this process, or (None, why not). Only the
     kernel's word counts: the socket on `fd` must be a connected Unix stream socket whose other end was made
     by this process's parent, of our user (SO_PEERCRED, which says no more than who made it), is held by that
@@ -1228,7 +1348,7 @@ def ticket_from_parent(fd, main, ask):
             why = procs.peer_holder_problem(sock, parent)
             if why != "":
                 return None, ("its socket is not its parent's alone: %s" % why) if isinstance(why, str) else "cc_procs gave no answer"
-            why = dashboard_problem(procs, main, parent)
+            why = dashboard_problem(procs, main, parent, delta)
             if why:
                 return None, "its parent is not your dashboard: %s" % why
             answer = read_ticket(sock, ask)
@@ -1257,11 +1377,11 @@ def ticket_problem(t, ask, events):
     return ""
 
 
-def dashboard_ticket(args, main, oid, gate, verb, rework, decision, command, events):
+def dashboard_ticket(args, main, oid, gate, verb, rework, decision, command, events, delta=None):
     """The human's decision from cc-dash in control mode, or a refusal: the only process that gets past this
     is the child cc-dash started for a decision it just took (lib/cc_dash/gates.py has the threat model)."""
     ask = {"order": oid, "gate": gate, "decision": verb, "rework": rework}
-    ticket, why = ticket_from_parent(args.ticket_fd, main, dict(ask, v=1, op="redeem"))
+    ticket, why = ticket_from_parent(args.ticket_fd, main, dict(ask, v=1, op="redeem"), delta)
     if why == NO_PROC:
         refuse_no_proc(decision, command)
     why = why or ticket_problem(ticket, ask, events)
@@ -1271,13 +1391,13 @@ def dashboard_ticket(args, main, oid, gate, verb, rework, decision, command, eve
     return ticket
 
 
-def gate_authority(args, main, oid, gate, verb, rework, decision, command, events):
+def gate_authority(args, main, oid, gate, verb, rework, decision, command, events, delta=None):
     """Who may take this decision, checked before the order's state: a ticket from the dashboard (returned)
     when --ticket-fd is given, else a human at their own terminal (None; confirm_human asks them)."""
     if args.ticket_fd is None:
         need_human(decision, command)
         return None
-    return dashboard_ticket(args, main, oid, gate, verb, rework, decision, command, events)
+    return dashboard_ticket(args, main, oid, gate, verb, rework, decision, command, events, delta)
 
 
 def ticket_fields(ticket):
@@ -1453,7 +1573,8 @@ def cmd_approve(args):
     gate = args.gate or ("merge" if o["status"] == "review" else "spec")
     command = "cc-factory approve %s --gate %s%s%s" % (oid, gate, " --into %s" % one_line(args.into, 60) if args.into else "",
                                                        " --note ..." if args.note else "")
-    ticket = gate_authority(args, main, oid, gate, "approve", False, "passing %s's %s gate" % (oid, gate), command, events)
+    delta = merge_code_delta(main, events) if gate == "merge" and args.ticket_fd is not None else None
+    ticket = gate_authority(args, main, oid, gate, "approve", False, "passing %s's %s gate" % (oid, gate), command, events, delta)
     gate = gate_args(o, args, "approve")
     line = line_of(main, o)
     if args.into and (gate != "merge" or ticket):
@@ -1486,7 +1607,27 @@ def cmd_approve(args):
     print("%s  merge gate passed: done" % oid)
     print("reviewed lane head %s is in %s (%s), merged by %s%s" % (head[:10], one_line(args.into or "HEAD", 60), target[:10], msha[:10],
                                                                     " (a fast-forward)" if msha == head else ""))
+    if ticket and delta and delta["paths"]:
+        print(re_record(delta))
     return 0
+
+
+def re_record(delta):
+    """After a dashboard-approved merge has been recorded: move the user-wide code record to exactly the merged
+    tree, but only when the code on disk is now the old record plus the delta (merge_code_delta: the reviewed
+    commit's own files). Never refuses: the event is already written. Returns the line to print."""
+    try:
+        procs = load_procs()
+        record, _why = procs.read_code_record(CC_TOOL_DIR)
+        if record is None:
+            return "cc-dash code was not re-recorded (there was no code record)"
+        expected, _ex = apply_delta(record, delta)
+        if procs.manifest_problem(CC_TOOL_DIR, expected) != "":
+            return "cc-dash code was not re-recorded: what is on disk is not the reviewed commit's code; record it with cc-dash --record-code in your terminal"
+        procs.write_code_record(CC_TOOL_DIR, expected)
+        return "cc-dash code re-recorded from the merged commit (%d file%s); restart the dashboard" % (len(delta["paths"]), "" if len(delta["paths"]) == 1 else "s")
+    except Exception as e:  # noqa: BLE001
+        return "cc-dash code was not re-recorded (%s); record it with cc-dash --record-code in your terminal" % one_line("%s: %s" % (type(e).__name__, e), 120)
 
 
 def seen_value(main, o, raw, events, gate):
@@ -1695,6 +1836,22 @@ def plan_doc_path(raw, o):
     return "docs/superpowers/plans/%s-%s-%s.md" % (created, o["id"].lower(), m.group(1))
 
 
+def sub_packages(main):
+    """Top-level sub-directories of the main checkout holding their own .venv or node_modules. The workflow script
+    cannot list directories, so this gives it the sub-package environments to mount into the verify sandbox."""
+    skip = {"node_modules", F.ORDERS_DIR.split("/")[0]}
+    found = []
+    try:
+        for e in os.scandir(main):
+            if e.name.startswith(".") or e.name in skip or not e.is_dir(follow_symlinks=False):
+                continue
+            if any(os.path.isdir(os.path.join(e.path, d)) for d in (".venv", "node_modules")):
+                found.append(e.name)
+    except OSError:
+        return []
+    return sorted(found)
+
+
 def cmd_run_args(args):
     main = resolve_main(args)
     oid = need_id(args.id)
@@ -1731,6 +1888,7 @@ def cmd_run_args(args):
         "base": last_lane_base(events, lane["branch"]), "holdout": os.path.join(main, F.HOLDOUT_DIR, oid),
         "stations": line["stations"], "retries": line["retries"], "line": o.get("line") or "default",
         "threshold": F.line_threshold(line)}}
+    out["args"]["subPackages"] = sub_packages(main)
     plan_doc = plan_doc_path(raw, o)
     if plan_doc:
         out["args"]["planDoc"] = plan_doc
@@ -2303,6 +2461,14 @@ def briefing_lines(oid, res, facts, line, summary, line_name=""):
             out.append("Holdout verdicts are STATIC (sandbox %s, git %s): verify ran none of the lane's code, it only read it, so nothing "
                        "observed the behaviour. Recommendation: needs-human-check, not merge: run the change yourself first." % (h["sandbox"], h["git"]))
     st = res.get("stations") if isinstance(res.get("stations"), dict) else {}
+    ts = st.get("test") if isinstance(st.get("test"), dict) else {}
+    tr = ts.get("report") if isinstance(ts.get("report"), dict) else {}
+    fl = [f for f in (tr.get("flaky") if isinstance(tr.get("flaky"), list) else []) if isinstance(f, dict)]
+    if fl:
+        out.append("Tests: %d flaky test file%s: failed in the full run, then passed when rerun alone (not counted as failures):"
+                   % (len(fl), "" if len(fl) == 1 else "s"))
+        out += ["  - %s: first run: %s; rerun alone: %s" % (one_line(f.get("file") or "-", 200), one_line(f.get("firstRun") or "-", 200),
+                                                         one_line(f.get("rerun") or "-", 200)) for f in fl]
     rs = st.get("review") if isinstance(st.get("review"), dict) else {}
     rv = rs.get("report") if isinstance(rs.get("report"), dict) else None
     if not any(s["name"] == "review" or s["name"] == rs.get("name") for s in line["stations"]):

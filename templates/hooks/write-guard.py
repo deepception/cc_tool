@@ -28,7 +28,8 @@ Blocks (deny):
     hooks run, so an agent must not change it from another project. Unless the
     project IS that checkout or one of its worktrees: developing cc_tool
     itself is outside control mode's protection.
-  - writes to cc-dash's project registry (.../cc_tool/projects.json).
+  - writes to cc-dash's project registry (.../cc_tool/projects.json) and to the record of
+    the cc-dash code you approved (.../cc_tool/cc_dash_code.json).
   NotebookEdit gets the location checks (these denials, .git/, system paths,
   dotfiles, outside the project), not the content ones.
   - secrets in the proposed content: private-key blocks, AWS/GitHub/Slack/
@@ -181,6 +182,9 @@ def check_cc_dash(root: str, path: str) -> None:
     real = os.path.realpath(path)
     sd = _cc_state_dir()
     for spot in {sd, os.path.realpath(sd)}:
+        if real == os.path.join(spot, "cc_dash_code.json"):
+            deny(root, path, f"writing '{real}' would make cc-dash trust code you did not approve",
+                 "record it from your own terminal with cc-dash --record-code, or approve a merge in the dashboard")
         if _under(real, os.path.join(spot, "control")) or real in (os.path.join(spot, "cc-dash.log"),
                                                                     os.path.join(spot, "projects.json")):
             deny(root, path, f"writing '{real}' forges cc-dash's control channel (approvals, messages and stops "

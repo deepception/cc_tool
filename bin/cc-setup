@@ -117,11 +117,14 @@ find "$PROJECT_DIR/.claude/hooks" -maxdepth 1 -name "*.sh" -exec chmod +x {} \;
 # unchanged and only when the process runs that very interpreter, so a Bash edit
 # of the checkout cannot vouch for itself and a binary merely named python3 is
 # not trusted. After a `git pull` of cc_tool, or a python3 upgrade,
-# cc-update-project re-records it. bin/cc-dash re-executes the interpreter its
+# `cc-dash --record-code` (or cc-update-project) re-records it. The record the hook, cc-factory and
+# cc-dash read is the ONE user-wide file ${XDG_STATE_HOME:-~/.local/state}/cc_tool/cc_dash_code.json
+# (0600), written here too from a terminal: re-recording covers every project at once. bin/cc-dash re-executes the interpreter its
 # shebang resolved, so run cc-setup with the python3 you run cc-dash with.
 # The manifest also lists your terminal programs (terminal_hosts): what holds the
-# terminal cc-setup runs in, plus CC_DASH_TERMINALS (only beside a detected one). The control code is shown
-# only on a terminal one of them holds.
+# terminal cc-setup runs in, plus CC_DASH_TERMINALS (only beside a detected one). The list is kept for
+# reference only: no check reads it. The control code and every gate decision judge the terminal live
+# (procs.terminal_problem with recording_problem's rules), so no recording step is needed.
 # And the project goes into ${XDG_STATE_HOME:-~/.local/state}/cc_tool/projects.json
 # (0600): cc-dash shows a permission request only from a registered project's hook.
 python3 - "$CC_TOOL_DIR" "$PROJECT_DIR" "$RESET_TERMINALS" <<'EOF'
@@ -163,7 +166,7 @@ python = procs.python_record()
 # The terminals the control code may be shown in: whatever holds the master side of the
 # terminal this runs in (its fdinfo tty-index), plus CC_DASH_TERMINALS=/path1:/path2 (only
 # beside a terminal detected in this run), plus what was recorded before (kept: they are
-# yours). The hook refuses a dashboard whose terminal is held by anything else.
+# yours). Informational: the hook and cc-dash check the terminal live, not against this list.
 mpath = os.path.join(hooks, procs.MANIFEST_NAME)
 try:
     with open(mpath, encoding="utf-8") as fh:
@@ -192,7 +195,14 @@ else:
     # recordable terminal holding this one, whatever it names is not recorded either.
     named = [p for p in extra if p not in bad] if detected else []
     terminals = procs.merge_terminals([] if reset_terminals else old, (detected or []) + named)
-write(mpath, json.dumps(procs.build_manifest(root, python, terminals), indent=1, sort_keys=True) + "\n")
+manifest = procs.build_manifest(root, python, terminals)
+write(mpath, json.dumps(manifest, indent=1, sort_keys=True) + "\n")
+# The code record the hooks, cc-factory and cc-dash trust is ONE file for every project (see below): it is
+# re-recorded here, from your terminal, and nowhere an agent can reach (recording_problem refused above).
+if refusal:
+    print("  • control mode: cc-dash code not recorded (%s); run cc-dash --record-code from your own terminal." % refusal)
+else:
+    print("  • control mode: cc-dash code recorded for every project (%s)" % procs.write_code_record(root, manifest))
 for path, why in skipped:
     print("  • control mode: not recording %s as a terminal: %s" % (path, why))
 if not refusal and not detected:

@@ -118,6 +118,8 @@
 .pl-line-c .fx-steps { flex: 1 1 auto; min-width: 60px; }
 .pl-gate { margin-top: var(--sp-1h); font-size: var(--fs-12); white-space: normal; }
 .pl-wk td:has(.pl-gate) { overflow: visible; }
+.pl-cmd { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1); margin-top: var(--sp-1); }
+.pl-cmd .pl-code { margin-top: 0; }
 .pl-gate code { display: block; width: fit-content; max-width: 100%; margin-top: var(--sp-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 640px) {

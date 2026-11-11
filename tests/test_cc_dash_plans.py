@@ -642,8 +642,10 @@ def work_cases(base):
     check("work: both orders listed", set(orders) == {"FO-001", "FO-002"}, str(sorted(orders)))
     o1 = orders.get("FO-001", {})
     keys = {"project", "id", "title", "status", "priority", "line", "gate", "stations", "done", "total", "rework",
-            "recommendation", "why", "branch", "worktree", "path", "plan", "updated"}
+            "recommendation", "why", "branch", "worktree", "path", "plan", "updated", "decide", "spec_changed", "main", "outside"}
     check("work: an order carries exactly Contract B's keys", set(o1) == keys, str(set(o1) ^ keys))
+    check("work: an order on its path has no outside box (a stuck one would carry gates.order_outside)",
+          o1.get("outside") is None and orders["FO-002"]["outside"] is None, str((o1.get("outside"), orders["FO-002"].get("outside"))))
     check("work: an order on its path has no why", o1.get("why") is None and orders["FO-002"]["why"] is None, str(o1.get("why")))
     check("work: order status, gate, progress and recommendation", o1.get("status") == "review"
           and o1.get("gate") == {"name": "merge", "waiting": True} and (o1.get("done"), o1.get("total")) == (2, 5)

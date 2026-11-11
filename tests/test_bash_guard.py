@@ -1114,6 +1114,147 @@ CASES = [
     ("CD24", "ccdash", FEATURE, "cc-dash --no-open --days 3", A),                   # read-only cc-dash is fine
     ("CD25", "ccdash", FEATURE, "python3 lib/cc_dash/control.py", A),
     ("CD26", "ccdash", FEATURE, "curl -s http://127.0.0.1:7878/api/plans?project=x", A),
+    ("CD26a", "ccdash", FEATURE, "cc-dash --record-code", D),             # FO-004: the code record is yours to make
+    ("CD26b", "ccdash", FEATURE, "echo {} > ~/.local/state/cc_tool/cc_dash_code.json", D),
+    ('CD26c', "ccdash", FEATURE, 'rm ~/.local/state/cc_tool/cc_dash_code.json', D),
+    ('CD26d', "ccdash", FEATURE, 'mv /tmp/x ~/.local/state/cc_tool/cc_dash_code.json', D),
+    ('CD26e', "ccdash", FEATURE, 'cp a ~/.local/state/cc_tool/cc_dash_code.json', D),
+    ('CD26f', "ccdash", FEATURE, 'tee ~/.local/state/cc_tool/cc_dash_code.json < x', D),
+    ('CD26g', "ccdash", FEATURE, 'python3 -c "open(\'/h/.local/state/cc_tool/cc_dash_code.json\',\'w\')"', D),
+    ('CD26h', "ccdash", FEATURE, "bash -c 'cc-dash --record-code'", D),
+    ('CD26i', "ccdash", FEATURE, '/home/u/cc_tool/bin/cc-dash --record-code', D),
+    ('CD26j', "ccdash", FEATURE, 'ccdash --record-code', D),
+    ('CD26k', "ccdash", FEATURE, 'ls -l ~/.local/state/cc_tool/cc_dash_code.json', A),
+    ('CD26l', "ccdash", FEATURE, 'cat ~/.local/state/cc_tool/cc_dash_code.json', A),
+    ('CD26m', "ccdash", FEATURE, 'grep -c files ~/.local/state/cc_tool/cc_dash_code.json', A),
+    ('CD26n', "ccdash", FEATURE, 'git commit -m "Document cc_dash_code.json and cc-dash --record-code"', A),
+    ('CD26o', "ccdash", FEATURE, "grep -rn -- '--record-code' docs/", A),
+    ('CD26p', "ccdash", FEATURE, 'sed -in s/a/b/ ~/.local/state/cc_tool/cc_dash_code.json', D),  # FO-005: fail closed
+    ('CD26q', "ccdash", FEATURE, "perl -pi -e 's/a/b/' ~/.local/state/cc_tool/cc_dash_code.json", D),  # FO-005: fail closed
+    ('CD26r', "ccdash", FEATURE, 'sponge ~/.local/state/cc_tool/cc_dash_code.json', D),  # FO-005: fail closed
+    ('CD26s', "ccdash", FEATURE, 'rsync a ~/.local/state/cc_tool/cc_dash_code.json', D),  # FO-005: fail closed
+    ('CD26t', "ccdash", FEATURE, 'cp ~/.local/state/cc_tool/cc_dash_code.json /tmp/x', D),  # FO-005: fail closed
+    ('CD26u', "ccdash", FEATURE, 'mv ~/.local/state/cc_tool/cc_dash_code.json /tmp/x', D),  # FO-005: fail closed
+    ('CD26v', "ccdash", FEATURE, 'python3 script.py ~/.local/state/cc_tool/cc_dash_code.json', D),  # FO-005: fail closed
+    ('CD26w', "ccdash", FEATURE, '> ~/.local/state/cc_tool/cc_dash_code.json', D),  # FO-005: fail closed
+    ('CD26x', "ccdash", FEATURE, 'vim ~/.local/state/cc_tool/cc_dash_code.json', D),  # FO-005: fail closed
+    ('CD26y', "ccdash", FEATURE, 'cat ~/.local/state/cc_tool/cc_dash_code.json > /tmp/copy', D),  # FO-005: fail closed
+    ('CD26z', "ccdash", FEATURE, 'cat ~/.local/state/cc_tool/cc_dash_code.json | tee /tmp/copy', D),  # FO-005: fail closed
+    ('CD26p11', "ccdash", FEATURE, 'find ~/.local/state/cc_tool -name cc_dash_code.json -delete', D),  # FO-005: fail closed
+    ('CD26p12', "ccdash", FEATURE, 'ls ~/.local/state/cc_tool | grep cc_dash_code.json | xargs rm', D),  # FO-005: fail closed
+    ('CD26p13', "ccdash", FEATURE, 'python3 bin/cc-dash --record-code', D),  # FO-005: fail closed
+    ('CD26p14', "ccdash", FEATURE, './bin/cc-dash --record-code', D),  # FO-005: fail closed
+    ('CD26p15', "ccdash", FEATURE, 'env X=1 cc-dash --record-code', D),  # FO-005: fail closed
+    ('CD26p16', "ccdash", FEATURE, 'python3 -I /home/u/cc_tool/bin/ccdash --record-code', D),  # FO-005: fail closed
+    ('CD26p17', "ccdash", FEATURE, 'ls ~/.local/state/cc_tool/cc_dash_code.json', A),  # FO-005: fail closed
+    ('CD26p18', "ccdash", FEATURE, 'cat ~/.local/state/cc_tool/cc_dash_code.json', A),  # FO-005: fail closed
+    ('CD26p19', "ccdash", FEATURE, 'grep files ~/.local/state/cc_tool/cc_dash_code.json', A),  # FO-005: fail closed
+    ('CD26p20', "ccdash", FEATURE, 'jq . ~/.local/state/cc_tool/cc_dash_code.json', A),  # FO-005: fail closed
+    ('CD26p21', "ccdash", FEATURE, 'jq . < ~/.local/state/cc_tool/cc_dash_code.json', A),  # FO-005: fail closed
+    ('CD26p22', "ccdash", FEATURE, 'cat ~/.local/state/cc_tool/cc_dash_code.json 2>/dev/null', A),  # FO-005: fail closed
+    ('CD26p23', "ccdash", FEATURE, 'git log -- ~/.local/state/cc_tool/cc_dash_code.json', A),  # FO-005: fail closed
+    ('CD26p24', "ccdash", FEATURE, 'git commit -m "Explain cc_dash_code.json"', A),  # FO-005: fail closed
+    ('CD26p25', "ccdash", FEATURE, 'git commit -m "Run cc-dash --record-code after merging"', A),  # FO-005: fail closed
+    ('CD26p26', "ccdash", FEATURE, 'grep -rn -- --record-code bin/cc-dash', A),  # FO-005: fail closed
+    ('CD26p27', "ccdash", FEATURE, '$(which cc-dash) --record-code', D),  # FO-005: unreadable program word
+    ('CD26p28', "ccdash", FEATURE, '`which cc-dash` --record-code', D),  # FO-005: unreadable program word
+    ('CD26p29', "ccdash", FEATURE, '$P --record-code', D),  # FO-005: unreadable program word
+    ('CD26p30', "ccdash", FEATURE, '"$P" --record-code', D),  # FO-005: unreadable program word
+    ('CD26p31', "ccdash", FEATURE, '${P} --record-code', D),  # FO-005: unreadable program word
+    ('CD26p32', "ccdash", FEATURE, "bash -c '$P --record-code'", D),  # FO-005: unreadable program word
+    ('CD26p33', "ccdash", FEATURE, 'ls; $P --record-code', D),  # FO-005: unreadable program word
+    ('CD26p34', "ccdash", FEATURE, 'git commit -m "Run cc-dash --record-code, never $(which cc-dash) --record-code"', A),  # FO-005: unreadable program word
+    ('CD26p35', "ccdash", FEATURE, 'grep -rn -- --record-code $DIR', A),  # FO-005: unreadable program word
+    ('CD26p36', "ccdash", FEATURE, 'git commit -m "Document cc-dash --record-code"', A),  # FO-005: unreadable program word
+    ('CD26p37', "ccdash", FEATURE, 'grep x "$(cp /tmp/x cc_dash_code.json)"', D),  # FO-005: substitution is not a read
+    ('CD26p38', "ccdash", FEATURE, 'git commit -m "$(rm cc_dash_code.json)"', D),  # FO-005: substitution is not a read
+    ('CD26p39', "ccdash", FEATURE, 'ls `rm cc_dash_code.json`', D),  # FO-005: substitution is not a read
+    ('CD26p40', "ccdash", FEATURE, 'echo `cc-dash --record-code`', D),  # FO-005: substitution is not a read
+    ('CD26p41', "ccdash", FEATURE, '`cc-dash --record-code`', D),  # FO-005: substitution is not a read
+    ('CD26p42', "ccdash", FEATURE, 'ls "$(cc-dash --record-code)"', D),  # FO-005: substitution is not a read
+    ('CD26p43', "ccdash", FEATURE, 'git commit -m "$(cc-dash --record-code)"', D),  # FO-005: substitution is not a read
+    ('CD26p44', "ccdash", FEATURE, "git commit -m 'literal $(cc-dash --record-code) text'", A),  # FO-005: single quotes are literal
+    ('CD26p45', "ccdash", FEATURE, 'ls "$(cp /tmp/x ~/.local/state/cc_tool/cc_dash_code\'\'.json)"', D),  # FO-007
+    ('CD26p46', "ccdash", FEATURE, 'echo "$(cc-dash --record""-code)"', D),  # FO-007
+    ('CD26p47', "ccdash", FEATURE, 'echo "\'$(cc-dash --record-code)\'"', D),  # FO-007
+    ('CD26p48', "ccdash", FEATURE, 'echo "it\'s" "$(cc-dash --record""-code)" "it\'s"', D),  # FO-007
+    ('CD26p49', "ccdash", FEATURE, 'ls "`cp /tmp/x ~/.local/state/cc_tool/cc_dash_code\'\'.json`"', D),  # FO-007
+    ('CD26p50', "ccdash", FEATURE, 'echo "`cc-dash --record""-code`"', D),  # FO-007
+    ('CD26p51', "ccdash", FEATURE, 'echo "\'`cc-dash --record-code`\'"', D),  # FO-007
+    ('CD26p52', "ccdash", FEATURE, 'echo "it\'s" "`cc-dash --record""-code`" "it\'s"', D),  # FO-007
+    ('CD26p53', "ccdash", FEATURE, 'echo --record-code | xargs cc-dash', D),  # FO-007
+    ('CD26p54', "ccdash", FEATURE, "printf '%s\\n' --record-code | xargs bin/cc-dash", D),  # FO-007
+    ('CD26p55', "ccdash", FEATURE, 'echo --record-code | xargs $P', D),  # FO-007
+    ('CD26p56', "ccdash", FEATURE, 'echo cc-dash --record-code | sh', D),  # FO-007
+    ('CD26p57', "ccdash", FEATURE, 'cp y ~/.local/state/cc_tool/cc_dash_c*.json', D),  # FO-007
+    ('CD26p58', "ccdash", FEATURE, 'cp y ~/.local/state/cc_tool/cc_dash_cod?.json', D),  # FO-007
+    ('CD26p59', "ccdash", FEATURE, 'F=cc_dash_code; cp y ~/.local/state/cc_tool/$F.json', D),  # FO-007
+    ('CD26p60', "ccdash", FEATURE, 'cp y ~/.local/state/cc_tool/*', D),  # FO-007
+    ('CD26p61', "ccdash", FEATURE, 'rm $D/cc_dash_c*.json', D),  # FO-007
+    ('CD26p62', "ccdash", FEATURE, 'echo x > ~/.local/state/cc_tool/cc_dash_c*.json', D),  # FO-007
+    ('CD26p63', "ccdash", FEATURE, 'rm -rf ~/.local/state/cc_tool', D),  # FO-007
+    ('CD26p64', "ccdash", FEATURE, 'cp -r src ~/.local/state/cc_tool/', D),  # FO-007
+    ('CD26p65', "ccdash", FEATURE, "echo '$(cc-dash --record-code)'", A),  # FO-007
+    ('CD26p66', "ccdash", FEATURE, "git commit -m 'mention cc-dash --record-code and cc_dash_code.json'", A),  # FO-007
+    ('CD26p67', "ccdash", FEATURE, 'git commit -m "it\'s about cc-dash --record-code"', A),  # FO-007
+    ('CD26p68', "ccdash", FEATURE, "grep -rl -- '--record-code' docs/ | xargs wc -l", A),  # FO-007
+    ('CD26p69', "ccdash", FEATURE, 'cp a $OUT/$NAME', A),  # FO-007
+    ('CD26p70', "ccdash", FEATURE, 'ls ~/.local/state/cc_tool/*', A),  # FO-007
+    ('CD26p71', "ccdash", FEATURE, 'cat ~/.local/state/cc_tool/cc_dash_c*.json', A),  # FO-007
+    ('CD26p72', "ccdash", FEATURE, 'rm tests/*.json', K),  # FO-007
+    # An unbalanced quote or an unclosed substitution: the whole command is scanned with its quotes removed.
+    ('CD26p73', "ccdash", FEATURE, 'echo "$(cc-dash --record""-code)" \'unbalanced', D),  # FO-007
+    ('CD26p74', "ccdash", FEATURE, 'echo "$(cc-dash --record""-code)', D),  # FO-007
+    ('CD26p75', "ccdash", FEATURE, 'echo "$(cc-dash --record""-code', D),  # FO-007
+    ('CD26p76', "ccdash", FEATURE, 'echo "$(cp y ~/.local/state/cc_tool/cc_dash_code\'\'.json)" \'x', D),  # FO-007
+    # A $(...) in the basename counts as * (spec, glob criterion).
+    ('CD26p77', "ccdash", FEATURE, 'cp y ~/.local/state/cc_tool/$(pwd).json', D),  # FO-007
+    ('CD26p78', "ccdash", FEATURE, 'cp y ${XDG_STATE_HOME}/cc_tool/$(echo x).json', D),  # FO-007
+    # Raw-text backstop (FO-007).
+    ('CD26p79', "ccdash", FEATURE, "cp y ~/.local/state/cc_tool/$(echo cc_dash)_code''.json", D),  # FO-007
+    ('CD26p80', "ccdash", FEATURE, 'echo "$(case x in x) cc-dash --record\'\'-code;; esac)"', D),  # FO-007
+    ('CD26p81', "ccdash", FEATURE, 'cp y ~/.local/state//cc_tool/*.json', D),  # FO-007
+    ('CD26p82', "ccdash", FEATURE, 'cp y ~/.local/state/./cc_tool/*', D),  # FO-007
+    ('CD26p83', "ccdash", FEATURE, 'cp y ~/.local/state/cc_tool/../cc_tool/*', D),  # FO-007
+    ('CD26p84', "ccdash", FEATURE, 'rm -rf ~/.local/state/cc_tool/.', D),  # FO-007
+    ('CD26p85', "ccdash", FEATURE, 'cat /tmp/args | xargs cc-dash', D),  # FO-007
+    ('CD26p86', "ccdash", FEATURE, 'xargs -a /tmp/args bin/cc-dash', D),  # FO-007
+    ('CD26p87', "ccdash", FEATURE, 'git commit -m "note $(cc-dash --record-code)"', D),  # FO-007
+    ('CD26p88', "ccdash", FEATURE, 'cd "$R" && cp y ~/.local/state/cc_tool/x.json', D),  # FO-007
+    ('CD26p89', "ccdash", FEATURE, 'ls "$XDG_STATE_HOME/cc_tool/"', A),  # FO-007
+    ('CD26p90', "ccdash", FEATURE, 'grep -rn -- \'--record-code\' "$DIR"', A),  # FO-007
+    ('CD26p91', "ccdash", FEATURE, 'cd "$ROOT" && grep -rn cc_dash_code.json docs/', A),  # FO-007
+    ('CD26p92', "ccdash", FEATURE, 'cp "$SRC" lib/cc_dash/gates.py', A),  # FO-007
+    ('CD26p93', "ccdash", FEATURE, 'python3 tests/test_cc_dash_control.py "$X"', A),  # FO-007
+    ('CD26p94', "ccdash", FEATURE, 'rm tests/fixtures/*.json', K),  # FO-007
+    ('CD26p95', "ccdash", FEATURE, 'git add lib/cc_dash && git commit -m "cc_dash: tidy"', A),  # FO-007
+    ('CD26p96', "ccdash", FEATURE, 'echo "it\'s done: $(date)"', A),  # FO-007
+    ('CD26p97', "ccdash", FEATURE, 'tar czf "$D/backup-$(date +%F).tgz" src', A),  # FO-007
+    # Test station probes (FO-007): unusual inputs for the glob/run-time/xargs criteria.
+    ('CD26t01', "ccdash", FEATURE, 'cp y ${HOME}/.local/state/cc_tool/cc_dash_c*.json', D),  # FO-007
+    ('CD26t02', "ccdash", FEATURE, 'echo x | tee ~/.local/state/cc_tool/cc_dash_cod?.json', D),  # FO-007
+    ('CD26t03', "ccdash", FEATURE, 'parallel cc-dash ::: --record-code', D),  # FO-007
+    ('CD26t04', "ccdash", FEATURE, 'cat /tmp/args | parallel ccdash', D),  # FO-007
+    ('CD26t05', "ccdash", FEATURE, 'cp y $XDG_STATE_HOME/cc_tool/cc_dash_c*.json', D),  # FO-007
+    ('CD26t06', "ccdash", FEATURE, 'mv x ~/.local/state/cc_tool/cc_dash_code{,}.json', D),  # FO-007
+    ('CD26t07', "ccdash", FEATURE, 'echo "$(echo --record""-code | xargs cc-dash)"', D),  # FO-007
+    ('CD26t08', "ccdash", FEATURE, 'cp y /tmp/x/cc_dash_c*.json', D),  # FO-007
+    # Literal text is decided by an allowlist; --record-code beside cc-dash needs nothing dynamic (FO-007).
+    ('CD26p98', "ccdash", FEATURE, r'ssh localhost "cp y ~/.local/state/cc_tool/\$(echo x).json"', D),  # FO-007
+    ('CD26p99', "ccdash", FEATURE, "flock /tmp/l -c 'cp y ~/.local/state/cc_tool/$F.json'", D),  # FO-007
+    ('CD26p100', "ccdash", FEATURE, "timeout 5 sh -c 'cp y ~/.local/state/cc_tool/$(pwd).json'", D),  # FO-007
+    ('CD26p101', "ccdash", FEATURE, r"""find . -exec sh -c 'cc-dash --record""-code' \;""", D),  # FO-007
+    ('CD26p102', "ccdash", FEATURE, r'nohup bash -c "cc-dash --record\"\"-code"', D),  # FO-007
+    ('CD26p103', "ccdash", FEATURE, """su -c 'cc-dash --record-code' "$USER\"""", D),  # FO-007
+    ('CD26p104', "ccdash", FEATURE, "echo $(flock /tmp/l -c 'cp y $HOME/.local/state/cc_tool/$F.json')", D),  # FO-007
+    ('CD26p105', "ccdash", FEATURE, r"""echo \"'$(cc-dash --record-code)'""", A),  # FO-007
+    ('CD26p106', "ccdash", FEATURE, "grep -rn -- '--record-code' bin/cc-dash", A),  # FO-007
+    # sudo -s / -i hands the line to a shell, so quoted text is live
+    ('CD26p107', "ccdash", FEATURE, "sudo -s echo 'cp y ~/.local/state/cc_tool/$(pwd).json'", D),
+    ('CD26p108', "ccdash", FEATURE, "sudo -u root -i echo 'cp y ~/.local/state/cc_tool/$F.json'", D),
+    ('CD26p109', "ccdash", FEATURE, "sudo --shell echo 'cc-dash --record-code'", D),
+    ('CD26p110', "ccdash", FEATURE, "doas -s echo 'cc-dash --record-code'", D),
+    ('CD26p111', "ccdash", FEATURE, "timeout -s KILL 5 echo 'cc-dash --record-code'", A),
     ("CD27", "ccdash", FEATURE, "jq -c .message ~/.claude/projects/x/s.jsonl", A),
     ("CD28", "ccdash", FEATURE, "ls ~/Files/hobby/cc_tool/docs", A),
     ("CD29", "ccdash", FEATURE, "cat ~/.local/state/cc_tool/controller.txt", A),
@@ -1700,6 +1841,9 @@ def main():
             want = "BLOCKED:" if r["got"] == D else "NEEDS APPROVAL:"
             if want not in r["detail"]:
                 fails.append((cid, r["section"], r["cmd"], "message starts with " + want, r["detail"][:60]))
+        # A CD26 deny must come from the code-record rule, not another rule that happens to deny the same text.
+        if cid.startswith("CD26") and r["expected"] == D and r["got"] == D and "code record" not in r["detail"]:
+            fails.append((cid, r["section"], r["cmd"], "denied by the code-record rule", r["detail"][:60]))
     log = os.path.join(MASTER, ".git", "cc_tool", "activity.jsonl")
     if not os.path.exists(log) or "deny" not in open(log).read():
         fails.append(("LOG", "activity", log, "deny events logged", "missing"))

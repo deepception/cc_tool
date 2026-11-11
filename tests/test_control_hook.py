@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from state_guard import StateGuard  # noqa: E402  (tests/state_guard.py)
 STATE_GUARD = StateGuard()         # the real state dir, before anything here runs a hook
 BASE = tempfile.mkdtemp(prefix="cc-control-hook-")
+os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "xdg-default")   # in-process checks read the user-wide code record from here, never the real state
 SID = "0f0e0d0c-1111-2222-3333-444455556666"
 AGENT = "a1b2c3d4e5f6a7b8c"
 TIMINGS = {}
@@ -1288,8 +1289,9 @@ def pinned_hooks(root=REPO, name="pinned"):
     return d
 
 
-def write_manifest(hooks_dir, root):
-    """cc_dash_manifest.json for `root`, as cc-setup writes it (cc_procs.build_manifest)."""
+def write_manifest(hooks_dir, root, state=None):
+    """cc_dash_manifest.json for `root`, as cc-setup writes it (cc_procs.build_manifest), and the user-wide code record
+    (<state>/cc_tool/cc_dash_code.json, default $XDG_STATE_HOME) the hook judges the code by."""
     import importlib.util
     path = os.path.join(REPO, "templates", "hooks", "cc_procs.py")
     if not os.path.exists(path):
@@ -1300,8 +1302,11 @@ def write_manifest(hooks_dir, root):
     if not hasattr(mod, "build_manifest"):
         return
     fd = os.open(os.path.join(hooks_dir, "cc_dash_manifest.json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.write(fd, json.dumps(mod.build_manifest(root)).encode())
+    manifest = mod.build_manifest(root)
+    os.write(fd, json.dumps(manifest).encode())
     os.close(fd)
+    if hasattr(mod, "write_code_record"):
+        mod.write_code_record(root, manifest, path=os.path.join(state or os.environ["XDG_STATE_HOME"], "cc_tool", "cc_dash_code.json"))
 
 
 def load_hook(path, name):

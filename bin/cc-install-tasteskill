@@ -35,8 +35,9 @@ if ! command -v npx &>/dev/null; then
     exit 1
 fi
 
-# v2 ships scripts/; a pre-v2 copy is a lone SKILL.md.
-main_current() { [[ -e "$SKILLS_DIR/design-taste-frontend/scripts/draw.mjs" ]]; }
+# v2 ships scripts/; a pre-v2 copy is a lone SKILL.md. Check the directory, not one script:
+# upstream renames them between releases (draw.mjs was gone by 2.5.1).
+main_current() { [[ -d "$SKILLS_DIR/design-taste-frontend/scripts" ]]; }
 # A classic installed from taste-skill-classics carries disable-model-invocation; one left
 # over from the pre-split taste-skill repo does not, and Claude would still auto-load it.
 classic_current() { grep -q '^disable-model-invocation: true' "$SKILLS_DIR/$1/SKILL.md" 2>/dev/null; }

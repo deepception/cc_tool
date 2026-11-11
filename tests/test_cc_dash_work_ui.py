@@ -30,6 +30,7 @@ BASE = tempfile.mkdtemp(prefix="cc-dash-work-ui-test-")
 os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(BASE, "claude")     # before cc_dash is imported: an empty config dir
 os.makedirs(os.environ["CLAUDE_CONFIG_DIR"], exist_ok=True)
 sys.path.insert(0, os.path.join(REPO, "lib"))
+from cc_dash import gates  # noqa: E402
 from cc_dash import server as server_mod  # noqa: E402
 from cc_dash.auth import Auth  # noqa: E402
 from cc_dash.store import Store  # noqa: E402
@@ -68,13 +69,27 @@ def payload(n):
         stations = [{"name": s, "title": s.title(), "status": st} for s, st in (("plan", "pass"), ("build", "pass"), ("test", "active"), ("review", "pending"))]
         order = {"project": "alpha", "title": "Widget", "status": "building", "priority": "p2", "line": "quick", "gate": None, "stations": stations,
                  "done": 2, "total": 4, "rework": 0, "recommendation": "", "branch": "factory/FO-001-x", "worktree": "",
-                 "path": "factory/orders/FO-001-x.md", "updated": now - 30,
+                 "path": "factory/orders/FO-001-x.md", "updated": now - 30, "decide": None, "spec_changed": False, "main": "~/work/alpha",
                  "plan": {"key": plans[0]["key"], "path": plans[0]["path"], "title": "Widget plan", "tasks": {"done": 3, "total": 7}}}
+        drop = {"kind": "drop", "gate": "spec", "approve": False, "reject": True, "rework": False}
         waiting = dict(order, id="FO-002", title=EVIL, status="review", gate={"name": "merge", "waiting": True}, plan=None, branch="factory/FO-002-y",
-                       path="factory/orders/FO-002-y.md")
+                       path="factory/orders/FO-002-y.md", decide={"kind": "merge", "gate": "merge", "approve": True, "reject": True, "rework": True})
         blocked = dict(order, id="FO-003", title="Blocked one", status="blocked", plan=None, branch="", path="factory/orders/FO-003-z.md",
-                       why={"note": "cc-factory record: the spec changed " + EVIL, "recommendation": "rerun"})
-        d["orders"] = [dict(order, id="FO-001"), waiting, blocked]
+                       why={"note": "cc-factory record: the spec changed " + EVIL, "recommendation": "rerun"}, decide=drop)
+        changed = dict(order, id="FO-004", title="Changed spec", status="approved", plan=None, branch="", path="factory/orders/FO-004-c.md", spec_changed=True,
+                       decide={"kind": "changed", "gate": "spec", "approve": True, "reject": True, "rework": False})
+        queued = dict(order, id="FO-005", title="Queued one", status="queued", plan=None, branch="", path="factory/orders/FO-005-q.md", decide=drop)
+        failed = dict(order, id="FO-006", title="Failed one", status="failed", plan=None, branch="", path="factory/orders/FO-006-f.md", decide=drop,
+                      why={"note": "the run failed", "recommendation": "rerun"})
+        running = dict(order, id="FO-007", title="Verifying one", status="verifying", plan=None, branch="", path="factory/orders/FO-007-v.md", decide=None)
+        wt = "~/work/alpha/.claude/worktrees/FO-008-d"
+        deletion = dict(order, id="FO-008", title="Needs a deletion", status="blocked", plan=None, branch="factory/FO-008-d", worktree=wt,
+                        path="factory/orders/FO-008-d.md", decide=None, why={"note": "needs-deletion: app/old_export.py", "recommendation": "rerun"})
+        tampered = dict(order, id="FO-009", title="Tampered lane", status="blocked", plan=None, branch="factory/FO-009-t", worktree=wt.replace("008-d", "009-t"),
+                        path="factory/orders/FO-009-t.md", decide=None, why={"note": "lane-tampered: HEAD moved", "recommendation": ""})
+        d["orders"] = [dict(order, id="FO-001"), waiting, blocked, changed, queued, failed, running, deletion, tampered]
+        for o in d["orders"]:      # what graph.py attaches, through the real builder
+            o["outside"] = gates.order_outside(dict(o, lane={"worktree": o["worktree"]} if o["worktree"] else None))
         d["documents"] = [{"project": "alpha", "path": "docs/UI-UX-REVIEW.md", "type": "report", "title": "UI review", "status": "", "updated": now - 90},
                           {"project": "alpha", "path": "docs/adr/0001.md", "type": "decision", "title": "Use SQLite", "status": "accepted", "updated": now - 99},
                           {"project": "alpha", "path": "docs/notes.md", "type": "report", "title": "Notes", "status": "", "updated": now - 120}]
@@ -148,7 +163,42 @@ const secs = (page) => page.$$eval('.pl-sec', (e) => e.map((x) => [x.dataset.key
       r.planTasks = await page.$eval('tr[data-order="FO-001"]', (e) => e.textContent.includes('3 of 7 tasks'));
       r.hint = await page.$eval('tr[data-order="FO-002"] .pl-gate', (e) => e.textContent);
       if (process.env.SHOTS) await page.screenshot({ path: process.env.SHOTS + '/work-' + scheme + '.png', fullPage: true });
-      r.nohint =await page.$eval('tr[data-order="FO-001"]', (e) => !e.querySelector('.pl-gate'));
+      r.nohint =await page.$eval('tr[data-order="FO-001"]', (e) => !e.querySelector('.pl-gate:not(.pl-run)'));
+      const rowText = (o) => page.$eval('tr[data-order="' + o + '"]', (e) => e.textContent);
+      r.changed = await rowText('FO-004');
+      r.changedPill = await page.$eval('tr[data-order="FO-004"] .pill', (e) => e.textContent);
+      r.queued = await rowText('FO-005');
+      r.failed = await rowText('FO-006');
+      r.verifying = await rowText('FO-007');
+      r.blockedRow = await rowText('FO-003');
+      r.copyButtons = await page.$$eval('tr[data-order="FO-006"] button[data-copy]', (e) => e.map((b) => b.dataset.copy));
+      const runCopy = 'tr[data-order="FO-006"] button[data-copy="/factory run FO-006"]';
+      await page.click(runCopy);
+      await page.waitForFunction((q) => /Copied|Selected/.test(document.querySelector(q).textContent), runCopy);
+      r.copyLabel = await page.$eval(runCopy, (e) => e.textContent);
+      const box = async (o, sel) => page.$eval('tr[data-order="' + o + '"] ' + (sel || '.ctl-next'), (e) => ({ text: e.textContent, kind: e.dataset.outside,
+        copies: [...e.querySelectorAll('button[data-copy]')].map((b) => b.dataset.copy), open: e.querySelector('details') ? e.querySelector('details').open : null }));
+      r.boxRerun = await box('FO-006');
+      r.boxRerunCount = await page.$$eval('tr[data-order="FO-006"] .ctl-next', (e) => e.length);
+      r.boxDead = await box('FO-007');
+      r.boxDel = await box('FO-008');
+      r.boxTamper = await box('FO-009');
+      r.boxStyle = await page.$eval('tr[data-order="FO-006"] .ctl-next', (e) => { const c = getComputedStyle(e); return { anim: c.animationName, trans: c.transitionDuration, border: c.borderTopColor }; });
+      r.errBorder = await page.evaluate(() => { const d = document.createElement('div'); d.className = 'ctl-err'; document.body.append(d); const c = getComputedStyle(d).color; d.remove(); return c; });
+      const boxCopy = 'tr[data-order="FO-008"] .ctl-next button[data-copy]';
+      await page.click(boxCopy);
+      await page.waitForFunction((q) => /Copied|Selected/.test(document.querySelector(q).textContent), boxCopy);
+      r.boxCopyLabel = await page.$eval(boxCopy, (e) => e.textContent);
+      r.noControlBox = await box('FO-002', '.ctl-next[data-outside="no-control"]');
+      r.noControlCmds = await page.$$eval('tr[data-order="FO-002"] button[data-copy]', (e) => e.map((b) => b.dataset.copy));
+      r.noButtonsOff = await page.$$eval('[data-ctl-gate]', (e) => e.length);
+      if (scheme === 'light') {
+        // Control mode on: every actionable row gets the decision button, the rest none.
+        await page.evaluate(() => { window.ccControl = { on: () => true }; });
+        await page.evaluate(() => { location.hash = '#/plans?order=FO-004'; });
+        await page.waitForSelector('tr.sel[data-order="FO-004"]');
+        r.ctl = await page.$$eval('[data-ctl-gate]', (e) => e.map((b) => b.closest('tr').dataset.order + ':' + b.dataset.ctlGate + ':' + b.textContent));
+      }
       r.why = await page.$eval('tr[data-order="FO-003"] .pl-why', (e) => e.textContent);
       r.cardSpec = await page.$$eval('.pl-card a', (e) => e.map((a) => a.textContent + '|' + a.getAttribute('href')));
       r.planLink = await page.$eval('tr[data-order="FO-001"] a[href^="#/plan?"]', (a) => a.textContent);
@@ -172,8 +222,10 @@ const secs = (page) => page.$$eval('.pl-sec', (e) => e.map((x) => [x.dataset.key
     {
       const { ctx, page, errs } = await open(browser, '#/plans?order=FO-002');
       await page.waitForSelector('tr.sel[data-order="FO-002"]');
+      await page.waitForTimeout(400);
       out.deep = { errs, sel: await page.$$eval('tr.sel', (e) => e.map((x) => x.dataset.order)),
-        visible: await page.$eval('tr.sel', (e) => { const b = e.getBoundingClientRect(); return b.top >= 0 && b.bottom <= innerHeight; }) };
+        scrollY: await page.evaluate(() => scrollY),
+        visible: await page.$eval('tr.sel', (e) => { const b = e.getBoundingClientRect(); return b.top >= 0 && b.top < innerHeight; })  /* a tall row (its next-step box) may run past the fold */ };
       await ctx.close();
     }
     {
@@ -200,7 +252,7 @@ def test_browser(srv):
         check("browser: the page check ran", False, r.stderr[-1200:])
         return
     o = json.loads(r.stdout.strip().splitlines()[-1])
-    want = [["sec:orders", "3"], ["sec:plans", "2"], ["sec:docs", "3"], ["sec:runs", "1"]]
+    want = [["sec:orders", "9"], ["sec:plans", "2"], ["sec:docs", "3"], ["sec:runs", "1"]]
     for scheme in ("light", "dark"):
         s = o[scheme]
         check("%s: four sections in order, each with its count" % scheme, s["sections"] == want, s["sections"])
@@ -213,12 +265,44 @@ def test_browser(srv):
         check("%s: an order waiting at a gate shows the terminal commands, one that is not shows none" % scheme,
               "cc-factory approve FO-002 --gate merge" in s["hint"] and "cc-factory reject FO-002 --gate merge" in s["hint"] and s["nohint"], s["hint"])
         check("%s: a blocked order shows its reason as text, the recommendation and the next-step commands" % scheme,
-              "the spec changed <img src=x" in s["why"] and "Recommended: rerun" in s["why"] and "/factory run FO-003" in s["why"]
-              and "cc-factory reject FO-003" in s["why"], s["why"])
+              "the spec changed <img src=x" in s["why"] and "Recommended: rerun" in s["why"] and "/factory run FO-003" in s["blockedRow"]
+              and "cc-factory reject FO-003 --gate spec" in s["blockedRow"], s["why"])
+        check("%s: a merge row shows the approve, send-back and reject commands" % scheme,
+              "cc-factory reject FO-002 --gate merge --rework" in s["hint"] and "git merge --no-ff" in s["hint"], s["hint"])
+        check("%s: a spec changed since approval says so on its pill and row and offers re-approve and drop" % scheme,
+              "Spec changed" in s["changedPill"] and "Spec changed since approval: re-approve" in s["changed"]
+              and "cc-factory approve FO-004 --gate spec" in s["changed"] and "cc-factory reject FO-004 --gate spec" in s["changed"], s["changed"])
+        check("%s: a queued order offers only the drop command, never approve" % scheme,
+              "cc-factory reject FO-005 --gate spec" in s["queued"] and "approve" not in s["queued"], s["queued"])
+        check("%s: a failed order shows /factory run, where to run it and a Copy control that copies or selects" % scheme,
+              "/factory run FO-006" in s["failed"] and "~/work/alpha" in s["failed"] and "Claude Code session" in s["failed"]
+              and s["copyButtons"] == ["cc-factory reject FO-006 --gate spec", "/factory run FO-006"] and s["copyLabel"] in ("Copied", "Selected"), (s["failed"], s["copyButtons"], s["copyLabel"]))
+        check("%s: a verifying order shows the mark-failed command and says to use it only when the run is dead" % scheme,
+              'cc-factory mark FO-007 failed --note "run died"' in s["verifying"] and "Only when the run is dead" in s["verifying"]
+              and "approve" not in s["verifying"] and "reject" not in s["verifying"], s["verifying"])
+        check("%s: a failed order has one 'Do this outside ccdash' box: where, with the path, and the command" % scheme,
+              s["boxRerunCount"] == 1 and s["boxRerun"]["kind"] == "rerun" and "Do this outside ccdash" in s["boxRerun"]["text"]
+              and "a Claude Code session in ~/work/alpha" in s["boxRerun"]["text"] and "/factory run FO-006" in s["boxRerun"]["text"], s["boxRerun"])
+        check("%s: a verifying order's box is dead-run" % scheme, s["boxDead"]["kind"] == "dead-run" and "cc-factory mark FO-007 failed" in s["boxDead"]["text"], s["boxDead"])
+        check("%s: needs-deletion: the copy list is rm, commit, rerun, in order" % scheme,
+              s["boxDel"]["kind"] == "needs-deletion" and s["boxDel"]["copies"] == [
+                  "git -C ~/work/alpha/.claude/worktrees/FO-008-d rm -- app/old_export.py",
+                  "git -C ~/work/alpha/.claude/worktrees/FO-008-d commit -m 'FO-008: remove app/old_export.py'", "/factory run FO-008"], s["boxDel"])
+        check("%s: lane-tampered shows the lane status and diff" % scheme,
+              s["boxTamper"]["kind"] == "lane-tampered" and "git -C" in s["boxTamper"]["text"] and " status" in s["boxTamper"]["text"], s["boxTamper"])
+        check("%s: a box Copy button copies or selects" % scheme, s["boxCopyLabel"] in ("Copied", "Selected"), s["boxCopyLabel"])
+        check("%s: the box neither animates nor transitions, and is not the error colour" % scheme,
+              s["boxStyle"]["anim"] == "none" and set(s["boxStyle"]["trans"].split(", ")) == {"0s"} and s["boxStyle"]["border"] != s["errBorder"], (s["boxStyle"], s["errBorder"]))
+        check("%s: without control mode a gate row says how to start it, and keeps the terminal commands" % scheme,
+              s["noControlBox"]["kind"] == "no-control" and "ccdash --control" in s["noControlBox"]["copies"] and "cc-factory approve FO-002 --gate merge" in s["noControlCmds"], (s["noControlBox"], s["noControlCmds"]))
+        check("%s: with control mode off no decision button is drawn" % scheme, s["noButtonsOff"] == 0, s["noButtonsOff"])
         check("%s: a plan card links its spec and its order" % scheme,
               any(x.startswith("Spec") and "#/docs?p=alpha&f=factory%2Forders%2FFO-001-x.md" in x for x in s["cardSpec"])
               and any(x.startswith("FO-001|#/plans?p=alpha&order=FO-001") for x in s["cardSpec"]), s["cardSpec"])
         check("%s: an order links its plan" % scheme, s["planLink"] == "Widget plan", s["planLink"])
+    check("control mode on: every order with a decision gets a button of its kind, building and verifying none",
+          sorted(o["light"]["ctl"]) == sorted(["FO-002:merge:Review merge gate", "FO-003:spec:Drop order", "FO-004:spec:Re-approve spec",
+                                                "FO-005:spec:Drop order", "FO-006:spec:Drop order"]), o["light"]["ctl"])
     check("documents: type chips are All plus each type with counts", o["light"]["chips"] == ["All3", "decision1", "report2"], o["light"]["chips"])
     check("documents: a type chip filters the rows", o["light"]["rowsAfter"] == 1, o["light"]["rowsAfter"])
     check("documents: a row opens Docs", o["light"]["docHash"].startswith("#/docs?p=alpha&f=docs%2Fadr"), o["light"]["docHash"])

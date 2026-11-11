@@ -1350,7 +1350,8 @@ class Plans:
                         "recommendation": recs.get(o["id"], ""), "why": o.get("why"), "branch": lane.get("branch", ""),
                         "worktree": lane.get("worktree", ""), "path": o["path"],
                         "plan": {"key": plan["key"], "path": plan["doc"] or "", "title": plan["title"], "tasks": plan["tasks"]} if plan else None,
-                        "updated": o["updated"] or 0})
+                        "decide": o.get("decide"), "spec_changed": o.get("spec_changed", False), "main": o.get("main", ""),
+                        "outside": o.get("outside"), "updated": o["updated"] or 0})
                 # documents: the Docs tree minus what the Plans and Orders sections already show
                 skip = {p["key"] for p in shown if p["project"] == label}
                 skip |= {p["doc"] for p in shown if p["project"] == label and p["doc"]}

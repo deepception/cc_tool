@@ -93,16 +93,17 @@ launched the way bin/cc-dash launches itself (argv exactly `<that python> -I
 Code or PYTHON* variable in its /proc/<pid>/environ, no claude process among its
 parents or its session and process-group leaders' parents (a leader or a chain
 that cannot be inspected counts as one), no detached terminal driver (script,
-expect, unbuffer ...) on the way, every holder of its terminal's master side
-(found by fdinfo tty-index; it reads the control code) one of the terminal
-programs cc-setup recorded in the manifest (terminal_hosts) and none of them
-Claude Code or carrying its variables, not a fresh session after a re-parent, not
+expect, unbuffer ...) on the way, a pseudo-terminal of its own, every holder of
+its terminal's master side (found by fdinfo tty-index; it reads the control
+code) checked live, with no recorded list: not a generic interpreter, terminal
+driver or copy of one, and none of them Claude Code or carrying its variables, not a fresh session after a re-parent, not
 re-parented with no controlling terminal; no LD_* variable either. And its code
-must be what cc-setup recorded: the sha256 of
+must be what you approved: the sha256 of
 bin/cc-dash, cc_procs.py and every entry under lib/ (nothing unlisted, no
-symlink), in cc_dash_manifest.json beside this hook ("cc-dash's code changed
-since cc-setup ran; run cc-update-project to re-record it if you changed it
-yourself"), and that code and the record must have last changed (ctime) before
+symlink), in the one user-wide record, cc_dash_code.json under cc_tool's state
+directory (cc_procs.read_code_record: a 0600 file of yours; it covers every
+project and is re-recorded with `cc-dash --record-code` from your terminal, or
+by a dashboard-approved merge: "cc-dash's code is not the code you approved"), and that code and the record must have last changed (ctime) before
 the dashboard process started ("... changed after the dashboard started;
 restart it"). The checks are
 cc_procs.py beside this hook (cc-setup copies it here; never code from the
@@ -330,17 +331,15 @@ def dashboard_problem(pid):
     if mod is None:
         return "cc_procs.py is not next to this hook (run cc-update-project)"
     try:
-        manifest, why = read_manifest(mod)
+        manifest, why = read_manifest(mod, root)
         if why:
             return why
-        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), mod.MANIFEST_NAME)
+        path = (mod.code_record_path() if hasattr(mod, "read_code_record")
+                else os.path.join(os.path.dirname(os.path.realpath(__file__)), mod.MANIFEST_NAME))
         # The recorded code, a real cc-dash process on the recorded interpreter, and that
         # process started after the code last changed.
-        terminals = manifest.get("terminal_hosts") if isinstance(manifest.get("terminal_hosts"), list) else []
-        # An AppImage terminal host is hashed in full once in this process (cc_procs.TERMINAL_HASHES,
-        # memory only), then every later check in it (each verify, the lease every second) reuses it.
         why = mod.manifest_problem(root, manifest) or mod.dashboard_problem(
-            pid, root, python=manifest.get("python"), terminals=terminals)
+            pid, root, python=manifest.get("python"))
         return (why
                 or mod.code_after_start(pid, root, path))
     except Exception as e:  # noqa: BLE001
@@ -356,13 +355,18 @@ def code_problem(root, mod=None):
     mod = mod or _procs()
     if mod is None:
         return "cc_procs.py is not next to this hook (run cc-update-project)"
-    manifest, why = read_manifest(mod)
+    manifest, why = read_manifest(mod, root)
     return why or mod.manifest_problem(root, manifest)
 
 
-def read_manifest(mod):
-    """(cc_dash_manifest.json beside this hook as a dict, '') or (None, why not):
-    only a plain file we own that nobody else can write counts."""
+def read_manifest(mod, root=None):
+    """(the record of cc-dash's code for the pinned root as a dict, '') or (None, why not): the user-wide
+    record (cc_procs.read_code_record, one for every project: only a plain file we own that nobody else can
+    write counts). A cc_procs copy from before that record existed keeps reading cc_dash_manifest.json
+    beside this hook."""
+    if root and hasattr(mod, "read_code_record"):
+        manifest, why = mod.read_code_record(root)
+        return (manifest, "") if manifest is not None else (None, "no code record for this checkout (run cc-dash --record-code in your terminal)")
     raw = None
     p = os.path.join(os.path.dirname(os.path.realpath(__file__)), getattr(mod, "MANIFEST_NAME", "cc_dash_manifest.json"))
     try:

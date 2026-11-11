@@ -2,6 +2,22 @@
 
 All notable changes to `cc_tool` are documented here. See the [README](README.md) for usage.
 
+## v0.4.5
+
+Every factory decision can be made from the dashboard, in any terminal and any project, and what still has to happen outside it is shown as a command to copy.
+
+**Upgrading:** run `cc-update-project` in each project to deploy the new hooks and `factory-line.js`, then run `cc-dash --record-code` once and restart `ccdash`, both from your own terminal.
+
+- **Gates clear from the dashboard.** The Work view, the Factory floor's inspector and the alerts band carry the decision for every order that needs you: a gate waiting, a spec changed since approval, a failed or blocked run. The dashboard can make the merge itself, and the terminal showing the control code is checked live, so no per-project recording step is needed.
+- **One code record for the whole user.** `cc-dash --record-code` records cc-dash's code once for every project. It is re-recorded when a dashboard merge changes that code, and survives `cc-update-project`.
+- **"Do this outside ccdash" box.** A refused decision or a stuck order shows the exact commands to run in your own terminal, and a refusal writes nothing.
+- **Context usage on each agent tile.** Session and agent tiles on the floor show a context meter, with the raw count in the inspector.
+- **Merges are safer.** A dashboard merge refuses any filter or merge-driver key and `info/attributes`, and every git call on the merge path runs without attributes or submodule recursion.
+- **Hidden terminal holders are found more reliably.** `/proc` is listed again after a hidden handoff, exiting processes no longer count as holders, and a decision refused while another Claude session starts is retried.
+- **Verify sees sub-package dependencies.** Each top-level sub-directory with its own `.venv` or `node_modules` is mounted read-only into the verify sandbox. A failed gate or speed test is rerun alone before the failure counts.
+- **bash-guard denies writes to the code record by name.** An agent's Bash call may read `cc_dash_code.json` but not write it or run `cc-dash --record-code`, including through quoting tricks, substitutions, globs, run-time-built names, `xargs`, `ssh`, `flock -c`, `find -exec` and `sudo -s`. The rule matches names and is not a boundary; the guide says what it does not cover.
+- **Leftover test fixtures no longer dirty a checkout.** `tests/.bashguard-matrix-*` directories from a cut-off test run are ignored, so they cannot block a lane at review.
+
 ## v0.4.4
 
 The factory's verify station runs lane code in a tighter sandbox, bash-guard stops treating a disguised `git rm` as a harmless untrack, and the dashboard says why an order stopped.

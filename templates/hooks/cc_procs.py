@@ -39,11 +39,16 @@ code_after_start, recording_problem, control_mode_problem).
                                 cannot be inspected counts)
   driver_detached(pid)          a terminal driver (script, expect, ...) among its
                                 parents or its leaders' parents, itself detached
-  terminal_problem(pid, terminals)
-                                a holder of the master side of its terminal that
-                                is not one of your recorded terminals, or is, or
-                                descends from, Claude Code (fail closed);
-                                detect_terminals records them (cc-setup)
+  terminal_problem(pid)         a holder of the master side of its terminal that
+                                is a generic interpreter or terminal driver (or a
+                                copy of one), or is, or descends from, Claude Code
+                                (fail closed): a live check, no recorded list;
+                                detect_terminals records terminals (cc-setup) by
+                                the same rules, for reference only
+                                (an unreadable process under Claude Code is hidden only if still
+                                alive after a 200 ms re-check: HIDDEN_SETTLE; when one
+                                exits, /proc is listed once more; the checks then rescan once
+                                when only that relist found a hidden process)
   fresh_session(pid)            a process that leads a session it started after
                                 being re-parented (a typical double-fork escape)
   origin_problem(pid, ...)      all of the above, the one set of rules for
@@ -53,9 +58,11 @@ code_after_start, recording_problem, control_mode_problem).
   detached(pid)                 re-parented to init or a subreaper with no
                                 controlling terminal left
 """
+import json
 import os
 import re
 import stat
+import time
 
 # What Claude Code puts in the environment of its Bash tool's processes
 # (checked against `env` from a headless `claude -p` Bash call, CLI 2.1.30x).
@@ -73,14 +80,21 @@ def have_proc():
     return os.path.isdir("/proc/self")
 
 
+# A process whose open files cannot be read may be exiting (a headless `claude -p`
+# does this every few seconds on a busy machine): scans re-check it for up to
+# HIDDEN_SETTLE seconds in all, in steps of HIDDEN_STEP, before calling it hidden.
+HIDDEN_SETTLE = 0.2
+HIDDEN_STEP = 0.02
+
+
 def proc_stat(pid, proc="/proc"):
-    """{comm, ppid, pgrp, sid, tty} from /proc/<pid>/stat, or None."""
+    """{comm, state, ppid, pgrp, sid, tty} from /proc/<pid>/stat, or None."""
     try:
         with open("%s/%d/stat" % (proc, pid), encoding="utf-8", errors="replace") as fh:
             st = fh.read()
         comm = st[st.index("(") + 1:st.rindex(")")]
         f = st[st.rindex(")") + 2:].split()
-        return {"comm": comm, "ppid": int(f[1]), "pgrp": int(f[2]), "sid": int(f[3]), "tty": int(f[4])}
+        return {"comm": comm, "state": f[0], "ppid": int(f[1]), "pgrp": int(f[2]), "sid": int(f[3]), "tty": int(f[4])}
     except (OSError, ValueError, IndexError, TypeError):
         return None
 
@@ -315,61 +329,141 @@ def _hidden(pid, me, proc):
     return me in (uids(pid, proc) or []) and bool(claude_descent(pid, proc))
 
 
-def pty_master_scan(index, proc="/proc"):
+def _gone(pid, proc):
+    """True when pid no longer holds any file: its /proc entry is gone, or it is a
+    zombie (Z) or dead (X). Unknown (stat unreadable, entry there) is False."""
+    if not os.path.isdir("%s/%d" % (proc, pid)):
+        return True
+    st = proc_stat(pid, proc)
+    return bool(st) and st["state"] in ("Z", "X")
+
+
+def _settle(pending, examine, proc, first, me, late=None):
+    """(extra_holders, hidden) after re-checking the pids in `pending` (those
+    `examine` could not read: it returns True holds, False does not, None
+    unreadable) for at most HIDDEN_SETTLE seconds in total. A pid that is gone
+    or a zombie is dropped; one that becomes readable is judged; one still
+    alive and unreadable at the end is hidden.
+    `first` is the set of pids the scan's first listing of /proc held, `me` the
+    uid. A hidden process could fork a child after that listing and exit: the
+    child keeps its fd and is never listed. So when any pending pid is dropped
+    as gone or a zombie, /proc is listed once more. A pid absent from `first`
+    is judged once, at once: readable, it may be a holder; unreadable and
+    `_hidden`, it is hidden with no second settle window. The scan waits at
+    most HIDDEN_SETTLE plus that one listing. Pids the relist counted hidden are
+    also appended to `late` (when given), so a caller can tell a handoff seen only
+    by the relist from a process that stayed hidden for the whole settle."""
+    holders = []
+    pending = list(pending)
+    dropped = False
+    deadline = time.monotonic() + HIDDEN_SETTLE
+    while pending:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(HIDDEN_STEP, left))
+        keep = []
+        for pid in pending:
+            if _gone(pid, proc):
+                dropped = True
+                continue
+            r = examine(pid)
+            if r is None:
+                keep.append(pid)
+            elif r:
+                holders.append(pid)
+        pending = keep
+    hidden = []
+    for pid in pending:
+        if _gone(pid, proc):
+            dropped = True
+        else:
+            hidden.append(pid)
+    if dropped:
+        try:
+            names = os.listdir(proc)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.isdigit() or int(name) in first:
+                continue
+            pid = int(name)
+            r = examine(pid)
+            if r:
+                holders.append(pid)
+            elif r is None and os.path.isdir("%s/%d" % (proc, pid)) and _hidden(pid, me, proc):
+                hidden.append(pid)
+                if late is not None:
+                    late.append(pid)
+    return holders, hidden
+
+
+def _pty_examine(pid, index, proc):
+    """True when pid holds the master of /dev/pts/<index>, False when not (or gone),
+    None when its fd table, a link or an fdinfo cannot be read."""
+    d = "%s/%d/fd" % (proc, pid)
+    try:
+        fds = os.listdir(d)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            if os.readlink(os.path.join(d, fd)) not in PTMX:
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        try:
+            with open("%s/%d/fdinfo/%s" % (proc, pid, fd), encoding="ascii", errors="replace") as fh:
+                m = re.search(r"^tty-index:\s*(\d+)\s*$", fh.read(4096), re.M)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        if m and int(m.group(1)) == index:
+            return True
+    return False
+
+
+def pty_master_scan(index, proc="/proc", late=None):
     """(holders, hidden) for /dev/pts/<index>: holders are the pids with a
     /dev/ptmx fd whose fdinfo says `tty-index: <index>`; hidden are processes
     running as you, descending from Claude Code (claude_descent), whose fd
     table or a ptmx fdinfo cannot be read (any program can make itself
     non-dumpable): such a process could hold that master, and the callers
-    refuse (fail closed). A hidden process of yours outside Claude Code's
-    lineage (an ssh-agent, an editor's sandbox helper) is not counted: hiding
-    from Claude Code needs that and a double fork away from it, the documented
-    same-user limit. Other users' processes cannot hold your terminal's master
-    without your help."""
-    out, hidden = [], []
+    refuse (fail closed). Such a process is re-checked for up to 200 ms in
+    total (HIDDEN_SETTLE): one that exits or becomes a zombie meanwhile holds
+    nothing any more and is skipped, but its exit makes the scan list /proc once
+    more (a child it forked meanwhile could have inherited the master): a
+    process that appeared since the first listing and cannot be read counts as
+    hidden at once, one that can be read is judged and may be a holder. One
+    still alive and unreadable counts. A
+    hidden process of yours outside Claude Code's lineage (an ssh-agent, an
+    editor's sandbox helper) is not counted: hiding from Claude Code needs that
+    and a double fork away from it, the documented same-user limit. Other
+    users' processes cannot hold your terminal's master without your help.
+    `late` (a list) receives the hidden pids found only by the relist."""
+    out, pending = [], []
     me = os.getuid()
     try:
         names = os.listdir(proc)
     except OSError:
-        return out, hidden
+        return out, []
     for name in names:
         if not name.isdigit():
             continue
         pid = int(name)
-        d = "%s/%s/fd" % (proc, name)
-        try:
-            fds = os.listdir(d)
-        except FileNotFoundError:
-            continue                       # gone
-        except OSError:
-            if os.path.isdir("%s/%s" % (proc, name)) and _hidden(pid, me, proc):
-                hidden.append(pid)
-            continue
-        for fd in fds:
-            try:
-                if os.readlink(os.path.join(d, fd)) not in PTMX:
-                    continue
-            except FileNotFoundError:
-                continue                   # closed meanwhile
-            except OSError:
-                if _hidden(pid, me, proc):
-                    hidden.append(pid)
-                    break
-                continue
-            try:
-                with open("%s/%s/fdinfo/%s" % (proc, name, fd), encoding="ascii", errors="replace") as fh:
-                    m = re.search(r"^tty-index:\s*(\d+)\s*$", fh.read(4096), re.M)
-            except FileNotFoundError:
-                continue
-            except OSError:
-                if _hidden(pid, me, proc):
-                    hidden.append(pid)
-                    break
-                continue
-            if m and int(m.group(1)) == index:
-                out.append(pid)
-                break
-    return sorted(out), sorted(set(hidden))
+        r = _pty_examine(pid, index, proc)
+        if r:
+            out.append(pid)
+        elif r is None and os.path.isdir("%s/%s" % (proc, name)) and _hidden(pid, me, proc):
+            pending.append(pid)
+    first = {int(n) for n in names if n.isdigit()}
+    extra, hidden = _settle(pending, lambda p: _pty_examine(p, index, proc), proc, first, me, late)
+    return sorted(set(out + extra)), sorted(set(hidden))
 
 
 def hidden_problem(hidden, what, proc="/proc"):
@@ -390,72 +484,198 @@ def _inherited_from(h, hosts, proc="/proc"):
     return complete and any(p in hosts for p, _c, _e, _a in up[1:])
 
 
-def terminal_problem(pid, proc="/proc", terminals=None, mountinfo="/proc/self/mountinfo", cache=None):
+O_CLOEXEC_FLAG = 0o2000000     # as fdinfo prints a descriptor's flags, in octal
+
+
+def _master_flags(pid, index, proc="/proc"):
+    """The fdinfo flags (ints) of every /dev/ptmx descriptor of pid for /dev/pts/<index>, or None when one
+    cannot be read."""
+    d = "%s/%d/fd" % (proc, pid)
+    out = []
+    try:
+        fds = os.listdir(d)
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            if os.readlink(os.path.join(d, fd)) not in PTMX:
+                continue
+            with open("%s/%d/fdinfo/%s" % (proc, pid, fd), encoding="ascii", errors="replace") as fh:
+                text = fh.read(4096)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        m = re.search(r"^tty-index:\s*(\d+)\s*$", text, re.M)
+        if not (m and int(m.group(1)) == index):
+            continue
+        f = re.search(r"^flags:\s*([0-7]+)\s*$", text, re.M)
+        if not f:
+            return None
+        out.append(int(f.group(1), 8))
+    return out
+
+
+def ptrace_scope(proc="/proc"):
+    """kernel.yama.ptrace_scope as an int, or None (no Yama, or unreadable)."""
+    try:
+        with open("%s/sys/kernel/yama/ptrace_scope" % proc, encoding="ascii", errors="replace") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _claude_sibling_ok(h, holders, index, proc="/proc"):
+    """True when holder h, a claude CLI itself, only carries a terminal host's leaked master and cannot hand it
+    to anything: it inherited the fd from a holder that is a terminal host (complete parent chain; a leaked copy
+    like the one an IDE's pty host leaves in every process it starts), every master descriptor it has for this
+    pty carries O_CLOEXEC (so no program it starts, no tool call, inherits it), and Yama's ptrace_scope is 1 or
+    more (so a descendant of it cannot ptrace it or pidfd_getfd the descriptor out). Anything else is False."""
+    hosts = [x for x in holders if x != h and not _inherited_from(x, holders, proc)]
+    if not hosts or not _inherited_from(h, hosts, proc):
+        return False
+    flags = _master_flags(h, index, proc)
+    if not flags or any(not f & O_CLOEXEC_FLAG for f in flags):
+        return False
+    scope = ptrace_scope(proc)
+    return scope is not None and scope >= 1
+
+
+def _judge_holders(holders, index, proc, cache):
+    """(why, vanished) for the holders of /dev/pts/<index>: why is the first refusal ('' when they pass);
+    vanished lists holders whose refusal came from a process that is confirmed gone by now (_gone), which
+    holds nothing and is not judged."""
+    vanished = []
+
+    def gone(h, why):
+        if why and _gone(h, proc):
+            vanished.append(h)
+            return ""
+        return why
+
+    for h in holders:
+        if _inherited_from(h, holders, proc):
+            continue
+        exe = _link(h, "exe", proc)
+        if not exe:
+            why = gone(h, "the program holding the terminal showing the control code (/dev/pts/%d, process %d) cannot be read" % (index, h))
+            if why:
+                return why, vanished
+            continue
+        exe = exe[:-len(" (deleted)")] if exe.endswith(" (deleted)") else exe
+        path = os.path.realpath(exe) if proc == "/proc" else exe
+        if _bare(path) in NOT_RECORDABLE:
+            why = gone(h, "the terminal showing the control code (/dev/pts/%d) is held by %s (process %d), a generic "
+                          "interpreter or terminal driver, which never counts as your terminal" % (index, path, h))
+            if why:
+                return why, vanished
+    for h in holders:
+        if h in vanished:
+            continue
+        # The terminal programs themselves (not a shell that inherited the fd from one, as the shells
+        # of an IDE's terminals keep their siblings' masters) must not be interpreters by content.
+        copy = interpreter_copy("%s/%d/exe" % (proc, h), cache) if not _inherited_from(h, holders, proc) else ""
+        if copy:
+            why = gone(h, "process %d, which holds its terminal (/dev/pts/%d), runs a copy of %s, an interpreter or shell"
+                       % (h, index, copy))
+            if why:
+                return why, vanished
+            continue
+        env = environ(h, proc)
+        if env is None:
+            why = gone(h, "cannot read the environment of process %d, which holds its terminal (/dev/pts/%d)" % (h, index))
+            if why:
+                return why, vanished
+            continue
+        seen = [k for k in CLAUDE_ENV_SIGNALS if env.get(k)]
+        if seen:
+            why = gone(h, "process %d, which holds its terminal (/dev/pts/%d), carries %s (set by Claude Code)"
+                       % (h, index, ", ".join(seen)))
+            if why:
+                return why, vanished
+            continue
+        # The environment checks apply to every holder; the argv switches too, except for a shell (by
+        # content) that inherited the fd from a terminal: an IDE terminal's zsh runs with -i, interactive.
+        inherited_shell = _inherited_from(h, holders, proc) and is_shell("%s/%d/exe" % (proc, h), cache)
+        why = debug_problem(h, proc, switches=not inherited_shell)
+        if why:
+            why = gone(h, "%s; it holds its terminal (/dev/pts/%d)" % (why, index))
+            if why:
+                return why, vanished
+            continue
+        up, complete = chain(h, proc=proc)
+        for p, comm, exe, argv in up:
+            if is_claude(comm, exe, argv):
+                if p == h and _claude_sibling_ok(h, holders, index, proc):
+                    continue
+                why = gone(h, "process %d, which holds its terminal (/dev/pts/%d), %s process %d, %s"
+                           % (h, index, "is" if p == h else "descends from", p, comm))
+                if why:
+                    return why, vanished
+                break
+        else:
+            if not up or not complete:
+                why = gone(h, "the parent chain of process %d, which holds its terminal (/dev/pts/%d), cannot be read" % (h, index))
+                if why:
+                    return why, vanished
+    return "", vanished
+
+
+def terminal_problem(pid, proc="/proc", cache=None):
     """Why the terminal pid writes to (and the control code with it) may be read
     by something other than your own terminal. The processes holding the master
-    side of its controlling pseudo-terminal (pty_master_holders) are judged:
+    side of its controlling pseudo-terminal (pty_master_holders) are judged live,
+    with no recorded list: each holder that did not inherit the fd from another
+    holder must run a program that can be read and is not a generic interpreter
+    or terminal driver (NOT_RECORDABLE) nor a copy of one (interpreter_copy);
+    and no holder may be the claude CLI, descend from it, or carry a variable
+    Claude Code sets for its tools. These are the rules cc-setup records a
+    terminal by (detect_terminals).
 
-      with `terminals` (the recorded terminal hosts, terminal_entry dicts; [] when
-      none were recorded): each holder must run one of them (/proc/<p>/exe, see
-      terminal_host_ok), or descend from a holder that does (an inherited fd);
-      and, as extra signals, no holder may be the claude CLI, descend from it, or
-      carry a variable Claude Code sets for its tools.
+    IDE terminals (Cursor, VS Code) work with Claude Code open in another tab, and their helper
+    processes (cpuUsage.sh and its sed and sleep) come and go:
+      - a holder that cannot be judged because it exited since the scan (_gone confirms it) is not
+        judged, and the whole scan is run once more (one bounded retry, never a loop); on that second
+        scan a holder confirmed gone again is never assumed gone: the check refuses ("kept changing; try
+        again"), as does any other unreadable holder;
+      - a scan whose only hidden processes came from the /proc relist (they appeared after the first
+        listing) is likewise run once more; anything hidden in that second scan refuses;
+      - a holder that is the claude CLI itself passes only when _claude_sibling_ok: it inherited the
+        master from a terminal host, every master descriptor it has carries O_CLOEXEC, and
+        kernel.yama.ptrace_scope is 1 or more. The pty host leaks the master into every shell it
+        starts, and so into the claude of a sibling tab, which neither lends it to its tool calls
+        (O_CLOEXEC closes it at exec: a Bash tool call holds no ptmx descriptor, and
+        /proc/<pid>/fd/<n> of a ptmx opens a new pty, not this master) nor lets them take it
+        (ptrace_scope 1: a descendant cannot pidfd_getfd or ptrace its ancestor). A descendant of
+        claude holding the master, a claude without O_CLOEXEC, and any system with ptrace_scope 0 or
+        no Yama still refuse.
 
     Fails closed: nobody visible holding the master, a holder whose program,
     parents or environment cannot be read, or a process of yours descending
     from Claude Code whose open files cannot be read (pty_master_scan), counts. '' when the holders pass, and
     when pid has no controlling terminal or one that is not a pseudo-terminal
-    (the detach rules judge the first; nothing as you can hold a console's
-    master). terminals=None skips the recorded-host rule (only the signals)."""
+    (pty_problem and the detach rules judge that)."""
     st = proc_stat(pid, proc)
     if st is None:
         return "process %d cannot be inspected" % pid
     index = pts_index(st["tty"])
     if index is None:
         return ""
-    holders, hidden = pty_master_scan(index, proc)
-    why = hidden_problem(hidden, "this terminal (/dev/pts/%d)" % index, proc)
-    if why:
-        return why
-    if not holders:
-        return ("nobody visible holds the master side of its terminal (/dev/pts/%d), so who reads it cannot be "
-                "told" % index)
-    if terminals is not None:
-        exes = {h: _link(h, "exe", proc) for h in holders}
-        hosts = [h for h in holders if exes[h] and terminal_host_ok(exes[h], terminals, "%s/%d/exe" % (proc, h), mountinfo, cache)]
-        for h in holders:
-            if h not in hosts and not _inherited_from(h, hosts, proc):
-                return ("the terminal showing the control code (/dev/pts/%d) is held by %s (process %d), which is not one "
-                        "of your recorded terminals; run cc-update-project from your terminal to record it"
-                        % (index, exes[h] or "a program that cannot be read", h))
-    for h in holders:
-        # The terminal programs themselves (not a shell that inherited the fd from one, as the shells
-        # of an IDE's terminals keep their siblings' masters) must not be interpreters by content.
-        copy = interpreter_copy("%s/%d/exe" % (proc, h), cache) if not _inherited_from(h, holders, proc) else ""
-        if copy:
-            return ("process %d, which holds its terminal (/dev/pts/%d), runs a copy of %s, an interpreter or shell"
-                    % (h, index, copy))
-        env = environ(h, proc)
-        if env is None:
-            return "cannot read the environment of process %d, which holds its terminal (/dev/pts/%d)" % (h, index)
-        seen = [k for k in CLAUDE_ENV_SIGNALS if env.get(k)]
-        if seen:
-            return ("process %d, which holds its terminal (/dev/pts/%d), carries %s (set by Claude Code)"
-                    % (h, index, ", ".join(seen)))
-        # The environment checks apply to every holder; the argv switches too, except for a shell (by
-        # content) that inherited the fd from a terminal: an IDE terminal's zsh runs with -i, interactive.
-        inherited_shell = _inherited_from(h, holders, proc) and is_shell("%s/%d/exe" % (proc, h), cache)
-        why = debug_problem(h, proc, switches=not inherited_shell)
+    for attempt in (0, 1):
+        late = []
+        holders, hidden = pty_master_scan(index, proc, late=late)
+        if attempt == 0 and hidden and set(hidden) <= set(late):
+            continue
+        why = hidden_problem(hidden, "this terminal (/dev/pts/%d)" % index, proc)
         if why:
-            return "%s; it holds its terminal (/dev/pts/%d)" % (why, index)
-        up, complete = chain(h, proc=proc)
-        for p, comm, exe, argv in up:
-            if is_claude(comm, exe, argv):
-                return ("process %d, which holds its terminal (/dev/pts/%d), %s process %d, %s"
-                        % (h, index, "is" if p == h else "descends from", p, comm))
-        if not up or not complete:
-            return "the parent chain of process %d, which holds its terminal (/dev/pts/%d), cannot be read" % (h, index)
-    return ""
+            return why
+        if not holders:
+            return ("nobody visible holds the master side of its terminal (/dev/pts/%d), so who reads it cannot be "
+                    "told" % index)
+        why, vanished = _judge_holders(holders, index, proc, cache)
+        if why or not vanished:
+            return why
+    return "a process holding this terminal (/dev/pts/%d) kept changing; try again" % index
 
 
 # ── your terminals, as cc-setup recorded them ───────────────────────────────
@@ -523,50 +743,6 @@ def terminal_entry(path):
         e["appimage"] = {"name": m.group(2), "rel": m.group(3), "size": os.stat(real).st_size,
                          "sha256": TerminalCache().sha256(real)}
     return e
-
-
-def _fuse_mount(mountpoint, mountinfo="/proc/self/mountinfo"):
-    """The mount ID of mountpoint when it is a FUSE mount (an AppImage's), from
-    mountinfo, else ''."""
-    try:
-        with open(mountinfo, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                left, _, right = line.partition(" - ")
-                f = left.split()
-                if len(f) >= 5 and f[4] == mountpoint and right.split()[:1] and right.split()[0].startswith("fuse"):
-                    return f[0]
-    except OSError:
-        pass
-    return ""
-
-
-def terminal_host_ok(exe, terminals, open_path=None, mountinfo="/proc/self/mountinfo", cache=None):
-    """True when the program at real path `exe` is one of the recorded terminal
-    hosts: the same real path (a program installed normally), or, for an
-    AppImage, the same image name and path inside it, on a FUSE mount, with the
-    same size and full sha256 (read through open_path, e.g. /proc/<pid>/exe,
-    the very file running; `cache`, a TerminalCache, default this process's
-    TERMINAL_HASHES, spares rehashing within the process)."""
-    terminals = [t for t in terminals or [] if isinstance(t, dict)]
-    if any(t.get("path") == exe and not isinstance(t.get("appimage"), dict) for t in terminals):
-        return True
-    m = APPIMAGE_RE.match(exe or "")
-    if not m:
-        return False
-    cache = cache if cache is not None else TERMINAL_HASHES
-    for t in terminals:
-        a = t.get("appimage")
-        if isinstance(a, dict) and a.get("name") == m.group(2) and a.get("rel") == m.group(3) \
-                and isinstance(a.get("sha256"), str):
-            try:
-                st = os.stat(open_path or exe)
-                mount = _fuse_mount(m.group(1), mountinfo)
-                if st.st_size == a.get("size") and mount and \
-                        cache.sha256(open_path or exe, "%s %s" % (mount, m.group(1))) == a["sha256"]:
-                    return True
-            except OSError:
-                continue
-    return False
 
 
 # Programs never recorded as a terminal host, whatever holds the terminal: a generic
@@ -931,7 +1107,7 @@ def python_problem(pid, python, proc="/proc"):
     return ""
 
 
-def dashboard_problem(pid, root, proc="/proc", python=None, terminals=None, cache=None):
+def dashboard_problem(pid, root, proc="/proc", python=None, cache=None):
     """'' when pid is cc-dash from the checkout at `root`, run by the interpreter
     cc-setup recorded, started the way bin/cc-dash starts itself and from
     outside Claude Code; else the reason.
@@ -946,9 +1122,10 @@ def dashboard_problem(pid, root, proc="/proc", python=None, terminals=None, cach
     Code, PYTHON* or LD_* variable in its environment, no claude process among
     its parents or its session and process-group leaders' parents (a leader that
     cannot be inspected counts), no detached terminal driver (script, expect ...)
-    on the way, every holder of its terminal's master side one of your recorded
-    terminals (`terminals`, from the manifest; None skips that rule) and none
-    of them Claude Code (terminal_problem), not a fresh session after a re-parent,
+    on the way, a controlling pseudo-terminal of its own (pty_problem), every
+    holder of its terminal's master side live-checked (terminal_problem: no
+    generic interpreter, driver or copy of one, nothing of Claude Code; no
+    recorded terminal list is read), not a fresh session after a re-parent,
     and not re-parented with no controlling terminal left."""
     if not isinstance(pid, int) or pid <= 1:
         return "the lease names no process"
@@ -968,8 +1145,11 @@ def dashboard_problem(pid, root, proc="/proc", python=None, terminals=None, cach
     env = environ(pid, proc)
     if env is None:
         return "cannot read the environment of process %d" % pid
+    st = proc_stat(pid, proc)
+    if st is None:
+        return "process %d cannot be inspected" % pid
     why = env_problem(env) or origin_problem(
-        pid, proc, terminal=lambda: terminal_problem(pid, proc, terminals=terminals, cache=cache))[1]
+        pid, proc, terminal=lambda: pty_problem(st) or terminal_problem(pid, proc, cache=cache))[1]
     return ("process %d: %s" % (pid, why)) if why else ""
 
 
@@ -1118,53 +1298,76 @@ def unix_peer_inode(sock):
     return None
 
 
-def socket_holders(inode, proc="/proc"):
+def _socket_examine(pid, target, proc):
+    """True when pid has the socket `target` open, False when not (or gone), None
+    when its fd table or a link cannot be read."""
+    d = "%s/%d/fd" % (proc, pid)
+    try:
+        fds = os.listdir(d)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            if os.readlink(os.path.join(d, fd)) == target:
+                return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return False
+
+
+def socket_holders(inode, proc="/proc", late=None):
     """(holders, hidden) for the socket with this inode, from one scan of
     /proc/*/fd: holders have it open; hidden are processes of yours descending
-    from Claude Code whose fd table cannot be read (they could hold it too)."""
+    from Claude Code whose fd table cannot be read (they could hold it too).
+    An unreadable process is re-checked for up to 200 ms in total
+    (HIDDEN_SETTLE); one that exits or becomes a zombie meanwhile holds nothing
+    and is skipped, one still alive and unreadable is hidden. Its exit makes the
+    scan list /proc once more (a child it forked meanwhile could have inherited
+    the socket): a process that appeared since the first listing and cannot be
+    read counts as hidden at once, one that can be read is judged and may be a
+    holder. `late` (a list) receives the hidden pids found only by the relist."""
     target = "socket:[%s]" % inode
-    out, hidden = [], []
+    out, pending = [], []
     me = os.getuid()
     try:
         names = os.listdir(proc)
     except OSError:
-        return out, hidden
+        return out, []
     for name in names:
         if not name.isdigit():
             continue
         pid = int(name)
-        d = "%s/%s/fd" % (proc, name)
-        try:
-            fds = os.listdir(d)
-        except FileNotFoundError:
-            continue
-        except OSError:
-            if os.path.isdir("%s/%s" % (proc, name)) and _hidden(pid, me, proc):
-                hidden.append(pid)
-            continue
-        for fd in fds:
-            try:
-                if os.readlink(os.path.join(d, fd)) == target:
-                    out.append(pid)
-                    break
-            except FileNotFoundError:
-                continue
-            except OSError:
-                if _hidden(pid, me, proc):
-                    hidden.append(pid)
-                    break
-    return sorted(out), sorted(set(hidden))
+        r = _socket_examine(pid, target, proc)
+        if r:
+            out.append(pid)
+        elif r is None and os.path.isdir("%s/%s" % (proc, name)) and _hidden(pid, me, proc):
+            pending.append(pid)
+    first = {int(n) for n in names if n.isdigit()}
+    extra, hidden = _settle(pending, lambda p: _socket_examine(p, target, proc), proc, first, me, late)
+    return sorted(set(out + extra)), sorted(set(hidden))
 
 
 def peer_holder_problem(sock, pid, proc="/proc"):
     """'' when the other end of the connected Unix socket `sock` is held by
     process `pid` and nothing else (unix_peer_inode, socket_holders); else why
     not. Fails closed: no answer from the kernel, or a hidden process of yours
-    descending from Claude Code, counts."""
+    descending from Claude Code, counts. When the only hidden processes are ones
+    the relist found (they appeared after the first listing, as a short-lived
+    process may at any time), the check runs one fresh scan; anything hidden in
+    that scan, or hidden from the first listing on, refuses. At most two scans."""
     inode = unix_peer_inode(sock)
     if not inode:
         return "the kernel cannot say which socket is at the other end (sock_diag)"
-    holders, hidden = socket_holders(inode, proc)
+    for attempt in (0, 1):
+        late = []
+        holders, hidden = socket_holders(inode, proc, late=late)
+        if attempt == 0 and hidden and set(hidden) <= set(late):
+            continue
+        break
     why = hidden_problem(hidden, "the connecting socket", proc)
     if why:
         return why
@@ -1278,9 +1481,102 @@ def hook_problem(pid, root, proc="/proc", ident=None, projects=None):
 
 # ── the dashboard's code, as cc-setup recorded it ───────────────────────────
 MANIFEST_NAME = "cc_dash_manifest.json"
-CODE_CHANGED = "cc-dash's code changed since cc-setup ran; run cc-update-project to re-record it if you changed it yourself"
+CODE_RECORD_NAME = "cc_dash_code.json"
+RECORD_COMMAND = "cc-dash --record-code"
+CODE_CHANGED = "cc-dash's code is not the code you approved"
 CODE_AFTER_START = "cc-dash's code changed after the dashboard started; restart it"
 _HASHES = {}
+
+
+def cc_state_dir(env=None):
+    """cc_tool's state directory: $XDG_STATE_HOME (when absolute) or ~/.local/state, plus /cc_tool."""
+    env = os.environ if env is None else env
+    base = env.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "cc_tool")
+
+
+def code_record_path(env=None):
+    """The one record of the cc-dash code you approved, for every project: <state dir>/cc_dash_code.json."""
+    return os.path.join(cc_state_dir(env), CODE_RECORD_NAME)
+
+
+def _read_json_file(path):
+    """(dict, '') from a plain file of ours that nobody else can write, not through a symlink; else (None, why)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None, "there is no code record yet"
+    except OSError as e:
+        return None, "the code record cannot be opened (%s)" % (e.strerror or e)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "the code record is not a plain file"
+        if st.st_uid != os.getuid():
+            return None, "the code record is not yours"
+        if st.st_mode & 0o022:
+            return None, "the code record can be written by others"
+        if st.st_size >= (1 << 20):
+            return None, "the code record is too large"
+        data = os.read(fd, 1 << 20)
+    except OSError as e:
+        return None, "the code record cannot be read (%s)" % (e.strerror or e)
+    finally:
+        os.close(fd)
+    try:
+        doc = json.loads(data)
+    except ValueError:
+        return None, "the code record is not valid"
+    return (doc, "") if isinstance(doc, dict) else (None, "the code record is not valid")
+
+
+def read_code_record(root, path=None):
+    """(manifest, '') for the checkout at root from the user-wide code record (code_record_path), read with the
+    rules of the old per-project manifest: your own plain file, not group- or world-writable, no symlink. Else
+    (None, why), and the why names the one command that records it."""
+    path = path or code_record_path()
+    doc, why = _read_json_file(path)
+    if doc is None:
+        return None, "%s; record it with %s in your own terminal" % (why, RECORD_COMMAND)
+    entry = (doc.get("checkouts") or {}).get(os.path.realpath(root)) if doc.get("v") == 1 and isinstance(doc.get("checkouts"), dict) else None
+    if not isinstance(entry, dict):
+        return None, "there is no code record for this checkout; record it with %s in your own terminal" % RECORD_COMMAND
+    return entry, ""
+
+
+def write_code_record(root, manifest, path=None):
+    """Record `manifest` (build_manifest) for the checkout at root in the user-wide record. Callers decide who may
+    (recording_problem for a terminal, a ticketed merge of a reviewed commit for cc-factory). The directory is 0700,
+    the file 0600, written to a temporary name and renamed; an unchanged record is left alone (its ctime stays)."""
+    path = path or code_record_path()
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    doc, _why = _read_json_file(path)
+    if not (isinstance(doc, dict) and doc.get("v") == 1 and isinstance(doc.get("checkouts"), dict)):
+        doc = {"v": 1, "checkouts": {}}
+    key = os.path.realpath(root)
+    if doc["checkouts"].get(key) == manifest:
+        return path
+    doc["checkouts"][key] = manifest
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=1, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, 0o600)
+    return path
+
+
 # Outside lib/: the two files cc-dash runs from elsewhere in the checkout, and the
 # directories they sit in (a swapped directory changes their ctime).
 _SCOPE_FILES = ("bin/cc-dash", "templates/hooks/cc_procs.py")
@@ -1430,7 +1726,7 @@ def process_start(pid, proc="/proc"):
         return None
 
 
-def code_after_start(pid, root, manifest_path, proc="/proc", start=None):
+def code_after_start(pid, root, manifest_path, proc="/proc", start=None, exempt=(), exempt_since=None):
     """'' when every file and directory of cc-dash's code (scan_code's scope and
     its parent directories), and the manifest itself, last changed (ctime: any
     write, rename or restore sets it, and a normal user cannot set it back)
@@ -1439,7 +1735,12 @@ def code_after_start(pid, root, manifest_path, proc="/proc", start=None):
     from changed files that were then put back. Fails closed: a change counts
     unless its ctime is at least START_MARGIN before the (early) start estimate,
     so a dashboard started within about a second of a change must be restarted.
-    `start` overrides the estimate (tests)."""
+    `start` overrides the estimate (tests). `exempt` names relative paths skipped (the files, and their
+    directories, that a merge cc-factory is about to re-record just changed), and only when
+    changed no earlier than `exempt_since` (the time cc-dash took immediately before its merge, rounded up to the next
+    whole second (gates.merge_clock; the merge starts no earlier than that second), carried as the
+    merge commit's committer time): anything changed before it and after the process started still counts, and
+    exempt entries with no exempt_since skip nothing. The record itself never is exempt."""
     start = process_start(pid, proc) if start is None else start
     if start is None:
         return CODE_AFTER_START + " (the start time of process %s is unknown)" % pid
@@ -1450,6 +1751,8 @@ def code_after_start(pid, root, manifest_path, proc="/proc", start=None):
     except OSError:
         return CODE_AFTER_START + " (no record of the code)"
     for rel, st in entries:
+        if rel in exempt and exempt_since is not None and st.st_ctime_ns / 1e9 >= exempt_since:
+            continue
         if st.st_ctime_ns / 1e9 >= start - START_MARGIN:
             return CODE_AFTER_START + " (%s changed after process %d started)" % (rel, pid)
     return ""

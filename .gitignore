@@ -10,6 +10,10 @@ docs/*
 .taste-skill/
 # cc_tool factory: holdout scenarios and lane worktrees
 .factory-holdout/
+# this repo's own work orders: local working notes, not part of the tool
+factory/orders/FO-*.md
+# fixtures a cut-off tests/test_bash_guard.py run leaves behind
+tests/.bashguard-matrix-*/
 # this repo's own harness: cc-update-project generates it from templates/
 /CLAUDE.md
 .claude/hooks/
